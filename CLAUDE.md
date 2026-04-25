@@ -41,9 +41,16 @@ Everything durable belongs in `ai-docs/`. Treat docs as the project's long-term 
 - Updates and end-of-turn summaries stay short. Diffs and docs speak for themselves.
 - This is a one-developer research repo. There is no team to coordinate with, no external users, no SLAs.
 
+## Session resume
+
+If the user says **"resume SOMNUS prompt"** (or a close variation: "resume", "resume SOMNUS", "where were we"), read `.claude/session-state.md` end-to-end and continue from where the previous session left off. That file is the canonical record of the conversation arc and what's queued next. After reading, state briefly where things stand and either ask for direction or proceed with the queued next step.
+
+When wrapping a session at a logical break point (a substantive set of edits has been committed), update `.claude/session-state.md` so the next resume is accurate.
+
 ## File-system landmarks
 
 - `CLAUDE.md` — this file.
 - `ai-docs/` — project knowledge. Start at `ai-docs/README.md`.
+- `.claude/session-state.md` — last-known session state; read on "resume SOMNUS prompt".
 - `experiments/` — throwaway prototypes; expect frequent churn. No CI gates, no API stability.
 - `crates/` — main system code, once it exists.
