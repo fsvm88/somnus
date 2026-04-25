@@ -122,16 +122,49 @@ Conceptually:
 - Long-term archive ≈ remote / consolidated cortical memory.
 - Recollection layer ≈ hippocampal retrieval mechanism.
 
-## Sleep, growth, and compression
+## Sleep cycle and wake/sleep control
 
-During sleep, the system runs four interleaved processes:
+### Wake (live mode)
 
-1. **Replay.** Episodes from episodic memory are replayed into the semantic memory of the regions they involve, driving consolidation.
-2. **Self-probe (gist-level).** The system picks recent episodes and attempts to *reconstruct* them through the semantic + recollection path. The reconstruction is compared at **gist level** — categorical content matches, even when details differ (dream-style: town and weather right, color and order of houses wrong is acceptable).
-3. **Growth.** If gist-level reconstruction fails for a meaningful share of recent episodes in a region, that region's semantic memory **grows**. Growth is local — adding units, not whole layers — and likely cascade-correlation-style (new units trained on residual error). See open questions.
-4. **Compression.** Under memory pressure, oldest / least-cued semantic content is quantized, pruned, or distilled, then spilled to the cold archive.
+During wake, the system runs in real time:
 
-This is the operationalization of `vision.md` commitment 5 (bottom-up growth) and the behavioral saturation criterion stated there.
+- **Reads** from semantic memory and the cold archive (via the recollection layer) for recognition and retrieval.
+- **Writes** to episodic memory: integrated episodes from the binding area land here.
+- **Does not update** semantic memory. All consolidation is deferred to sleep — keeps the wake path real-time-cheap and prevents incoming experience from interfering with consolidated knowledge mid-stream.
+- **Working memory** holds transient context but does not produce long-term updates.
+
+### Sleep stages
+
+Sleep is **two-stage**, loosely modeled on mammalian NREM/REM. Each stage has different work.
+
+**NREM-like — consolidation, homeostasis, compression.**
+
+- **Replay.** Recent episodic memories are replayed into the semantic memory of the regions they involve, driving consolidation.
+- **Homeostatic downscaling.** Global, gentle decay of semantic weights, with selective protection of those reinforced by replay. Restores plasticity headroom for the next wake cycle. Inspired by Tononi's synaptic homeostasis hypothesis.
+- **Compression.** Oldest or least-cued semantic content is quantized / pruned / distilled, then spilled to the cold archive.
+
+**REM-like — generative replay, self-probe, growth.**
+
+- **Generative replay.** The system attempts to *reconstruct* recent episodes through the semantic + recollection path.
+- **Self-probe (gist-level).** The reconstruction is compared to the original at categorical / gist level — right scene, right objects, right events, even when details differ (dream-style: town and weather right, color and order of houses wrong is acceptable).
+- **Growth.** If a meaningful share of recent episodes in a region fail gist-level recall, that region's semantic memory grows. Growth is local — adding units, not whole layers — likely cascade-correlation-style (new units trained on residual error).
+- **Future scope (Phase 3+):** creative recombination — stitching pieces from different episodes into synthetic novel episodes that are themselves replayed. The architectural locus where creativity, in the recombinational sense, can live.
+
+This is the operationalization of `vision.md` commitments 2 (sleep/wake) and 5 (bottom-up growth + behavioral saturation).
+
+### Entry triggers and duration
+
+Entry triggers (any of):
+
+- **Exhaustion** — episodic memory passes a high-water mark.
+- **Wake-performance degradation** — recognition quality / predictive accuracy drops on incoming inputs.
+- **Schedule fallback** — max wake-time cap reached, even if neither of the above has fired.
+
+Duration is **adaptive**: run until consolidation goals are met (replay covers recent episodes, gist-recall reaches a stable rate per region, compression has cleared memory pressure) **or** a max-sleep-time cap, whichever comes first.
+
+### Interruptibility
+
+Sleep is **interruptible by high-salience external events** (loud novel sound, motion onset, alert pattern that breaches a salience threshold). Sleep operations are idempotent or checkpointed so partial work is preserved across interruption. After interruption, the system enters wake; the next sleep cycle resumes from where the previous one was checkpointed.
 
 ## Cross-cutting
 
@@ -151,8 +184,7 @@ Tracked here so they don't get lost. Resolutions become ADRs.
 - **Recollection-layer implementation.** Vector ANN (e.g., `hnsw_rs`) over the archive? Hopfield-style associative memory? Hybrid?
 - **Compression strategy.** Quantization, structured pruning, knowledge distillation, or layered combination? When is content moved cold vs. dropped?
 - **Sparse-coding scheme.** k-WTA, top-k, learned sparsity penalty? Per-region or global?
-- **Replay budget within a sleep cycle.** Split between replay (consolidation), self-probe, growth, and compression.
-- **Sleep granularity.** One sleep mode or multiple (NREM-like for consolidation, REM-like for generative replay / dreaming)?
+- **Sleep-cycle time budget.** How to split a sleep cycle between NREM-like work (replay, homeostatic downscaling, compression) and REM-like work (generative replay, self-probe, growth, future creative recombination), and how to schedule within each stage.
 - **Action loop.** Does the system have one in early phases? Effector — internal state only, or external (audio out, motor)?
 - **Scheduling.** Async tasks, dedicated threads, event loop? How do real-time wake constraints coexist with batch sleep work?
 - **Tensor representation.** Single shared tensor type across subsystems, or each subsystem picks its own?
