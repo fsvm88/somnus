@@ -1,0 +1,2 @@
+models/qwen3_tokenizer.json filter=lfs diff=lfs merge=lfs -text
+crates/somnus-encoding/tests/fixtures/*.f32 filter=lfs diff=lfs merge=lfs -text

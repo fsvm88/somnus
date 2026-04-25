@@ -1,0 +1,12 @@
+# Claude state — project memory (.claude/mind.mv2) is tracked; lock files are not
+.claude/*.lock
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Editor and OS noise
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
