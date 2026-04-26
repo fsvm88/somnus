@@ -21,19 +21,32 @@ Constraints carried in from prior research:
 - `thiserror` in libraries; `anyhow` in the binary.
 - `tracing` for all telemetry; no `println!` or `eprintln!` in production paths.
 
+Additional constraints settled post-design:
+
+- The system must accept a video file as input (user has no camera). A media file
+  provides both audio and video streams from one path.
+- Mic audio can run alongside file audio simultaneously (e.g., processing a movie
+  while a person speaks in the room). No sample-level mixing in Phase 1 — sources
+  independently produce `AudioFrame`s that fan into the same downstream channel.
+- Graceful shutdown on Ctrl+C is required; frames in flight are discarded, not
+  flushed.
+- Phase 1 "done" = capture pipeline running, metrics logging, clean shutdown.
+  Encoding (frozen models via `ort`) is Phase 2. No visualizer in Phase 1.
+
 ## Decision
 
 ### Module layout (`crates/somnus-sensory/src/`)
 
 ```
-lib.rs        re-exports: AudioFrame, VideoFrame, Timestamp, PixelFormat,
-              AudioCapture, VideoCapture, SensorError, SensorResult,
-              SensorMetrics, MetricsSnapshot
-frame.rs      Timestamp, AudioFrame, VideoFrame, PixelFormat
-audio.rs      AudioCapture, AUDIO_CHANNEL_CAPACITY
-video.rs      VideoCapture, VIDEO_CHANNEL_CAPACITY
-error.rs      SensorError, SensorResult
-metrics.rs    SensorMetrics, MetricsSnapshot
+lib.rs          re-exports: AudioFrame, VideoFrame, Timestamp, PixelFormat,
+                AudioCapture, VideoCapture, MediaFile, MediaFileStreams,
+                SensorError, SensorResult, SensorMetrics, MetricsSnapshot
+frame.rs        Timestamp, AudioFrame, VideoFrame, PixelFormat
+audio.rs        AudioCapture, AUDIO_CHANNEL_CAPACITY
+video.rs        VideoCapture, VIDEO_CHANNEL_CAPACITY
+media_file.rs   MediaFile, MediaFileStreams
+error.rs        SensorError, SensorResult
+metrics.rs      SensorMetrics, MetricsSnapshot
 ```
 
 ---
@@ -135,6 +148,15 @@ pub enum SensorError {
 
     #[error("video frame capture: {0}")]
     VideoCapture(String),
+
+    #[error("media file open: {path}: {reason}")]
+    MediaFileOpen { path: std::path::PathBuf, reason: String },
+
+    #[error("media file has no {0} stream")]
+    MediaFileNoStream(&'static str),
+
+    #[error("media file decode: {0}")]
+    MediaFileDecode(String),
 
     #[error("sensor channel closed")]
     ChannelClosed,
@@ -281,10 +303,18 @@ impl AudioCapture {
   Receiver sees the same channel minus whichever frames were drained.
 - The callback never blocks. `try_send` and `try_recv` are both O(1).
 - `_stream` is never read; it is held only to prevent `Drop` from stopping playback.
+- **Multi-source fan-in:** because `crossbeam_channel::Sender<T>` is `Clone`, a
+  `MediaFile`'s audio output and a live `AudioCapture` can both send into the
+  *same* downstream channel by cloning the `Sender`. The binary handles this; no
+  special mixer type is needed. Frames from both sources are interleaved by
+  arrival order. Sample-level mixing (summing waveforms) is deferred to Phase 2+.
 
 ---
 
 ### `video.rs`
+
+`VideoCapture` is webcam-only. Video from files is handled by `MediaFile`
+(see below). This keeps the nokhwa and ffmpeg dependencies separate.
 
 Video uses a pull model: the caller drives the loop and requests frames one by one.
 Unlike audio, there is no platform callback to bridge.
@@ -352,30 +382,122 @@ is actively maintained. The project runs on Linux; `v4l` would also work, but
 
 ---
 
+### `media_file.rs`
+
+Decodes both audio and video streams from a single media file (MP4, MKV, etc.).
+The primary use case is testing without a camera: supply a video file and get
+the same `AudioFrame` / `VideoFrame` stream types as live capture.
+
+```rust
+use std::path::PathBuf;
+use crossbeam_channel::Receiver;
+
+/// Decoded streams from a media file. Dropping this stops decoding.
+pub struct MediaFileStreams {
+    /// Decoded audio frames (f32 PCM, sample rate from the file's audio track).
+    pub audio: Receiver<AudioFrame>,
+    /// Decoded video frames (Rgb8, resolution from the file's video track).
+    pub video: Receiver<VideoFrame>,
+    pub audio_metrics: Arc<SensorMetrics>,
+    pub video_metrics: Arc<SensorMetrics>,
+    _handles: MediaFileHandles, // background thread handles; drop = stop
+}
+
+/// Open a media file and start decoding both streams on background threads.
+pub struct MediaFile {
+    path: PathBuf,
+}
+
+impl MediaFile {
+    pub fn open(path: impl Into<PathBuf>) -> SensorResult<Self> {
+        let path = path.into();
+        if !path.exists() {
+            return Err(SensorError::MediaFileOpen {
+                path,
+                reason: "file not found".into(),
+            });
+        }
+        Ok(Self { path })
+    }
+
+    /// Start decoding. Spawns two background threads (audio decoder, video decoder).
+    /// Both channels are bounded with drop-oldest backpressure.
+    pub fn start(self) -> SensorResult<MediaFileStreams> {
+        // implementation uses ffmpeg-next to open the format context,
+        // find the best audio and video streams, and decode packets in
+        // separate threads → crossbeam senders
+        todo!()
+    }
+}
+
+// Private: keeps decoder thread handles alive.
+struct MediaFileHandles {
+    _audio_thread: std::thread::JoinHandle<()>,
+    _video_thread: std::thread::JoinHandle<()>,
+}
+```
+
+**Decoding implementation sketch** (inside `MediaFile::start`):
+
+```rust
+// Open format context (ffmpeg-next):
+let mut ictx = ffmpeg_next::format::input(&self.path)
+    .map_err(|e| SensorError::MediaFileOpen { path: self.path.clone(), reason: e.to_string() })?;
+
+// Find best audio / video stream index:
+let audio_stream_idx = ictx.streams()
+    .best(ffmpeg_next::media::Type::Audio)
+    .ok_or(SensorError::MediaFileNoStream("audio"))?
+    .index();
+let video_stream_idx = ictx.streams()
+    .best(ffmpeg_next::media::Type::Video)
+    .ok_or(SensorError::MediaFileNoStream("video"))?
+    .index();
+
+// Build decoders, spawn one thread per stream, packet-demux loop.
+// Audio decoder → resample to f32 if needed → AudioFrame → audio_tx
+// Video decoder → convert to Rgb8 via ffmpeg swscale → VideoFrame → video_tx
+```
+
+**Crate selection — `ffmpeg-next`:**
+
+Alternatives:
+- `video-rs` (higher-level ffmpeg wrapper; audio support is limited)
+- `gstreamer` (pipeline model; heavyweight, hard to bundle)
+- `symphonia` + `video-rs` (pure Rust; symphonia handles audio; video-rs handles video;
+  but they cannot share a single format context for the same file)
+
+`ffmpeg-next` chosen because it exposes both the audio and video streams of a
+single file through one format context, handles resampling and pixel-format
+conversion via libswresample/libswscale, and supports every common container and
+codec. Requires `libavcodec`, `libavformat`, `libavutil`, `libswresample`,
+`libswscale` installed on the system (Arch: `pacman -S ffmpeg`).
+
+---
+
 ### Channel topology
 
 ```
-Phase 1:
-                                               consumer
-  [cpal callback]──crossbeam::bounded(256)──► [tokio::task::spawn_blocking bridge]
-                                                         │
-                                                         ▼
-                                               tokio::sync::mpsc::Receiver<AudioFrame>
-                                                         │
-                                                         ▼
-                                                [async audio consumer task]
+Phase 1 — live capture (webcam + mic):
 
-  [video thread]──────────────────────────────► VideoCapture::next_frame() (blocking pull)
-                                                         │
-                                                tokio::task::spawn_blocking
-                                                         │
-                                                         ▼
-                                                [async video consumer task]
+  [cpal callback]──crossbeam::bounded(256)──► [spawn_blocking bridge]──► tokio::mpsc──► [consumer]
+  [VideoCapture thread]──────────────────────► [spawn_blocking bridge]──► tokio::mpsc──► [consumer]
+
+Phase 1 — file input (MediaFile only):
+
+  [audio decoder thread]──crossbeam::bounded──► \
+                                                 fan-in via Sender::clone ──► tokio::mpsc──► [consumer]
+  [video decoder thread]───crossbeam::bounded──► [spawn_blocking bridge]───► tokio::mpsc──► [consumer]
+
+Phase 1 — mixed (MediaFile + live mic):
+
+  [cpal callback]─────────────────────────────► \
+                                                 same crossbeam Sender clone ──► tokio::mpsc──► [consumer]
+  [audio decoder thread]──crossbeam::bounded──► /
 
 Phase 2 change:
-  - Add a fanout bridge: crossbeam → tokio::sync::broadcast<AudioFrame>
-  - somnus-encoding subscribes; somnus-perception subscribes (once it exists)
-  - VideoCapture wrapped in a dedicated thread → crossbeam channel → broadcast
+  - Replace per-consumer mpsc with tokio::sync::broadcast (one sender, N subscribers)
+  - somnus-encoding subscribes to both audio and video broadcast channels
 ```
 
 The Phase 1 binary bridges sync capture to async using:
@@ -405,13 +527,14 @@ members = ["crates/somnus", "crates/somnus-sensory"]
 resolver = "2"
 
 [workspace.dependencies]
-anyhow       = "1"
-cpal         = "0.15"
+anyhow            = "1"
+cpal              = "0.15"
 crossbeam-channel = "0.5"
-nokhwa       = { version = "0.10", features = ["input-native"] }
-thiserror    = "2"
-tokio        = { version = "1", features = ["full"] }
-tracing      = "0.1"
+ffmpeg-next       = "7"
+nokhwa            = { version = "0.10", features = ["input-native"] }
+thiserror         = "2"
+tokio             = { version = "1", features = ["full"] }
+tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ```
 
@@ -424,11 +547,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cpal             = { workspace = true }
+cpal              = { workspace = true }
 crossbeam-channel = { workspace = true }
-nokhwa           = { workspace = true }
-thiserror        = { workspace = true }
-tracing          = { workspace = true }
+ffmpeg-next       = { workspace = true }
+nokhwa            = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
 ```
 
 **`crates/somnus/Cargo.toml`:**
@@ -455,12 +579,25 @@ tracing-subscriber = { workspace = true }
 
 ### Binary sketch (`crates/somnus/src/main.rs`)
 
+The binary accepts an optional `--file` argument. If supplied, `MediaFile` provides
+both audio and video; an optional `--mic` flag additionally enables live microphone
+input. If neither `--file` nor `--mic` is given with a live webcam, it falls back
+to live capture.
+
 ```rust
 use anyhow::Result;
-use somnus_sensory::{AudioCapture, VideoCapture, MetricsSnapshot};
+use crossbeam_channel::bounded;
+use somnus_sensory::{AudioCapture, AudioFrame, MediaFile, VideoCapture, VideoFrame};
+use std::{path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
-use std::time::Duration;
 use tracing::info;
+
+#[derive(Debug)]
+struct Args {
+    file: Option<PathBuf>,
+    mic: bool,       // mix in live mic alongside file audio
+    webcam: Option<u32>, // None when --file is supplied
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -468,73 +605,127 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let audio = AudioCapture::start(None)?;
-    let mut video = VideoCapture::open(0)?;
+    let args = parse_args(); // simple manual parse or `clap` — TBD at implementation
 
-    let audio_metrics = audio.metrics.clone();
-    let video_metrics = video.metrics.clone();
+    // ── audio setup ────────────────────────────────────────────────────────
+    // Shared bounded channel: multiple producers can clone the sender.
+    let (audio_cb_tx, audio_cb_rx) = bounded::<AudioFrame>(256);
+    let mut audio_metric_handles = vec![];
 
-    // Bridge audio: sync crossbeam → async tokio mpsc
-    let (audio_tx, mut audio_rx) = mpsc::channel(64);
+    if let Some(ref path) = args.file {
+        let streams = MediaFile::open(path)?.start()?;
+        audio_metric_handles.push(streams.audio_metrics.clone());
+        let tx = audio_cb_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(frame) = streams.audio.recv() {
+                if tx.is_full() { let _ = tx.try_recv(); } // drop-oldest reuse
+                let _ = tx.try_send(frame);
+            }
+        });
+    }
+
+    if args.mic || args.file.is_none() {
+        let mic = AudioCapture::start(None)?;
+        audio_metric_handles.push(mic.metrics.clone());
+        let tx = audio_cb_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(frame) = mic.receiver.recv() {
+                if tx.is_full() { let _ = tx.try_recv(); }
+                let _ = tx.try_send(frame);
+            }
+        });
+    }
+
+    // ── video setup ────────────────────────────────────────────────────────
+    let (video_cb_tx, video_cb_rx) = bounded::<VideoFrame>(16);
+    let video_metrics;
+
+    if let Some(ref path) = args.file {
+        let streams = MediaFile::open(path)?.start()?;
+        video_metrics = streams.video_metrics.clone();
+        let tx = video_cb_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(frame) = streams.video.recv() {
+                if tx.is_full() { let _ = tx.try_recv(); }
+                let _ = tx.try_send(frame);
+            }
+        });
+    } else {
+        let mut cam = VideoCapture::open(args.webcam.unwrap_or(0))?;
+        video_metrics = cam.metrics.clone();
+        std::thread::spawn(move || loop {
+            match cam.next_frame() {
+                Ok(frame) => { if video_cb_tx.is_full() { let _ = video_cb_tx.try_recv(); }
+                               let _ = video_cb_tx.try_send(frame); }
+                Err(e)    => { tracing::error!(?e, "video capture error"); break; }
+            }
+        });
+    }
+
+    // ── async bridges ──────────────────────────────────────────────────────
+    let (audio_tx, mut audio_rx) = mpsc::channel::<AudioFrame>(64);
     tokio::task::spawn_blocking(move || {
-        while let Ok(frame) = audio.receiver.recv() {
-            if audio_tx.blocking_send(frame).is_err() {
-                break;
-            }
+        while let Ok(f) = audio_cb_rx.recv() {
+            if audio_tx.blocking_send(f).is_err() { break; }
         }
     });
 
-    // Bridge video: blocking pull → async tokio mpsc
-    let (video_tx, mut video_rx) = mpsc::channel(16);
-    tokio::task::spawn_blocking(move || loop {
-        match video.next_frame() {
-            Ok(frame) => {
-                if video_tx.blocking_send(frame).is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::error!(?e, "video capture error");
-                break;
-            }
+    let (video_tx, mut video_rx) = mpsc::channel::<VideoFrame>(16);
+    tokio::task::spawn_blocking(move || {
+        while let Ok(f) = video_cb_rx.recv() {
+            if video_tx.blocking_send(f).is_err() { break; }
         }
     });
 
-    // Periodic metrics log
+    // ── main loop ──────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         tokio::select! {
             Some(frame) = audio_rx.recv() => {
                 tracing::debug!(
-                    frames = frame.frame_count(),
-                    duration_ms = frame.duration_secs() * 1000.0,
+                    frames   = frame.frame_count(),
+                    duration = frame.duration_secs(),
                     "audio"
                 );
             }
             Some(frame) = video_rx.recv() => {
                 tracing::debug!(
-                    width = frame.width,
+                    width  = frame.width,
                     height = frame.height,
                     format = ?frame.format,
                     "video"
                 );
             }
             _ = metrics_tick.tick() => {
-                let a = audio_metrics.snapshot();
                 let v = video_metrics.snapshot();
-                info!(
-                    audio_captured = a.frames_captured,
-                    audio_dropped = a.frames_dropped,
-                    audio_drop_rate = format!("{:.2}%", a.drop_rate() * 100.0),
-                    video_captured = v.frames_captured,
-                    "metrics"
-                );
+                info!(video_captured = v.frames_captured, video_dropped = v.frames_dropped);
+                for m in &audio_metric_handles {
+                    let a = m.snapshot();
+                    info!(audio_captured = a.frames_captured,
+                          audio_drop_rate = format!("{:.1}%", a.drop_rate() * 100.0));
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutting down");
+                break;
             }
         }
     }
+    Ok(())
 }
 ```
+
+**Notes:**
+
+- `MediaFile::open` is called twice when a file is the source (once for audio,
+  once for video), because `start()` consumes `self`. Either restructure
+  `MediaFile` to yield both streams in a single `start()` call — which is the
+  design above via `MediaFileStreams` — or open the file once and split the
+  decoders internally. The implementation should take the latter path; the sketch
+  above is simplified.
+- The drop-oldest reuse in the std::thread spawns is a simplified inline version;
+  in implementation use the same `try_send` error-path pattern from `audio.rs`.
 
 ---
 
@@ -572,35 +763,46 @@ async fn main() -> Result<()> {
 
 ## Alternatives considered
 
-**`tokio::sync::broadcast` for Phase 1 audio.** Broadcast channels discard
-messages when a slow reader falls behind rather than dropping the oldest. For
-Phase 1 with one consumer, this doesn't matter. For Phase 2 with multiple
-consumers at different speeds, the semantics are wrong (a slow encoder would
-cause frame loss for everyone). The crossbeam-bounded + explicit drain approach
-gives controlled drop-oldest semantics independent of consumer speed. The Phase 2
-ADR will revisit whether a fanout broadcast is acceptable or whether each consumer
-gets its own bounded channel.
+**`VideoSource` enum inside `VideoCapture`.** An alternative to `MediaFile` would
+be a `VideoSource { Webcam(u32), File(PathBuf) }` enum that `VideoCapture` dispatches
+on. Rejected because: (1) it would hide the `nokhwa` vs `ffmpeg-next` backend split
+inside one type, making the dependency graph harder to reason about; (2) a video file
+also has an audio track, which `VideoCapture` has no business decoding — `MediaFile`
+owns both streams cleanly.
 
-**`tokio::sync::mpsc` directly in the cpal callback.** The callback is not in an
-async context; `mpsc::Sender::try_send` is available but `mpsc::Sender` cannot be
-cloned into both the callback (for sending) and the drain path (for drop-oldest).
-crossbeam gives both.
+**`AudioSource` enum for mic vs file.** Symmetric to the VideoSource alternative.
+Rejected for the same reason: mic uses cpal, file uses ffmpeg-next; mixing them in
+one enum couples unrelated backends. The fan-in via `Sender::clone` achieves the
+same result at the binary level with no coupling in the library.
+
+**Sample-level audio mixing in Phase 1.** True mixing (summing waveforms from mic
+and file to produce a single coherent audio stream) requires resampling both sources
+to a common rate and synchronizing their timelines. Deferred to Phase 2+: Phase 1
+interleaves frames by arrival order, which is sufficient for verifying capture works.
+
+**`tokio::sync::broadcast` for Phase 1 audio.** Broadcast channels discard
+messages when a slow reader falls behind rather than dropping the oldest. For Phase 1
+with one consumer this doesn't matter. For Phase 2 with multiple consumers at
+different speeds, the semantics are wrong. The Phase 2 ADR will revisit.
+
+**`tokio::sync::mpsc` directly in the cpal callback.** Not possible: `mpsc::Sender`
+cannot be cloned for the drain path. crossbeam gives both send and drain on the same
+channel.
 
 **`ndarray` as the tensor type in `somnus-sensory`.** Rejected: `somnus-sensory` has no
-ML computation. It captures raw bytes and f32 samples. Introducing a tensor
-dependency here would couple the sensory layer to the ML stack unnecessarily.
-Conversion to tensors happens in `somnus-encoding`.
+ML computation. Conversion to tensors happens in `somnus-encoding`.
 
 ## Consequences
 
-- Phase 1 implementation can begin directly: create the workspace, initialize the
-  two crates, implement types in the order defined above (frame → error → metrics
-  → audio → video → binary).
-- The crossbeam channel in `AudioCapture` is an internal detail. If Phase 2
-  requires a different channel topology (broadcast, multiple consumers), the
-  change is isolated to `audio.rs` and the bridge code in the binary.
-- `nokhwa` is a non-trivial dependency. If it causes problems on the target
-  hardware, fall back to the `v4l` crate with minimal API changes.
+- Phase 1 implementation order: frame → error → metrics → audio → video →
+  media_file → binary.
+- `ffmpeg-next` requires libavcodec/libavformat/libavutil/libswresample/libswscale
+  installed on the build host (`pacman -S ffmpeg` on Arch). This is a hard build
+  dependency.
+- The crossbeam channel in `AudioCapture` is internal. Phase 2 channel topology
+  changes are isolated to `audio.rs` and the bridge code in the binary.
+- `nokhwa` is unused in the primary test path (file input). It will first be
+  exercised when a webcam is available.
 
 ## What would invalidate this
 

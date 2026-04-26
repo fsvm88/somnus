@@ -51,7 +51,7 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `sleep-and-consolidation.md` — supplemented with sleep time/memory budget estimates.
 - Phase 1 architectural design. Two ADRs:
   - `ai-docs/decisions/0001-rust-workspace-layout.md` — crate structure: `crates/somnus-sensory` (lib) + `crates/somnus` (binary) for Phase 1; reserved names for Phase 2–5 crates; no premature traits.
-  - `ai-docs/decisions/0002-phase1-sensory-types.md` — full concrete Rust signatures: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`; crossbeam drop-oldest bridge from cpal callbacks; tokio mpsc bridge pattern; Cargo.toml sketches; main loop sketch; structural Phase 2+ sketches.
+  - `ai-docs/decisions/0002-phase1-sensory-types.md` — full concrete Rust signatures: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`; crossbeam drop-oldest bridge; tokio mpsc bridge; fan-in multi-source pattern; Ctrl+C shutdown; Cargo.toml sketches (including `ffmpeg-next`); main loop sketch; structural Phase 2+ sketches. Phase 1 "done" = capture running + metrics logging + clean shutdown (no visualizer; encoding is Phase 2).
 
 ## Where to pick up
 
