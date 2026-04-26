@@ -530,7 +530,7 @@ resolver = "2"
 anyhow            = "1"
 cpal              = "0.15"
 crossbeam-channel = "0.5"
-ffmpeg-next       = "7"
+ffmpeg-next       = "8"
 nokhwa            = { version = "0.10", features = ["input-native"] }
 thiserror         = "2"
 tokio             = { version = "1", features = ["full"] }
