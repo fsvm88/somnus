@@ -47,3 +47,10 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 - Routine implementation details.
 - Choices fully determined by `principles.md` or `tech-stack.md`.
 - Throwaway code in `experiments/`.
+
+## Index
+
+| # | Title | Status |
+|---|-------|--------|
+| [0001](0001-rust-workspace-layout.md) | Rust workspace layout | accepted |
+| [0002](0002-phase1-sensory-types.md) | Phase 1 sensory pipeline: concrete types and interfaces | accepted |
