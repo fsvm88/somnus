@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-04-25
-> **Last commit on main:** `48ea97e` — *Add first research notes: continuous learning, sleep and consolidation*
+> **Last updated:** 2026-04-26
+> **Last commit on main:** `1c388d1` — *Add engineering-tradeoffs research pass across all planned components*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -37,18 +37,24 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - Git initialized as SHA-256 repo on `main`, pushed to Codeberg.
 - `.claude/mind.mv2` (memvid project memory) is tracked; lock files are not.
 - Vision and architecture sharpened across multiple commits through a structured Q1/Q2/Q3 + sub-question conversation.
-- First two research notes:
-  - `ai-docs/research/continuous-learning.md` — CL approach families, CLS, growth methods, regularization, sparse codes; web-verified citations.
-  - `ai-docs/research/sleep-and-consolidation.md` — NREM/REM functional roles, SHY (Tononi-Cirelli), mapping to somnus with honest divergences (REM in mammals does not grow new units).
+- Full engineering-tradeoffs research pass (Option B — engineering estimates). Nine new notes + two supplement sections. All notes indexed in `ai-docs/research/README.md`.
+  - `encoders.md` — Whisper/CLAP/HuBERT/DINOv2/SigLIP; VRAM, latency, pairing recommendations.
+  - `ml-runtimes.md` — ort/candle/burn/tch-rs; split runtime (ort for frozen inference, candle for cognitive training).
+  - `vector-retrieval.md` — flat/HNSW/IVF-PQ/Hopfield; memory formula; budget by scale.
+  - `sparse-coding.md` — k-WTA/top-k/SAE; dead-unit problem; interaction with growth.
+  - `memory-compression.md` — FP16/INT8/INT4/PQ; warm→cold pipeline; time estimates.
+  - `growth-mechanisms.md` — cascade-correlation; ~10–40 min GPU per unit added; dominates sleep budget.
+  - `replay-strategies.md` — uniform/PER/reservoir/generative; episodic buffer sizing (12M episodes in VRAM).
+  - `multimodal-binding.md` — concatenation→gated fusion→cross-attention upgrade path.
+  - `predictive-coding.md` — Friston FEP; partial adoption (SAE reconstruction error = prediction error).
+  - `continuous-learning.md` — supplemented with hardware budget section.
+  - `sleep-and-consolidation.md` — supplemented with sleep time/memory budget estimates.
 
 ## Where to pick up
 
-Two natural directions — wait for the user to call which unless they've already signalled:
-
-1. **Phase 1 planning.** Scope the actual implementation per `ai-docs/roadmap.md`'s Phase 1 (sensory I/O for one modality). Concrete artifacts: Rust workspace layout, crate split (sensory, perception, memory, …), encoder selection (likely the first ADR), initial audio pipeline shape.
-2. **More research notes.** Candidate topics: sparse coding (k-WTA, top-k, learned sparsity), predictive processing / Friston, recollection-layer mechanisms (Hopfield, ANN like `hnsw_rs`, hybrid), multimodal binding / cross-modal priors in more depth. Each can feed an ADR before code lands.
-
-The user, on the previous turn, indicated either is acceptable. Default to asking which they want to start with.
+1. **Phase 1 planning.** The research foundation is solid. Scope the first implementation: Rust workspace, crate split, encoder selection ADR, initial audio pipeline.
+2. **Option A research pass.** Refine Option B estimates with cited benchmark numbers. Priority: encoder latency on real hardware, HNSW query latency with `usearch`.
+3. **ADRs.** Multiple open questions in each research note are ADR-ready. First 2–3 ADRs could lock in encoder choice and runtime split before coding.
 
 ## Open architectural questions
 
