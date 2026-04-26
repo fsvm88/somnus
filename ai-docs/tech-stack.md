@@ -1,6 +1,6 @@
 # Tech stack
 
-> **Status:** initial survey. Choices listed here are *candidates* unless explicitly noted as committed; commitments are made in ADRs.
+> **Status:** candidates are noted as such; committed choices are marked **[committed]** and backed by an ADR or research note.
 
 ## Language
 
@@ -15,65 +15,77 @@ Order of preference when the ecosystem has a gap:
 
 ## Numerical / ML core
 
-Candidates for the tensor + autograd layer:
+**Split runtime — [committed], see `research/ml-runtimes.md`:**
 
-- **`candle`** (HuggingFace) — actively developed, decent API, GPU support via CUDA/Metal. Reasonable default.
-- **`burn`** — modular, multi-backend (ndarray, wgpu, candle, libtorch), thoughtful design.
-- **`tch-rs`** — libtorch bindings; mature, but ties us to a heavy native dependency and PyTorch ABI.
-- **`ort`** — ONNX Runtime bindings; great for *inference* of pretrained models, not training.
-- **`dfdx`** — pure-Rust, type-safe shapes, but slower-moving.
+- **`ort`** (ONNX Runtime bindings) — **[committed]** for frozen pretrained encoder inference (Phase 2+). Best inference latency; no training support.
+- **`candle`** (HuggingFace) — **[committed]** for cognitive-layer training (Phase 3+). GPU via cuBLAS/cuDNN; actively maintained.
 
-Likely path: start with `candle` or `burn` for prototypes, escalate to `tch-rs` if we need PyTorch parity, use `ort` for any pretrained inference (e.g., a vision/audio encoder we don't want to retrain).
+Candidates not adopted:
 
-Lower-level math:
+- `burn` — backend-agnostic; reconsider if `candle` CUDA support becomes a problem.
+- `tch-rs` — full libtorch; fallback if `candle` can't support a needed op.
+- `dfdx` — pure-Rust autograd; slower-moving.
+
+Lower-level math (candidates, no commitment yet):
 
 - **`ndarray`** — N-dimensional arrays, host-side.
-- **`nalgebra`** — general linear algebra.
-- **`faer`** — high-performance dense linear algebra.
+- **`half`** — `f16` / `bf16` types (needed for FP16 storage in cold tier).
 
 ## Audio
 
-- **`cpal`** — cross-platform audio I/O (microphone, speaker).
-- **`symphonia`** — pure-Rust decoders for offline files.
-- **`rubato`** — sample-rate conversion.
-- **`hound`** — WAV read/write for offline experiments.
-- Features: hand-rolled mel-spectrograms initially; pretrained encoders via `ort` later if needed.
+- **`cpal`** — **[committed]** real-time microphone capture (Phase 1). Cross-platform audio I/O; callback model bridged to crossbeam channel.
+- **`ffmpeg-next = "8"`** — **[committed]** audio track decoding from media files (Phase 1, via `MediaFile`). Also the video decoder; one dep for both.
+- **`rubato`** — candidate for sample-rate resampling at encoding time (Phase 2), when audio must be normalized to 16 kHz for Whisper.
+- **`hound`** — WAV read/write for offline experiments only.
+
+`symphonia` (pure-Rust audio decoder) is superseded by `ffmpeg-next` for the file-input use case. Revisit only if we need a pure-Rust build without system ffmpeg.
 
 ## Video / camera
 
-- **`nokhwa`** — cross-platform webcam capture.
-- **`opencv`** (Rust bindings) — broad image/video processing; heavy native dep, accept only if we use it widely.
-- **`ffmpeg-next`** — for offline video files.
-- **`image`**, **`imageproc`** — pure-Rust image ops.
+- **`nokhwa`** (feature: `input-native`) — **[committed]** live webcam capture (Phase 1). Cross-platform v4l2/AVFoundation/MSMF wrapper.
+- **`ffmpeg-next = "8"`** — **[committed]** video frame decoding from media files (Phase 1, via `MediaFile`). Shared dep with audio above.
+- `image`, `imageproc` — pure-Rust image ops; candidates for preprocessing in Phase 2.
+
+System requirement: `libavcodec`, `libavformat`, `libavutil`, `libswresample`, `libswscale` (Arch: `pacman -S ffmpeg`).
+
+## Vector retrieval
+
+- **`usearch`** — **[committed]** HNSW index for warm semantic memory (Phase 4). Supports FP16 vectors natively; best-maintained Rust HNSW crate. See `research/vector-retrieval.md`.
+- Flat search (no crate) — Phase 1–3 before the index is needed.
+- `memmap2` — candidate for cold-tier disk access (Phase 4+).
 
 ## Storage / persistence
 
-Undecided. Candidates:
+Three-tier hierarchy is architecturally committed (`architecture.md`); crate choices are confirmed for Phase 4:
 
-- **Embedded KV.** `redb` (active, pure-Rust), `fjall` (LSM, pure-Rust), `sled` (mature but stalled).
-- **Embedded SQL.** `rusqlite` (sync), `sqlx` with SQLite (async).
-- **Vector recall.** Roll our own ANN over a flat store initially, or use `hnsw_rs` / `instant-distance`.
+| Tier | Medium | Crate(s) |
+|------|--------|-----------|
+| Hot (episodic) | VRAM / candle tensors | `candle-core` |
+| Warm (semantic) | RAM | `usearch` (HNSW) + plain `Vec` |
+| Cold (archive) | Disk | `memmap2` + custom binary format |
 
-The choice will be driven by what episodic and semantic memory actually need; deferred until we have a use case.
+Embedded KV (`redb`, `fjall`, `sled`) and SQL (`rusqlite`, `sqlx`) are candidates only if the cold-tier format outgrows hand-rolled serialization.
 
 ## Concurrency / runtime
 
-- **`tokio`** for async I/O (sensory ingestion, telemetry sinks).
-- Dedicated threads (`std::thread`) or **`rayon`** for compute-heavy subsystems where async adds noise without benefit.
-- **`crossbeam`** channels for cross-subsystem messaging where async isn't needed.
+- **`tokio`** — **[committed]** async runtime in the binary (Phase 1). `features = ["full"]` for signals, timers, and task scheduling.
+- **`crossbeam-channel`** — **[committed]** bounded sync channels bridging cpal callbacks and decoder threads to the async runtime (Phase 1). Chosen for cloneable Sender + Receiver (enables drop-oldest pattern and multi-source fan-in).
+- `std::thread` — for decoder and capture threads that must not be async.
+- `rayon` — candidate for compute-heavy parallel work in sleep cycle (Phase 5+).
 
 ## Observability
 
-- **`tracing`** + **`tracing-subscriber`** for structured logs and spans.
-- An in-process structured **observation log** for "the system observing itself" — design TBD; see `architecture.md`.
+- **`tracing`** + **`tracing-subscriber`** — **[committed]** structured logs and spans. `features = ["env-filter", "fmt"]`. No `println!` / `eprintln!` in production paths.
 
 ## Tooling
 
-- **`cargo`** workspace once we have multiple crates.
-- **`cargo-nextest`** for faster test runs.
-- **`criterion`** for benches when we have a target.
-- **`proptest`** for property tests on stateful logic (memory, learning rules).
-- **`insta`** for snapshot tests where a stable output is useful.
+- **`cargo`** workspace — **[committed]** multi-crate layout defined in ADR 0001.
+- **`thiserror`** — **[committed]** error types in library crates.
+- **`anyhow`** — **[committed]** error handling in the binary.
+- `cargo-nextest` — for faster test runs.
+- `criterion` — benches when we have a latency target to hit.
+- `proptest` — property tests for stateful logic (memory, learning rules).
+- `clap` — candidate for CLI argument parsing in the binary (Phase 1; alternative: manual `std::env::args` parse).
 
 ## Things we will *not* do (yet)
 
