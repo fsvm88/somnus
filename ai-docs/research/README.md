@@ -14,15 +14,27 @@ Topic-organized research notes that inform design decisions.
 
 `kebab-case.md`, named for the topic.
 
-## Suggested first topics
+## Current notes
 
-Listed for orientation only — no obligation to fill in any particular order:
+### Theory / design rationale
+- [`continuous-learning.md`](continuous-learning.md) — CL families (replay, regularization, growth, CLS), where somnus sits, + hardware budget tradeoffs.
+- [`sleep-and-consolidation.md`](sleep-and-consolidation.md) — NREM/REM biology, mapping to somnus's two-stage cycle, + sleep time/memory budget estimates.
+- [`predictive-coding.md`](predictive-coding.md) — Friston FEP / PC framework; partial adoption rationale; what it costs to implement fully vs. what somnus already borrows.
 
-- Predictive processing / active inference.
-- Complementary Learning Systems and consolidation.
-- Replay (hippocampal sharp-wave ripples, generative replay in ML).
-- Catastrophic forgetting and continual-learning benchmarks.
-- Sparse distributed representations and Hawkins-lineage models.
+### Component engineering (memory / latency / compute tradeoffs)
+- [`encoders.md`](encoders.md) — Frozen pretrained audio (Whisper, CLAP, HuBERT) and visual (DINOv2, SigLIP, MobileViT) encoder options; VRAM, latency, embedding dimension, pairing recommendations.
+- [`ml-runtimes.md`](ml-runtimes.md) — `ort`, `candle`, `burn`, `tch-rs`; inference vs. training use cases; recommended split runtime.
+- [`vector-retrieval.md`](vector-retrieval.md) — Recollection layer options: flat search, HNSW, IVF-PQ, modern Hopfield; memory/query latency by scale.
+- [`sparse-coding.md`](sparse-coding.md) — k-WTA, top-k, SAE/L1; compute overhead, dead-unit problem, interaction with growth.
+- [`memory-compression.md`](memory-compression.md) — FP16/INT8/INT4 quantization, PQ, pruning, distillation; warm→cold compression pipeline.
+
+### Algorithms (compute / quality tradeoffs)
+- [`growth-mechanisms.md`](growth-mechanisms.md) — Cascade-correlation, GNG, online cloning; cost per unit added, growth trigger detection.
+- [`replay-strategies.md`](replay-strategies.md) — Uniform, recency-weighted, PER, reservoir sampling, generative replay; compute overhead and episodic buffer sizing.
+- [`multimodal-binding.md`](multimodal-binding.md) — Concatenation, gated fusion, cross-attention, contrastive, PoE; latency and top-down feedback mechanisms.
+
+## Suggested future topics
+
 - Neuromodulation as gain control in deep networks.
-- Sleep stages and their computational roles.
-- Self-supervised learning from video and audio.
+- Self-supervised learning from video and audio (foundation for Phase 2 encoding).
+- Scheduling and concurrency: real-time wake + batch sleep on one GPU.

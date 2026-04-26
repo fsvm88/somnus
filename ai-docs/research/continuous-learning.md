@@ -90,6 +90,49 @@ The framework:
 - The literature mostly assumes a fixed-capacity network and a curriculum of discrete tasks. somnus is fixed-encoder + growable-cognitive-layers operating on a single continuous stream with no task labels.
 - Most CL benchmarks (Permuted MNIST, Split CIFAR, etc.) are task-discrete. somnus's evaluation will need to be different — likely streaming benchmarks built around the system's own self-probe.
 
+## Hardware budget and performance tradeoffs
+
+> This section was added as a tradeoffs supplement. The theory above is unchanged.
+>
+> Hardware target: 14 GB VRAM, 56 GB RAM.
+
+### What fits at what scale
+
+Regional concept areas (sparse-coded, SAE or k-WTA) hold the learnable part of the system. Encoder weights are frozen and much larger. Budget analysis:
+
+| Component | Params (est.) | FP16 VRAM |
+|-----------|--------------|-----------|
+| Per region (384-dim input, 2000 units) | 384×2000×2 = 1.5M | 3 MB |
+| 4 regions total | 6M | 12 MB |
+| Binding area (cross-attention, 4 regions) | ~4M | 8 MB |
+| **Total cognitive layers** | **~10M** | **~20 MB** |
+
+The cognitive layers are tiny relative to the 14 GB VRAM budget. Growing them 10× (to 20K units per region, ~100M cognitive params) would still cost only ~200 MB VRAM — well within budget. The ceiling on growth is **compute during sleep** (time to train new units), not memory.
+
+### CL performance: forgetting and replay cost
+
+**Experience replay during NREM-like sleep:**
+- One forward + backward pass through the cognitive layers per replayed episode.
+- 10M-param network, batch=1: ~2–5 ms/episode on GPU (est.).
+- 10K episodes replayed per sleep cycle: ~20–50 s of GPU time.
+- **Not the bottleneck.**
+
+**Growth via cascade-correlation:**
+- Adding one unit: candidate training + output weight update = ~10–40 min GPU (see `growth-mechanisms.md`).
+- Adding 10 units across all regions per sleep: ~100–400 min GPU.
+- **This is the bottleneck.** Growth time dominates the sleep budget, not replay.
+
+**Forgetting rate without replay:**
+- Standard catastrophic forgetting: a fixed-capacity network loses ~30–60% of earlier-task performance after a new task with no replay (Kirkpatrick et al., 2017).
+- With sparse codes (2–5% sparsity, 2000 units): expected inter-concept overlap ~0.4 units per concept pair → interference per update ~0.02% of all stored patterns — dramatically reduced.
+- With replay covering recent N episodes: forgetting rate drops near zero for recently replayed content; older unreplayed content decays at the homeostatic downscaling rate (~1–5% per sleep cycle — an open hyperparameter).
+
+### Catastrophic forgetting detection
+
+Forgetting is detectable via the same self-probe used for growth triggering: if gist-level recall of *old* episodes (not just recent ones) drops, the forgetting rate has exceeded the repair rate of replay. This should be monitored as a system health metric from Phase 3 onward.
+
+**Compute cost of forgetting probe:** same as growth trigger — one forward pass per probed episode. Probing a random sample of 1K old episodes: ~2–5 s. Run this once per sleep cycle as part of the self-probe phase.
+
 ## Sources
 
 - Fahlman & Lebiere, 1990. "The Cascade-Correlation Learning Architecture." NIPS.

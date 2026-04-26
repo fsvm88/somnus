@@ -67,6 +67,54 @@ A consistent gap between ML and biology: biological replay has features ML usual
 - **Interruption cost.** Sleep deprivation impairs consolidation in mammals. What's the analogous cost in somnus? Specifically, how much partial-sleep work is recoverable after interruption?
 - **Creative recombination's value.** Phase-3+ feature. Will REM-style dream recombination produce useful generalization, or just noise?
 
+## Hardware budget and time tradeoffs
+
+> This section was added as a tradeoffs supplement. The biology and design rationale above are unchanged.
+>
+> Hardware target: 14 GB VRAM, 56 GB RAM.
+
+### Per-operation time estimates (one sleep cycle)
+
+All estimates assume 14 GB VRAM GPU; cognitive layers ~10M params; 10K recent episodes in episodic memory.
+
+| Sleep operation | Estimated wall-clock time | Notes |
+|----------------|--------------------------|-------|
+| **NREM-like: replay consolidation** (10K episodes) | 20–50 s | ~2–5 ms/episode forward+backward |
+| **NREM-like: homeostatic downscaling** (1 pass over weights) | <1 s | One multiply-add per param |
+| **NREM-like: compression + cold spill** (100K vectors, INT8 quantize + write) | ~2–5 min | Includes NVMe write |
+| **REM-like: generative replay + self-probe** (10K episodes) | 1–5 min | Reconstruction + cosine compare |
+| **REM-like: growth** (1 unit per region, 4 regions) | **40–160 min** | Cascade-correlation candidate training |
+| **REM-like: HNSW index rebuild** (if needed) | 5–30 min | Triggered by tombstone accumulation |
+| **Total sleep cycle (no growth)** | ~10–20 min | Replay + homeostasis + probe + compression |
+| **Total sleep cycle (with growth)** | **~1–4 hours** | Growth dominates |
+
+**Key insight:** growth is 1–2 orders of magnitude more expensive than all other sleep operations combined. Sleep duration should be adaptive based on whether growth is triggered.
+
+### NREM/REM time budget recommendation
+
+| Growth triggered? | Recommended sleep structure |
+|-------------------|-----------------------------|
+| No | Short sleep: 90% NREM replay+homeostasis+compression, 10% REM probe |
+| Yes | Long sleep: 50% NREM, 50% REM with growth; cap at max-sleep-time |
+
+The mammalian NREM-heavy early sleep / REM-heavy late sleep pattern is a convenient default; for somnus the right split depends on whether growth is needed, not circadian rhythm.
+
+### Memory budget during sleep
+
+Sleep operations use VRAM for:
+- Replay forward+backward passes: ~200–500 MB activation memory (frees after each episode).
+- Growth candidate training: one candidate unit's activations + gradients: <10 MB. Fine to run 20 candidates in parallel if VRAM allows.
+- Reconstruction for self-probe: same as replay.
+
+The encoders (frozen) can be swapped to RAM during sleep if their VRAM is needed for sleep operations. Encoder swap cost: ~500 MB transfer at ~16 GB/s PCIe 4.0 = ~30 ms. Negligible.
+
+### Sleep entry threshold calibration
+
+Sleep entry triggers from `architecture.md`:
+- **Episodic memory high-water mark:** the warm/cold compression creates pressure sooner than VRAM fills (VRAM can hold ~12M episodes; the right trigger is probably ~10K–100K episodes to limit growth work per cycle).
+- **Wake-performance degradation:** reconstruction error on recent inputs exceeds a baseline. This is the most direct signal that consolidation is needed.
+- **Schedule fallback:** recommended max wake duration = 30–60 min of active experience before forcing sleep; this keeps each sleep cycle's growth load manageable.
+
 ## Sources
 
 - Tononi & Cirelli, 2003. "Sleep and synaptic homeostasis: a hypothesis." *Brain Research Bulletin*.
