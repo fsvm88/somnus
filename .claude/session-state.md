@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-04-26
-> **Last commit on main:** `1c388d1` — *Add engineering-tradeoffs research pass across all planned components*
+> **Last commit on main:** `17297b6` — *Add Phase 1 architectural design: workspace layout and concrete Rust types*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -49,12 +49,15 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `predictive-coding.md` — Friston FEP; partial adoption (SAE reconstruction error = prediction error).
   - `continuous-learning.md` — supplemented with hardware budget section.
   - `sleep-and-consolidation.md` — supplemented with sleep time/memory budget estimates.
+- Phase 1 architectural design. Two ADRs:
+  - `ai-docs/decisions/0001-rust-workspace-layout.md` — crate structure: `crates/somnus-sensory` (lib) + `crates/somnus` (binary) for Phase 1; reserved names for Phase 2–5 crates; no premature traits.
+  - `ai-docs/decisions/0002-phase1-sensory-types.md` — full concrete Rust signatures: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`; crossbeam drop-oldest bridge from cpal callbacks; tokio mpsc bridge pattern; Cargo.toml sketches; main loop sketch; structural Phase 2+ sketches.
 
 ## Where to pick up
 
-1. **Phase 1 planning.** The research foundation is solid. Scope the first implementation: Rust workspace, crate split, encoder selection ADR, initial audio pipeline.
+1. **Create the Cargo workspace.** Follow ADR 0001/0002 exactly: `cargo new --lib crates/somnus-sensory`, `cargo new crates/somnus`, workspace `Cargo.toml`, add dependencies from the Cargo.toml sketches. Then implement the types in order: `frame.rs` → `error.rs` → `metrics.rs` → `audio.rs` → `video.rs` → `main.rs`.
 2. **Option A research pass.** Refine Option B estimates with cited benchmark numbers. Priority: encoder latency on real hardware, HNSW query latency with `usearch`.
-3. **ADRs.** Multiple open questions in each research note are ADR-ready. First 2–3 ADRs could lock in encoder choice and runtime split before coding.
+3. **Encoder selection ADR.** The encoder choice (Whisper-tiny + CLAP vs. single multi-task) is ADR-ready. First implementation milestone: a working audio capture loop; encoder ADR can run in parallel.
 
 ## Open architectural questions
 

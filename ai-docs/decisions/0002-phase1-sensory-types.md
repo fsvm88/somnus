@@ -225,8 +225,6 @@ impl AudioCapture {
         let config = device
             .default_input_config()
             .map_err(SensorError::AudioConfig)?;
-        let sample_rate = config.sample_rate().0;
-        let channels = config.channels() as u8;
 
         let metrics = Arc::new(SensorMetrics::default());
         let (tx, rx) = bounded::<AudioFrame>(AUDIO_CHANNEL_CAPACITY);
@@ -258,13 +256,15 @@ impl AudioCapture {
                         timestamp: Timestamp::now(),
                     };
                     metrics.increment_captured();
-                    if tx.is_full() {
-                        // Drop-oldest: discard one from the head to make room.
+                    // Drop-oldest: attempt send; if full, drain one then retry.
+                    // Using try_send's error path avoids the TOCTOU race of
+                    // is_full() followed by try_recv().
+                    if let Err(crossbeam_channel::TrySendError::Full(frame)) = tx.try_send(frame) {
                         let _ = rx_drain.try_recv();
                         metrics.increment_dropped();
                         tracing::trace!("audio channel full; dropped oldest frame");
+                        let _ = tx.try_send(frame);
                     }
-                    let _ = tx.try_send(frame);
                 },
                 |err| tracing::error!(?err, "audio stream error"),
                 None,
@@ -291,7 +291,7 @@ Unlike audio, there is no platform callback to bridge.
 
 ```rust
 use nokhwa::{Camera, CameraIndex, pixel_format::RgbFormat};
-use nokhwa::utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType, Resolution};
+use nokhwa::utils::{RequestedFormat, RequestedFormatType};
 use std::sync::Arc;
 
 pub const VIDEO_CHANNEL_CAPACITY: usize = 16; // reserved for Phase 2 bridge
@@ -560,7 +560,7 @@ async fn main() -> Result<()> {
 - HNSW index managed inside `SemanticStore`; rebuilt lazily when tombstone
   fraction exceeds threshold
 - `Episode` type: `{ id: u64, timestamp: Timestamp, activations: Vec<SparseActivation>,
-  binding_embedding: Vec<f16> }`
+  binding_embedding: Vec<half::f16> }` (`f16` is unstable; use the `half` crate)
 
 **`somnus-sleep`** (Phase 5)
 - Deps: all above
