@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-04-26
-> **Last commit on main:** `(see git log)` — *Update tech-stack and roadmap to reflect Phase 1 decisions*
+> **Last commit on main:** `8e8a05a` — *Update tech-stack and roadmap to reflect Phase 1 decisions*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
