@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-04-27
-> **Last commit on main:** `6aaa4ed` — *Complete ADR 0002: fix 5 pre-implementation gaps, spec MediaFile::start()*
+> **Last updated:** 2026-04-28
+> **Last commit on main:** `e36b57e` — *ADR 0002: add missing crate-local imports, verify nokhwa API*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -51,7 +51,7 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `sleep-and-consolidation.md` — supplemented with sleep time/memory budget estimates.
 - Phase 1 architectural design. Two ADRs:
   - `ai-docs/decisions/0001-rust-workspace-layout.md` — crate structure: `crates/somnus-sensory` (lib) + `crates/somnus` (binary) for Phase 1; reserved names for Phase 2–5 crates; no premature traits.
-  - `ai-docs/decisions/0002-phase1-sensory-types.md` — full concrete Rust signatures: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`; crossbeam drop-oldest bridge; tokio mpsc bridge; fan-in multi-source pattern; Ctrl+C shutdown; Cargo.toml sketches (including `ffmpeg-next`); main loop sketch; structural Phase 2+ sketches. Phase 1 "done" = capture running + metrics logging + clean shutdown (no visualizer; encoding is Phase 2). **Pre-implementation audit complete:** 5 gaps fixed — `UnsupportedSampleFormat` variant, `make_cb!` macro for all 10 cpal `SampleFormat` variants, cpal bumped to 0.17 + clap 4 added, double-open bug fixed, `TrySendError::Disconnected` shutdown propagation added, full `MediaFile::start()` spec with ffmpeg-next (single decode thread, nested scope borrows, channel layout fallback, fresh output frames, flush sequence).
+  - `ai-docs/decisions/0002-phase1-sensory-types.md` — **fully spec'd and audit-complete.** All types: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`. Full import blocks for every module. All 10 cpal `SampleFormat` variants dispatched via `make_cb!`. Complete `MediaFile::start()` (single decode thread, nested scope borrows, channel layout fallback, fresh output frames, flush sequence). nokhwa 0.10 API verified against source. Shutdown cascade documented. Cargo.toml with cpal 0.17, clap 4, all deps pinned.
 
 ## Where to pick up
 
