@@ -160,6 +160,9 @@ pub enum SensorError {
 
     #[error("sensor channel closed")]
     ChannelClosed,
+
+    #[error("unsupported audio sample format: {0:?}")]
+    UnsupportedSampleFormat(cpal::SampleFormat),
 }
 
 pub type SensorResult<T> = Result<T, SensorError>;
@@ -221,6 +224,7 @@ impl MetricsSnapshot {
 
 ```rust
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::FromSample;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
 
@@ -266,38 +270,62 @@ impl AudioCapture {
     ) -> SensorResult<cpal::Stream> {
         let sample_rate = config.sample_rate().0;
         let channels = config.channels() as u8;
+        let fmt = config.sample_format();
+        let stream_config: cpal::StreamConfig = config.into();
 
-        device
-            .build_input_stream(
-                &config.into(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+        // Expands to a typed callback for a given SizedSample type.
+        // f32::from_sample(s) (cpal 0.17 re-exports dasp_sample::FromSample)
+        // normalises any integer or float sample to [-1.0, 1.0] f32.
+        macro_rules! make_cb {
+            ($T:ty) => {{
+                let tx = tx.clone();
+                let rx_drain = rx_drain.clone();
+                let metrics = metrics.clone();
+                move |data: &[$T], _: &cpal::InputCallbackInfo| {
                     let frame = AudioFrame {
-                        samples: data.to_vec(),
+                        samples: data.iter().map(|&s| f32::from_sample(s)).collect(),
                         sample_rate,
                         channels,
                         timestamp: Timestamp::now(),
                     };
                     metrics.increment_captured();
-                    // Drop-oldest: attempt send; if full, drain one then retry.
-                    // Using try_send's error path avoids the TOCTOU race of
-                    // is_full() followed by try_recv().
                     if let Err(crossbeam_channel::TrySendError::Full(frame)) = tx.try_send(frame) {
                         let _ = rx_drain.try_recv();
                         metrics.increment_dropped();
                         tracing::trace!("audio channel full; dropped oldest frame");
                         let _ = tx.try_send(frame);
                     }
-                },
-                |err| tracing::error!(?err, "audio stream error"),
-                None,
-            )
-            .map_err(SensorError::AudioBuild)
+                }
+            }};
+        }
+
+        let err_cb = |err| tracing::error!(?err, "audio stream error");
+        let stream = match fmt {
+            cpal::SampleFormat::I8  => device.build_input_stream(&stream_config, make_cb!(i8),  err_cb, None),
+            cpal::SampleFormat::I16 => device.build_input_stream(&stream_config, make_cb!(i16), err_cb, None),
+            cpal::SampleFormat::I32 => device.build_input_stream(&stream_config, make_cb!(i32), err_cb, None),
+            cpal::SampleFormat::I64 => device.build_input_stream(&stream_config, make_cb!(i64), err_cb, None),
+            cpal::SampleFormat::U8  => device.build_input_stream(&stream_config, make_cb!(u8),  err_cb, None),
+            cpal::SampleFormat::U16 => device.build_input_stream(&stream_config, make_cb!(u16), err_cb, None),
+            cpal::SampleFormat::U32 => device.build_input_stream(&stream_config, make_cb!(u32), err_cb, None),
+            cpal::SampleFormat::U64 => device.build_input_stream(&stream_config, make_cb!(u64), err_cb, None),
+            cpal::SampleFormat::F32 => device.build_input_stream(&stream_config, make_cb!(f32), err_cb, None),
+            cpal::SampleFormat::F64 => device.build_input_stream(&stream_config, make_cb!(f64), err_cb, None),
+            other => return Err(SensorError::UnsupportedSampleFormat(other)),
+        };
+        stream.map_err(SensorError::AudioBuild)
     }
 }
 ```
 
 **Design notes:**
 
+- **Sample format dispatch:** `default_input_config()` returns the device's preferred
+  format, which on Linux ALSA is often I16 (not F32). The `make_cb!` macro generates a
+  typed callback for each `SizedSample` type; `f32::from_sample(s)` normalises every
+  sample to `[-1.0, 1.0]` f32. I8/I16/I32/I64/U8/U16/U32/U64/F32/F64 are all handled;
+  I24/U24/DSD variants return `SensorError::UnsupportedSampleFormat` (rare on consumer
+  hardware).
 - The callback captures both `tx` (Sender) and `rx_drain` (a clone of the same
   Receiver). `crossbeam_channel` Receivers are cloneable; the main consumer's
   Receiver sees the same channel minus whichever frames were drained.
@@ -517,6 +545,35 @@ tokio::task::spawn_blocking(move || {
 
 ---
 
+### Shutdown cascade
+
+On Ctrl+C the shutdown propagates automatically through the channel graph:
+
+```
+1. ctrl_c() resolves → main loop break → main() returns
+2. audio_tx / video_tx (tokio mpsc Senders) drop
+   → spawn_blocking bridges: blocking_send returns Err → bridges exit
+   → audio_cb_rx / video_cb_rx (crossbeam Receivers, held by bridges) drop
+3. crossbeam fan-in channels now have no receivers → Disconnected
+   → forwarding threads: tx.try_send returns TrySendError::Disconnected → break
+   → forward_frames returns; threads exit
+4. Forwarding threads drop their src Receivers (file_audio_rx / mic.receiver / file_video_rx)
+   → MediaFile decoder threads: their senders get Disconnected on next send → exit
+   → mic's AudioCapture drops → _stream drops → cpal stream stops
+5. VideoCapture pull loop: TrySendError::Disconnected → break → cam drops → device released
+```
+
+Requirements for this cascade:
+- Forwarding threads MUST use the `TrySendError::Disconnected` arm and break.
+  Silently ignoring send errors (`let _ = tx.try_send(...)`) breaks the cascade:
+  the thread loops forever and the source (cpal, decoder) is never released.
+- `MediaFileStreams._handles` being destructured-away (dropped) is intentional.
+  The decoder threads are responsible for detecting Disconnected on their senders
+  and exiting themselves; the JoinHandles are not the lifetime mechanism.
+- Frames in flight at shutdown are discarded. No flush is attempted.
+
+---
+
 ### Cargo.toml sketches
 
 **Workspace root (`Cargo.toml`):**
@@ -528,7 +585,8 @@ resolver = "2"
 
 [workspace.dependencies]
 anyhow            = "1"
-cpal              = "0.15"
+clap              = { version = "4", features = ["derive"] }
+cpal              = "0.17"
 crossbeam-channel = "0.5"
 ffmpeg-next       = "8"
 nokhwa            = { version = "0.10", features = ["input-native"] }
@@ -568,10 +626,11 @@ name = "somnus"
 path = "src/main.rs"
 
 [dependencies]
-somnus-sensory  = { path = "../somnus-sensory" }
-anyhow       = { workspace = true }
-tokio        = { workspace = true }
-tracing      = { workspace = true }
+somnus-sensory        = { path = "../somnus-sensory" }
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 ```
 
@@ -579,24 +638,33 @@ tracing-subscriber = { workspace = true }
 
 ### Binary sketch (`crates/somnus/src/main.rs`)
 
-The binary accepts an optional `--file` argument. If supplied, `MediaFile` provides
-both audio and video; an optional `--mic` flag additionally enables live microphone
-input. If neither `--file` nor `--mic` is given with a live webcam, it falls back
-to live capture.
+The binary accepts an optional `--file` argument (via `clap`). If supplied,
+`MediaFile` provides both audio and video streams from one format context; the
+file is opened **exactly once** and `MediaFileStreams` is destructured immediately
+so each receiver can be moved into its own forwarding thread. An optional `--mic`
+flag additionally enables live microphone input alongside file playback. If neither
+`--file` nor a webcam is used together, the fallback is live capture only.
 
 ```rust
 use anyhow::Result;
-use crossbeam_channel::bounded;
-use somnus_sensory::{AudioCapture, AudioFrame, MediaFile, VideoCapture, VideoFrame};
-use std::{path::PathBuf, time::Duration};
+use clap::Parser;
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use somnus_sensory::{
+    AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics,
+    VideoCapture, VideoFrame,
+};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::info;
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
 struct Args {
+    #[arg(long)]
     file: Option<PathBuf>,
-    mic: bool,       // mix in live mic alongside file audio
-    webcam: Option<u32>, // None when --file is supplied
+    #[arg(long)]
+    mic: bool,
+    #[arg(long, default_value = "0")]
+    webcam: u32,
 }
 
 #[tokio::main]
@@ -605,59 +673,70 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let args = parse_args(); // simple manual parse or `clap` — TBD at implementation
+    let args = Args::parse();
+
+    // ── open file once; destructure both streams immediately ───────────────
+    let (file_audio_rx, file_video_rx, file_audio_metrics, file_video_metrics) =
+        match args.file.as_ref()
+            .map(|p| MediaFile::open(p).and_then(|mf| mf.start()))
+            .transpose()?
+        {
+            Some(MediaFileStreams { audio, video, audio_metrics, video_metrics, .. }) =>
+                (Some(audio), Some(video), Some(audio_metrics), Some(video_metrics)),
+            None => (None, None, None, None),
+        };
 
     // ── audio setup ────────────────────────────────────────────────────────
-    // Shared bounded channel: multiple producers can clone the sender.
+    // audio_drain is a receiver clone; forwarding threads use it for drop-oldest
+    // backpressure on the fan-in channel. The async bridge holds audio_cb_rx.
     let (audio_cb_tx, audio_cb_rx) = bounded::<AudioFrame>(256);
-    let mut audio_metric_handles = vec![];
+    let audio_drain = audio_cb_rx.clone();
+    let mut audio_metric_handles: Vec<Arc<SensorMetrics>> = Vec::new();
 
-    if let Some(ref path) = args.file {
-        let streams = MediaFile::open(path)?.start()?;
-        audio_metric_handles.push(streams.audio_metrics.clone());
+    if let Some(rx) = file_audio_rx {
+        audio_metric_handles.push(file_audio_metrics.unwrap());
         let tx = audio_cb_tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(frame) = streams.audio.recv() {
-                if tx.is_full() { let _ = tx.try_recv(); } // drop-oldest reuse
-                let _ = tx.try_send(frame);
-            }
-        });
+        let drain = audio_drain.clone();
+        std::thread::spawn(move || forward_frames(rx, tx, drain));
     }
 
     if args.mic || args.file.is_none() {
         let mic = AudioCapture::start(None)?;
-        audio_metric_handles.push(mic.metrics.clone());
+        audio_metric_handles.push(Arc::clone(&mic.metrics));
         let tx = audio_cb_tx.clone();
+        let drain = audio_drain.clone();
         std::thread::spawn(move || {
-            while let Ok(frame) = mic.receiver.recv() {
-                if tx.is_full() { let _ = tx.try_recv(); }
-                let _ = tx.try_send(frame);
-            }
+            // mic.receiver moved here; mic dropped at closure end → cpal stream stops.
+            forward_frames(mic.receiver, tx, drain);
         });
     }
 
     // ── video setup ────────────────────────────────────────────────────────
     let (video_cb_tx, video_cb_rx) = bounded::<VideoFrame>(16);
-    let video_metrics;
+    let video_drain = video_cb_rx.clone();
+    let video_metrics_handle: Arc<SensorMetrics>;
 
-    if let Some(ref path) = args.file {
-        let streams = MediaFile::open(path)?.start()?;
-        video_metrics = streams.video_metrics.clone();
+    if let Some(rx) = file_video_rx {
+        video_metrics_handle = file_video_metrics.unwrap();
         let tx = video_cb_tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(frame) = streams.video.recv() {
-                if tx.is_full() { let _ = tx.try_recv(); }
-                let _ = tx.try_send(frame);
-            }
-        });
+        let drain = video_drain.clone();
+        std::thread::spawn(move || forward_frames(rx, tx, drain));
     } else {
-        let mut cam = VideoCapture::open(args.webcam.unwrap_or(0))?;
-        video_metrics = cam.metrics.clone();
+        let mut cam = VideoCapture::open(args.webcam)?;
+        video_metrics_handle = Arc::clone(&cam.metrics);
+        let tx = video_cb_tx.clone();
+        let drain = video_drain.clone();
         std::thread::spawn(move || loop {
             match cam.next_frame() {
-                Ok(frame) => { if video_cb_tx.is_full() { let _ = video_cb_tx.try_recv(); }
-                               let _ = video_cb_tx.try_send(frame); }
-                Err(e)    => { tracing::error!(?e, "video capture error"); break; }
+                Ok(frame) => match tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(frame)) => {
+                        let _ = drain.try_recv();
+                        if tx.try_send(frame).is_err() { break; }
+                    }
+                    Err(TrySendError::Disconnected(_)) => break,
+                },
+                Err(e) => { tracing::error!(?e, "video capture error"); break; }
             }
         });
     }
@@ -683,22 +762,13 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             Some(frame) = audio_rx.recv() => {
-                tracing::debug!(
-                    frames   = frame.frame_count(),
-                    duration = frame.duration_secs(),
-                    "audio"
-                );
+                tracing::debug!(frames = frame.frame_count(), duration = frame.duration_secs(), "audio");
             }
             Some(frame) = video_rx.recv() => {
-                tracing::debug!(
-                    width  = frame.width,
-                    height = frame.height,
-                    format = ?frame.format,
-                    "video"
-                );
+                tracing::debug!(width = frame.width, height = frame.height, format = ?frame.format, "video");
             }
             _ = metrics_tick.tick() => {
-                let v = video_metrics.snapshot();
+                let v = video_metrics_handle.snapshot();
                 info!(video_captured = v.frames_captured, video_dropped = v.frames_dropped);
                 for m in &audio_metric_handles {
                     let a = m.snapshot();
@@ -714,18 +784,35 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+/// Forward frames from src to tx with drop-oldest backpressure via drain.
+/// Exits cleanly when tx is disconnected — the shutdown signal from the consumer.
+fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
+    while let Ok(frame) = src.recv() {
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(TrySendError::Full(frame)) => {
+                let _ = drain.try_recv();
+                if tx.try_send(frame).is_err() { break; }
+            }
+            Err(TrySendError::Disconnected(_)) => break,
+        }
+    }
+}
 ```
 
 **Notes:**
 
-- `MediaFile::open` is called twice when a file is the source (once for audio,
-  once for video), because `start()` consumes `self`. Either restructure
-  `MediaFile` to yield both streams in a single `start()` call — which is the
-  design above via `MediaFileStreams` — or open the file once and split the
-  decoders internally. The implementation should take the latter path; the sketch
-  above is simplified.
-- The drop-oldest reuse in the std::thread spawns is a simplified inline version;
-  in implementation use the same `try_send` error-path pattern from `audio.rs`.
+- `MediaFileStreams` is destructured with `..` in the match arm, which drops
+  `_handles` (the decoder thread JoinHandles) immediately. Dropping JoinHandles
+  detaches the threads; they exit when their channel senders detect `Disconnected`
+  (see Shutdown cascade below).
+- The webcam pull loop cannot use `forward_frames` because `VideoCapture` has no
+  source `Receiver` — it is a blocking pull model. The drop-oldest pattern is
+  inlined identically.
+- `audio_drain` / `video_drain` receiver clones are not consumed by the bridge;
+  they are held only as drain templates for spawned threads and drop when main
+  returns.
 
 ---
 
@@ -806,9 +893,9 @@ ML computation. Conversion to tensors happens in `somnus-encoding`.
 
 ## What would invalidate this
 
-- If the cpal callback's `to_vec()` allocation measurably increases callback
-  latency (it shouldn't at typical chunk sizes), replace with a pre-allocated
-  ring buffer and zero-copy frames.
+- If the cpal callback's `iter().map().collect()` allocation measurably increases
+  callback latency (unlikely at typical 10 ms chunk sizes), replace with a
+  pre-allocated ring buffer and zero-copy frames passed as `Arc<[f32]>`.
 - If `nokhwa` fails to open the camera or produces incorrect pixel formats on the
   target hardware, replace with `v4l` (Linux-only but smaller and more direct).
 - If Phase 2 encoding proves that multiple simultaneous consumers need different
