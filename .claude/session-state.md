@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-04-26
-> **Last commit on main:** `8e8a05a` — *Update tech-stack and roadmap to reflect Phase 1 decisions*
+> **Last updated:** 2026-04-27
+> **Last commit on main:** `6aaa4ed` — *Complete ADR 0002: fix 5 pre-implementation gaps, spec MediaFile::start()*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -51,11 +51,11 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `sleep-and-consolidation.md` — supplemented with sleep time/memory budget estimates.
 - Phase 1 architectural design. Two ADRs:
   - `ai-docs/decisions/0001-rust-workspace-layout.md` — crate structure: `crates/somnus-sensory` (lib) + `crates/somnus` (binary) for Phase 1; reserved names for Phase 2–5 crates; no premature traits.
-  - `ai-docs/decisions/0002-phase1-sensory-types.md` — full concrete Rust signatures: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`; crossbeam drop-oldest bridge; tokio mpsc bridge; fan-in multi-source pattern; Ctrl+C shutdown; Cargo.toml sketches (including `ffmpeg-next`); main loop sketch; structural Phase 2+ sketches. Phase 1 "done" = capture running + metrics logging + clean shutdown (no visualizer; encoding is Phase 2).
+  - `ai-docs/decisions/0002-phase1-sensory-types.md` — full concrete Rust signatures: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`; crossbeam drop-oldest bridge; tokio mpsc bridge; fan-in multi-source pattern; Ctrl+C shutdown; Cargo.toml sketches (including `ffmpeg-next`); main loop sketch; structural Phase 2+ sketches. Phase 1 "done" = capture running + metrics logging + clean shutdown (no visualizer; encoding is Phase 2). **Pre-implementation audit complete:** 5 gaps fixed — `UnsupportedSampleFormat` variant, `make_cb!` macro for all 10 cpal `SampleFormat` variants, cpal bumped to 0.17 + clap 4 added, double-open bug fixed, `TrySendError::Disconnected` shutdown propagation added, full `MediaFile::start()` spec with ffmpeg-next (single decode thread, nested scope borrows, channel layout fallback, fresh output frames, flush sequence).
 
 ## Where to pick up
 
-1. **Create the Cargo workspace.** Follow ADR 0001/0002 exactly: `cargo new --lib crates/somnus-sensory`, `cargo new crates/somnus`, workspace `Cargo.toml`, add dependencies from the Cargo.toml sketches. Then implement the types in order: `frame.rs` → `error.rs` → `metrics.rs` → `audio.rs` → `video.rs` → `main.rs`.
+1. **Create the Cargo workspace and implement Phase 1.** Follow ADR 0001/0002 exactly: `cargo new --lib crates/somnus-sensory`, `cargo new crates/somnus`, workspace `Cargo.toml`, add dependencies from the Cargo.toml sketches. Implement types in order: `frame.rs` → `error.rs` → `metrics.rs` → `audio.rs` → `video.rs` → `media_file.rs` → `main.rs`. ADR 0002 is fully spec'd — this is a oneshot implementation task.
 2. **Option A research pass.** Refine Option B estimates with cited benchmark numbers. Priority: encoder latency on real hardware, HNSW query latency with `usearch`.
 3. **Encoder selection ADR.** The encoder choice (Whisper-tiny + CLAP vs. single multi-task) is ADR-ready. First implementation milestone: a working audio capture loop; encoder ADR can run in parallel.
 
