@@ -227,6 +227,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::FromSample;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::sync::Arc;
+use crate::{AudioFrame, SensorError, SensorMetrics, SensorResult, Timestamp};
 
 /// Frames in the crossbeam ring before the callback starts dropping oldest.
 /// At a typical 10 ms chunk period this is ~2.5 s of headroom.
@@ -351,6 +352,7 @@ Unlike audio, there is no platform callback to bridge.
 use nokhwa::{Camera, CameraIndex, pixel_format::RgbFormat};
 use nokhwa::utils::{RequestedFormat, RequestedFormatType};
 use std::sync::Arc;
+use crate::{PixelFormat, SensorError, SensorMetrics, SensorResult, Timestamp, VideoFrame};
 
 pub const VIDEO_CHANNEL_CAPACITY: usize = 16; // reserved for Phase 2 bridge
 
@@ -407,6 +409,10 @@ Alternatives:
 is actively maintained. The project runs on Linux; `v4l` would also work, but
 `nokhwa` keeps the option open if the hardware ever moves. Add
 `features = ["input-native"]` for native platform capture without requiring OpenCV.
+
+API verified against nokhwa 0.10.10 source: `Camera::frame()` returns
+`Result<Buffer, NokhwaError>`; `Buffer::buffer()` returns `&[u8]`;
+`RequestedFormatType::AbsoluteHighestFrameRate` exists.
 
 ---
 
