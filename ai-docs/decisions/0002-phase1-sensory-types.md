@@ -416,22 +416,41 @@ Decodes both audio and video streams from a single media file (MP4, MKV, etc.).
 The primary use case is testing without a camera: supply a video file and get
 the same `AudioFrame` / `VideoFrame` stream types as live capture.
 
+**Phase 1 limitation:** the file must contain both an audio and a video stream. Audio-only
+(`.wav`, `.mp3`) or video-only files will fail at `start()` with `MediaFileNoStream`.
+
+**Thread architecture:** a single background thread demuxes packets and decodes both streams
+inline. This avoids inter-thread packet queues and the complexity of sharing a
+format context. For typical video files (H.264 + AAC), decoding is fast enough that
+serialising audio and video decode does not introduce perceptible latency.
+
 ```rust
 use std::path::PathBuf;
-use crossbeam_channel::Receiver;
+use std::sync::Arc;
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use ffmpeg_next as ffmpeg;
+use ffmpeg::{
+    codec,
+    channel_layout::ChannelLayout,
+    format::{self, sample::Type as SampleType, Pixel},
+    frame,
+    media::Type as MediaType,
+    software::{resampling, scaling},
+};
+use crate::{AudioFrame, PixelFormat, SensorError, SensorMetrics, SensorResult, Timestamp, VideoFrame};
 
 /// Decoded streams from a media file. Dropping this stops decoding.
 pub struct MediaFileStreams {
-    /// Decoded audio frames (f32 PCM, sample rate from the file's audio track).
+    /// Decoded audio frames (f32 PCM interleaved, sample rate from the file's audio track).
     pub audio: Receiver<AudioFrame>,
-    /// Decoded video frames (Rgb8, resolution from the file's video track).
+    /// Decoded video frames (Rgb8 packed, resolution from the file's video track).
     pub video: Receiver<VideoFrame>,
     pub audio_metrics: Arc<SensorMetrics>,
     pub video_metrics: Arc<SensorMetrics>,
-    _handles: MediaFileHandles, // background thread handles; drop = stop
+    _handles: MediaFileHandles,
 }
 
-/// Open a media file and start decoding both streams on background threads.
+/// Open a media file and start decoding on a background thread.
 pub struct MediaFile {
     path: PathBuf,
 }
@@ -448,44 +467,272 @@ impl MediaFile {
         Ok(Self { path })
     }
 
-    /// Start decoding. Spawns two background threads (audio decoder, video decoder).
-    /// Both channels are bounded with drop-oldest backpressure.
+    /// Open the format context, create decoders and format converters, then spawn the
+    /// decode thread. All initialisation errors surface here before the thread starts.
     pub fn start(self) -> SensorResult<MediaFileStreams> {
-        // implementation uses ffmpeg-next to open the format context,
-        // find the best audio and video streams, and decode packets in
-        // separate threads → crossbeam senders
-        todo!()
+        ffmpeg::init().map_err(|e| SensorError::MediaFileDecode(e.to_string()))?;
+
+        // ── format context ─────────────────────────────────────────────────
+        let mut ictx = format::input(&self.path)
+            .map_err(|e| SensorError::MediaFileOpen {
+                path: self.path.clone(),
+                reason: e.to_string(),
+            })?;
+
+        // ── audio decoder ──────────────────────────────────────────────────
+        // Nested scope so the stream borrow on ictx ends before we look up the video stream.
+        let (audio_idx, mut audio_decoder) = {
+            let stream = ictx.streams().best(MediaType::Audio)
+                .ok_or(SensorError::MediaFileNoStream("audio"))?;
+            let idx = stream.index();
+            let dec = codec::context::Context::from_parameters(stream.parameters())
+                .map_err(|e| SensorError::MediaFileDecode(e.to_string()))?
+                .decoder()
+                .audio()
+                .map_err(|e| SensorError::MediaFileDecode(e.to_string()))?;
+            (idx, dec)
+        };
+
+        // Some containers omit channel layout (bits == 0); fall back to channel count.
+        let channel_layout = if audio_decoder.channel_layout().bits() == 0 {
+            match audio_decoder.channels() {
+                1 => ChannelLayout::MONO,
+                _ => ChannelLayout::STEREO,
+            }
+        } else {
+            audio_decoder.channel_layout()
+        };
+
+        // Resample any source format to interleaved f32 at the file's own sample rate.
+        // Handles FLTP (f32 planar), S16 (i16 packed), etc. Same-rate: no buffering delay.
+        let mut audio_resampler = resampling::Context::get(
+            audio_decoder.format(),
+            channel_layout,
+            audio_decoder.rate(),
+            format::Sample::F32(SampleType::Packed),
+            channel_layout,
+            audio_decoder.rate(),
+        ).map_err(|e| SensorError::MediaFileDecode(e.to_string()))?;
+
+        let sample_rate = audio_decoder.rate();
+        let channels    = audio_decoder.channels() as u8;
+
+        // ── video decoder ──────────────────────────────────────────────────
+        let (video_idx, mut video_decoder) = {
+            let stream = ictx.streams().best(MediaType::Video)
+                .ok_or(SensorError::MediaFileNoStream("video"))?;
+            let idx = stream.index();
+            let dec = codec::context::Context::from_parameters(stream.parameters())
+                .map_err(|e| SensorError::MediaFileDecode(e.to_string()))?
+                .decoder()
+                .video()
+                .map_err(|e| SensorError::MediaFileDecode(e.to_string()))?;
+            (idx, dec)
+        };
+
+        // Scale any source pixel format to packed RGB24.
+        let mut video_scaler = scaling::Context::get(
+            video_decoder.format(),
+            video_decoder.width(),
+            video_decoder.height(),
+            Pixel::RGB24,
+            video_decoder.width(),
+            video_decoder.height(),
+            scaling::flag::Flags::BILINEAR,
+        ).map_err(|e| SensorError::MediaFileDecode(e.to_string()))?;
+
+        let width  = video_decoder.width();
+        let height = video_decoder.height();
+
+        // ── channels ───────────────────────────────────────────────────────
+        let (audio_tx, audio_rx) = bounded::<AudioFrame>(256);
+        let (video_tx, video_rx) = bounded::<VideoFrame>(16);
+        // Drain clones: used inside the decode thread for drop-oldest backpressure.
+        // Single producer → the retry after drain is always safe.
+        let audio_drain = audio_rx.clone();
+        let video_drain = video_rx.clone();
+
+        let audio_metrics   = Arc::new(SensorMetrics::default());
+        let video_metrics   = Arc::new(SensorMetrics::default());
+        let audio_metrics_t = Arc::clone(&audio_metrics);
+        let video_metrics_t = Arc::clone(&video_metrics);
+
+        // ── decode thread ──────────────────────────────────────────────────
+        let handle = std::thread::spawn(move || {
+            // Reuse raw decoded frames; allocate converter output fresh each call
+            // because frame sizes can vary (VFR, codec flush boundaries).
+            let mut audio_raw = frame::Audio::empty();
+            let mut video_raw = frame::Video::empty();
+
+            // Main demux + decode loop.
+            for (stream, packet) in ictx.packets() {
+                if stream.index() == audio_idx {
+                    if audio_decoder.send_packet(&packet).is_err() { break; }
+                    while audio_decoder.receive_frame(&mut audio_raw).is_ok() {
+                        let mut conv = frame::Audio::empty();
+                        if audio_resampler.run(&audio_raw, &mut conv).is_err() { continue; }
+                        if conv.samples() == 0 { continue; }
+                        let af = AudioFrame {
+                            samples:     f32_from_audio_frame(&conv),
+                            sample_rate,
+                            channels,
+                            timestamp:   Timestamp::now(),
+                        };
+                        audio_metrics_t.increment_captured();
+                        if !send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t) {
+                            return; // consumer gone; skip flush
+                        }
+                    }
+                } else if stream.index() == video_idx {
+                    if video_decoder.send_packet(&packet).is_err() { break; }
+                    while video_decoder.receive_frame(&mut video_raw).is_ok() {
+                        let mut conv = frame::Video::empty();
+                        if video_scaler.run(&video_raw, &mut conv).is_err() { continue; }
+                        let vf = VideoFrame {
+                            data:      rgb_from_video_frame(&conv),
+                            width,
+                            height,
+                            format:    PixelFormat::Rgb8,
+                            timestamp: Timestamp::now(),
+                        };
+                        video_metrics_t.increment_captured();
+                        if !send_drop_oldest(&video_tx, &video_drain, vf, &video_metrics_t) {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // ── flush audio decoder ────────────────────────────────────────
+            audio_decoder.send_eof().ok();
+            while audio_decoder.receive_frame(&mut audio_raw).is_ok() {
+                let mut conv = frame::Audio::empty();
+                if audio_resampler.run(&audio_raw, &mut conv).is_ok() && conv.samples() > 0 {
+                    let af = AudioFrame {
+                        samples: f32_from_audio_frame(&conv),
+                        sample_rate, channels,
+                        timestamp: Timestamp::now(),
+                    };
+                    audio_metrics_t.increment_captured();
+                    send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t);
+                }
+            }
+            // Drain resampler residue (same-rate resampler holds ≤ 1 frame; loop is short).
+            loop {
+                let mut conv = frame::Audio::empty();
+                match audio_resampler.flush(&mut conv) {
+                    Ok(delay) => {
+                        if conv.samples() > 0 {
+                            let af = AudioFrame {
+                                samples: f32_from_audio_frame(&conv),
+                                sample_rate, channels,
+                                timestamp: Timestamp::now(),
+                            };
+                            audio_metrics_t.increment_captured();
+                            send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t);
+                        }
+                        if delay.is_none() { break; }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // ── flush video decoder ────────────────────────────────────────
+            video_decoder.send_eof().ok();
+            while video_decoder.receive_frame(&mut video_raw).is_ok() {
+                let mut conv = frame::Video::empty();
+                if video_scaler.run(&video_raw, &mut conv).is_ok() {
+                    let vf = VideoFrame {
+                        data: rgb_from_video_frame(&conv),
+                        width, height,
+                        format: PixelFormat::Rgb8,
+                        timestamp: Timestamp::now(),
+                    };
+                    video_metrics_t.increment_captured();
+                    send_drop_oldest(&video_tx, &video_drain, vf, &video_metrics_t);
+                }
+            }
+            // Scaler is stateless: no flush needed.
+        });
+
+        Ok(MediaFileStreams {
+            audio: audio_rx,
+            video: video_rx,
+            audio_metrics,
+            video_metrics,
+            _handles: MediaFileHandles { _decode_thread: handle },
+        })
     }
 }
 
-// Private: keeps decoder thread handles alive.
+// Private: keeps decode thread alive. Dropping detaches the thread;
+// it exits when both send channels detect Disconnected.
 struct MediaFileHandles {
-    _audio_thread: std::thread::JoinHandle<()>,
-    _video_thread: std::thread::JoinHandle<()>,
+    _decode_thread: std::thread::JoinHandle<()>,
+}
+
+// Extract interleaved f32 samples from an F32(Packed) audio frame (plane 0).
+fn f32_from_audio_frame(frame: &frame::Audio) -> Vec<f32> {
+    frame.data(0)
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+        .collect()
+}
+
+// Copy RGB24 pixels from a video frame, stripping row padding.
+// stride(0) may exceed width * 3 on some decoders/platforms.
+fn rgb_from_video_frame(frame: &frame::Video) -> Vec<u8> {
+    let w      = frame.width()  as usize;
+    let h      = frame.height() as usize;
+    let stride = frame.stride(0);
+    let src    = frame.data(0);
+    if stride == w * 3 {
+        src[..w * h * 3].to_vec()
+    } else {
+        let mut out = Vec::with_capacity(w * h * 3);
+        for row in 0..h {
+            out.extend_from_slice(&src[row * stride..row * stride + w * 3]);
+        }
+        out
+    }
+}
+
+// Send with drop-oldest backpressure. Returns true if the channel is alive.
+// Single-producer: after draining one slot the retry is always safe.
+fn send_drop_oldest<T>(
+    tx:      &Sender<T>,
+    drain:   &Receiver<T>,
+    frame:   T,
+    metrics: &SensorMetrics,
+) -> bool {
+    match tx.try_send(frame) {
+        Ok(()) => true,
+        Err(TrySendError::Full(frame)) => {
+            let _ = drain.try_recv();
+            metrics.increment_dropped();
+            tx.try_send(frame).is_ok()
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
 }
 ```
 
-**Decoding implementation sketch** (inside `MediaFile::start`):
+**Design notes:**
 
-```rust
-// Open format context (ffmpeg-next):
-let mut ictx = ffmpeg_next::format::input(&self.path)
-    .map_err(|e| SensorError::MediaFileOpen { path: self.path.clone(), reason: e.to_string() })?;
-
-// Find best audio / video stream index:
-let audio_stream_idx = ictx.streams()
-    .best(ffmpeg_next::media::Type::Audio)
-    .ok_or(SensorError::MediaFileNoStream("audio"))?
-    .index();
-let video_stream_idx = ictx.streams()
-    .best(ffmpeg_next::media::Type::Video)
-    .ok_or(SensorError::MediaFileNoStream("video"))?
-    .index();
-
-// Build decoders, spawn one thread per stream, packet-demux loop.
-// Audio decoder → resample to f32 if needed → AudioFrame → audio_tx
-// Video decoder → convert to Rgb8 via ffmpeg swscale → VideoFrame → video_tx
-```
+- `ffmpeg::init()` is idempotent (uses a static `AtomicBool`); calling it in `start()`
+  is safe even if the binary calls it separately.
+- The decode thread reuses `audio_raw` / `video_raw` across iterations (decoder fills
+  them each call). Converter output frames (`conv`) are allocated fresh per call because
+  the resampler allocates on `is_empty()` check and frame sizes can vary across codec
+  flush boundaries.
+- Channel layout fallback (`bits() == 0`) prevents a resampler init panic on containers
+  that omit channel layout (common in raw PCM or some MP4 muxings).
+- The resampler flush loop terminates on `delay.is_none()` (no samples remaining in
+  the SwrContext buffer). For same-rate format conversion the buffer holds ≤ 1 frame,
+  so the loop runs at most twice.
+- Video scaler is stateless; no flush is required.
+- Audio-only and video-only files are not supported in Phase 1. Both streams must be
+  present or `start()` returns `MediaFileNoStream`.
 
 **Crate selection — `ffmpeg-next`:**
 
