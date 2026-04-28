@@ -1,0 +1,12 @@
+[package]
+name    = "somnus-sensory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal              = { workspace = true }
+crossbeam-channel = { workspace = true }
+ffmpeg-next       = { workspace = true }
+nokhwa            = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }

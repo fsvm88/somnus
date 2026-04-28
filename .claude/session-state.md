@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-04-28
-> **Last commit on main:** `e36b57e` — *ADR 0002: add missing crate-local imports, verify nokhwa API*
+> **Last commit on main:** `(see below — committed this session)`
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -52,12 +52,22 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - Phase 1 architectural design. Two ADRs:
   - `ai-docs/decisions/0001-rust-workspace-layout.md` — crate structure: `crates/somnus-sensory` (lib) + `crates/somnus` (binary) for Phase 1; reserved names for Phase 2–5 crates; no premature traits.
   - `ai-docs/decisions/0002-phase1-sensory-types.md` — **fully spec'd and audit-complete.** All types: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`. Full import blocks for every module. All 10 cpal `SampleFormat` variants dispatched via `make_cb!`. Complete `MediaFile::start()` (single decode thread, nested scope borrows, channel layout fallback, fresh output frames, flush sequence). nokhwa 0.10 API verified against source. Shutdown cascade documented. Cargo.toml with cpal 0.17, clap 4, all deps pinned.
+- **Phase 1 sensory pipeline implemented and fully tested.** Crate layout: `crates/somnus-sensory` (library) + `crates/somnus` (binary). All modules pass `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. 22 tests total (13 unit, 9 integration).
+  - `frame.rs` — `Timestamp`, `AudioFrame` (frame_count, duration_secs), `PixelFormat`, `VideoFrame` (bytes_per_pixel).
+  - `error.rs` — `SensorError` (11 variants via thiserror), `SensorResult`.
+  - `metrics.rs` — `SensorMetrics` (AtomicU64), `MetricsSnapshot` (drop_rate).
+  - `audio.rs` — `AudioCapture`: cpal live mic capture, 10-format `make_cb!` dispatch, drop-oldest backpressure.
+  - `video.rs` — `VideoCapture`: nokhwa pull-model webcam; `unsafe impl Send` (single dedicated thread, documented safety).
+  - `media_file.rs` — `MediaFile`/`MediaFileStreams`: single decode thread, ffmpeg-next 8, nested-scope stream borrows, channel-layout fallback, `scaling::Context` built inside thread (it is `!Send`), flush sequences, `send_drop_oldest` helper.
+  - `main.rs` — clap CLI (`--file`, `--mic`, `--webcam`), tokio async runtime, `spawn_blocking` bridges, `select!` loop with 10s metrics tick.
+  - `tests/media_file_it.rs` — 9 integration tests: error path, video geometry, frame count, pixel invariants, audio metadata, sample finiteness, total duration, and metrics accounting for both streams. Each test synthesizes its own MP4 via `ffmpeg` CLI.
+  - **ADR deviations (not in ADR 0002):** `unsafe impl Send for VideoCapture` (nokhwa Camera is !Send); `scaling::Context` moved into decode thread (ffmpeg-next scaler is !Send, unlike the resampler).
 
 ## Where to pick up
 
-1. **Create the Cargo workspace and implement Phase 1.** Follow ADR 0001/0002 exactly: `cargo new --lib crates/somnus-sensory`, `cargo new crates/somnus`, workspace `Cargo.toml`, add dependencies from the Cargo.toml sketches. Implement types in order: `frame.rs` → `error.rs` → `metrics.rs` → `audio.rs` → `video.rs` → `media_file.rs` → `main.rs`. ADR 0002 is fully spec'd — this is a oneshot implementation task.
-2. **Option A research pass.** Refine Option B estimates with cited benchmark numbers. Priority: encoder latency on real hardware, HNSW query latency with `usearch`.
-3. **Encoder selection ADR.** The encoder choice (Whisper-tiny + CLAP vs. single multi-task) is ADR-ready. First implementation milestone: a working audio capture loop; encoder ADR can run in parallel.
+1. **Option A research pass.** Refine Option B estimates with cited benchmark numbers. Priority: encoder latency on real hardware, HNSW query latency with `usearch`.
+2. **Encoder selection ADR.** The encoder choice (Whisper-tiny + CLAP vs. single multi-task) is ADR-ready. Phase 2 milestone: wire a frozen encoder to the sensory pipeline and emit embeddings.
+3. **ADR 0002 deviation note** (optional housekeeping): the two implementation deviations (`unsafe impl Send for VideoCapture`; `scaling::Context` moved into decode thread) were not anticipated in the ADR. Could add an "Implementation notes" section to ADR 0002 for traceability.
 
 ## Open architectural questions
 
