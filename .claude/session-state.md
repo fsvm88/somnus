@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-04-28
-> **Last commit on main:** (to be updated after commit)
+> **Last commit on main:** `77b7fb2` — *ADR 0004: Phase 2 encoding types; ort smoke test; model exports*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
