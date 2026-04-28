@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name    = "ort-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ort-smoke"
+path = "src/main.rs"
+
+[dependencies]
+anyhow  = "1"
+ndarray = "0.17"
+ort     = { version = "2.0.0-rc.12", features = ["load-dynamic", "ndarray"] }

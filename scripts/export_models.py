@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Export Whisper-tiny encoder, CLAP audio encoder, and DINOv2-S/14 to ONNX.
+
+Run from the repo root:
+    scripts/.venv/bin/python scripts/export_models.py
+
+Exports to models/ (gitignored). Idempotent: re-running skips existing files.
+Pinned HF revisions from ADR 0003.
+
+Input/output shapes (batch=1, FP32):
+  whisper_tiny_encoder.onnx
+    in:  input_features   (1,  80, 3000) — mel spectrogram, 30 s @ 16 kHz, 80 bins
+    out: last_hidden_state (1, 1500, 384) — Rust mean-pools to (1, 384)
+
+  clap_audio_encoder.onnx
+    in:  input_features  (1, 1, 1001, 64) — 10 s mel spectrogram @ 48 kHz, 64 bins
+    out: audio_embeds    (1, 512)         — L2-normalised projection embedding
+
+  dinov2_small.onnx
+    in:  pixel_values    (1, 3, 224, 224) — ImageNet-normalised RGB
+    out: last_hidden_state (1, 257, 384)  — Rust mean-pools patch tokens [1:] to (1, 384)
+"""
+
+import hashlib
+import sys
+from pathlib import Path
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = REPO_ROOT / "models"
+
+REVISIONS = {
+    "whisper": ("openai/whisper-tiny", "169d4a4341b33bc18d8881c4b69c2e104e1cc0af"),
+    "clap":    ("laion/clap-htsat-unfused", "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"),
+    "dinov2":  ("facebook/dinov2-small",    "ed25f3a31f01632728cabb09d1542f84ab7b0056"),
+}
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def report(out: Path) -> None:
+    """Print size and sha256 for an ONNX export (graph + optional external data)."""
+    data = Path(str(out) + ".data")
+    if data.exists():
+        total = out.stat().st_size + data.stat().st_size
+        print(f"  graph {out.stat().st_size / 1e6:.1f} MB  data {data.stat().st_size / 1e6:.0f} MB"
+              f"  total {total / 1e6:.0f} MB")
+        print(f"  sha256(graph)={sha256(out)}")
+        print(f"  sha256(data) ={sha256(data)}")
+    else:
+        print(f"  {out.stat().st_size / 1e6:.1f} MB  sha256={sha256(out)}")
+
+
+# ── wrappers (force tuple output so torch.onnx.export works cleanly) ──────────
+
+class WhisperEncoderWrapper(torch.nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.enc = encoder
+
+    def forward(self, input_features):
+        return self.enc(input_features, return_dict=False)[0]
+
+
+class ClapAudioWrapper(torch.nn.Module):
+    """HTSAT encoder + ClapProjectionLayer → 512-dim L2-normalised embedding."""
+    def __init__(self, audio_model, audio_projection):
+        super().__init__()
+        self.audio_model = audio_model
+        self.audio_projection = audio_projection
+
+    def forward(self, input_features):
+        pooler = self.audio_model(input_features=input_features, return_dict=False)[1]
+        return self.audio_projection(pooler)
+
+
+class Dinov2Wrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        return self.model(pixel_values, return_dict=False)[0]
+
+
+# ── per-model exports ──────────────────────────────────────────────────────────
+
+def export_whisper_encoder() -> None:
+    out = MODELS_DIR / "whisper_tiny_encoder.onnx"
+    if out.exists():
+        print(f"  skip: {out.name} already present")
+        return
+
+    from transformers import WhisperModel
+    repo, rev = REVISIONS["whisper"]
+    print(f"  loading {repo} @ {rev[:12]}…")
+    model = WhisperModel.from_pretrained(repo, revision=rev)
+    wrapper = WhisperEncoderWrapper(model.encoder).eval()
+
+    dummy = torch.zeros(1, 80, 3000)
+    print(f"  exporting…")
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            str(out),
+            input_names=["input_features"],
+            output_names=["last_hidden_state"],
+            dynamic_axes={"input_features": {0: "batch"}, "last_hidden_state": {0: "batch"}},
+            opset_version=17,
+        )
+    report(out)
+
+
+def export_clap_encoder() -> None:
+    out = MODELS_DIR / "clap_audio_encoder.onnx"
+    if out.exists():
+        print(f"  skip: {out.name} already present")
+        return
+
+    from transformers import ClapModel
+    repo, rev = REVISIONS["clap"]
+    print(f"  loading {repo} @ {rev[:12]}…")
+    model = ClapModel.from_pretrained(repo, revision=rev)
+    wrapper = ClapAudioWrapper(model.audio_model, model.audio_projection).eval()
+
+    # (batch, 1, 1001, 64): mono channel, 1001 time frames, 64 mel bins
+    # Preprocessed by ClapFeatureExtractor: 10 s @ 48 kHz, hop_length=480
+    dummy = torch.zeros(1, 1, 1001, 64)
+    print(f"  exporting…")
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            str(out),
+            input_names=["input_features"],
+            output_names=["audio_embeds"],
+            dynamic_axes={"input_features": {0: "batch"}, "audio_embeds": {0: "batch"}},
+            opset_version=17,
+        )
+    report(out)
+
+
+def export_dinov2() -> None:
+    out = MODELS_DIR / "dinov2_small.onnx"
+    if out.exists():
+        print(f"  skip: {out.name} already present")
+        return
+
+    from transformers import Dinov2Model
+    repo, rev = REVISIONS["dinov2"]
+    print(f"  loading {repo} @ {rev[:12]}…")
+    model = Dinov2Model.from_pretrained(repo, revision=rev)
+    wrapper = Dinov2Wrapper(model).eval()
+
+    dummy = torch.zeros(1, 3, 224, 224)
+    print(f"  exporting…")
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            str(out),
+            input_names=["pixel_values"],
+            output_names=["last_hidden_state"],
+            dynamic_axes={"pixel_values": {0: "batch"}, "last_hidden_state": {0: "batch"}},
+            opset_version=17,
+        )
+    report(out)
+
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    MODELS_DIR.mkdir(exist_ok=True)
+
+    print("=== Whisper-tiny encoder ===")
+    export_whisper_encoder()
+
+    print("=== CLAP-HTSAT-unfused audio encoder ===")
+    export_clap_encoder()
+
+    print("=== DINOv2-ViT-S/14 ===")
+    export_dinov2()
+
+    print("\nAll exports complete:")
+    for f in sorted(MODELS_DIR.glob("*.onnx")):
+        print(f"\n  {f.name}")
+        report(f)

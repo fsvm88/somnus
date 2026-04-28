@@ -10,3 +10,12 @@ target/
 *.swo
 .DS_Store
 Thumbs.db
+
+# ONNX model artifacts (export via scripts/export_models.py)
+# The new torch ONNX exporter writes weights to *.onnx.data alongside the graph file.
+models/*.onnx
+models/*.onnx.data
+
+# Python venv for export scripts
+scripts/.venv/
+experiments/**/.claude/
