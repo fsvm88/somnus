@@ -56,8 +56,11 @@ All parameters verified against HuggingFace source
 **CLAP-HTSAT-unfused** (`ClapFeatureExtractor` defaults, `_np_extract_fbank_features`):
 - Sample rate: 48 000 Hz
 - n_fft: 1024, window: Hann, hop_length: 480
-- n_mels: 64, fmin: 0 Hz, fmax: 14 000 Hz
-- Mel scale: HTK (no Slaney normalisation); used when `truncation="fusion"` (default)
+- n_mels: 64, **fmin: 50 Hz**, fmax: 14 000 Hz
+- **Mel scale: Slaney (area-normalised triangular filters, `mel_filters_slaney`).**
+  The ADR originally said HTK with `truncation="fusion"` — this was wrong.
+  The actual default is `truncation="rand_trunc"`, which uses `mel_filters_slaney`
+  (librosa Slaney) not HTK. Verified by fixture parity tests.
 - Pipeline:
   1. **Power** spectrogram: `|stft|²` (`power=2.0`)
   2. Mel filterbank → `(64, T)`
@@ -230,6 +233,30 @@ fn mean_pool_2d(tensor: &[f32], seq_len: usize, dim: usize) -> Vec<f32> {
 // DINOv2: patch tokens = tokens[1..] → (256, 384), mean-pool → (384,)
 // Token 0 is the CLS token and is skipped per ADR 0003.
 ```
+
+## Implementation notes (from parity testing)
+
+Several non-obvious implementation details emerged during parity testing:
+
+1. **LOGSTEP = ln(6.4)/27 exactly.** The Slaney mel scale uses `LOGSTEP = np.log(6.4) / 27.0`.
+   Both `hz_to_mel_slaney` and `mel_to_hz_slaney` must use the same constant
+   (≈ 0.068_751_777_5). Using different values in the two directions gives slightly wrong
+   filterbank centre frequencies and visible parity errors.
+
+2. **f64 throughout the mel pipeline.** The Hann window, STFT, filterbank matrix, and
+   mel matmul must all run in f64 — matching numpy's float64 pipeline — before casting
+   to f32 at the final output. f32 precision in the filterbank matmul accumulates rounding
+   errors that exceed 1e-4 tolerance, especially for near-floor sidelobe values.
+
+3. **Bilinear resize in float space.** DINOv2 preprocessing must convert u8 → f32 / 255
+   *before* the bilinear resize, matching PyTorch's `F.interpolate` which operates on
+   float tensors. Rounding back to u8 after resize causes quantisation errors on
+   high-frequency patterns (e.g., checkerboard) that exceed 1e-4 tolerance.
+
+4. **Near-floor values are FFT-implementation-dependent.** STFT sidelobe power at bins
+   far from a pure tone's fundamental (~-90 dB) differs by a few ULPs between numpy's
+   pocketfft and rustfft. After the f64 rewrite (point 2 above), the maximum error at
+   such values stays within the 1e-4 tolerance.
 
 ## Consequences
 

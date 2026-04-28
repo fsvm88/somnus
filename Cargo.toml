@@ -1,5 +1,5 @@
 [workspace]
-members  = ["crates/somnus", "crates/somnus-sensory"]
+members  = ["crates/somnus", "crates/somnus-sensory", "crates/somnus-encoding"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -8,7 +8,11 @@ clap               = { version = "4", features = ["derive"] }
 cpal               = "0.17"
 crossbeam-channel  = "0.5"
 ffmpeg-next        = "8"
+ndarray            = "0.17"
 nokhwa             = { version = "0.10", features = ["input-native"] }
+ort                = { version = "2.0.0-rc.12", features = ["load-dynamic", "ndarray"] }
+rubato             = "0.16"
+rustfft            = "6"
 thiserror          = "2"
 tokio              = { version = "1", features = ["full"] }
 tracing            = "0.1"
