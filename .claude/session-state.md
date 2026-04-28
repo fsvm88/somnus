@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-04-28
-> **Last commit on main:** `(see below — committed this session)`
+> **Last commit on main:** `e45f10c` — *Implement Phase 1 sensory pipeline (somnus-sensory + somnus binary)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
