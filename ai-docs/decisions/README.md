@@ -54,3 +54,4 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 |---|-------|--------|
 | [0001](0001-rust-workspace-layout.md) | Rust workspace layout | accepted |
 | [0002](0002-phase1-sensory-types.md) | Phase 1 sensory pipeline: concrete types and interfaces | accepted |
+| [0003](0003-phase2-encoder-selection.md) | Phase 2 encoder selection: Whisper-tiny + CLAP + DINOv2-S/14 | accepted |

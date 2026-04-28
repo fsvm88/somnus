@@ -179,7 +179,7 @@ Sleep is **interruptible by high-salience external events** (loud novel sound, m
 Tracked here so they don't get lost. Resolutions become ADRs.
 
 - **Initial regional set.** Is the minimal viable set audio-speech + symbolic, with audio-env and visual added later? Or commit to all four regions from Phase 1?
-- **Encoder specifics.** Single multi-task audio encoder (CLAP-style) vs. two specialized (Whisper + CLAP/AST). Visual encoder choice.
+- ~~**Encoder specifics.**~~ Resolved in ADR 0003: Whisper-tiny (speech, 384-dim) + CLAP-HTSAT-unfused (env, 512-dim) + DINOv2-S/14 (visual, 384-dim).
 - **Growth mechanism.** Cascade-Correlation-style unit addition? At what granularity (single unit, group, sub-cluster)? How do new units integrate with sparse codes?
 - **Recollection-layer implementation.** Vector ANN (e.g., `hnsw_rs`) over the archive? Hopfield-style associative memory? Hybrid?
 - **Compression strategy.** Quantization, structured pruning, knowledge distillation, or layered combination? When is content moved cold vs. dropped?
