@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-04-28
-> **Last commit on main:** `e45f10c` — *Implement Phase 1 sensory pipeline (somnus-sensory + somnus binary)*
+> **Last commit on main:** `d366eae` — *ADR 0003: Phase 2 encoder selection (Whisper-tiny + CLAP + DINOv2-S/14)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -49,9 +49,10 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `predictive-coding.md` — Friston FEP; partial adoption (SAE reconstruction error = prediction error).
   - `continuous-learning.md` — supplemented with hardware budget section.
   - `sleep-and-consolidation.md` — supplemented with sleep time/memory budget estimates.
-- Phase 1 architectural design. Two ADRs:
+- Phase 1 and Phase 2 architectural design. Three ADRs:
   - `ai-docs/decisions/0001-rust-workspace-layout.md` — crate structure: `crates/somnus-sensory` (lib) + `crates/somnus` (binary) for Phase 1; reserved names for Phase 2–5 crates; no premature traits.
-  - `ai-docs/decisions/0002-phase1-sensory-types.md` — **fully spec'd and audit-complete.** All types: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`. Full import blocks for every module. All 10 cpal `SampleFormat` variants dispatched via `make_cb!`. Complete `MediaFile::start()` (single decode thread, nested scope borrows, channel layout fallback, fresh output frames, flush sequence). nokhwa 0.10 API verified against source. Shutdown cascade documented. Cargo.toml with cpal 0.17, clap 4, all deps pinned.
+  - `ai-docs/decisions/0002-phase1-sensory-types.md` — **fully spec'd and audit-complete.**
+  - `ai-docs/decisions/0003-phase2-encoder-selection.md` — **accepted.** Whisper-tiny encoder-only (384-dim speech), CLAP-HTSAT-unfused (512-dim env), DINOv2-S/14 (384-dim visual). HF revisions pinned. ONNX artifacts in `.gitignore`'d `models/`, exported via `scripts/export_models.py`. Whisper: non-overlapping 30s chunks, mean-pooled to 384-dim per chunk. Invalidation criteria named. All types: `AudioFrame`, `VideoFrame`, `Timestamp`, `PixelFormat`, `SensorError`, `SensorMetrics`, `AudioCapture`, `VideoCapture`, `MediaFile`, `MediaFileStreams`. Full import blocks for every module. All 10 cpal `SampleFormat` variants dispatched via `make_cb!`. Complete `MediaFile::start()` (single decode thread, nested scope borrows, channel layout fallback, fresh output frames, flush sequence). nokhwa 0.10 API verified against source. Shutdown cascade documented. Cargo.toml with cpal 0.17, clap 4, all deps pinned.
 - **Phase 1 sensory pipeline implemented and fully tested.** Crate layout: `crates/somnus-sensory` (library) + `crates/somnus` (binary). All modules pass `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. 22 tests total (13 unit, 9 integration).
   - `frame.rs` — `Timestamp`, `AudioFrame` (frame_count, duration_secs), `PixelFormat`, `VideoFrame` (bytes_per_pixel).
   - `error.rs` — `SensorError` (11 variants via thiserror), `SensorResult`.
@@ -65,9 +66,16 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 ## Where to pick up
 
-1. **Option A research pass.** Refine Option B estimates with cited benchmark numbers. Priority: encoder latency on real hardware, HNSW query latency with `usearch`.
-2. **Encoder selection ADR.** The encoder choice (Whisper-tiny + CLAP vs. single multi-task) is ADR-ready. Phase 2 milestone: wire a frozen encoder to the sensory pipeline and emit embeddings.
-3. **ADR 0002 deviation note** (optional housekeeping): the two implementation deviations (`unsafe impl Send for VideoCapture`; `scaling::Context` moved into decode thread) were not anticipated in the ADR. Could add an "Implementation notes" section to ADR 0002 for traceability.
+**Phase 2 implementation.** Encoders are selected and pinned (ADR 0003). Setup steps:
+
+1. Install system `onnxruntime` (Arch: `yay -S onnxruntime` or community repo).
+2. Set up Python env with `torch`, `transformers`, `optimum[onnxruntime]`.
+3. Run `scripts/export_models.py` (to be created) to export the three ONNX graphs into `models/`.
+4. Create `crates/somnus-encoding` with `ort` crate; define `AudioEmbedding`, `VideoEmbedding`.
+5. Wire `somnus-sensory` → `somnus-encoding` in the `somnus` binary.
+6. Verify: embeddings flowing in real time on the Phase 1 test video; latency ≤ frame period.
+
+Before starting, write a Phase 2 types ADR (analogous to ADR 0002) to spec out the `somnus-encoding` crate interface.
 
 ## Open architectural questions
 
