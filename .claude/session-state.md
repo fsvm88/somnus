@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-04-28
-> **Last commit on main:** `afbf37e` — *Phase 2 encoding: crates/somnus-encoding with all parity tests passing*
+> **Last updated:** 2026-05-07
+> **Last commit on main:** `33b72dc` — *Phase 2 wiring: somnus-sensory → somnus-encoding in the somnus binary*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -55,6 +55,7 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `ai-docs/decisions/0003-phase2-encoder-selection.md` — **accepted.** Whisper-tiny encoder-only (384-dim speech), CLAP-HTSAT-unfused (512-dim env), DINOv2-S/14 (384-dim visual). HF revisions pinned. ONNX artifacts in `.gitignore`'d `models/`, exported via `scripts/export_models.py`.
   - `ai-docs/decisions/0004-phase2-encoding-types.md` — **accepted (corrected).** `ort` 2.0.0-rc.12 + `load-dynamic` against system ORT 1.24.4. Exact mel-spectrogram preprocessing formulas verified by parity tests. CLAP correction: `rand_trunc` mode, Slaney scale, fmin=50 Hz (not HTK/fusion as originally stated). ADR updated with implementation notes (LOGSTEP, f64 pipeline, float-space resize).
 - **Phase 2 encoding crate implemented and fully tested.** `crates/somnus-encoding`: `WhisperMel`, `ClapMel`, `frame_to_tensor` (DINOv2 image), `AudioEncoder`, `VideoEncoder`. 7 parity fixture tests pass within 1e-4 absolute vs. HuggingFace Python reference. `scripts/gen_mel_fixtures.py` generates fixtures. ADR 0004 updated with corrected CLAP parameters and implementation notes.
+- **Phase 2 wiring complete.** `crates/somnus/src/main.rs` wired end-to-end: ORT initialised from system library at startup; `--models-dir` CLI arg (default `models/`) with up-front file existence checks; `AudioProcessor` (lazy resampler init via `SincResampler` from `somnus-encoding::preprocess::resample`, 480k-sample accumulation for both 16 kHz and 48 kHz, `encode_speech` + `encode_env`); `VideoEncoder` task per frame; embedding shape + latency logged via `tracing::info!`. All 31 workspace tests pass.
 - **Phase 1 sensory pipeline implemented and fully tested.** Crate layout: `crates/somnus-sensory` (library) + `crates/somnus` (binary). All modules pass `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. 22 tests total (13 unit, 9 integration).
   - `frame.rs` — `Timestamp`, `AudioFrame` (frame_count, duration_secs), `PixelFormat`, `VideoFrame` (bytes_per_pixel).
   - `error.rs` — `SensorError` (11 variants via thiserror), `SensorResult`.
@@ -68,25 +69,30 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 ## Where to pick up
 
-**Phase 2 step 4: wire `somnus-sensory` → `somnus-encoding` in the `somnus` binary.**
+**Phase 2 complete. Start Phase 3: memory / concept areas.**
 
-`crates/somnus-encoding` is complete and all 7 parity fixture tests pass (< 1e-4 absolute).
-Key implementation gotchas are documented in ADR 0004 (Implementation notes section).
+Phase 2 is fully wired end-to-end: sensory frames → resampling → ONNX encoding → embeddings logged to stdout.
+
+To do a live smoke test (needs ≥30 s media file so the Whisper buffer fills):
+```
+RUST_LOG=info cargo run -p somnus -- --file /path/to/file.mp4 --models-dir models/
+```
+Expect to see `speech embedding dim=384`, `env embedding dim=512`, `video embedding dim=384` in logs.
 
 Next steps:
-1. Wire `somnus-encoding` into `crates/somnus/src/main.rs`:
-   - Call `ort::init_from("/usr/lib/libonnxruntime.so")?.commit()` at startup.
-   - Construct `AudioEncoder::new(models_dir)` and `VideoEncoder::new(models_dir)`.
-   - Add resampling: accumulate `AudioFrame`s in a ring buffer, resample to 16 kHz and
-     48 kHz via `SincResampler`, batch into 480 000-sample chunks, call `encode_speech`
-     / `encode_env` via `spawn_blocking`.
-   - For video: call `VideoEncoder::encode` via `spawn_blocking` on each `VideoFrame`.
-2. Verify: embeddings flowing end-to-end on Phase 1 test video; log embedding shape and
-   timestamp; check latency ≤ frame period.
-3. Once wired, update architecture.md and start Phase 3 planning (memory / concept areas).
+1. **Smoke test** on a real ≥30 s MP4 (optional but recommended before Phase 3).
+2. **Update `ai-docs/architecture.md`** — mark Phase 2 sensory + encoding as implemented.
+3. **Phase 3 design**: memory / concept areas.
+   - Regional concept stores (audio-speech, audio-env, visual).
+   - Hot episodic buffer (VRAM): receives embeddings from the encoder tasks.
+   - Sparse coding (k-WTA / top-k) for concept representations.
+   - Write ADR 0005 for Phase 3 memory types before implementing.
 
-Models dir: `models/` (gitignored); ONNX artifacts already exported in `experiments/ort-smoke`
-or via `scripts/export_models.py`.
+Key open questions for Phase 3 (from `ai-docs/architecture.md`):
+- Initial regional set (start with all three now that encoders are all three?)
+- Sparse-coding scheme (k-WTA vs. top-k vs. SAE)
+- Episodic buffer sizing and eviction policy
+- Tensor representation type (`ndarray::Array1<f32>` vs. a newtype)
 
 ## Open architectural questions
 
