@@ -9,9 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 somnus-sensory        = { path = "../somnus-sensory" }
+somnus-encoding       = { path = "../somnus-encoding" }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 crossbeam-channel  = { workspace = true }
+ort                = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

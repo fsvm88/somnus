@@ -1,8 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use somnus_encoding::{
+    preprocess::resample::SincResampler,
+    AudioEmbedding, AudioEncoder, VideoEmbedding, VideoEncoder,
+};
 use somnus_sensory::{
-    AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, VideoCapture, VideoFrame,
+    AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
+    VideoFrame,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -11,7 +16,7 @@ use tracing::info;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
-#[command(about = "somnus sensory pipeline — Phase 1")]
+#[command(about = "somnus sensory + encoding pipeline — Phase 2")]
 struct Args {
     /// Media file to decode (must contain both audio and video streams).
     #[arg(long)]
@@ -24,21 +29,157 @@ struct Args {
     /// Webcam device index (ignored when --file is supplied without --mic).
     #[arg(long, default_value = "0")]
     webcam: u32,
+
+    /// Directory containing ONNX model files.
+    #[arg(long, default_value = "models")]
+    models_dir: PathBuf,
+}
+
+// ── audio accumulator + resampler ─────────────────────────────────────────────
+
+const AUDIO_CHUNK: usize = 4096; // rubato fixed input chunk
+const WHISPER_SAMPLES: usize = 480_000; // 30 s @ 16 kHz
+const CLAP_SAMPLES: usize = 480_000; // 10 s @ 48 kHz
+
+struct AudioProcessor {
+    encoder: AudioEncoder,
+    r16k: Option<SincResampler>,
+    r48k: Option<SincResampler>,
+    in_rate: Option<u32>,
+    src_buf: Vec<f32>,
+    buf_16k: Vec<f32>,
+    buf_48k: Vec<f32>,
+    ts_16k: Option<Timestamp>,
+    ts_48k: Option<Timestamp>,
+}
+
+impl AudioProcessor {
+    fn new(models_dir: &std::path::Path) -> Result<Self> {
+        Ok(Self {
+            encoder: AudioEncoder::new(models_dir)?,
+            r16k: None,
+            r48k: None,
+            in_rate: None,
+            src_buf: Vec::new(),
+            buf_16k: Vec::new(),
+            buf_48k: Vec::new(),
+            ts_16k: None,
+            ts_48k: None,
+        })
+    }
+
+    fn ingest(&mut self, frame: AudioFrame) -> Result<Vec<AudioEmbedding>> {
+        // Reject mid-stream rate change — resamplers are fixed at init.
+        if let Some(known) = self.in_rate {
+            if frame.sample_rate != known {
+                tracing::warn!(
+                    got = frame.sample_rate,
+                    expected = known,
+                    "audio sample rate changed mid-stream — frame dropped"
+                );
+                return Ok(vec![]);
+            }
+        }
+
+        // Downmix to mono.
+        let ch = frame.channels as usize;
+        let mono: Vec<f32> = if ch == 1 {
+            frame.samples.clone()
+        } else {
+            (0..frame.frame_count())
+                .map(|i| {
+                    (0..ch).map(|c| frame.samples[i * ch + c]).sum::<f32>() / ch as f32
+                })
+                .collect()
+        };
+
+        // Lazy-init resamplers on first frame.
+        if self.in_rate.is_none() {
+            let rate = frame.sample_rate;
+            self.r16k = Some(SincResampler::new(rate, 16_000, AUDIO_CHUNK)?);
+            self.r48k = Some(SincResampler::new(rate, 48_000, AUDIO_CHUNK)?);
+            self.in_rate = Some(rate);
+            info!(in_rate = rate, "audio resamplers initialised");
+        }
+
+        // Timestamp of the oldest unencoded sample in each output buffer.
+        if self.ts_16k.is_none() {
+            self.ts_16k = Some(frame.timestamp.clone());
+        }
+        if self.ts_48k.is_none() {
+            self.ts_48k = Some(frame.timestamp.clone());
+        }
+
+        self.src_buf.extend_from_slice(&mono);
+
+        // Resample in fixed-size chunks.
+        while self.src_buf.len() >= AUDIO_CHUNK {
+            let chunk = self.src_buf[..AUDIO_CHUNK].to_vec();
+            self.src_buf.drain(..AUDIO_CHUNK);
+            self.buf_16k
+                .extend_from_slice(&self.r16k.as_mut().unwrap().process(&chunk)?);
+            self.buf_48k
+                .extend_from_slice(&self.r48k.as_mut().unwrap().process(&chunk)?);
+        }
+
+        // Emit embeddings when output buffers are full.
+        let mut embs = Vec::new();
+
+        if self.buf_16k.len() >= WHISPER_SAMPLES {
+            let pcm: Vec<f32> = self.buf_16k.drain(..WHISPER_SAMPLES).collect();
+            let ts = self.ts_16k.take().unwrap();
+            let start = std::time::Instant::now();
+            let emb = self.encoder.encode_speech(&pcm, ts)?;
+            tracing::info!(
+                dim = emb.values.len(),
+                encode_ms = start.elapsed().as_millis(),
+                "speech embedding"
+            );
+            embs.push(emb);
+        }
+
+        if self.buf_48k.len() >= CLAP_SAMPLES {
+            let pcm: Vec<f32> = self.buf_48k.drain(..CLAP_SAMPLES).collect();
+            let ts = self.ts_48k.take().unwrap();
+            let start = std::time::Instant::now();
+            let emb = self.encoder.encode_env(&pcm, ts)?;
+            tracing::info!(
+                dim = emb.values.len(),
+                encode_ms = start.elapsed().as_millis(),
+                "env embedding"
+            );
+            embs.push(emb);
+        }
+
+        Ok(embs)
+    }
 }
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let args = Args::parse();
 
+    // Verify model files are present before constructing sessions.
+    for name in &[
+        "whisper_tiny_encoder.onnx",
+        "clap_audio_encoder.onnx",
+        "dinov2_small.onnx",
+    ] {
+        let p = args.models_dir.join(name);
+        if !p.exists() {
+            anyhow::bail!("model file not found: {}", p.display());
+        }
+    }
+
     // ── open file once; destructure both streams immediately ──────────────────
-    // `..` drops `_handles` (the JoinHandles), detaching the decode thread.
-    // The thread exits when its senders detect Disconnected on shutdown.
     let (file_audio_rx, file_video_rx, file_audio_metrics, file_video_metrics) = match args
         .file
         .as_ref()
@@ -60,9 +201,7 @@ async fn main() -> Result<()> {
         None => (None, None, None, None),
     };
 
-    // ── audio fan-in setup ────────────────────────────────────────────────────
-    // Multiple sources (file + mic) fan into the same crossbeam channel by
-    // sharing the Sender. Frames from each source are interleaved by arrival.
+    // ── audio fan-in ──────────────────────────────────────────────────────────
     let (audio_cb_tx, audio_cb_rx) = bounded::<AudioFrame>(256);
     let audio_drain = audio_cb_rx.clone();
     let mut audio_metric_handles: Vec<Arc<SensorMetrics>> = Vec::new();
@@ -74,14 +213,12 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || forward_frames(rx, tx, drain));
     }
 
-    // Enable live mic when --mic is set, or when no file is supplied at all.
     if args.mic || args.file.is_none() {
         let mic = AudioCapture::start(None)?;
         audio_metric_handles.push(Arc::clone(&mic.metrics));
         let tx = audio_cb_tx.clone();
         let drain = audio_drain.clone();
         std::thread::spawn(move || {
-            // mic dropped at closure end → cpal stream stops.
             forward_frames(mic.receiver, tx, drain);
         });
     }
@@ -121,9 +258,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── async bridges ─────────────────────────────────────────────────────────
-    // Bridges the sync crossbeam channels into tokio mpsc for the async main loop.
-    let (audio_tx, mut audio_rx) = mpsc::channel::<AudioFrame>(64);
+    // ── async bridges: crossbeam → tokio mpsc ─────────────────────────────────
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(64);
     tokio::task::spawn_blocking(move || {
         while let Ok(f) = audio_cb_rx.recv() {
             if audio_tx.blocking_send(f).is_err() {
@@ -132,7 +268,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (video_tx, mut video_rx) = mpsc::channel::<VideoFrame>(16);
+    let (video_tx, video_rx) = mpsc::channel::<VideoFrame>(16);
     tokio::task::spawn_blocking(move || {
         while let Ok(f) = video_cb_rx.recv() {
             if video_tx.blocking_send(f).is_err() {
@@ -141,31 +277,82 @@ async fn main() -> Result<()> {
         }
     });
 
+    // ── audio encoder task ────────────────────────────────────────────────────
+    let (audio_emb_tx, mut audio_emb_rx) = mpsc::channel::<AudioEmbedding>(32);
+    {
+        let models_dir = args.models_dir.clone();
+        let mut audio_rx = audio_rx;
+        tokio::task::spawn_blocking(move || {
+            let mut proc = match AudioProcessor::new(&models_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(?e, "audio encoder init failed");
+                    return;
+                }
+            };
+            while let Some(frame) = audio_rx.blocking_recv() {
+                match proc.ingest(frame) {
+                    Ok(embs) => {
+                        for emb in embs {
+                            if audio_emb_tx.blocking_send(emb).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!(?e, "audio encode error"),
+                }
+            }
+        });
+    }
+
+    // ── video encoder task ────────────────────────────────────────────────────
+    let (video_emb_tx, mut video_emb_rx) = mpsc::channel::<VideoEmbedding>(16);
+    {
+        let models_dir = args.models_dir.clone();
+        let mut video_rx = video_rx;
+        tokio::task::spawn_blocking(move || {
+            let mut enc = match VideoEncoder::new(&models_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(?e, "video encoder init failed");
+                    return;
+                }
+            };
+            while let Some(frame) = video_rx.blocking_recv() {
+                let start = std::time::Instant::now();
+                match enc.encode(&frame) {
+                    Ok(emb) => {
+                        tracing::info!(
+                            dim = emb.values.len(),
+                            encode_ms = start.elapsed().as_millis(),
+                            "video embedding"
+                        );
+                        if video_emb_tx.blocking_send(emb).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => tracing::error!(?e, "video encode error"),
+                }
+            }
+        });
+    }
+
     // ── main loop ─────────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
 
     loop {
         tokio::select! {
-            Some(frame) = audio_rx.recv() => {
-                tracing::debug!(
-                    frame_count = frame.frame_count(),
-                    duration_secs = frame.duration_secs(),
-                    "audio"
-                );
+            Some(_emb) = audio_emb_rx.recv() => {
+                // logged inside AudioProcessor::ingest
             }
-            Some(frame) = video_rx.recv() => {
-                tracing::debug!(
-                    width = frame.width,
-                    height = frame.height,
-                    format = ?frame.format,
-                    "video"
-                );
+            Some(_emb) = video_emb_rx.recv() => {
+                // logged inside video encoder task
             }
             _ = metrics_tick.tick() => {
                 let v = video_metrics_handle.snapshot();
                 info!(
                     video_captured = v.frames_captured,
-                    video_dropped   = v.frames_dropped,
+                    video_dropped  = v.frames_dropped,
                     "video metrics"
                 );
                 for m in &audio_metric_handles {
@@ -189,9 +376,6 @@ async fn main() -> Result<()> {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Forward frames from `src` to `tx` with drop-oldest backpressure via `drain`.
-/// Exits cleanly when `tx` is disconnected — the shutdown signal propagating back
-/// from the consumer.
 fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
     while let Ok(frame) = src.recv() {
         match tx.try_send(frame) {
