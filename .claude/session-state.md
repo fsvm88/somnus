@@ -69,30 +69,39 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 ## Where to pick up
 
-**Phase 2 complete. Start Phase 3: memory / concept areas.**
+**Smoke test the Phase 2 pipeline, then decide on output improvements.**
 
-Phase 2 is fully wired end-to-end: sensory frames → resampling → ONNX encoding → embeddings logged to stdout.
+Phase 2 is fully wired: sensory frames → resampling → ONNX encoding → embeddings logged via `tracing`.
 
-To do a live smoke test (needs ≥30 s media file so the Whisper buffer fills):
+### Current output situation (discussed, not yet resolved)
+
+The binary has **one output device**: `tracing` to stdout via `RUST_LOG`.
+
+What you see at `RUST_LOG=info` on a ≥30 s file:
+- `audio resamplers initialised in_rate=44100` (once)
+- `video embedding dim=384 encode_ms=N` — **every frame (~30/s), very noisy**
+- `env embedding dim=512 encode_ms=N` — every 10 s of audio
+- `speech embedding dim=384 encode_ms=N` — every 30 s of audio
+- metrics tick every 10 s
+
+Two issues flagged before smoke testing:
+1. **Video log spam** — 30 `info!` lines/s drowns the audio embeddings. Fix: move per-frame video logs to `debug`, emit one `info` per second (or every N frames).
+2. **Embeddings are dropped after logging** — no sink. For research utility, a simple embedding sink (e.g. newline-delimited JSON to file) would let us inspect what the system "perceived".
+
+User was asked to choose:
+- **A** — throttle video logs to 1/s, then smoke test
+- **B** — throttle + add NDJSON embedding sink, then smoke test
+
+**Resume here: get the user's answer (A or B), implement, then run the smoke test.**
+
+Smoke test command (needs ≥30 s MP4):
 ```
 RUST_LOG=info cargo run -p somnus -- --file /path/to/file.mp4 --models-dir models/
 ```
-Expect to see `speech embedding dim=384`, `env embedding dim=512`, `video embedding dim=384` in logs.
 
-Next steps:
-1. **Smoke test** on a real ≥30 s MP4 (optional but recommended before Phase 3).
-2. **Update `ai-docs/architecture.md`** — mark Phase 2 sensory + encoding as implemented.
-3. **Phase 3 design**: memory / concept areas.
-   - Regional concept stores (audio-speech, audio-env, visual).
-   - Hot episodic buffer (VRAM): receives embeddings from the encoder tasks.
-   - Sparse coding (k-WTA / top-k) for concept representations.
-   - Write ADR 0005 for Phase 3 memory types before implementing.
-
-Key open questions for Phase 3 (from `ai-docs/architecture.md`):
-- Initial regional set (start with all three now that encoders are all three?)
-- Sparse-coding scheme (k-WTA vs. top-k vs. SAE)
-- Episodic buffer sizing and eviction policy
-- Tensor representation type (`ndarray::Array1<f32>` vs. a newtype)
+After smoke test passes:
+1. Update `ai-docs/architecture.md` — mark Phase 2 as implemented.
+2. Phase 3 design: memory / concept areas (ADR 0005, episodic buffer, sparse coding).
 
 ## Open architectural questions
 
