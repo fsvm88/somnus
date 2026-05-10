@@ -466,7 +466,8 @@ impl PerceptionProcessor {
     /// Grown layers (n_units > N_UNITS) have no bias; unmodified layers keep theirs.
     fn rebuild_linears(&mut self) -> PerceptionResult<()> {
         // Collect tensors with the lock held, then drop it before mutating layers.
-        let (sw, sb, dw_s, ew, eb, dw_e, vw, vb_t, dw_v, yw, yb, dw_y, bw) = {
+        let (sw, sb, dw_s, ew, eb, dw_e, vw, vb_t, dw_v, yw, yb, dw_y,
+             brp0, brp1, brp2, brp3, bwq, bwk, bwv) = {
             let data = self.varmap.data().lock().unwrap();
             (
                 data["speech_layer.weight"].as_tensor().clone(),
@@ -481,7 +482,13 @@ impl PerceptionProcessor {
                 data["symbolic_layer.weight"].as_tensor().clone(),
                 data.get("symbolic_layer.bias").map(|v| v.as_tensor().clone()),
                 data["symbolic_decoder.weight"].as_tensor().clone(),
-                data["binding.weight"].as_tensor().clone(),
+                data["binding.region_0.weight"].as_tensor().clone(),
+                data["binding.region_1.weight"].as_tensor().clone(),
+                data["binding.region_2.weight"].as_tensor().clone(),
+                data["binding.region_3.weight"].as_tensor().clone(),
+                data["binding.attn_q.weight"].as_tensor().clone(),
+                data["binding.attn_k.weight"].as_tensor().clone(),
+                data["binding.attn_v.weight"].as_tensor().clone(),
             )
         };
 
@@ -501,7 +508,13 @@ impl PerceptionProcessor {
         self.symbolic_layer.linear = Linear::new(yw, if yn == N_UNITS { yb } else { None });
         self.symbolic_decoder.replace_linear(Linear::new(dw_y, None), yn);
 
-        self.binding.set_proj(Linear::new(bw, None));
+        self.binding.region_projs[0] = Linear::new(brp0, None);
+        self.binding.region_projs[1] = Linear::new(brp1, None);
+        self.binding.region_projs[2] = Linear::new(brp2, None);
+        self.binding.region_projs[3] = Linear::new(brp3, None);
+        self.binding.w_q = Linear::new(bwq, None);
+        self.binding.w_k = Linear::new(bwk, None);
+        self.binding.w_v = Linear::new(bwv, None);
         Ok(())
     }
 
