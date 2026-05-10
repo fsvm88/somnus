@@ -21,6 +21,42 @@ const GROWTH_BATCH: usize = 64;
 /// Pending-embedding count above which sleep is considered interruptible by external salience.
 const SALIENCE_THRESHOLD: usize = 16;
 
+/// Neuromodulated learning rate schedule for NREM replay.
+///
+/// Combines cosine annealing over the cycle length (high plasticity early,
+/// low late) with a loss-trend gate: if the loss EWMA is not improving, the
+/// multiplier shrinks toward LR_STAGNANT_SCALE, reducing wasted updates.
+///
+/// `step`        — 0-indexed step within this NREM cycle
+/// `total`       — total steps planned for this cycle
+/// `loss_ewma`   — exponential moving average of loss up to this step
+/// `prev_ewma`   — ewma from the previous step (or 0.0 on the first step)
+const LR_MAX: f64 = 1e-3;
+const LR_MIN: f64 = 1e-5;
+const LR_STAGNANT_SCALE: f64 = 0.25; // multiplier when loss has plateaued
+
+fn nrem_lr(step: usize, total: usize, loss_ewma: f32, prev_ewma: f32) -> f64 {
+    // Cosine annealing: full cycle from LR_MAX → LR_MIN
+    let t = if total > 1 { step as f64 / (total - 1) as f64 } else { 1.0 };
+    let cosine = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + (std::f64::consts::PI * t).cos());
+
+    // Loss-trend gate: scale down when improvement has stalled
+    let trend_scale = if prev_ewma < 1e-9 || step == 0 {
+        1.0 // first step — no history yet
+    } else {
+        let improvement = (prev_ewma - loss_ewma) / prev_ewma;
+        if improvement > 0.01 {
+            1.0 // improving >1% per step: full lr
+        } else if improvement > -0.01 {
+            0.5 // plateau (−1%..+1%): half lr
+        } else {
+            LR_STAGNANT_SCALE // worsening: quarter lr
+        }
+    };
+
+    cosine * trend_scale
+}
+
 #[allow(dead_code)]
 pub struct SleepStats {
     pub traces_replayed: usize,
@@ -55,7 +91,11 @@ pub fn run_sleep_cycle(
         .map(|t| t.regional.clone())
         .collect();
 
-    for regional in &traces {
+    let n_traces = traces.len();
+    let mut loss_ewma = 0.0f32;
+    const EWMA_ALPHA: f32 = 0.3;
+
+    for (step, regional) in traces.iter().enumerate() {
         let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD;
         if interrupt.load(Ordering::Relaxed) || salient {
             if salient {
@@ -67,8 +107,19 @@ pub fn run_sleep_cycle(
             was_interrupted = true;
             break;
         }
+
+        // Neuromodulated lr: cosine schedule × loss-trend gate
+        let prev_ewma = loss_ewma;
+        let lr = nrem_lr(step, n_traces, loss_ewma, prev_ewma);
+        perception.set_learning_rate(lr);
+
         match perception.replay_step(regional) {
             Ok(loss) => {
+                loss_ewma = if step == 0 {
+                    loss
+                } else {
+                    EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
+                };
                 total_train_loss += loss;
                 traces_replayed += 1;
                 episodic.replay_checkpoint += 1;
@@ -76,6 +127,9 @@ pub fn run_sleep_cycle(
             Err(e) => tracing::warn!(?e, "replay_step error — skipping trace"),
         }
     }
+
+    // Restore base lr so grow_region's optimizer reset starts from a known point.
+    perception.set_learning_rate(LR_MAX);
 
     if !was_interrupted {
         // Reset checkpoint after a full cycle.

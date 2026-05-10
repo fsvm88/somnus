@@ -419,6 +419,16 @@ impl PerceptionProcessor {
         ]
     }
 
+    /// Set the optimizer learning rate (used by the sleep neuromodulation schedule).
+    pub fn set_learning_rate(&mut self, lr: f64) {
+        self.optimizer.set_learning_rate(lr);
+    }
+
+    /// Current optimizer learning rate.
+    pub fn learning_rate(&self) -> f64 {
+        self.optimizer.learning_rate()
+    }
+
     /// Save all weights to a safetensors file.
     pub fn save_weights(&self, path: &std::path::Path) -> PerceptionResult<()> {
         self.varmap.save(path)?;
