@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-10
-> **Last commit on main:** 3a1ed71 — *Durable growth: persist/restore grown region sizes across restarts*
+> **Last commit on main:** 9da74a8 — *Phase 6: cross-attention binding area (ADR 0008)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -77,8 +77,10 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - Phase 5 exit criterion verified: 16-trace buffer accumulates enough samples; speech/visual/symbolic grow 1024→1088 in first sleep cycle; loss decreases cycle-over-cycle.
 - Durable growth: `region_sizes.bin` (4 × u64 LE) saved to snapshot dir; `load_weights_with_sizes` pre-grows layers, loads safetensors, calls `rebuild_linears()` (which re-reads all weights from VarMap since `Var::set` does not update Tensor clones in-place — also fixes silent no-op bug in the prior `load_weights`). Verified across two runs.
 
-**Next: Phase 6** — per `ai-docs/roadmap.md`, candidates include:
-- Cross-attention binding (upgrade from concat+linear)
+**Also done (2026-05-10):**
+- Cross-attention binding (ADR 0008): replaced concat+linear(4096→512) with single-head self-attention over 4 region tokens. Per-region projections N_UNITS→128, Q/K/V [128,128], flatten [4,128]→[512]. 573K params vs old 2.1M. Input clamped to N_UNITS via to_dense_n (growth-invariant). Old snapshots incompatible (binding.weight key replaced by 7 keys).
+
+**Next: Phase 6 remaining candidates:**
 - Bidirectional region ↔ binding top-down priors
 - Neuromodulation as global gain control / learning-rate gate
 - Salience-gated sleep interruption (interrupt flag wired, detector always false)
