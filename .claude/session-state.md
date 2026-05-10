@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-10
-> **Last commit on main:** (pending commit) — *Phase 3: somnus-perception crate (k-WTA, binding area, SAE decoder)*
+> **Last commit on main:** c79e010 — *Phase 4: somnus-memory crate (EpisodicBuffer, SemanticStore, ColdArchive, RecollectionLayer)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -56,6 +56,7 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `ai-docs/decisions/0004-phase2-encoding-types.md` — **accepted (corrected).** `ort` 2.0.0-rc.12 + `load-dynamic` against system ORT 1.24.4. Exact mel-spectrogram preprocessing formulas verified by parity tests. CLAP correction: `rand_trunc` mode, Slaney scale, fmin=50 Hz (not HTK/fusion as originally stated). ADR updated with implementation notes (LOGSTEP, f64 pipeline, float-space resize).
 - **Phase 2 encoding crate implemented and fully tested.** `crates/somnus-encoding`: `WhisperMel`, `ClapMel`, `frame_to_tensor` (DINOv2 image), `AudioEncoder`, `VideoEncoder`. 7 parity fixture tests pass within 1e-4 absolute vs. HuggingFace Python reference. `scripts/gen_mel_fixtures.py` generates fixtures. ADR 0004 updated with corrected CLAP parameters and implementation notes.
 - **Phase 2 wiring complete.** `crates/somnus/src/main.rs` wired end-to-end: ORT initialised from system library at startup; `--models-dir` CLI arg (default `models/`) with up-front file existence checks; `AudioProcessor` (lazy resampler init via `SincResampler` from `somnus-encoding::preprocess::resample`, 480k-sample accumulation for both 16 kHz and 48 kHz, `encode_speech` + `encode_env`); `VideoEncoder` task per frame; embedding shape + latency logged via `tracing::info!`. All 31 workspace tests pass.
+- **Phase 4 memory hierarchy complete.** `crates/somnus-memory`: `EpisodicBuffer` (VecDeque ring), `SemanticStore` (hnsw_rs HNSW, L2, eager insert), `ColdArchive` (INT8 quantised append-only binary, memmap2), `RecollectionLayer` (warm query live; promote stubbed). `somnus` binary updated with `--episodic-capacity`, `--memory-dir`, `--top-k`; memory metrics on 10s tick. 44 workspace tests pass. ADR 0006 written.
 - **Phase 1 sensory pipeline implemented and fully tested.** Crate layout: `crates/somnus-sensory` (library) + `crates/somnus` (binary). All modules pass `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. 22 tests total (13 unit, 9 integration).
   - `frame.rs` — `Timestamp`, `AudioFrame` (frame_count, duration_secs), `PixelFormat`, `VideoFrame` (bytes_per_pixel).
   - `error.rs` — `SensorError` (11 variants via thiserror), `SensorResult`.
@@ -69,24 +70,25 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 ## Where to pick up
 
-**Phase 4 design: memory hierarchy.**
+**Phase 5 design: sleep cycle + consolidation.**
 
-Phase 3 is complete (2026-05-10). `crates/somnus-perception` implements:
-- Four k-WTA layers (n=1024, k=20, boosting): audio-speech (384→1024), audio-env (512→1024), visual (384→1024), symbolic (384→1024, fed from Whisper)
-- Binding area: concat 4×dense(1024) → linear → 512-dim `EpisodeVector`
-- SAE decoders: one thin reverse-linear per region; reconstruction error observable as `RUST_LOG=debug` metric
-- `PerceptionProcessor` wired inline in the `somnus` main loop; episode vectors written to `--embeddings-out` NDJSON alongside raw embeddings
+Phase 4 is complete (2026-05-10). `crates/somnus-memory` implements:
+- `EpisodicBuffer`: bounded VecDeque ring (default 4096 episodes, hot tier)
+- `SemanticStore`: hnsw_rs HNSW (L2, M=16, ef_c=400) over 512-dim episode vectors + sidecar HashMap; eager eager insert policy
+- `ColdArchive`: INT8 per-vector quantised append-only binary (`memory/episodes.cold`); `memmap2` reader; append() implemented but not yet called from main loop
+- `RecollectionLayer`: wraps warm+cold; `query_warm()` live; `promote()` stubbed
+- `somnus` binary: episodes inserted into hot+warm on every perception; `--episodic-capacity`, `--memory-dir`, `--top-k` CLI args; memory metrics on 10s tick
 
-36 workspace tests pass. ADR 0005 written.
+44 workspace tests pass. ADR 0006 written.
 
-**Next: Phase 4 — memory hierarchy** (ADR 0006, `crates/somnus-memory`).
+**Next: Phase 5 — sleep cycle + consolidation** (ADR 0007).
 
-Per roadmap, Phase 4 adds:
-- **Hot (episodic):** bounded VRAM ring of recent episode vectors; `EpisodicBuffer`
-- **Warm (semantic):** region-sharded sparse-coded representations in RAM; `usearch` HNSW for retrieval; `SemanticStore`
-- **Cold (archive):** INT8-quantized vectors on disk via `memmap2`; `ColdArchive`
-- **Recollection layer:** HNSW query → top-k candidates; cold→warm promotion on cache miss
-- Exit criterion: given a cue, the system retrieves top-k most similar episodes from semantic memory
+Per roadmap and architecture.md, Phase 5 adds:
+- **NREM-like stage:** replay (episodic → semantic), homeostatic downscaling (gentle global weight decay + replay protection), compression (warm → cold spill)
+- **REM-like stage:** generative replay, gist-level self-probe, growth trigger (cascade-correlation-style unit addition when recall failure rate exceeds threshold)
+- **Sleep controller:** entry triggers (episodic buffer high-water mark, wake-perf degradation, schedule fallback); adaptive duration with cap; interruptibility
+- **Persistence:** snapshot/restore for EpisodicBuffer + SemanticStore HNSW across restarts
+- Cold→warm promotion logic filling `RecollectionLayer::promote()`
 
 ## Open architectural questions
 
