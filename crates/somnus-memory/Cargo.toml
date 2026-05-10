@@ -1,0 +1,12 @@
+[package]
+name    = "somnus-memory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hnsw_rs   = { workspace = true }
+memmap2   = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

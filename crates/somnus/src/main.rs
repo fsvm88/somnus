@@ -6,6 +6,7 @@ use somnus_encoding::{
     preprocess::resample::SincResampler, AudioEmbedding, AudioEncoder, AudioEncoderSource,
     VideoEmbedding, VideoEncoder,
 };
+use somnus_memory::{ColdArchive, EpisodicBuffer, RecollectionLayer, SemanticStore};
 use somnus_perception::PerceptionProcessor;
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
@@ -23,7 +24,7 @@ use tracing::info;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
-#[command(about = "somnus sensory + encoding + perception pipeline — Phase 3")]
+#[command(about = "somnus sensory + encoding + perception + memory pipeline — Phase 4")]
 struct Args {
     /// Media file to decode (must contain both audio and video streams).
     #[arg(long)]
@@ -44,6 +45,18 @@ struct Args {
     /// Write embeddings as newline-delimited JSON to this file.
     #[arg(long)]
     embeddings_out: Option<PathBuf>,
+
+    /// Maximum number of episodes in the hot episodic buffer.
+    #[arg(long, default_value = "4096")]
+    episodic_capacity: usize,
+
+    /// Directory for the cold archive and future memory snapshots.
+    #[arg(long, default_value = "memory")]
+    memory_dir: PathBuf,
+
+    /// Number of nearest episodes to retrieve on each query (logged at debug level).
+    #[arg(long, default_value = "5")]
+    top_k: usize,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -424,6 +437,20 @@ async fn main() -> Result<()> {
     };
     info!("perception processor initialised (n=1024, k=20, cpu)");
 
+    // ── memory hierarchy ──────────────────────────────────────────────────────
+    let mut episodic = EpisodicBuffer::new(args.episodic_capacity);
+    let semantic = SemanticStore::new(somnus_perception::binding::EPISODE_DIM);
+    let cold = match ColdArchive::open(&args.memory_dir) {
+        Ok(c) => c,
+        Err(e) => anyhow::bail!("cold archive init failed: {e}"),
+    };
+    let mut recall = RecollectionLayer::new(semantic, cold);
+    info!(
+        episodic_capacity = args.episodic_capacity,
+        memory_dir = %args.memory_dir.display(),
+        "memory hierarchy initialised"
+    );
+
     // ── main loop ─────────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
 
@@ -436,14 +463,20 @@ async fn main() -> Result<()> {
                     AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
                 };
                 match result {
-                    Ok(out) => log_perception_output(&out, &emb.timestamp, &mut sink),
+                    Ok(out) => log_perception_output(
+                        &out, &emb.timestamp, &mut sink,
+                        &mut episodic, &mut recall, args.top_k,
+                    ),
                     Err(e)  => tracing::error!(?e, "perception error (audio)"),
                 }
             }
             Some(emb) = video_emb_rx.recv() => {
                 sink_write(&mut sink, &video_emb_json(&emb));
                 match perception.ingest_visual(&emb.values) {
-                    Ok(out) => log_perception_output(&out, &emb.timestamp, &mut sink),
+                    Ok(out) => log_perception_output(
+                        &out, &emb.timestamp, &mut sink,
+                        &mut episodic, &mut recall, args.top_k,
+                    ),
                     Err(e)  => tracing::error!(?e, "perception error (video)"),
                 }
             }
@@ -463,6 +496,12 @@ async fn main() -> Result<()> {
                         "audio metrics"
                     );
                 }
+                info!(
+                    episodic_len = episodic.len(),
+                    semantic_len = recall.warm.len(),
+                    cold_len     = recall.cold.len(),
+                    "memory metrics"
+                );
             }
             _ = tokio::signal::ctrl_c() => {
                 sink_flush(&mut sink);
@@ -481,15 +520,42 @@ fn log_perception_output(
     out: &somnus_perception::PerceptionOutput,
     ts: &Timestamp,
     sink: &mut Option<BufWriter<std::fs::File>>,
+    episodic: &mut EpisodicBuffer,
+    recall: &mut RecollectionLayer,
+    top_k: usize,
 ) {
     for &(region, err) in &out.recon_errors {
         tracing::debug!(region = ?region, recon_mse = err, "reconstruction error");
     }
     if let Some(ep) = &out.episode {
+        let ts_secs = wall_secs(&ts.wall);
         tracing::info!(dim = ep.0.len(), "episode vector");
+
+        // Insert into episodic buffer (hot tier).
+        let id = episodic.push(ts_secs, ep.0.clone());
+
+        // Insert into semantic store (warm tier) — eager policy in Phase 4.
+        recall.warm.insert(somnus_memory::EpisodeRecord {
+            id,
+            timestamp_secs: ts_secs,
+            values: ep.0.clone(),
+        });
+
+        // Log nearest neighbours at debug level (smoke-test for retrieval).
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let neighbours = recall.query_warm(&ep.0, top_k);
+            tracing::debug!(
+                episode_id = id,
+                retrieved = neighbours.len(),
+                top1_id = neighbours.first().map(|r| r.id),
+                "memory retrieval"
+            );
+        }
+
         let line = serde_json::json!({
             "type":           "episode",
-            "timestamp_secs": wall_secs(&ts.wall),
+            "id":             id,
+            "timestamp_secs": ts_secs,
             "dim":            ep.0.len(),
             "values":         ep.0,
         })

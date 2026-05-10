@@ -19,4 +19,5 @@ tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json         = { workspace = true }
 somnus-perception     = { path = "../somnus-perception" }
+somnus-memory         = { path = "../somnus-memory" }
 candle-core        = { workspace = true }

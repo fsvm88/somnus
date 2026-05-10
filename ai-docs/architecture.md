@@ -2,7 +2,7 @@
 
 > **Status:** working sketch. Reflects decisions through the vision discussion (Q1/Q2/Q3 + sub-Q1). Subject to further change as research matures. Update this doc when subsystem boundaries shift; record the *why* in an ADR.
 >
-> **Implementation state (2026-05-10):** Phases 1–3 implemented. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv2-S/14 (384-dim) via ORT. `crates/somnus-perception` runs four k-WTA layers (n=1024, k=20) + binding area → 512-dim episode vectors + SAE decoders for reconstruction error. The `somnus` binary wires all crates end-to-end; `--embeddings-out` writes NDJSON including episode vectors. Phase 4 (memory hierarchy) is next.
+> **Implementation state (2026-05-10):** Phases 1–4 implemented. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv2-S/14 (384-dim) via ORT. `crates/somnus-perception` runs four k-WTA layers (n=1024, k=20) + binding area → 512-dim episode vectors + SAE decoders for reconstruction error. `crates/somnus-memory` implements the three-tier memory hierarchy: `EpisodicBuffer` (bounded ring, hot), `SemanticStore` (hnsw_rs HNSW over episode vectors, warm), `ColdArchive` (INT8-quantised append-only binary, cold), `RecollectionLayer` (warm query live; cold→warm promotion stubbed for Phase 5). The `somnus` binary wires all crates end-to-end. Phase 5 (sleep cycle + consolidation) is next.
 
 somnus is decomposed by **function**, in loose correspondence with brain systems. Four shaping commitments:
 
@@ -183,7 +183,7 @@ Tracked here so they don't get lost. Resolutions become ADRs.
 - ~~**Initial regional set.**~~ Resolved in ADR 0005: all four regions from Phase 3 (audio-speech, audio-env, visual, symbolic). Symbolic fed from audio-speech until text bypass arrives (Phase 6+).
 - ~~**Encoder specifics.**~~ Resolved in ADR 0003: Whisper-tiny (speech, 384-dim) + CLAP-HTSAT-unfused (env, 512-dim) + DINOv2-S/14 (visual, 384-dim).
 - **Growth mechanism.** Cascade-Correlation-style unit addition? At what granularity (single unit, group, sub-cluster)? How do new units integrate with sparse codes?
-- **Recollection-layer implementation.** Vector ANN (e.g., `hnsw_rs`) over the archive? Hopfield-style associative memory? Hybrid?
+- ~~**Recollection-layer implementation.**~~ Resolved in ADR 0006: `hnsw_rs` HNSW (L2 distance) for warm tier; cold→warm promotion stubbed for Phase 5.
 - **Compression strategy.** Quantization, structured pruning, knowledge distillation, or layered combination? When is content moved cold vs. dropped?
 - ~~**Sparse-coding scheme.**~~ Resolved in ADR 0005: k-WTA with per-unit duty-cycle boosting, n=1024, k=20 (2% sparsity). Per-region weights; shared hyperparameters.
 - **Sleep-cycle time budget.** How to split a sleep cycle between NREM-like work (replay, homeostatic downscaling, compression) and REM-like work (generative replay, self-probe, growth, future creative recombination), and how to schedule within each stage.
