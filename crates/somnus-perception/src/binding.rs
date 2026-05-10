@@ -20,6 +20,10 @@ pub struct BindingArea {
 }
 
 impl BindingArea {
+    pub fn set_proj(&mut self, proj: Linear) {
+        self.proj = proj;
+    }
+
     pub fn new(vb: VarBuilder, device: Device) -> PerceptionResult<Self> {
         let proj = linear_no_bias(N_UNITS * 4, EPISODE_DIM, vb)?;
         Ok(Self { proj, device })

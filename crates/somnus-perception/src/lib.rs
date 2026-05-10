@@ -409,15 +409,99 @@ impl PerceptionProcessor {
         Ok(())
     }
 
+    /// Current n_units per region: [speech, env, visual, symbolic].
+    pub fn region_sizes(&self) -> [usize; 4] {
+        [
+            self.speech_layer.n_units,
+            self.env_layer.n_units,
+            self.visual_layer.n_units,
+            self.symbolic_layer.n_units,
+        ]
+    }
+
     /// Save all weights to a safetensors file.
     pub fn save_weights(&self, path: &std::path::Path) -> PerceptionResult<()> {
         self.varmap.save(path)?;
         Ok(())
     }
 
-    /// Load weights from a safetensors file (shapes must match).
+    /// Load weights from a safetensors file.
+    ///
+    /// `Var::set` does not update Tensor clones already held by layers, so
+    /// `rebuild_linears` is called after load to propagate the new values.
     pub fn load_weights(&mut self, path: &std::path::Path) -> PerceptionResult<()> {
         self.varmap.load(path)?;
+        self.rebuild_linears()
+    }
+
+    /// Pre-grow regions to `sizes`, load weights, then rebuild all layer Linears.
+    ///
+    /// Call this on restore when region sizes from a prior session differ from
+    /// the default `N_UNITS`; `sizes` comes from `load_region_sizes`.
+    pub fn load_weights_with_sizes(
+        &mut self,
+        path: &std::path::Path,
+        sizes: [usize; 4],
+    ) -> PerceptionResult<()> {
+        let regions = [
+            RegionId::AudioSpeech,
+            RegionId::AudioEnv,
+            RegionId::Visual,
+            RegionId::Symbolic,
+        ];
+        let current = self.region_sizes();
+        for (i, &region) in regions.iter().enumerate() {
+            if sizes[i] > current[i] {
+                self.grow_region(region, sizes[i] - current[i])?;
+            }
+        }
+        self.varmap.load(path)?;
+        self.rebuild_linears()
+    }
+
+    /// Rebuild all layer Linear objects from the current VarMap contents.
+    ///
+    /// Required because `Var::set` (called inside `varmap.load`) writes new data
+    /// into the Var but does not update Tensor handles cloned before the set.
+    /// Grown layers (n_units > N_UNITS) have no bias; unmodified layers keep theirs.
+    fn rebuild_linears(&mut self) -> PerceptionResult<()> {
+        // Collect tensors with the lock held, then drop it before mutating layers.
+        let (sw, sb, dw_s, ew, eb, dw_e, vw, vb_t, dw_v, yw, yb, dw_y, bw) = {
+            let data = self.varmap.data().lock().unwrap();
+            (
+                data["speech_layer.weight"].as_tensor().clone(),
+                data.get("speech_layer.bias").map(|v| v.as_tensor().clone()),
+                data["speech_decoder.weight"].as_tensor().clone(),
+                data["env_layer.weight"].as_tensor().clone(),
+                data.get("env_layer.bias").map(|v| v.as_tensor().clone()),
+                data["env_decoder.weight"].as_tensor().clone(),
+                data["visual_layer.weight"].as_tensor().clone(),
+                data.get("visual_layer.bias").map(|v| v.as_tensor().clone()),
+                data["visual_decoder.weight"].as_tensor().clone(),
+                data["symbolic_layer.weight"].as_tensor().clone(),
+                data.get("symbolic_layer.bias").map(|v| v.as_tensor().clone()),
+                data["symbolic_decoder.weight"].as_tensor().clone(),
+                data["binding.weight"].as_tensor().clone(),
+            )
+        };
+
+        let sn = self.speech_layer.n_units;
+        self.speech_layer.linear = Linear::new(sw, if sn == N_UNITS { sb } else { None });
+        self.speech_decoder.replace_linear(Linear::new(dw_s, None), sn);
+
+        let en = self.env_layer.n_units;
+        self.env_layer.linear = Linear::new(ew, if en == N_UNITS { eb } else { None });
+        self.env_decoder.replace_linear(Linear::new(dw_e, None), en);
+
+        let vn = self.visual_layer.n_units;
+        self.visual_layer.linear = Linear::new(vw, if vn == N_UNITS { vb_t } else { None });
+        self.visual_decoder.replace_linear(Linear::new(dw_v, None), vn);
+
+        let yn = self.symbolic_layer.n_units;
+        self.symbolic_layer.linear = Linear::new(yw, if yn == N_UNITS { yb } else { None });
+        self.symbolic_decoder.replace_linear(Linear::new(dw_y, None), yn);
+
+        self.binding.set_proj(Linear::new(bw, None));
         Ok(())
     }
 

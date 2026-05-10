@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
-use somnus_memory::{save_snapshot, weights_path, EpisodicBuffer, RecollectionLayer};
+use somnus_memory::{save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, RecollectionLayer};
 use somnus_perception::{PerceptionProcessor, RegionId};
 
 const DECAY_RATE: f32 = 1e-4;
@@ -170,6 +170,10 @@ pub fn run_sleep_cycle(
         let w_path = weights_path(memory_dir);
         if let Err(e) = perception.save_weights(&w_path) {
             tracing::warn!(?e, "weight snapshot write failed");
+        }
+        // Region sizes written so restore can pre-grow before loading weights.
+        if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
+            tracing::warn!(?e, "region sizes write failed");
         }
         tracing::info!("snapshot written");
     }

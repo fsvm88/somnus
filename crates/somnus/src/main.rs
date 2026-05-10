@@ -9,7 +9,8 @@ use somnus_encoding::{
     VideoEmbedding, VideoEncoder,
 };
 use somnus_memory::{
-    load_snapshot, weights_path, ColdArchive, EpisodicBuffer, RecollectionLayer, SemanticStore,
+    load_region_sizes, load_snapshot, weights_path, ColdArchive, EpisodicBuffer, RecollectionLayer,
+    SemanticStore,
 };
 use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
 use somnus_sensory::{
@@ -283,13 +284,15 @@ async fn main() -> Result<()> {
                     semantic_len = sem.len(),
                     "restored from snapshot"
                 );
-                // Restore perception weights if present.
+                // Restore perception weights; pre-grow regions if they grew last session.
                 let w_path = weights_path(&args.memory_dir);
                 if w_path.exists() {
-                    if let Err(e) = perception.load_weights(&w_path) {
+                    let sizes = load_region_sizes(&args.memory_dir)
+                        .unwrap_or([somnus_perception::N_UNITS; 4]);
+                    if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
                         tracing::warn!(?e, "weight restore failed — starting with fresh weights");
                     } else {
-                        info!("perception weights restored");
+                        info!(sizes = ?sizes, "perception weights restored");
                     }
                 }
                 (ep, sem)

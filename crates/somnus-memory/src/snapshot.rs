@@ -4,6 +4,7 @@
 ///   memory/snapshot/
 ///     episodic.bin          — binary dump of EpisodicBuffer traces
 ///     weights.safetensors   — perception weights (written by the somnus binary)
+///     region_sizes.bin      — 4 × u64 LE: n_units per region after growth
 ///
 /// The SemanticStore (warm HNSW) is NOT persisted. On restore it is rebuilt
 /// by reinserting all episode records from the loaded hot buffer. This avoids
@@ -123,6 +124,37 @@ pub fn save_snapshot(episodic: &EpisodicBuffer, memory_dir: &Path) -> MemoryResu
 /// Path where perception weights should be saved.
 pub fn weights_path(memory_dir: &Path) -> PathBuf {
     memory_dir.join("snapshot").join("weights.safetensors")
+}
+
+/// Path where region sizes are saved.
+pub fn region_sizes_path(memory_dir: &Path) -> PathBuf {
+    memory_dir.join("snapshot").join("region_sizes.bin")
+}
+
+/// Save per-region n_units (4 × u64 LE). Written after growth so the next
+/// restore knows which regions to pre-expand before loading weights.
+pub fn save_region_sizes(sizes: [usize; 4], memory_dir: &Path) -> MemoryResult<()> {
+    let path = region_sizes_path(memory_dir);
+    let mut buf = [0u8; 32];
+    for (i, &s) in sizes.iter().enumerate() {
+        buf[i * 8..i * 8 + 8].copy_from_slice(&(s as u64).to_le_bytes());
+    }
+    fs::write(path, buf)?;
+    Ok(())
+}
+
+/// Load per-region n_units. Returns None if the file is absent or malformed.
+pub fn load_region_sizes(memory_dir: &Path) -> Option<[usize; 4]> {
+    let data = fs::read(region_sizes_path(memory_dir)).ok()?;
+    if data.len() < 32 {
+        return None;
+    }
+    let mut sizes = [0usize; 4];
+    for (i, s) in sizes.iter_mut().enumerate() {
+        let bytes: [u8; 8] = data[i * 8..i * 8 + 8].try_into().ok()?;
+        *s = u64::from_le_bytes(bytes) as usize;
+    }
+    Some(sizes)
 }
 
 /// Restore episodic buffer + rebuild SemanticStore from `memory_dir/snapshot/`.
