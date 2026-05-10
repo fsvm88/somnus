@@ -4,7 +4,6 @@
 //! using WhisperFeatureExtractor and ClapFeatureExtractor from transformers 4.x.
 //! Tolerance: 1e-4 absolute (ADR 0004 requirement).
 
-
 // Re-export preprocess as pub so we can call it from tests.
 // (mel and image are private mod; we expose them here via a test helper.)
 mod helpers {
@@ -40,7 +39,10 @@ mod helpers {
     pub fn sine440(n_samples: usize, sample_rate: u32) -> Vec<f32> {
         // Use f64 argument to match numpy's arange+sin precision before casting to f32.
         (0..n_samples)
-            .map(|i| (2.0_f64 * std::f64::consts::PI * 440.0 * i as f64 / sample_rate as f64).sin() as f32)
+            .map(|i| {
+                (2.0_f64 * std::f64::consts::PI * 440.0 * i as f64 / sample_rate as f64).sin()
+                    as f32
+            })
             .collect()
     }
 }
@@ -109,7 +111,12 @@ fn clap_sine440_parity() {
 
 // ── DINOv2 image parity ────────────────────────────────────────────────────
 
-fn make_video_frame(data: Vec<u8>, w: u32, h: u32, fmt: somnus_sensory::PixelFormat) -> somnus_sensory::VideoFrame {
+fn make_video_frame(
+    data: Vec<u8>,
+    w: u32,
+    h: u32,
+    fmt: somnus_sensory::PixelFormat,
+) -> somnus_sensory::VideoFrame {
     somnus_sensory::VideoFrame {
         data,
         width: w,
@@ -123,7 +130,8 @@ fn make_video_frame(data: Vec<u8>, w: u32, h: u32, fmt: somnus_sensory::PixelFor
 fn dino_black_parity() {
     let frame = make_video_frame(
         vec![0u8; 320 * 240 * 3],
-        320, 240,
+        320,
+        240,
         somnus_sensory::PixelFormat::Rgb8,
     );
     let got = somnus_encoding::preprocess::image::frame_to_tensor(&frame).unwrap();
@@ -139,7 +147,8 @@ fn dino_black_parity() {
 fn dino_gray128_parity() {
     let frame = make_video_frame(
         vec![128u8; 320 * 240 * 3],
-        320, 240,
+        320,
+        240,
         somnus_sensory::PixelFormat::Rgb8,
     );
     let got = somnus_encoding::preprocess::image::frame_to_tensor(&frame).unwrap();
@@ -157,7 +166,11 @@ fn dino_checkerboard_parity() {
     let mut data = vec![0u8; 240 * 320 * 3];
     for row in 0..240usize {
         for col in 0..320usize {
-            let val = if (row / 1 + col / 1) % 2 == 0 { 0u8 } else { 255u8 };
+            let val = if (row / 1 + col / 1) % 2 == 0 {
+                0u8
+            } else {
+                255u8
+            };
             let base = (row * 320 + col) * 3;
             data[base] = val;
             data[base + 1] = val;

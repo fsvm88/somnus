@@ -79,11 +79,7 @@ fn drains_approximately_correct_video_frame_count() {
     let streams = MediaFile::open(path).unwrap().start().unwrap();
 
     let mut count = 0u32;
-    while streams
-        .video
-        .recv_timeout(Duration::from_secs(10))
-        .is_ok()
-    {
+    while streams.video.recv_timeout(Duration::from_secs(10)).is_ok() {
         count += 1;
     }
 
@@ -187,11 +183,7 @@ fn video_metrics_captured_equals_frames_received_plus_dropped() {
     let streams = MediaFile::open(path).unwrap().start().unwrap();
 
     let mut received = 0u64;
-    while streams
-        .video
-        .recv_timeout(Duration::from_secs(10))
-        .is_ok()
-    {
+    while streams.video.recv_timeout(Duration::from_secs(10)).is_ok() {
         received += 1;
     }
 
@@ -214,11 +206,7 @@ fn audio_metrics_captured_equals_frames_received_plus_dropped() {
     let streams = MediaFile::open(path).unwrap().start().unwrap();
 
     let mut received = 0u64;
-    while streams
-        .audio
-        .recv_timeout(Duration::from_secs(10))
-        .is_ok()
-    {
+    while streams.audio.recv_timeout(Duration::from_secs(10)).is_ok() {
         received += 1;
     }
 

@@ -2,7 +2,7 @@ use crate::{EncodingError, EncodingResult};
 use somnus_sensory::{PixelFormat, VideoFrame};
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
-const IMAGENET_STD:  [f32; 3] = [0.229, 0.224, 0.225];
+const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const TARGET: usize = 224;
 
 /// Convert a `VideoFrame` to a `(3, 224, 224)` f32 tensor, ImageNet-normalised,
@@ -23,7 +23,8 @@ pub fn frame_to_tensor(frame: &VideoFrame) -> EncodingResult<Vec<f32>> {
     let mut out = vec![0.0f32; 3 * TARGET * TARGET];
     for c in 0..3 {
         for i in 0..TARGET * TARGET {
-            out[c * TARGET * TARGET + i] = (resized[i * 3 + c] - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
+            out[c * TARGET * TARGET + i] =
+                (resized[i * 3 + c] - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
         }
     }
     Ok(out)
@@ -48,7 +49,12 @@ fn yuyv_to_rgb(yuyv: &[u8]) -> Vec<u8> {
     let n_pixels = yuyv.len() / 2;
     let mut rgb = Vec::with_capacity(n_pixels * 3);
     for chunk in yuyv.chunks_exact(4) {
-        let (y0, u, y1, v) = (chunk[0] as f32, chunk[1] as f32, chunk[2] as f32, chunk[3] as f32);
+        let (y0, u, y1, v) = (
+            chunk[0] as f32,
+            chunk[1] as f32,
+            chunk[2] as f32,
+            chunk[3] as f32,
+        );
         let u = u - 128.0;
         let v = v - 128.0;
         for y in [y0, y1] {

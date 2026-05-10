@@ -1,17 +1,15 @@
 use std::path::Path;
 
+use somnus_sensory::{Timestamp, VideoFrame};
 use ndarray::Array4;
 use ort::{session::Session, value::TensorRef};
-use somnus_sensory::{Timestamp, VideoFrame};
 
 use crate::{
-    audio::mean_pool_2d,
-    preprocess::image::frame_to_tensor,
-    EncodingError, EncodingResult,
+    audio::mean_pool_2d, preprocess::image::frame_to_tensor, EncodingError, EncodingResult,
 };
 
 pub struct VideoEmbedding {
-    pub values:    Vec<f32>,   // 384-dim, DINOv2 mean-pooled patch tokens
+    pub values: Vec<f32>, // 384-dim, DINOv2 mean-pooled patch tokens
     pub timestamp: Timestamp,
 }
 
@@ -21,8 +19,7 @@ pub struct VideoEncoder {
 
 impl VideoEncoder {
     pub fn new(models_dir: &Path) -> EncodingResult<Self> {
-        let session = Session::builder()?
-            .commit_from_file(models_dir.join("dinov2_small.onnx"))?;
+        let session = Session::builder()?.commit_from_file(models_dir.join("dinov2_small.onnx"))?;
         Ok(Self { session })
     }
 
@@ -41,13 +38,19 @@ impl VideoEncoder {
         let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
         let dims: Vec<i64> = shape.iter().copied().collect();
         if dims != [1, 257, 384] {
-            return Err(EncodingError::ShapeMismatch { expected: vec![1, 257, 384], got: dims });
+            return Err(EncodingError::ShapeMismatch {
+                expected: vec![1, 257, 384],
+                got: dims,
+            });
         }
 
         // Skip CLS token (index 0), mean-pool patch tokens [1..] → (256, 384)
         let flat = data.to_vec();
-        let values = mean_pool_2d(&flat[384..], 256, 384);  // skip CLS token (384 values)
+        let values = mean_pool_2d(&flat[384..], 256, 384); // skip CLS token (384 values)
 
-        Ok(VideoEmbedding { values, timestamp: frame.timestamp.clone() })
+        Ok(VideoEmbedding {
+            values,
+            timestamp: frame.timestamp.clone(),
+        })
     }
 }

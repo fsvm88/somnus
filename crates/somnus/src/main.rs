@@ -1,10 +1,12 @@
 use anyhow::Result;
+use candle_core::Device as CandleDevice;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use somnus_encoding::{
     preprocess::resample::SincResampler, AudioEmbedding, AudioEncoder, AudioEncoderSource,
     VideoEmbedding, VideoEncoder,
 };
+use somnus_perception::PerceptionProcessor;
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
     VideoFrame,
@@ -21,7 +23,7 @@ use tracing::info;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
-#[command(about = "somnus sensory + encoding pipeline — Phase 2")]
+#[command(about = "somnus sensory + encoding + perception pipeline — Phase 3")]
 struct Args {
     /// Media file to decode (must contain both audio and video streams).
     #[arg(long)]
@@ -415,6 +417,13 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── perception processor ──────────────────────────────────────────────────
+    let mut perception = match PerceptionProcessor::new(CandleDevice::Cpu) {
+        Ok(p) => p,
+        Err(e) => anyhow::bail!("perception processor init failed: {e}"),
+    };
+    info!("perception processor initialised (n=1024, k=20, cpu)");
+
     // ── main loop ─────────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
 
@@ -422,9 +431,21 @@ async fn main() -> Result<()> {
         tokio::select! {
             Some(emb) = audio_emb_rx.recv() => {
                 sink_write(&mut sink, &audio_emb_json(&emb));
+                let result = match emb.source {
+                    AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
+                    AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
+                };
+                match result {
+                    Ok(out) => log_perception_output(&out, &emb.timestamp, &mut sink),
+                    Err(e)  => tracing::error!(?e, "perception error (audio)"),
+                }
             }
             Some(emb) = video_emb_rx.recv() => {
                 sink_write(&mut sink, &video_emb_json(&emb));
+                match perception.ingest_visual(&emb.values) {
+                    Ok(out) => log_perception_output(&out, &emb.timestamp, &mut sink),
+                    Err(e)  => tracing::error!(?e, "perception error (video)"),
+                }
             }
             _ = metrics_tick.tick() => {
                 sink_flush(&mut sink);
@@ -455,6 +476,27 @@ async fn main() -> Result<()> {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+fn log_perception_output(
+    out: &somnus_perception::PerceptionOutput,
+    ts: &Timestamp,
+    sink: &mut Option<BufWriter<std::fs::File>>,
+) {
+    for &(region, err) in &out.recon_errors {
+        tracing::debug!(region = ?region, recon_mse = err, "reconstruction error");
+    }
+    if let Some(ep) = &out.episode {
+        tracing::info!(dim = ep.0.len(), "episode vector");
+        let line = serde_json::json!({
+            "type":           "episode",
+            "timestamp_secs": wall_secs(&ts.wall),
+            "dim":            ep.0.len(),
+            "values":         ep.0,
+        })
+        .to_string();
+        sink_write(sink, &line);
+    }
+}
 
 fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
     while let Ok(frame) = src.recv() {

@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-10
-> **Last commit on main:** (pending commit) — *Phase 2 smoke test: output improvements + NDJSON embedding sink*
+> **Last commit on main:** (pending commit) — *Phase 3: somnus-perception crate (k-WTA, binding area, SAE decoder)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -31,7 +31,7 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - **Recollection layer** — cross-tier index pulling cold memories back into warm/hot when cued.
 - **Sleep cycle** runs replay + self-probe + growth + compression across the two stages.
 
-## What's been done in the repo
+## What's been done in the repo (excerpt — see git log for full history)
 
 - Project skeleton: `ai-docs/` (vision, principles, glossary, architecture, tech-stack, roadmap), `ai-docs/research/` and `ai-docs/decisions/` with conventions, `CLAUDE.md` for behavioral instructions, `.gitignore`.
 - Git initialized as SHA-256 repo on `main`, pushed to Codeberg.
@@ -69,23 +69,24 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 ## Where to pick up
 
-**Phase 3 design: memory / concept areas.**
+**Phase 4 design: memory hierarchy.**
 
-Phase 2 is fully implemented and smoke-tested (2026-05-10). The `somnus` binary:
-- Accepts `--file`, `--mic`, `--webcam`, `--models-dir`, `--embeddings-out`
-- Runs Whisper-tiny (384-dim, 30 s window), CLAP (512-dim, 10 s window), DINOv2-S/14 (384-dim, per frame)
-- Throttles video logs to 1 summary/s (`RUST_LOG=debug` for per-frame detail)
-- Writes NDJSON to `--embeddings-out` (flushed every 10 s on metrics tick and on shutdown)
+Phase 3 is complete (2026-05-10). `crates/somnus-perception` implements:
+- Four k-WTA layers (n=1024, k=20, boosting): audio-speech (384→1024), audio-env (512→1024), visual (384→1024), symbolic (384→1024, fed from Whisper)
+- Binding area: concat 4×dense(1024) → linear → 512-dim `EpisodeVector`
+- SAE decoders: one thin reverse-linear per region; reconstruction error observable as `RUST_LOG=debug` metric
+- `PerceptionProcessor` wired inline in the `somnus` main loop; episode vectors written to `--embeddings-out` NDJSON alongside raw embeddings
 
-Smoke test on a synthesized 60 s MP4 produced: 104 video embeddings, 3 env embeddings, 1 speech embedding; `embeddings.ndjson` is 108 lines.
+36 workspace tests pass. ADR 0005 written.
 
-**Next: Phase 3 — memory / concept areas.**
+**Next: Phase 4 — memory hierarchy** (ADR 0006, `crates/somnus-memory`).
 
-Design work needed:
-- ADR 0005: episodic buffer (hot VRAM) — structure, capacity, eviction policy
-- ADR 0006 (or merged): sparse coding scheme for concept areas (k-WTA vs top-k vs learned penalty)
-- Crate layout: `crates/somnus-memory` once boundaries are clear
-- Hook embeddings from Phase 2 into the episodic buffer
+Per roadmap, Phase 4 adds:
+- **Hot (episodic):** bounded VRAM ring of recent episode vectors; `EpisodicBuffer`
+- **Warm (semantic):** region-sharded sparse-coded representations in RAM; `usearch` HNSW for retrieval; `SemanticStore`
+- **Cold (archive):** INT8-quantized vectors on disk via `memmap2`; `ColdArchive`
+- **Recollection layer:** HNSW query → top-k candidates; cold→warm promotion on cache miss
+- Exit criterion: given a cue, the system retrieves top-k most similar episodes from semantic memory
 
 ## Open architectural questions
 

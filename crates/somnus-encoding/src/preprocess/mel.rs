@@ -38,7 +38,12 @@ fn reflect_pad(signal: &[f32], pad: usize) -> Vec<f32> {
 
 /// Returns the power spectrogram `|STFT|²` with shape `(n_frames, n_fft/2+1)` in f64.
 /// `power=2.0`, unnormalized FFT (matches librosa/HF).
-fn power_stft_f64(signal: &[f32], n_fft: usize, hop_length: usize, window: &[f64]) -> Vec<Vec<f64>> {
+fn power_stft_f64(
+    signal: &[f32],
+    n_fft: usize,
+    hop_length: usize,
+    window: &[f64],
+) -> Vec<Vec<f64>> {
     let padded = reflect_pad(signal, n_fft / 2);
     let n_bins = n_fft / 2 + 1;
     let n_frames = 1 + signal.len() / hop_length;
@@ -132,11 +137,11 @@ fn mel_filterbank_f64(
     let mut bank = vec![vec![0.0f64; n_bins]; n_mels];
 
     for m in 0..n_mels {
-        let f_low  = mel_pts[m];
+        let f_low = mel_pts[m];
         let f_peak = mel_pts[m + 1];
         let f_high = mel_pts[m + 2];
 
-        let norm_low  = if slaney { 2.0 / (f_high - f_low) } else { 1.0 };
+        let norm_low = if slaney { 2.0 / (f_high - f_low) } else { 1.0 };
         let norm_high = if slaney { 2.0 / (f_high - f_low) } else { 1.0 };
 
         for (k, &f) in freqs.iter().enumerate() {
@@ -153,17 +158,19 @@ fn mel_filterbank_f64(
 // ── Public mel structs ────────────────────────────────────────────────────────
 
 pub struct WhisperMel {
-    window:     Vec<f64>,
-    filterbank: Vec<Vec<f64>>,   // (80, 201)
+    window: Vec<f64>,
+    filterbank: Vec<Vec<f64>>, // (80, 201)
 }
 
 impl Default for WhisperMel {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WhisperMel {
     pub fn new() -> Self {
-        let window     = hann_window_f64(400);
+        let window = hann_window_f64(400);
         let filterbank = mel_filterbank_f64(16_000, 400, 80, 0.0, 8_000.0, true);
         Self { window, filterbank }
     }
@@ -173,7 +180,7 @@ impl WhisperMel {
     pub fn compute(&self, pcm: &[f32]) -> Vec<f32> {
         let frames = power_stft_f64(pcm, 400, 160, &self.window);
         let n_frames = frames.len();
-        let n_mels   = 80usize;
+        let n_mels = 80usize;
 
         // Mel filterbank application in f64 → (80, n_frames)
         let mut mel = vec![0.0f64; n_mels * n_frames];
@@ -201,7 +208,9 @@ impl WhisperMel {
 
         // Dynamic range: max(log_spec, global_max - 8)
         let global_max = out_f64.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        out_f64.iter_mut().for_each(|v| *v = v.max(global_max - 8.0));
+        out_f64
+            .iter_mut()
+            .for_each(|v| *v = v.max(global_max - 8.0));
 
         // Normalise: (x + 4) / 4, convert to f32
         out_f64.iter().map(|&v| ((v + 4.0) / 4.0) as f32).collect()
@@ -209,17 +218,19 @@ impl WhisperMel {
 }
 
 pub struct ClapMel {
-    window:     Vec<f64>,
-    filterbank: Vec<Vec<f64>>,   // (64, 513)
+    window: Vec<f64>,
+    filterbank: Vec<Vec<f64>>, // (64, 513)
 }
 
 impl Default for ClapMel {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClapMel {
     pub fn new() -> Self {
-        let window     = hann_window_f64(1024);
+        let window = hann_window_f64(1024);
         // rand_trunc mode: librosa/Slaney mel filters with fmin=50 Hz.
         let filterbank = mel_filterbank_f64(48_000, 1024, 64, 50.0, 14_000.0, true);
         Self { window, filterbank }
@@ -228,9 +239,9 @@ impl ClapMel {
     /// Compute CLAP log-mel from 480 000 mono f32 samples @ 48 kHz.
     /// Returns shape `(1001, 64)` flattened row-major.
     pub fn compute(&self, pcm: &[f32]) -> Vec<f32> {
-        let frames   = power_stft_f64(pcm, 1024, 480, &self.window);
+        let frames = power_stft_f64(pcm, 1024, 480, &self.window);
         let n_frames = frames.len();
-        let n_mels   = 64usize;
+        let n_mels = 64usize;
 
         // Mel filterbank in f64 → (64, n_frames)
         let mut mel = vec![0.0f64; n_mels * n_frames];
@@ -246,7 +257,8 @@ impl ClapMel {
         }
 
         // Floor, power_to_db in f64: 10 * log10(mel)
-        mel.iter_mut().for_each(|v| *v = 10.0 * v.max(1e-10).log10());
+        mel.iter_mut()
+            .for_each(|v| *v = 10.0 * v.max(1e-10).log10());
 
         // Trim to exactly 1001 frames
         let keep = 1001usize.min(n_frames);

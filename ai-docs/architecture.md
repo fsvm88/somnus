@@ -2,7 +2,7 @@
 
 > **Status:** working sketch. Reflects decisions through the vision discussion (Q1/Q2/Q3 + sub-Q1). Subject to further change as research matures. Update this doc when subsystem boundaries shift; record the *why* in an ADR.
 >
-> **Implementation state (2026-05-10):** Phase 1 (sensory pipeline) and Phase 2 (ONNX encoding) are implemented and smoke-tested. `crates/somnus-sensory` captures audio/video from file, mic, and webcam. `crates/somnus-encoding` runs Whisper-tiny (speech, 384-dim), CLAP-HTSAT (env, 512-dim), and DINOv2-S/14 (visual, 384-dim) via ORT. The `somnus` binary wires both crates end-to-end; `--embeddings-out` writes NDJSON. Phase 3 (memory / concept areas) is next.
+> **Implementation state (2026-05-10):** Phases 1–3 implemented. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv2-S/14 (384-dim) via ORT. `crates/somnus-perception` runs four k-WTA layers (n=1024, k=20) + binding area → 512-dim episode vectors + SAE decoders for reconstruction error. The `somnus` binary wires all crates end-to-end; `--embeddings-out` writes NDJSON including episode vectors. Phase 4 (memory hierarchy) is next.
 
 somnus is decomposed by **function**, in loose correspondence with brain systems. Four shaping commitments:
 
@@ -180,12 +180,12 @@ Sleep is **interruptible by high-salience external events** (loud novel sound, m
 
 Tracked here so they don't get lost. Resolutions become ADRs.
 
-- **Initial regional set.** Is the minimal viable set audio-speech + symbolic, with audio-env and visual added later? Or commit to all four regions from Phase 1?
+- ~~**Initial regional set.**~~ Resolved in ADR 0005: all four regions from Phase 3 (audio-speech, audio-env, visual, symbolic). Symbolic fed from audio-speech until text bypass arrives (Phase 6+).
 - ~~**Encoder specifics.**~~ Resolved in ADR 0003: Whisper-tiny (speech, 384-dim) + CLAP-HTSAT-unfused (env, 512-dim) + DINOv2-S/14 (visual, 384-dim).
 - **Growth mechanism.** Cascade-Correlation-style unit addition? At what granularity (single unit, group, sub-cluster)? How do new units integrate with sparse codes?
 - **Recollection-layer implementation.** Vector ANN (e.g., `hnsw_rs`) over the archive? Hopfield-style associative memory? Hybrid?
 - **Compression strategy.** Quantization, structured pruning, knowledge distillation, or layered combination? When is content moved cold vs. dropped?
-- **Sparse-coding scheme.** k-WTA, top-k, learned sparsity penalty? Per-region or global?
+- ~~**Sparse-coding scheme.**~~ Resolved in ADR 0005: k-WTA with per-unit duty-cycle boosting, n=1024, k=20 (2% sparsity). Per-region weights; shared hyperparameters.
 - **Sleep-cycle time budget.** How to split a sleep cycle between NREM-like work (replay, homeostatic downscaling, compression) and REM-like work (generative replay, self-probe, growth, future creative recombination), and how to schedule within each stage.
 - **Action loop.** Does the system have one in early phases? Effector — internal state only, or external (audio out, motor)?
 - **Scheduling.** Async tasks, dedicated threads, event loop? How do real-time wake constraints coexist with batch sleep work?

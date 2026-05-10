@@ -19,3 +19,7 @@ models/*.onnx.data
 # Python venv for export scripts
 scripts/.venv/
 experiments/**/.claude/
+
+# generated test artifacts
+test.mp4
+*.ndjson

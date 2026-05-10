@@ -4,8 +4,8 @@
 //! and mel-spectrogram preprocessing. All APIs are synchronous; async bridging
 //! is handled by the `somnus` binary via `spawn_blocking`.
 
-pub mod preprocess;
 pub mod audio;
+pub mod preprocess;
 pub mod video;
 
 pub use audio::{AudioEmbedding, AudioEncoder, AudioEncoderSource};
