@@ -5,7 +5,7 @@
 use std::{
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -18,6 +18,8 @@ const DECAY_RATE: f32 = 1e-4;
 const GROWTH_THRESHOLD: f32 = 0.1;
 const GROWTH_MIN_SAMPLES: usize = 16;
 const GROWTH_BATCH: usize = 64;
+/// Pending-embedding count above which sleep is considered interruptible by external salience.
+const SALIENCE_THRESHOLD: usize = 16;
 
 #[allow(dead_code)]
 pub struct SleepStats {
@@ -28,12 +30,16 @@ pub struct SleepStats {
     pub was_interrupted: bool,
 }
 
+/// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
+/// by the main loop. A high count means the world is active while the system sleeps;
+/// once it exceeds `SALIENCE_THRESHOLD` the current replay step is the last one.
 pub fn run_sleep_cycle(
     perception: &mut PerceptionProcessor,
     episodic: &mut EpisodicBuffer,
     recall: &mut RecollectionLayer,
     memory_dir: &Path,
     interrupt: Arc<AtomicBool>,
+    pending_embs: Arc<AtomicUsize>,
 ) -> Result<SleepStats> {
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
 
@@ -50,7 +56,14 @@ pub fn run_sleep_cycle(
         .collect();
 
     for regional in &traces {
-        if interrupt.load(Ordering::Relaxed) {
+        let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD;
+        if interrupt.load(Ordering::Relaxed) || salient {
+            if salient {
+                tracing::info!(
+                    pending = pending_embs.load(Ordering::Relaxed),
+                    "sleep interrupted: salience threshold exceeded"
+                );
+            }
             was_interrupted = true;
             break;
         }
@@ -84,7 +97,7 @@ pub fn run_sleep_cycle(
         }
     }
 
-    // ── Compression: spill hot → cold ────────────────────────────────────────
+    // ── Compression: spill hot → cold; consolidate into warm ─────────────────
     if !was_interrupted {
         let mut spilled = 0usize;
         for record in episodic.iter_records() {
@@ -92,9 +105,10 @@ pub fn run_sleep_cycle(
                 tracing::warn!(?e, "cold archive append error");
                 break;
             }
+            recall.warm.insert(record.clone());
             spilled += 1;
         }
-        tracing::info!(spilled, "hot→cold spill complete");
+        tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
     }
 
     // ── REM-like: measure MSE, trigger growth ─────────────────────────────────

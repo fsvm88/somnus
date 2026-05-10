@@ -21,7 +21,7 @@ use std::{
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -327,6 +327,10 @@ async fn main() -> Result<()> {
     let interrupt = Arc::new(AtomicBool::new(false));
     let interrupt_sleep = Arc::clone(&interrupt);
 
+    // Counts embeddings produced by encoder tasks but not yet consumed by the main loop.
+    // Sleep monitors this to detect external salience while the system is consolidating.
+    let pending_embs = Arc::new(AtomicUsize::new(0));
+
     // ── open file once; destructure both streams ──────────────────────────────
     let (file_audio_rx, file_video_rx, file_audio_metrics, file_video_metrics) = match args
         .file
@@ -430,6 +434,7 @@ async fn main() -> Result<()> {
     {
         let models_dir = args.models_dir.clone();
         let mut audio_rx = audio_rx;
+        let pending = Arc::clone(&pending_embs);
         tokio::task::spawn_blocking(move || {
             let mut proc = match AudioProcessor::new(&models_dir) {
                 Ok(p) => p,
@@ -442,7 +447,9 @@ async fn main() -> Result<()> {
                 match proc.ingest(frame) {
                     Ok(embs) => {
                         for emb in embs {
-                            if audio_emb_tx.blocking_send(emb).is_err() {
+                            if audio_emb_tx.blocking_send(emb).is_ok() {
+                                pending.fetch_add(1, Ordering::Relaxed);
+                            } else {
                                 return;
                             }
                         }
@@ -458,6 +465,7 @@ async fn main() -> Result<()> {
     {
         let models_dir = args.models_dir.clone();
         let mut video_rx = video_rx;
+        let pending = Arc::clone(&pending_embs);
         tokio::task::spawn_blocking(move || {
             let mut enc = match VideoEncoder::new(&models_dir) {
                 Ok(e) => e,
@@ -489,7 +497,9 @@ async fn main() -> Result<()> {
                             frames_this_sec = 0;
                             total_ms_this_sec = 0;
                         }
-                        if video_emb_tx.blocking_send(emb).is_err() {
+                        if video_emb_tx.blocking_send(emb).is_ok() {
+                            pending.fetch_add(1, Ordering::Relaxed);
+                        } else {
                             return;
                         }
                     }
@@ -508,12 +518,14 @@ async fn main() -> Result<()> {
 
         if should_sleep && !episodic.is_empty() {
             interrupt.store(false, Ordering::Relaxed);
+            pending_embs.store(0, Ordering::Relaxed); // reset; encoders will re-accumulate during sleep
             match sleep::run_sleep_cycle(
                 &mut perception,
                 &mut episodic,
                 &mut recall,
                 &args.memory_dir,
                 Arc::clone(&interrupt_sleep),
+                Arc::clone(&pending_embs),
             ) {
                 Ok(stats) => info!(
                     traces_replayed = stats.traces_replayed,
@@ -528,6 +540,7 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             Some(emb) = audio_emb_rx.recv() => {
+                pending_embs.fetch_sub(1, Ordering::Relaxed);
                 sink_write(&mut sink, &audio_emb_json(&emb));
                 let result = match emb.source {
                     AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
@@ -543,6 +556,7 @@ async fn main() -> Result<()> {
                 }
             }
             Some(emb) = video_emb_rx.recv() => {
+                pending_embs.fetch_sub(1, Ordering::Relaxed);
                 sink_write(&mut sink, &video_emb_json(&emb));
                 match perception.ingest_visual(&emb.values) {
                     Ok(out) => record_episode(
