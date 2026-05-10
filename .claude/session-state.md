@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-07
-> **Last commit on main:** `33b72dc` — *Phase 2 wiring: somnus-sensory → somnus-encoding in the somnus binary*
+> **Last updated:** 2026-05-10
+> **Last commit on main:** (pending commit) — *Phase 2 smoke test: output improvements + NDJSON embedding sink*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -69,39 +69,23 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 ## Where to pick up
 
-**Smoke test the Phase 2 pipeline, then decide on output improvements.**
+**Phase 3 design: memory / concept areas.**
 
-Phase 2 is fully wired: sensory frames → resampling → ONNX encoding → embeddings logged via `tracing`.
+Phase 2 is fully implemented and smoke-tested (2026-05-10). The `somnus` binary:
+- Accepts `--file`, `--mic`, `--webcam`, `--models-dir`, `--embeddings-out`
+- Runs Whisper-tiny (384-dim, 30 s window), CLAP (512-dim, 10 s window), DINOv2-S/14 (384-dim, per frame)
+- Throttles video logs to 1 summary/s (`RUST_LOG=debug` for per-frame detail)
+- Writes NDJSON to `--embeddings-out` (flushed every 10 s on metrics tick and on shutdown)
 
-### Current output situation (discussed, not yet resolved)
+Smoke test on a synthesized 60 s MP4 produced: 104 video embeddings, 3 env embeddings, 1 speech embedding; `embeddings.ndjson` is 108 lines.
 
-The binary has **one output device**: `tracing` to stdout via `RUST_LOG`.
+**Next: Phase 3 — memory / concept areas.**
 
-What you see at `RUST_LOG=info` on a ≥30 s file:
-- `audio resamplers initialised in_rate=44100` (once)
-- `video embedding dim=384 encode_ms=N` — **every frame (~30/s), very noisy**
-- `env embedding dim=512 encode_ms=N` — every 10 s of audio
-- `speech embedding dim=384 encode_ms=N` — every 30 s of audio
-- metrics tick every 10 s
-
-Two issues flagged before smoke testing:
-1. **Video log spam** — 30 `info!` lines/s drowns the audio embeddings. Fix: move per-frame video logs to `debug`, emit one `info` per second (or every N frames).
-2. **Embeddings are dropped after logging** — no sink. For research utility, a simple embedding sink (e.g. newline-delimited JSON to file) would let us inspect what the system "perceived".
-
-User was asked to choose:
-- **A** — throttle video logs to 1/s, then smoke test
-- **B** — throttle + add NDJSON embedding sink, then smoke test
-
-**Resume here: get the user's answer (A or B), implement, then run the smoke test.**
-
-Smoke test command (needs ≥30 s MP4):
-```
-RUST_LOG=info cargo run -p somnus -- --file /path/to/file.mp4 --models-dir models/
-```
-
-After smoke test passes:
-1. Update `ai-docs/architecture.md` — mark Phase 2 as implemented.
-2. Phase 3 design: memory / concept areas (ADR 0005, episodic buffer, sparse coding).
+Design work needed:
+- ADR 0005: episodic buffer (hot VRAM) — structure, capacity, eviction policy
+- ADR 0006 (or merged): sparse coding scheme for concept areas (k-WTA vs top-k vs learned penalty)
+- Crate layout: `crates/somnus-memory` once boundaries are clear
+- Hook embeddings from Phase 2 into the episodic buffer
 
 ## Open architectural questions
 

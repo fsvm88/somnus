@@ -2,14 +2,19 @@ use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use somnus_encoding::{
-    preprocess::resample::SincResampler,
-    AudioEmbedding, AudioEncoder, VideoEmbedding, VideoEncoder,
+    preprocess::resample::SincResampler, AudioEmbedding, AudioEncoder, AudioEncoderSource,
+    VideoEmbedding, VideoEncoder,
 };
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
     VideoFrame,
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -33,6 +38,10 @@ struct Args {
     /// Directory containing ONNX model files.
     #[arg(long, default_value = "models")]
     models_dir: PathBuf,
+
+    /// Write embeddings as newline-delimited JSON to this file.
+    #[arg(long)]
+    embeddings_out: Option<PathBuf>,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -87,9 +96,7 @@ impl AudioProcessor {
             frame.samples.clone()
         } else {
             (0..frame.frame_count())
-                .map(|i| {
-                    (0..ch).map(|c| frame.samples[i * ch + c]).sum::<f32>() / ch as f32
-                })
+                .map(|i| (0..ch).map(|c| frame.samples[i * ch + c]).sum::<f32>() / ch as f32)
                 .collect()
         };
 
@@ -155,6 +162,54 @@ impl AudioProcessor {
     }
 }
 
+// ── NDJSON sink helpers ───────────────────────────────────────────────────────
+
+fn wall_secs(t: &SystemTime) -> f64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn sink_write(sink: &mut Option<BufWriter<std::fs::File>>, line: &str) {
+    if let Some(w) = sink {
+        if let Err(e) = writeln!(w, "{}", line) {
+            tracing::warn!(?e, "embedding sink write failed");
+        }
+    }
+}
+
+fn sink_flush(sink: &mut Option<BufWriter<std::fs::File>>) {
+    if let Some(w) = sink {
+        if let Err(e) = w.flush() {
+            tracing::warn!(?e, "embedding sink flush failed");
+        }
+    }
+}
+
+fn audio_emb_json(emb: &AudioEmbedding) -> String {
+    let kind = match emb.source {
+        AudioEncoderSource::Speech => "speech",
+        AudioEncoderSource::Env => "env",
+    };
+    serde_json::json!({
+        "type":           kind,
+        "timestamp_secs": wall_secs(&emb.timestamp.wall),
+        "dim":            emb.values.len(),
+        "values":         emb.values,
+    })
+    .to_string()
+}
+
+fn video_emb_json(emb: &VideoEmbedding) -> String {
+    serde_json::json!({
+        "type":           "video",
+        "timestamp_secs": wall_secs(&emb.timestamp.wall),
+        "dim":            emb.values.len(),
+        "values":         emb.values,
+    })
+    .to_string()
+}
+
 // ── entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -178,6 +233,15 @@ async fn main() -> Result<()> {
             anyhow::bail!("model file not found: {}", p.display());
         }
     }
+
+    // Open embedding sink if requested.
+    let mut sink: Option<BufWriter<std::fs::File>> = if let Some(path) = &args.embeddings_out {
+        let f = std::fs::File::create(path)?;
+        info!(path = %path.display(), "embedding sink opened");
+        Some(BufWriter::new(f))
+    } else {
+        None
+    };
 
     // ── open file once; destructure both streams immediately ──────────────────
     let (file_audio_rx, file_video_rx, file_audio_metrics, file_video_metrics) = match args
@@ -318,15 +382,29 @@ async fn main() -> Result<()> {
                     return;
                 }
             };
+            let mut last_log = std::time::Instant::now();
+            let mut frames_this_sec: u32 = 0;
+            let mut total_ms_this_sec: u128 = 0;
             while let Some(frame) = video_rx.blocking_recv() {
                 let start = std::time::Instant::now();
                 match enc.encode(&frame) {
                     Ok(emb) => {
-                        tracing::info!(
-                            dim = emb.values.len(),
-                            encode_ms = start.elapsed().as_millis(),
-                            "video embedding"
-                        );
+                        let encode_ms = start.elapsed().as_millis();
+                        frames_this_sec += 1;
+                        total_ms_this_sec += encode_ms;
+                        tracing::debug!(dim = emb.values.len(), encode_ms, "video embedding");
+                        if last_log.elapsed() >= Duration::from_secs(1) {
+                            let avg_ms = total_ms_this_sec / frames_this_sec.max(1) as u128;
+                            tracing::info!(
+                                frames = frames_this_sec,
+                                dim = emb.values.len(),
+                                avg_encode_ms = avg_ms,
+                                "video embeddings/s"
+                            );
+                            last_log = std::time::Instant::now();
+                            frames_this_sec = 0;
+                            total_ms_this_sec = 0;
+                        }
                         if video_emb_tx.blocking_send(emb).is_err() {
                             return;
                         }
@@ -342,13 +420,14 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
-            Some(_emb) = audio_emb_rx.recv() => {
-                // logged inside AudioProcessor::ingest
+            Some(emb) = audio_emb_rx.recv() => {
+                sink_write(&mut sink, &audio_emb_json(&emb));
             }
-            Some(_emb) = video_emb_rx.recv() => {
-                // logged inside video encoder task
+            Some(emb) = video_emb_rx.recv() => {
+                sink_write(&mut sink, &video_emb_json(&emb));
             }
             _ = metrics_tick.tick() => {
+                sink_flush(&mut sink);
                 let v = video_metrics_handle.snapshot();
                 info!(
                     video_captured = v.frames_captured,
@@ -365,6 +444,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = tokio::signal::ctrl_c() => {
+                sink_flush(&mut sink);
                 info!("shutting down");
                 break;
             }

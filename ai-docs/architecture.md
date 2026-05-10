@@ -1,6 +1,8 @@
 # Architecture
 
 > **Status:** working sketch. Reflects decisions through the vision discussion (Q1/Q2/Q3 + sub-Q1). Subject to further change as research matures. Update this doc when subsystem boundaries shift; record the *why* in an ADR.
+>
+> **Implementation state (2026-05-10):** Phase 1 (sensory pipeline) and Phase 2 (ONNX encoding) are implemented and smoke-tested. `crates/somnus-sensory` captures audio/video from file, mic, and webcam. `crates/somnus-encoding` runs Whisper-tiny (speech, 384-dim), CLAP-HTSAT (env, 512-dim), and DINOv2-S/14 (visual, 384-dim) via ORT. The `somnus` binary wires both crates end-to-end; `--embeddings-out` writes NDJSON. Phase 3 (memory / concept areas) is next.
 
 somnus is decomposed by **function**, in loose correspondence with brain systems. Four shaping commitments:
 
