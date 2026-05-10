@@ -87,8 +87,10 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 **Also done (2026-05-11):**
 - Neuromodulation: `nrem_lr()` in `sleep.rs` — cosine annealing (LR_MAX=1e-3 → LR_MIN=1e-5) × loss-trend gate (full/half/quarter lr for improving/plateau/worsening loss). EWMA α=0.3. `set_learning_rate` / `learning_rate` wired on `PerceptionProcessor` (delegates to AdamW, no moment reset). Base lr restored after NREM so `grow_region` optimizer reset starts clean.
 
-**Next: Phase 6 remaining:**
-- Bidirectional region ↔ binding top-down priors (ADR-first; significant refactor of `try_bind` into a settling loop; 4 new binding→region weight matrices)
+**Next (agreed order):**
+1. **Recollection during wake** — query `recall.warm` for top-k nearest neighbours after `try_bind` produces an episode vector; log similarity + timestamp; optionally blend retrieved episode vectors. ADR-light, straight to implementation.
+2. **Output / reconstruction channel** — linear head on 512-dim episode vector predicting the 4 encoder embedding vectors (MSE loss, trains during wake replay and sleep). Needs a small ADR (new loss term + weight group).
+3. **Bidirectional top-down priors** — deferred until after the above; ADR-first when the time comes.
 
 ## Open architectural questions
 
