@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-10
-> **Last commit on main:** c79e010 — *Phase 4: somnus-memory crate (EpisodicBuffer, SemanticStore, ColdArchive, RecollectionLayer)*
+> **Last commit on main:** ecfc4e6 — *Phase 5: sleep cycle with k-WTA/SAE training, consolidation, and snapshot*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -57,6 +57,7 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - **Phase 2 encoding crate implemented and fully tested.** `crates/somnus-encoding`: `WhisperMel`, `ClapMel`, `frame_to_tensor` (DINOv2 image), `AudioEncoder`, `VideoEncoder`. 7 parity fixture tests pass within 1e-4 absolute vs. HuggingFace Python reference. `scripts/gen_mel_fixtures.py` generates fixtures. ADR 0004 updated with corrected CLAP parameters and implementation notes.
 - **Phase 2 wiring complete.** `crates/somnus/src/main.rs` wired end-to-end: ORT initialised from system library at startup; `--models-dir` CLI arg (default `models/`) with up-front file existence checks; `AudioProcessor` (lazy resampler init via `SincResampler` from `somnus-encoding::preprocess::resample`, 480k-sample accumulation for both 16 kHz and 48 kHz, `encode_speech` + `encode_env`); `VideoEncoder` task per frame; embedding shape + latency logged via `tracing::info!`. All 31 workspace tests pass.
 - **Phase 4 memory hierarchy complete.** `crates/somnus-memory`: `EpisodicBuffer` (VecDeque ring), `SemanticStore` (hnsw_rs HNSW, L2, eager insert), `ColdArchive` (INT8 quantised append-only binary, memmap2), `RecollectionLayer` (warm query live; promote stubbed). `somnus` binary updated with `--episodic-capacity`, `--memory-dir`, `--top-k`; memory metrics on 10s tick. 44 workspace tests pass. ADR 0006 written.
+- **Phase 5 sleep cycle complete.** NREM replay trains k-WTA encoder + SAE decoder via AdamW (straight-through estimator); homeostatic decay after replay; hot→cold spill + `episodic.clear()`; REM self-probe measures per-region MSE and triggers `grow_region` (Tensor::cat + Var rebuild) when MSE exceeds threshold; atomic snapshot (episodic binary + safetensors weights); snapshot restore on startup; HNSW rebuilt from episodic records on restore (not persisted — lifetime constraints). Sleep interruptible via `AtomicBool`; replay checkpoint preserved across interrupts. Growth is session-local in Phase 5 (shape mismatch on restore). 51 workspace tests pass. ADR 0007 written. Binary smoke test confirms: multiple sleep cycles fire, loss decreases (1.81 → 1.37 across 3 cycles on a short clip), snapshot written, restored correctly on next run.
 - **Phase 1 sensory pipeline implemented and fully tested.** Crate layout: `crates/somnus-sensory` (library) + `crates/somnus` (binary). All modules pass `cargo fmt`, `cargo clippy -D warnings`, `cargo test`. 22 tests total (13 unit, 9 integration).
   - `frame.rs` — `Timestamp`, `AudioFrame` (frame_count, duration_secs), `PixelFormat`, `VideoFrame` (bytes_per_pixel).
   - `error.rs` — `SensorError` (11 variants via thiserror), `SensorResult`.
@@ -70,25 +71,16 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 ## Where to pick up
 
-**Phase 5 design: sleep cycle + consolidation.**
+**Phase 5 is complete (2026-05-10).** All 51 workspace tests pass. Smoke test confirms the full sleep cycle works end-to-end.
 
-Phase 4 is complete (2026-05-10). `crates/somnus-memory` implements:
-- `EpisodicBuffer`: bounded VecDeque ring (default 4096 episodes, hot tier)
-- `SemanticStore`: hnsw_rs HNSW (L2, M=16, ef_c=400) over 512-dim episode vectors + sidecar HashMap; eager eager insert policy
-- `ColdArchive`: INT8 per-vector quantised append-only binary (`memory/episodes.cold`); `memmap2` reader; append() implemented but not yet called from main loop
-- `RecollectionLayer`: wraps warm+cold; `query_warm()` live; `promote()` stubbed
-- `somnus` binary: episodes inserted into hot+warm on every perception; `--episodic-capacity`, `--memory-dir`, `--top-k` CLI args; memory metrics on 10s tick
+**Next: Phase 6** — per `ai-docs/roadmap.md`, candidates include:
+- Durable growth: save/restore grown-region weight shapes across restarts (currently growth is session-local)
+- Cascade-correlation candidate-pool training for growth (train candidate units on residual error before insertion)
+- Salience-gated sleep interruption (currently the interrupt flag is wired but the salience detector always returns false)
+- Warm-tier promotion: `RecollectionLayer::promote()` is implemented (linear cold scan) but cold→warm is not yet triggered during recollection
+- SemanticStore insertion during sleep (currently warm tier only populated via direct episode insert; sleep replay doesn't add to warm)
 
-44 workspace tests pass. ADR 0006 written.
-
-**Next: Phase 5 — sleep cycle + consolidation** (ADR 0007).
-
-Per roadmap and architecture.md, Phase 5 adds:
-- **NREM-like stage:** replay (episodic → semantic), homeostatic downscaling (gentle global weight decay + replay protection), compression (warm → cold spill)
-- **REM-like stage:** generative replay, gist-level self-probe, growth trigger (cascade-correlation-style unit addition when recall failure rate exceeds threshold)
-- **Sleep controller:** entry triggers (episodic buffer high-water mark, wake-perf degradation, schedule fallback); adaptive duration with cap; interruptibility
-- **Persistence:** snapshot/restore for EpisodicBuffer + SemanticStore HNSW across restarts
-- Cold→warm promotion logic filling `RecollectionLayer::promote()`
+Check `ai-docs/roadmap.md` for the full Phase 6 scope as originally planned.
 
 ## Open architectural questions
 
