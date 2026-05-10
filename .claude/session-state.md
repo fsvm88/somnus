@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-10
-> **Last commit on main:** 24869a6 — *Warm consolidation during sleep + salience-gated interruption*
+> **Last updated:** 2026-05-11
+> **Last commit on main:** 41a25e9 — *Neuromodulation: cosine lr schedule + loss-trend gate for NREM replay*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -84,9 +84,11 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - SemanticStore warm consolidation: sleep now calls recall.warm.insert per spilled record; warm tier is populated within session but not across restarts (HNSW lifetime constraint, ADR 0007)
 - Salience-gated interruption: pending_embs Arc<AtomicUsize> tracks embeddings produced by encoder tasks but not yet consumed; reset to 0 at sleep entry; sleep checks count > SALIENCE_THRESHOLD=16 after each replay step and exits early if true
 
-**Next: Phase 6 remaining / Phase 7:**
-- Bidirectional region ↔ binding top-down priors (ADR-first; significant refactor of try_bind into a settling loop)
-- Neuromodulation as global gain control / learning-rate gate
+**Also done (2026-05-11):**
+- Neuromodulation: `nrem_lr()` in `sleep.rs` — cosine annealing (LR_MAX=1e-3 → LR_MIN=1e-5) × loss-trend gate (full/half/quarter lr for improving/plateau/worsening loss). EWMA α=0.3. `set_learning_rate` / `learning_rate` wired on `PerceptionProcessor` (delegates to AdamW, no moment reset). Base lr restored after NREM so `grow_region` optimizer reset starts clean.
+
+**Next: Phase 6 remaining:**
+- Bidirectional region ↔ binding top-down priors (ADR-first; significant refactor of `try_bind` into a settling loop; 4 new binding→region weight matrices)
 
 ## Open architectural questions
 
