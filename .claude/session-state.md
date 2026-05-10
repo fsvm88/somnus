@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-10
-> **Last commit on main:** ecfc4e6 — *Phase 5: sleep cycle with k-WTA/SAE training, consolidation, and snapshot*
+> **Last commit on main:** 3a1ed71 — *Durable growth: persist/restore grown region sizes across restarts*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -73,14 +73,16 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 
 **Phase 5 is complete (2026-05-10).** All 51 workspace tests pass. Smoke test confirms the full sleep cycle works end-to-end.
 
-**Next: Phase 6** — per `ai-docs/roadmap.md`, candidates include:
-- Durable growth: save/restore grown-region weight shapes across restarts (currently growth is session-local)
-- Cascade-correlation candidate-pool training for growth (train candidate units on residual error before insertion)
-- Salience-gated sleep interruption (currently the interrupt flag is wired but the salience detector always returns false)
-- Warm-tier promotion: `RecollectionLayer::promote()` is implemented (linear cold scan) but cold→warm is not yet triggered during recollection
-- SemanticStore insertion during sleep (currently warm tier only populated via direct episode insert; sleep replay doesn't add to warm)
+**Also done (2026-05-10):**
+- Phase 5 exit criterion verified: 16-trace buffer accumulates enough samples; speech/visual/symbolic grow 1024→1088 in first sleep cycle; loss decreases cycle-over-cycle.
+- Durable growth: `region_sizes.bin` (4 × u64 LE) saved to snapshot dir; `load_weights_with_sizes` pre-grows layers, loads safetensors, calls `rebuild_linears()` (which re-reads all weights from VarMap since `Var::set` does not update Tensor clones in-place — also fixes silent no-op bug in the prior `load_weights`). Verified across two runs.
 
-Check `ai-docs/roadmap.md` for the full Phase 6 scope as originally planned.
+**Next: Phase 6** — per `ai-docs/roadmap.md`, candidates include:
+- Cross-attention binding (upgrade from concat+linear)
+- Bidirectional region ↔ binding top-down priors
+- Neuromodulation as global gain control / learning-rate gate
+- Salience-gated sleep interruption (interrupt flag wired, detector always false)
+- SemanticStore insertion during sleep (warm tier populated by waking only)
 
 ## Open architectural questions
 
