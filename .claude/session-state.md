@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-10
-> **Last commit on main:** 9da74a8 — *Phase 6: cross-attention binding area (ADR 0008)*
+> **Last commit on main:** 24869a6 — *Warm consolidation during sleep + salience-gated interruption*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -80,11 +80,13 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 **Also done (2026-05-10):**
 - Cross-attention binding (ADR 0008): replaced concat+linear(4096→512) with single-head self-attention over 4 region tokens. Per-region projections N_UNITS→128, Q/K/V [128,128], flatten [4,128]→[512]. 573K params vs old 2.1M. Input clamped to N_UNITS via to_dense_n (growth-invariant). Old snapshots incompatible (binding.weight key replaced by 7 keys).
 
-**Next: Phase 6 remaining candidates:**
-- Bidirectional region ↔ binding top-down priors
+**Also done (2026-05-11):**
+- SemanticStore warm consolidation: sleep now calls recall.warm.insert per spilled record; warm tier is populated within session but not across restarts (HNSW lifetime constraint, ADR 0007)
+- Salience-gated interruption: pending_embs Arc<AtomicUsize> tracks embeddings produced by encoder tasks but not yet consumed; reset to 0 at sleep entry; sleep checks count > SALIENCE_THRESHOLD=16 after each replay step and exits early if true
+
+**Next: Phase 6 remaining / Phase 7:**
+- Bidirectional region ↔ binding top-down priors (ADR-first; significant refactor of try_bind into a settling loop)
 - Neuromodulation as global gain control / learning-rate gate
-- Salience-gated sleep interruption (interrupt flag wired, detector always false)
-- SemanticStore insertion during sleep (warm tier populated by waking only)
 
 ## Open architectural questions
 
