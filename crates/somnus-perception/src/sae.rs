@@ -6,14 +6,15 @@ use crate::{
     region::{RegionId, SparseActivation, N_UNITS},
 };
 
-/// Thin linear decoder: 1024 → n_in.
+/// Thin linear decoder: n_units → n_in.
 ///
 /// In Phase 3 the weights are randomly initialised; reconstruction error is
 /// observable as a metric but not meaningful until Phase 5 trains the decoder
 /// via experience replay.
 pub struct SaeDecoder {
     pub region: RegionId,
-    n_in: usize,
+    pub n_in: usize,
+    pub n_units: usize,
     decoder: Linear,
     device: Device,
 }
@@ -29,13 +30,14 @@ impl SaeDecoder {
         Ok(Self {
             region,
             n_in,
+            n_units: N_UNITS,
             decoder,
             device,
         })
     }
 
     /// MSE between the original encoder input and the decoder's reconstruction
-    /// from the sparse activation.
+    /// from the sparse activation (inference path — no gradient tracking).
     pub fn reconstruction_error(
         &self,
         input: &[f32],
@@ -43,7 +45,7 @@ impl SaeDecoder {
     ) -> PerceptionResult<f32> {
         debug_assert_eq!(input.len(), self.n_in);
         let dense = act.to_dense();
-        let dense_t = Tensor::from_vec(dense, (1, N_UNITS), &self.device)?;
+        let dense_t = Tensor::from_vec(dense, (1, act.n_units), &self.device)?;
         let recon = self.decoder.forward(&dense_t)?.squeeze(0)?;
         let recon_vec: Vec<f32> = recon.to_vec1()?;
         let mse = input
@@ -53,6 +55,29 @@ impl SaeDecoder {
             .sum::<f32>()
             / self.n_in as f32;
         Ok(mse)
+    }
+
+    /// MSE loss as a tracked Tensor — used during sleep training.
+    ///
+    /// `input_vec` is the original encoder embedding.
+    /// `sparse_z` is the masked linear output from the k-WTA layer (tracked tensor, shape [n_units]).
+    /// Gradient flows: loss → decoder weights → sparse_z → encoder Linear weights.
+    pub fn mse_loss_tensor(
+        &self,
+        input_vec: &[f32],
+        sparse_z: &Tensor,
+    ) -> PerceptionResult<Tensor> {
+        debug_assert_eq!(input_vec.len(), self.n_in);
+        let input_t = Tensor::from_vec(input_vec.to_vec(), (self.n_in,), &self.device)?;
+        let recon = self.decoder.forward(&sparse_z.unsqueeze(0)?)?.squeeze(0)?;
+        let loss = (input_t - recon)?.sqr()?.mean_all()?;
+        Ok(loss)
+    }
+
+    /// Replace the internal decoder with a new Linear (used during growth).
+    pub fn replace_linear(&mut self, new_decoder: Linear, new_n_units: usize) {
+        self.decoder = new_decoder;
+        self.n_units = new_n_units;
     }
 }
 
@@ -77,6 +102,7 @@ mod tests {
             region: RegionId::Visual,
             indices: (0u16..20).collect(),
             values: vec![0.5f32; 20],
+            n_units: N_UNITS,
         };
         let err = dec.reconstruction_error(&input, &act).unwrap();
         assert!(err.is_finite());

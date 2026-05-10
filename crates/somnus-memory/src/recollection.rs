@@ -2,10 +2,7 @@ use crate::{
     cold::ColdArchive, episode::EpisodeRecord, error::MemoryResult, semantic::SemanticStore,
 };
 
-/// Cross-tier recollection index: warm query + cold promotion stub.
-///
-/// Phase 4: only warm queries are live; cold promotion returns Ok(()) immediately.
-/// Phase 5 will fill in cold→warm promotion driven by the sleep loop.
+/// Cross-tier recollection index: warm query + cold→warm promotion.
 pub struct RecollectionLayer {
     pub warm: SemanticStore,
     pub cold: ColdArchive,
@@ -21,12 +18,24 @@ impl RecollectionLayer {
         self.warm.query(cue, k)
     }
 
-    /// Promote a record from cold to warm by id.
+    /// Locate a cold record by id and insert it into warm semantic memory.
     ///
-    /// Phase 4 stub — always succeeds without doing anything.
-    /// Phase 5: locate record in cold archive, dequantise, insert into warm.
-    #[allow(unused_variables)]
+    /// Linear scan over the cold archive — acceptable for Phase 5 (cold len < 10k).
+    /// Phase 6: build a cold-side id index to replace this scan.
     pub fn promote(&mut self, id: u64) -> MemoryResult<()> {
+        let record = self
+            .cold
+            .iter()?
+            .find_map(|r| match r {
+                Ok(rec) if rec.id == id => Some(Ok(rec)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e)),
+            })
+            .transpose()?;
+
+        if let Some(rec) = record {
+            self.warm.insert(rec);
+        }
         Ok(())
     }
 }

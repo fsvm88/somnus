@@ -27,10 +27,12 @@ impl BindingArea {
 
     /// Produce an episode vector from four sparse activations (one per region).
     /// The order must be [AudioSpeech, AudioEnv, Visual, Symbolic].
+    /// Uses `to_dense_n(N_UNITS)` so the binding area's fixed input size is maintained
+    /// even when a region's k-WTA layer has grown beyond N_UNITS.
     pub fn forward(&self, acts: &[&SparseActivation; 4]) -> PerceptionResult<EpisodeVector> {
         let mut concat = Vec::with_capacity(N_UNITS * 4);
         for act in acts {
-            concat.extend_from_slice(&act.to_dense());
+            concat.extend_from_slice(&act.to_dense_n(N_UNITS));
         }
         let t = Tensor::from_vec(concat, (1, N_UNITS * 4), &self.device)?;
         let out = self.proj.forward(&t)?.squeeze(0)?;
@@ -50,6 +52,7 @@ mod tests {
             region,
             indices: (0u16..20).collect(),
             values: vec![1.0f32; 20],
+            n_units: N_UNITS,
         }
     }
 

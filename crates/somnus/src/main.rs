@@ -1,3 +1,5 @@
+mod sleep;
+
 use anyhow::Result;
 use candle_core::Device as CandleDevice;
 use clap::Parser;
@@ -6,8 +8,10 @@ use somnus_encoding::{
     preprocess::resample::SincResampler, AudioEmbedding, AudioEncoder, AudioEncoderSource,
     VideoEmbedding, VideoEncoder,
 };
-use somnus_memory::{ColdArchive, EpisodicBuffer, RecollectionLayer, SemanticStore};
-use somnus_perception::PerceptionProcessor;
+use somnus_memory::{
+    load_snapshot, weights_path, ColdArchive, EpisodicBuffer, RecollectionLayer, SemanticStore,
+};
+use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
     VideoFrame,
@@ -15,7 +19,10 @@ use somnus_sensory::{
 use std::{
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
@@ -24,25 +31,20 @@ use tracing::info;
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
-#[command(about = "somnus sensory + encoding + perception + memory pipeline — Phase 4")]
+#[command(about = "somnus sensory + encoding + perception + memory + sleep pipeline — Phase 5")]
 struct Args {
-    /// Media file to decode (must contain both audio and video streams).
     #[arg(long)]
     file: Option<PathBuf>,
 
-    /// Enable live microphone input alongside file playback.
     #[arg(long)]
     mic: bool,
 
-    /// Webcam device index (ignored when --file is supplied without --mic).
     #[arg(long, default_value = "0")]
     webcam: u32,
 
-    /// Directory containing ONNX model files.
     #[arg(long, default_value = "models")]
     models_dir: PathBuf,
 
-    /// Write embeddings as newline-delimited JSON to this file.
     #[arg(long)]
     embeddings_out: Option<PathBuf>,
 
@@ -50,20 +52,28 @@ struct Args {
     #[arg(long, default_value = "4096")]
     episodic_capacity: usize,
 
-    /// Directory for the cold archive and future memory snapshots.
+    /// Directory for memory files (cold archive, snapshots).
     #[arg(long, default_value = "memory")]
     memory_dir: PathBuf,
 
     /// Number of nearest episodes to retrieve on each query (logged at debug level).
     #[arg(long, default_value = "5")]
     top_k: usize,
+
+    /// Fraction of episodic capacity that triggers a sleep cycle (0.0–1.0).
+    #[arg(long, default_value = "0.8")]
+    sleep_high_water: f64,
+
+    /// Maximum wake duration in seconds before a sleep cycle is forced.
+    #[arg(long, default_value = "600")]
+    max_wake_secs: u64,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
 
-const AUDIO_CHUNK: usize = 4096; // rubato fixed input chunk
-const WHISPER_SAMPLES: usize = 480_000; // 30 s @ 16 kHz
-const CLAP_SAMPLES: usize = 480_000; // 10 s @ 48 kHz
+const AUDIO_CHUNK: usize = 4096;
+const WHISPER_SAMPLES: usize = 480_000;
+const CLAP_SAMPLES: usize = 480_000;
 
 struct AudioProcessor {
     encoder: AudioEncoder,
@@ -93,7 +103,6 @@ impl AudioProcessor {
     }
 
     fn ingest(&mut self, frame: AudioFrame) -> Result<Vec<AudioEmbedding>> {
-        // Reject mid-stream rate change — resamplers are fixed at init.
         if let Some(known) = self.in_rate {
             if frame.sample_rate != known {
                 tracing::warn!(
@@ -105,7 +114,6 @@ impl AudioProcessor {
             }
         }
 
-        // Downmix to mono.
         let ch = frame.channels as usize;
         let mono: Vec<f32> = if ch == 1 {
             frame.samples.clone()
@@ -115,7 +123,6 @@ impl AudioProcessor {
                 .collect()
         };
 
-        // Lazy-init resamplers on first frame.
         if self.in_rate.is_none() {
             let rate = frame.sample_rate;
             self.r16k = Some(SincResampler::new(rate, 16_000, AUDIO_CHUNK)?);
@@ -124,7 +131,6 @@ impl AudioProcessor {
             info!(in_rate = rate, "audio resamplers initialised");
         }
 
-        // Timestamp of the oldest unencoded sample in each output buffer.
         if self.ts_16k.is_none() {
             self.ts_16k = Some(frame.timestamp.clone());
         }
@@ -134,7 +140,6 @@ impl AudioProcessor {
 
         self.src_buf.extend_from_slice(&mono);
 
-        // Resample in fixed-size chunks.
         while self.src_buf.len() >= AUDIO_CHUNK {
             let chunk = self.src_buf[..AUDIO_CHUNK].to_vec();
             self.src_buf.drain(..AUDIO_CHUNK);
@@ -144,7 +149,6 @@ impl AudioProcessor {
                 .extend_from_slice(&self.r48k.as_mut().unwrap().process(&chunk)?);
         }
 
-        // Emit embeddings when output buffers are full.
         let mut embs = Vec::new();
 
         if self.buf_16k.len() >= WHISPER_SAMPLES {
@@ -237,7 +241,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Verify model files are present before constructing sessions.
     for name in &[
         "whisper_tiny_encoder.onnx",
         "clap_audio_encoder.onnx",
@@ -249,7 +252,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Open embedding sink if requested.
     let mut sink: Option<BufWriter<std::fs::File>> = if let Some(path) = &args.embeddings_out {
         let f = std::fs::File::create(path)?;
         info!(path = %path.display(), "embedding sink opened");
@@ -258,7 +260,71 @@ async fn main() -> Result<()> {
         None
     };
 
-    // ── open file once; destructure both streams immediately ──────────────────
+    // ── perception processor ──────────────────────────────────────────────────
+    let mut perception = match PerceptionProcessor::new(CandleDevice::Cpu) {
+        Ok(p) => p,
+        Err(e) => anyhow::bail!("perception processor init failed: {e}"),
+    };
+    info!("perception processor initialised (n=1024, k=20, cpu)");
+
+    // ── memory hierarchy ──────────────────────────────────────────────────────
+    std::fs::create_dir_all(&args.memory_dir)?;
+    let cold = match ColdArchive::open(&args.memory_dir) {
+        Ok(c) => c,
+        Err(e) => anyhow::bail!("cold archive init failed: {e}"),
+    };
+
+    // Restore from snapshot if available; otherwise start fresh.
+    let (mut episodic, semantic) =
+        match load_snapshot(&args.memory_dir, args.episodic_capacity, EPISODE_DIM) {
+            Ok(Some((ep, sem))) => {
+                info!(
+                    episodic_len = ep.len(),
+                    semantic_len = sem.len(),
+                    "restored from snapshot"
+                );
+                // Restore perception weights if present.
+                let w_path = weights_path(&args.memory_dir);
+                if w_path.exists() {
+                    if let Err(e) = perception.load_weights(&w_path) {
+                        tracing::warn!(?e, "weight restore failed — starting with fresh weights");
+                    } else {
+                        info!("perception weights restored");
+                    }
+                }
+                (ep, sem)
+            }
+            Ok(None) => {
+                info!("no snapshot found — starting fresh");
+                (
+                    EpisodicBuffer::new(args.episodic_capacity),
+                    SemanticStore::new(EPISODE_DIM),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(?e, "snapshot load failed — starting fresh");
+                (
+                    EpisodicBuffer::new(args.episodic_capacity),
+                    SemanticStore::new(EPISODE_DIM),
+                )
+            }
+        };
+
+    let mut recall = RecollectionLayer::new(semantic, cold);
+    info!(
+        episodic_capacity = args.episodic_capacity,
+        memory_dir = %args.memory_dir.display(),
+        "memory hierarchy ready"
+    );
+
+    let high_water = (args.episodic_capacity as f64 * args.sleep_high_water) as usize;
+    let max_wake = Duration::from_secs(args.max_wake_secs);
+    let mut wake_start = std::time::Instant::now();
+
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let interrupt_sleep = Arc::clone(&interrupt);
+
+    // ── open file once; destructure both streams ──────────────────────────────
     let (file_audio_rx, file_video_rx, file_audio_metrics, file_video_metrics) = match args
         .file
         .as_ref()
@@ -337,7 +403,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── async bridges: crossbeam → tokio mpsc ─────────────────────────────────
+    // ── async bridges ─────────────────────────────────────────────────────────
     let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(64);
     tokio::task::spawn_blocking(move || {
         while let Ok(f) = audio_cb_rx.recv() {
@@ -430,31 +496,33 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── perception processor ──────────────────────────────────────────────────
-    let mut perception = match PerceptionProcessor::new(CandleDevice::Cpu) {
-        Ok(p) => p,
-        Err(e) => anyhow::bail!("perception processor init failed: {e}"),
-    };
-    info!("perception processor initialised (n=1024, k=20, cpu)");
-
-    // ── memory hierarchy ──────────────────────────────────────────────────────
-    let mut episodic = EpisodicBuffer::new(args.episodic_capacity);
-    let semantic = SemanticStore::new(somnus_perception::binding::EPISODE_DIM);
-    let cold = match ColdArchive::open(&args.memory_dir) {
-        Ok(c) => c,
-        Err(e) => anyhow::bail!("cold archive init failed: {e}"),
-    };
-    let mut recall = RecollectionLayer::new(semantic, cold);
-    info!(
-        episodic_capacity = args.episodic_capacity,
-        memory_dir = %args.memory_dir.display(),
-        "memory hierarchy initialised"
-    );
-
     // ── main loop ─────────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
 
     loop {
+        // ── sleep trigger check ───────────────────────────────────────────────
+        let should_sleep = episodic.len() >= high_water || wake_start.elapsed() >= max_wake;
+
+        if should_sleep && !episodic.is_empty() {
+            interrupt.store(false, Ordering::Relaxed);
+            match sleep::run_sleep_cycle(
+                &mut perception,
+                &mut episodic,
+                &mut recall,
+                &args.memory_dir,
+                Arc::clone(&interrupt_sleep),
+            ) {
+                Ok(stats) => info!(
+                    traces_replayed = stats.traces_replayed,
+                    mean_loss = stats.mean_train_loss,
+                    interrupted = stats.was_interrupted,
+                    "sleep cycle complete"
+                ),
+                Err(e) => tracing::warn!(?e, "sleep cycle error"),
+            }
+            wake_start = std::time::Instant::now();
+        }
+
         tokio::select! {
             Some(emb) = audio_emb_rx.recv() => {
                 sink_write(&mut sink, &audio_emb_json(&emb));
@@ -463,9 +531,10 @@ async fn main() -> Result<()> {
                     AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
                 };
                 match result {
-                    Ok(out) => log_perception_output(
-                        &out, &emb.timestamp, &mut sink,
-                        &mut episodic, &mut recall, args.top_k,
+                    Ok(out) => record_episode(
+                        &out, &emb.timestamp,
+                        &mut sink, &mut episodic,
+                        args.top_k, &recall,
                     ),
                     Err(e)  => tracing::error!(?e, "perception error (audio)"),
                 }
@@ -473,11 +542,12 @@ async fn main() -> Result<()> {
             Some(emb) = video_emb_rx.recv() => {
                 sink_write(&mut sink, &video_emb_json(&emb));
                 match perception.ingest_visual(&emb.values) {
-                    Ok(out) => log_perception_output(
-                        &out, &emb.timestamp, &mut sink,
-                        &mut episodic, &mut recall, args.top_k,
+                    Ok(out) => record_episode(
+                        &out, &emb.timestamp,
+                        &mut sink, &mut episodic,
+                        args.top_k, &recall,
                     ),
-                    Err(e)  => tracing::error!(?e, "perception error (video)"),
+                    Err(e) => tracing::error!(?e, "perception error (video)"),
                 }
             }
             _ = metrics_tick.tick() => {
@@ -504,6 +574,7 @@ async fn main() -> Result<()> {
                 );
             }
             _ = tokio::signal::ctrl_c() => {
+                interrupt.store(true, Ordering::Relaxed);
                 sink_flush(&mut sink);
                 info!("shutting down");
                 break;
@@ -516,13 +587,14 @@ async fn main() -> Result<()> {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn log_perception_output(
+/// Push an episode into the hot buffer (without touching warm tier — sleep does that).
+fn record_episode(
     out: &somnus_perception::PerceptionOutput,
     ts: &Timestamp,
     sink: &mut Option<BufWriter<std::fs::File>>,
     episodic: &mut EpisodicBuffer,
-    recall: &mut RecollectionLayer,
     top_k: usize,
+    recall: &RecollectionLayer,
 ) {
     for &(region, err) in &out.recon_errors {
         tracing::debug!(region = ?region, recon_mse = err, "reconstruction error");
@@ -531,17 +603,13 @@ fn log_perception_output(
         let ts_secs = wall_secs(&ts.wall);
         tracing::info!(dim = ep.0.len(), "episode vector");
 
-        // Insert into episodic buffer (hot tier).
-        let id = episodic.push(ts_secs, ep.0.clone());
+        let regional = out
+            .regional_inputs
+            .clone()
+            .unwrap_or([vec![], vec![], vec![], vec![]]);
 
-        // Insert into semantic store (warm tier) — eager policy in Phase 4.
-        recall.warm.insert(somnus_memory::EpisodeRecord {
-            id,
-            timestamp_secs: ts_secs,
-            values: ep.0.clone(),
-        });
+        let id = episodic.push(ts_secs, ep.0.clone(), regional);
 
-        // Log nearest neighbours at debug level (smoke-test for retrieval).
         if tracing::enabled!(tracing::Level::DEBUG) {
             let neighbours = recall.query_warm(&ep.0, top_k);
             tracing::debug!(

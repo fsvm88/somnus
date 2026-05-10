@@ -28,21 +28,36 @@ impl RegionId {
     }
 }
 
-/// Sparse output of a k-WTA layer: k active units out of N_UNITS total.
+/// Sparse output of a k-WTA layer.
 /// Indices are sorted ascending; values are the raw post-linear activations.
 #[derive(Debug, Clone)]
 pub struct SparseActivation {
     pub region: RegionId,
     pub indices: Vec<u16>,
     pub values: Vec<f32>,
+    /// Total number of units in the layer (N_UNITS at init; grows after unit addition).
+    pub n_units: usize,
 }
 
 impl SparseActivation {
-    /// Reconstruct a dense N_UNITS-dim vector from the sparse code.
+    /// Dense vector of size `self.n_units` — full layer representation.
     pub fn to_dense(&self) -> Vec<f32> {
-        let mut out = vec![0.0f32; N_UNITS];
+        let mut out = vec![0.0f32; self.n_units];
         for (&idx, &val) in self.indices.iter().zip(self.values.iter()) {
             out[idx as usize] = val;
+        }
+        out
+    }
+
+    /// Dense vector clamped to `n` elements — used by the binding area's fixed-size interface.
+    /// Units with index >= n are dropped (they exist in the extended layer but not in binding yet).
+    pub fn to_dense_n(&self, n: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; n];
+        for (&idx, &val) in self.indices.iter().zip(self.values.iter()) {
+            let i = idx as usize;
+            if i < n {
+                out[i] = val;
+            }
         }
         out
     }
@@ -51,10 +66,10 @@ impl SparseActivation {
 /// k-WTA linear layer with per-unit duty-cycle boosting.
 pub struct KWtaLayer {
     pub region: RegionId,
-    linear: Linear,
+    pub linear: Linear,
+    pub n_units: usize,
     device: Device,
-    // Running mean activation frequency per unit (exponential moving average).
-    duty_cycle: Vec<f32>,
+    pub duty_cycle: Vec<f32>,
 }
 
 impl KWtaLayer {
@@ -68,6 +83,7 @@ impl KWtaLayer {
         Ok(Self {
             region,
             linear,
+            n_units: N_UNITS,
             device,
             duty_cycle: vec![0.0f32; N_UNITS],
         })
@@ -77,30 +93,44 @@ impl KWtaLayer {
         let t = Tensor::from_vec(input.to_vec(), (1, input.len()), &self.device)?;
         let z = self.linear.forward(&t)?.squeeze(0)?;
         let z_vec: Vec<f32> = z.to_vec1()?;
+        self.select_top_k(z_vec)
+    }
 
-        // Apply boosting: raise pre-activations of chronically under-used units.
-        let target_dc = K_ACTIVE as f32 / N_UNITS as f32;
+    /// Forward pass that also returns the intermediate tracked tensor `z` for backprop.
+    /// Returns `(activation, z_tensor)` where z_tensor has shape `[n_units]`.
+    pub fn forward_tracked(
+        &mut self,
+        input: &[f32],
+    ) -> PerceptionResult<(SparseActivation, Tensor)> {
+        let t = Tensor::from_vec(input.to_vec(), (1, input.len()), &self.device)?;
+        let z = self.linear.forward(&t)?.squeeze(0)?; // tracked [n_units]
+        let z_vec: Vec<f32> = z.to_vec1()?; // read values — does NOT detach z
+
+        let act = self.select_top_k(z_vec)?;
+        Ok((act, z))
+    }
+
+    fn select_top_k(&mut self, z_vec: Vec<f32>) -> PerceptionResult<SparseActivation> {
+        let n = self.n_units;
+
+        let target_dc = K_ACTIVE as f32 / n as f32;
         let mut boosted = z_vec.clone();
         for (i, dc) in self.duty_cycle.iter().enumerate() {
             boosted[i] += BOOST_STRENGTH * (target_dc - dc);
         }
 
-        // Hard top-k on boosted activations; store original (unboosted) values.
         let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
-        // Partial sort: move top-K to the back.
-        let split = N_UNITS - K_ACTIVE;
+        let split = n - K_ACTIVE;
         indexed.select_nth_unstable_by(split, |a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
         });
         let top_k = &indexed[split..];
 
-        // Collect and sort by index for a canonical representation.
         let mut pairs: Vec<(u16, f32)> = top_k.iter().map(|&(i, _)| (i as u16, z_vec[i])).collect();
         pairs.sort_unstable_by_key(|(i, _)| *i);
 
-        // Update duty cycles.
         let active_set: std::collections::HashSet<usize> = top_k.iter().map(|&(i, _)| i).collect();
-        for i in 0..N_UNITS {
+        for i in 0..n {
             let fired = if active_set.contains(&i) { 1.0 } else { 0.0 };
             self.duty_cycle[i] =
                 (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
@@ -110,6 +140,7 @@ impl KWtaLayer {
             region: self.region,
             indices: pairs.iter().map(|(i, _)| *i).collect(),
             values: pairs.iter().map(|(_, v)| *v).collect(),
+            n_units: n,
         })
     }
 }
@@ -158,5 +189,20 @@ mod tests {
         assert_eq!(dense.len(), N_UNITS);
         let nonzero = dense.iter().filter(|&&v| v != 0.0).count();
         assert_eq!(nonzero, K_ACTIVE);
+    }
+
+    #[test]
+    fn to_dense_n_truncates_to_n() {
+        let act = SparseActivation {
+            region: RegionId::Visual,
+            indices: vec![0, 512, 1023],
+            values: vec![1.0, 2.0, 3.0],
+            n_units: 1024,
+        };
+        let dense = act.to_dense_n(512);
+        assert_eq!(dense.len(), 512);
+        assert_eq!(dense[0], 1.0);
+        // index 512 is out of range for n=512, should be dropped
+        assert!(dense.iter().skip(1).all(|&v| v == 0.0));
     }
 }

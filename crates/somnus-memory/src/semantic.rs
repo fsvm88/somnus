@@ -60,6 +60,22 @@ impl SemanticStore {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Expose the underlying HNSW index (for snapshot serialisation).
+    pub fn hnsw(&self) -> &Hnsw<'static, f32, DistL2> {
+        &self.index
+    }
+
+    /// Reconstruct from a pre-loaded HNSW index (restored from snapshot).
+    /// The sidecar `records` map is empty; callers should repopulate it from
+    /// the episodic buffer's records or accept reduced retrieval fidelity.
+    pub fn from_hnsw(index: Hnsw<'static, f32, DistL2>, dim: usize) -> Self {
+        Self {
+            index,
+            records: HashMap::new(),
+            dim,
+        }
+    }
 }
 
 #[cfg(test)]

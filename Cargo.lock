@@ -714,6 +714,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
