@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-11
-> **Last commit on main:** 41a25e9 — *Neuromodulation: cosine lr schedule + loss-trend gate for NREM replay*
+> **Last commit on main:** f1bbad1 — *Recollection during wake: query warm memory after each episode*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -87,10 +87,12 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 **Also done (2026-05-11):**
 - Neuromodulation: `nrem_lr()` in `sleep.rs` — cosine annealing (LR_MAX=1e-3 → LR_MIN=1e-5) × loss-trend gate (full/half/quarter lr for improving/plateau/worsening loss). EWMA α=0.3. `set_learning_rate` / `learning_rate` wired on `PerceptionProcessor` (delegates to AdamW, no moment reset). Base lr restored after NREM so `grow_region` optimizer reset starts clean.
 
+**Also done (2026-05-11):**
+- Recollection during wake: `SemanticStore::query_with_dist` + `RecollectionLayer::query_warm_with_dist` return `(f32 dist, &EpisodeRecord)`. `record_episode` always queries warm memory; logs top-1 id, timestamp, L2 distance at INFO. If top-1 L2 < RECALL_BLEND_THRESHOLD (50.0), blends α=0.1 of retrieved into stored episode (intentional feedback loop — recall shapes future recall). Threshold needs calibration once real distances are observed from a session with warm data.
+
 **Next (agreed order):**
-1. **Recollection during wake** — query `recall.warm` for top-k nearest neighbours after `try_bind` produces an episode vector; log similarity + timestamp; optionally blend retrieved episode vectors. ADR-light, straight to implementation.
-2. **Output / reconstruction channel** — linear head on 512-dim episode vector predicting the 4 encoder embedding vectors (MSE loss, trains during wake replay and sleep). Needs a small ADR (new loss term + weight group).
-3. **Bidirectional top-down priors** — deferred until after the above; ADR-first when the time comes.
+1. **Output / reconstruction channel** — linear head on 512-dim episode vector predicting the 4 encoder embedding vectors (MSE loss, trains during wake and sleep). Needs a small ADR (new loss term + weight group).
+2. **Bidirectional top-down priors** — ADR-first when the time comes.
 
 ## Open architectural questions
 
