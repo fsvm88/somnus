@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-11
-> **Last commit on main:** f1bbad1 — *Recollection during wake: query warm memory after each episode*
+> **Last commit on main:** a290fc1 — *Output reconstruction channel: 4 linear heads on episode vector (ADR 0009)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -90,9 +90,11 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 **Also done (2026-05-11):**
 - Recollection during wake: `SemanticStore::query_with_dist` + `RecollectionLayer::query_warm_with_dist` return `(f32 dist, &EpisodeRecord)`. `record_episode` always queries warm memory; logs top-1 id, timestamp, L2 distance at INFO. If top-1 L2 < RECALL_BLEND_THRESHOLD (50.0), blends α=0.1 of retrieved into stored episode (intentional feedback loop — recall shapes future recall). Threshold needs calibration once real distances are observed from a session with warm data.
 
+**Also done (2026-05-11):**
+- Output reconstruction channel (ADR 0009): four `linear_no_bias` heads (EPISODE_DIM→region_dim) per modality. `wake_reconstruct_step` called once per episode; MSE loss backprops through heads and binding area. `output_mse` logged at INFO. 4 new weight tensors in VarMap (output_heads.{0,1,2,3}.weight). `rebuild_linears` extended. NREM integration deferred (would need episode vector re-derivation during replay). 52 tests pass.
+
 **Next (agreed order):**
-1. **Output / reconstruction channel** — linear head on 512-dim episode vector predicting the 4 encoder embedding vectors (MSE loss, trains during wake and sleep). Needs a small ADR (new loss term + weight group).
-2. **Bidirectional top-down priors** — ADR-first when the time comes.
+1. **Bidirectional top-down priors** — ADR-first when the time comes. Deferred; revisit after observing real output_mse and recollection l2_dist numbers from a live run.
 
 ## Open architectural questions
 
