@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-11
-> **Last commit on main:** a1c43cb — *NREM output-head replay + warm-recall growth gate (items 2 & 3)*
+> **Last commit on main:** e4fbf1c — *Fix pending_embs underflow + replay_checkpoint on error*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -100,6 +100,11 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - Live observability run on `test.mp4` (models already exported). `output_mse` drops 4.03→3.32→2.44→1.81 across the first four episodes — output heads learn within-session. Clip too short to trigger sleep (needs ~3277 episodes at 80% high-water). Recollection doesn't fire on fresh run (no warm memory). `prior_cosine` silent (β=0.0 default). Calibration targets: `RECALL_BLEND_THRESHOLD=50.0` and `prior_beta` need a multi-session run.
 - NREM output-head replay: `sleep.rs` NREM loop now also calls `wake_reconstruct_step(episode_vec, regional)` after each `replay_step`. Stored episode_vec is a constant (untracked tensor), so gradients flow only through output head weights. `mean_output_mse` logged at NREM complete and in `SleepStats`.
 - Warm-recall growth gate: REM probe snapshots `pre_spill_warm_len` before spill; queries warm with each episode vector if `pre_spill_warm_len > 0`. Mean L2 logged as `warm_recall_l2`. Growth now requires both SAE MSE > 0.1 AND warm recall poor (L2 > 100.0 or no cross-session data). `WARM_RECALL_GROWTH_THRESHOLD=100.0` needs calibration.
+
+**Also done (2026-05-11):**
+- Codebase review: two latent bugs identified and fixed.
+  - `pending_embs.fetch_sub()` could underflow to `usize::MAX` when sleep resets the counter to 0 mid-flight. Both consume sites (audio + video arms in `main.rs`) now use `fetch_update` + `saturating_sub(1)`.
+  - `replay_checkpoint` in the NREM loop only advanced inside the `Ok` arm. A broken trace would be retried on every sleep restart. Moved increment outside the match so errored traces are always skipped.
 
 **Next (queued):**
 4. **Phase 6 roadmap** — remaining Phase 6+ items not yet done: predictive-coding settling loop (iterative refinement replacing single-pass), sample-level audio mixing (mic + file waveform summing), action loop, language as additional modality. ADR-first for any of these.
