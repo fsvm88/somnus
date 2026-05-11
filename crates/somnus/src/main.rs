@@ -551,7 +551,7 @@ async fn main() -> Result<()> {
 
         tokio::select! {
             Some(emb) = audio_emb_rx.recv() => {
-                pending_embs.fetch_sub(1, Ordering::Relaxed);
+                let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                 sink_write(&mut sink, &audio_emb_json(&emb));
                 let result = match emb.source {
                     AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
@@ -571,7 +571,7 @@ async fn main() -> Result<()> {
                 }
             }
             Some(emb) = video_emb_rx.recv() => {
-                pending_embs.fetch_sub(1, Ordering::Relaxed);
+                let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                 sink_write(&mut sink, &video_emb_json(&emb));
                 match perception.ingest_visual(&emb.values) {
                     Ok(out) => {

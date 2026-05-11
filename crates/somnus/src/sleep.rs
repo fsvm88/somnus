@@ -142,10 +142,11 @@ pub fn run_sleep_cycle(
                 };
                 total_train_loss += loss;
                 traces_replayed += 1;
-                episodic.replay_checkpoint += 1;
             }
             Err(e) => tracing::warn!(?e, "replay_step error — skipping trace"),
         }
+        // Always advance checkpoint, even on error, to avoid replaying a broken trace forever.
+        episodic.replay_checkpoint += 1;
 
         // Also train output heads during NREM using the stored episode vector (ADR 0010).
         // The stored episode_vec is a constant (untracked) so gradients flow only through

@@ -12,4 +12,6 @@ pub use episodic::EpisodicBuffer;
 pub use error::{MemoryError, MemoryResult};
 pub use recollection::RecollectionLayer;
 pub use semantic::SemanticStore;
-pub use snapshot::{load_region_sizes, load_snapshot, save_region_sizes, save_snapshot, weights_path};
+pub use snapshot::{
+    load_region_sizes, load_snapshot, save_region_sizes, save_snapshot, weights_path,
+};
