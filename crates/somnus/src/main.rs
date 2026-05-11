@@ -547,23 +547,31 @@ async fn main() -> Result<()> {
                     AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
                 };
                 match result {
-                    Ok(out) => record_episode(
-                        &out, &emb.timestamp,
-                        &mut sink, &mut episodic,
-                        args.top_k, &recall,
-                    ),
-                    Err(e)  => tracing::error!(?e, "perception error (audio)"),
+                    Ok(out) => {
+                        if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+                            match perception.wake_reconstruct_step(&ep.0, regional) {
+                                Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
+                                Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
+                            }
+                        }
+                        record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                    }
+                    Err(e) => tracing::error!(?e, "perception error (audio)"),
                 }
             }
             Some(emb) = video_emb_rx.recv() => {
                 pending_embs.fetch_sub(1, Ordering::Relaxed);
                 sink_write(&mut sink, &video_emb_json(&emb));
                 match perception.ingest_visual(&emb.values) {
-                    Ok(out) => record_episode(
-                        &out, &emb.timestamp,
-                        &mut sink, &mut episodic,
-                        args.top_k, &recall,
-                    ),
+                    Ok(out) => {
+                        if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+                            match perception.wake_reconstruct_step(&ep.0, regional) {
+                                Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
+                                Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
+                            }
+                        }
+                        record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                    }
                     Err(e) => tracing::error!(?e, "perception error (video)"),
                 }
             }

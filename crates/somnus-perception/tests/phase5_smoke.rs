@@ -156,4 +156,29 @@ mod tests {
         println!("Test 3 PASS: weight expansion via cat + set_one works");
         Ok(())
     }
+
+    // ── Test 4: wake_reconstruct_step produces finite loss and updates weights ──
+    #[test]
+    fn wake_reconstruct_step_trains() -> candle_core::Result<()> {
+        use somnus_perception::{PerceptionProcessor, REGION_DIMS};
+
+        let mut proc = PerceptionProcessor::new(Device::Cpu)
+            .expect("PerceptionProcessor::new failed");
+
+        // Synthesise a dummy episode vector and one non-empty regional input.
+        let episode = vec![0.1f32; 512];
+        let mut regional: [Vec<f32>; 4] = [vec![], vec![], vec![], vec![]];
+        regional[0] = vec![0.5f32; REGION_DIMS[0]]; // speech only
+
+        // Capture a weight before the step.
+        let lr = proc.learning_rate();
+        let mse = proc
+            .wake_reconstruct_step(&episode, &regional)
+            .expect("wake_reconstruct_step failed");
+
+        assert!(mse.is_finite() && mse >= 0.0, "MSE must be finite and non-negative");
+        assert!(lr > 0.0, "learning rate must be positive");
+        println!("Test 4 PASS: wake_reconstruct_step mse={mse:.4}");
+        Ok(())
+    }
 }

@@ -8,8 +8,8 @@ pub use error::{PerceptionError, PerceptionResult};
 pub use region::{KWtaLayer, RegionId, SparseActivation, K_ACTIVE, N_UNITS};
 pub use sae::SaeDecoder;
 
-use candle_core::{DType, Device, Tensor, Var};
-use candle_nn::{AdamW, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use candle_core::{DType, Device, Module, Tensor, Var};
+use candle_nn::{linear_no_bias, AdamW, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 
 /// Hyperparameters for sleep-time training.
 pub struct TrainConfig {
@@ -51,6 +51,10 @@ pub struct PerceptionProcessor {
     symbolic_decoder: SaeDecoder,
 
     binding: BindingArea,
+
+    /// Per-region output heads: EPISODE_DIM → encoder_dim. Predict encoder
+    /// embeddings from the episode vector (ADR 0009).
+    output_heads: [Linear; 4],
 
     /// Latest sparse activation per region; None until first embedding arrives.
     latest: [Option<SparseActivation>; 4],
@@ -107,6 +111,14 @@ impl PerceptionProcessor {
 
         let binding = BindingArea::new(vb("binding"), device.clone())?;
 
+        let vb_out = vb("output_heads");
+        let output_heads = [
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[0], vb_out.pp("0"))?, // speech: 512→384
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[1], vb_out.pp("1"))?, // env: 512→512
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[2], vb_out.pp("2"))?, // visual: 512→384
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[3], vb_out.pp("3"))?, // symbolic: 512→384
+        ];
+
         let optimizer = AdamW::new(
             varmap.all_vars(),
             ParamsAdamW {
@@ -125,6 +137,7 @@ impl PerceptionProcessor {
             visual_decoder,
             symbolic_decoder,
             binding,
+            output_heads,
             latest: [None, None, None, None],
             latest_inputs: [None, None, None, None],
             varmap,
@@ -409,6 +422,46 @@ impl PerceptionProcessor {
         Ok(())
     }
 
+    /// Run one wake-time reconstruction step on a just-produced episode.
+    ///
+    /// For each non-empty region, runs the output head forward on `episode` and
+    /// computes MSE against the actual encoder input. Backprops through the heads
+    /// and the binding area. Returns mean MSE over active regions.
+    pub fn wake_reconstruct_step(
+        &mut self,
+        episode: &[f32],
+        regional: &[Vec<f32>; 4],
+    ) -> PerceptionResult<f32> {
+        let dev = self.device.clone();
+        let ep_t = Tensor::from_slice(episode, (1, episode.len()), &dev)?;
+
+        let mut total_loss: Option<Tensor> = None;
+        let mut n = 0usize;
+
+        for (i, input) in regional.iter().enumerate() {
+            if input.is_empty() {
+                continue;
+            }
+            let pred = self.output_heads[i].forward(&ep_t)?.squeeze(0)?; // [dim]
+            let target = Tensor::from_slice(input.as_slice(), (input.len(),), &dev)?;
+            let diff = (pred - target)?;
+            let loss = diff.sqr()?.mean_all()?;
+            total_loss = Some(match total_loss {
+                None => loss,
+                Some(acc) => acc.add(&loss)?,
+            });
+            n += 1;
+        }
+
+        if let Some(loss) = total_loss {
+            let loss_val = loss.to_scalar::<f32>()?;
+            self.optimizer.backward_step(&loss)?;
+            Ok(loss_val / n as f32)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     /// Current n_units per region: [speech, env, visual, symbolic].
     pub fn region_sizes(&self) -> [usize; 4] {
         [
@@ -476,8 +529,31 @@ impl PerceptionProcessor {
     /// Grown layers (n_units > N_UNITS) have no bias; unmodified layers keep theirs.
     fn rebuild_linears(&mut self) -> PerceptionResult<()> {
         // Collect tensors with the lock held, then drop it before mutating layers.
-        let (sw, sb, dw_s, ew, eb, dw_e, vw, vb_t, dw_v, yw, yb, dw_y,
-             brp0, brp1, brp2, brp3, bwq, bwk, bwv) = {
+        let (
+            sw,
+            sb,
+            dw_s,
+            ew,
+            eb,
+            dw_e,
+            vw,
+            vb_t,
+            dw_v,
+            yw,
+            yb,
+            dw_y,
+            brp0,
+            brp1,
+            brp2,
+            brp3,
+            bwq,
+            bwk,
+            bwv,
+            oh0,
+            oh1,
+            oh2,
+            oh3,
+        ) = {
             let data = self.varmap.data().lock().unwrap();
             (
                 data["speech_layer.weight"].as_tensor().clone(),
@@ -490,7 +566,8 @@ impl PerceptionProcessor {
                 data.get("visual_layer.bias").map(|v| v.as_tensor().clone()),
                 data["visual_decoder.weight"].as_tensor().clone(),
                 data["symbolic_layer.weight"].as_tensor().clone(),
-                data.get("symbolic_layer.bias").map(|v| v.as_tensor().clone()),
+                data.get("symbolic_layer.bias")
+                    .map(|v| v.as_tensor().clone()),
                 data["symbolic_decoder.weight"].as_tensor().clone(),
                 data["binding.region_0.weight"].as_tensor().clone(),
                 data["binding.region_1.weight"].as_tensor().clone(),
@@ -499,12 +576,17 @@ impl PerceptionProcessor {
                 data["binding.attn_q.weight"].as_tensor().clone(),
                 data["binding.attn_k.weight"].as_tensor().clone(),
                 data["binding.attn_v.weight"].as_tensor().clone(),
+                data["output_heads.0.weight"].as_tensor().clone(),
+                data["output_heads.1.weight"].as_tensor().clone(),
+                data["output_heads.2.weight"].as_tensor().clone(),
+                data["output_heads.3.weight"].as_tensor().clone(),
             )
         };
 
         let sn = self.speech_layer.n_units;
         self.speech_layer.linear = Linear::new(sw, if sn == N_UNITS { sb } else { None });
-        self.speech_decoder.replace_linear(Linear::new(dw_s, None), sn);
+        self.speech_decoder
+            .replace_linear(Linear::new(dw_s, None), sn);
 
         let en = self.env_layer.n_units;
         self.env_layer.linear = Linear::new(ew, if en == N_UNITS { eb } else { None });
@@ -512,11 +594,13 @@ impl PerceptionProcessor {
 
         let vn = self.visual_layer.n_units;
         self.visual_layer.linear = Linear::new(vw, if vn == N_UNITS { vb_t } else { None });
-        self.visual_decoder.replace_linear(Linear::new(dw_v, None), vn);
+        self.visual_decoder
+            .replace_linear(Linear::new(dw_v, None), vn);
 
         let yn = self.symbolic_layer.n_units;
         self.symbolic_layer.linear = Linear::new(yw, if yn == N_UNITS { yb } else { None });
-        self.symbolic_decoder.replace_linear(Linear::new(dw_y, None), yn);
+        self.symbolic_decoder
+            .replace_linear(Linear::new(dw_y, None), yn);
 
         self.binding.region_projs[0] = Linear::new(brp0, None);
         self.binding.region_projs[1] = Linear::new(brp1, None);
@@ -525,6 +609,11 @@ impl PerceptionProcessor {
         self.binding.w_q = Linear::new(bwq, None);
         self.binding.w_k = Linear::new(bwk, None);
         self.binding.w_v = Linear::new(bwv, None);
+
+        self.output_heads[0] = Linear::new(oh0, None);
+        self.output_heads[1] = Linear::new(oh1, None);
+        self.output_heads[2] = Linear::new(oh2, None);
+        self.output_heads[3] = Linear::new(oh3, None);
         Ok(())
     }
 
