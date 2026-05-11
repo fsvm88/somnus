@@ -11,7 +11,9 @@ use std::{
 };
 
 use anyhow::Result;
-use somnus_memory::{save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, RecollectionLayer};
+use somnus_memory::{
+    save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, RecollectionLayer,
+};
 use somnus_perception::{PerceptionProcessor, RegionId};
 
 const DECAY_RATE: f32 = 1e-4;
@@ -20,6 +22,10 @@ const GROWTH_MIN_SAMPLES: usize = 16;
 const GROWTH_BATCH: usize = 64;
 /// Pending-embedding count above which sleep is considered interruptible by external salience.
 const SALIENCE_THRESHOLD: usize = 16;
+/// Mean warm-recall L2 above this threshold supplements the MSE growth signal.
+/// Only applied when warm had pre-spill entries (i.e., cross-cycle/cross-session data).
+/// Needs calibration once real distances are observed. 100.0 is a conservative starting point.
+const WARM_RECALL_GROWTH_THRESHOLD: f32 = 100.0;
 
 /// Neuromodulated learning rate schedule for NREM replay.
 ///
@@ -37,7 +43,11 @@ const LR_STAGNANT_SCALE: f64 = 0.25; // multiplier when loss has plateaued
 
 fn nrem_lr(step: usize, total: usize, loss_ewma: f32, prev_ewma: f32) -> f64 {
     // Cosine annealing: full cycle from LR_MAX → LR_MIN
-    let t = if total > 1 { step as f64 / (total - 1) as f64 } else { 1.0 };
+    let t = if total > 1 {
+        step as f64 / (total - 1) as f64
+    } else {
+        1.0
+    };
     let cosine = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + (std::f64::consts::PI * t).cos());
 
     // Loss-trend gate: scale down when improvement has stalled
@@ -61,9 +71,14 @@ fn nrem_lr(step: usize, total: usize, loss_ewma: f32, prev_ewma: f32) -> f64 {
 pub struct SleepStats {
     pub traces_replayed: usize,
     pub mean_train_loss: f32,
+    /// Mean MSE of output-head reconstruction during NREM replay (ADR 0010).
+    pub mean_output_mse: f32,
     pub per_region_mse: [f32; 4],
     pub regions_grown: Vec<RegionId>,
     pub was_interrupted: bool,
+    /// Mean L2 distance to nearest warm-memory neighbor during REM probe.
+    /// Some only when warm had pre-spill entries (cross-cycle/cross-session signal).
+    pub warm_recall_l2: Option<f32>,
 }
 
 /// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
@@ -81,21 +96,26 @@ pub fn run_sleep_cycle(
 
     let mut traces_replayed = 0usize;
     let mut total_train_loss = 0.0f32;
+    let mut total_output_mse = 0.0f32;
+    let mut output_mse_n = 0usize;
     let mut was_interrupted = false;
 
+    // Snapshot warm size before spill so REM can detect cross-cycle entries.
+    let pre_spill_warm_len = recall.warm.len();
+
     // ── NREM-like: replay + train ─────────────────────────────────────────────
-    // Collect traces into a snapshot so we don't borrow episodic mutably during training.
-    let traces: Vec<_> = episodic
+    // Collect (episode_vec, regional) snapshots; avoids borrowing episodic during training.
+    let traces: Vec<(Vec<f32>, [Vec<f32>; 4])> = episodic
         .iter_traces()
         .skip(episodic.replay_checkpoint)
-        .map(|t| t.regional.clone())
+        .map(|t| (t.record.values.clone(), t.regional.clone()))
         .collect();
 
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
 
-    for (step, regional) in traces.iter().enumerate() {
+    for (step, (episode_vec, regional)) in traces.iter().enumerate() {
         let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD;
         if interrupt.load(Ordering::Relaxed) || salient {
             if salient {
@@ -126,6 +146,17 @@ pub fn run_sleep_cycle(
             }
             Err(e) => tracing::warn!(?e, "replay_step error — skipping trace"),
         }
+
+        // Also train output heads during NREM using the stored episode vector (ADR 0010).
+        // The stored episode_vec is a constant (untracked) so gradients flow only through
+        // the output head weights, not the binding area or k-WTA layers.
+        match perception.wake_reconstruct_step(episode_vec, regional) {
+            Ok(mse) => {
+                total_output_mse += mse;
+                output_mse_n += 1;
+            }
+            Err(e) => tracing::warn!(?e, "output head replay error"),
+        }
     }
 
     // Restore base lr so grow_region's optimizer reset starts from a known point.
@@ -141,8 +172,18 @@ pub fn run_sleep_cycle(
     } else {
         0.0
     };
+    let mean_output_mse = if output_mse_n > 0 {
+        total_output_mse / output_mse_n as f32
+    } else {
+        0.0
+    };
 
-    tracing::info!(traces_replayed, mean_train_loss, "NREM replay complete");
+    tracing::info!(
+        traces_replayed,
+        mean_train_loss,
+        mean_output_mse,
+        "NREM replay complete"
+    );
 
     // ── Homeostatic downscaling ───────────────────────────────────────────────
     if !was_interrupted {
@@ -165,15 +206,21 @@ pub fn run_sleep_cycle(
         tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
     }
 
-    // ── REM-like: measure MSE, trigger growth ─────────────────────────────────
+    // ── REM-like: measure MSE + warm recall, trigger growth ──────────────────
     let mut per_region_mse = [0.0f32; 4];
     let mut per_region_count = [0usize; 4];
     let mut regions_grown: Vec<RegionId> = Vec::new();
+    let mut warm_recall_l2: Option<f32> = None;
 
     if !was_interrupted {
-        // Measure reconstruction quality without updating weights.
-        let traces_for_rem: Vec<_> = episodic.iter_traces().map(|t| t.regional.clone()).collect();
-        for regional in &traces_for_rem {
+        // Collect (episode_vec, regional) — same shape as NREM traces.
+        let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 4])> = episodic
+            .iter_traces()
+            .map(|t| (t.record.values.clone(), t.regional.clone()))
+            .collect();
+
+        // Measure SAE reconstruction quality without updating weights.
+        for (_, regional) in &traces_for_rem {
             match perception.measure_mse(regional) {
                 Ok(mse) => {
                     for i in 0..4 {
@@ -193,7 +240,29 @@ pub fn run_sleep_cycle(
             }
         }
 
-        // Growth: flagged regions exceed threshold with sufficient samples.
+        // Warm recall probe: query warm memory with each episode vector (ADR 0010 item 3).
+        // Only meaningful when warm had entries from a prior cycle before this spill.
+        // Self-distances from same-cycle records are near-zero and uninformative.
+        if pre_spill_warm_len > 0 {
+            let mut total_l2 = 0.0f32;
+            let mut n_probed = 0usize;
+            for (ep_vec, _) in &traces_for_rem {
+                if let Some(&(dist, _)) = recall.warm.query_with_dist(ep_vec, 1).first() {
+                    total_l2 += dist;
+                    n_probed += 1;
+                }
+            }
+            if n_probed > 0 {
+                let mean_l2 = total_l2 / n_probed as f32;
+                warm_recall_l2 = Some(mean_l2);
+                tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
+            }
+        }
+
+        // Growth: SAE MSE above threshold with sufficient samples.
+        // When cross-cycle warm data is available, also require poor warm recall
+        // to avoid growing when the model already recognises these patterns.
+        let warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
         let region_ids = [
             RegionId::AudioSpeech,
             RegionId::AudioEnv,
@@ -201,7 +270,10 @@ pub fn run_sleep_cycle(
             RegionId::Symbolic,
         ];
         for (i, &region) in region_ids.iter().enumerate() {
-            if per_region_count[i] >= GROWTH_MIN_SAMPLES && per_region_mse[i] > GROWTH_THRESHOLD {
+            if per_region_count[i] >= GROWTH_MIN_SAMPLES
+                && per_region_mse[i] > GROWTH_THRESHOLD
+                && warm_recall_poor
+            {
                 tracing::info!(
                     region = ?region,
                     mse = per_region_mse[i],
@@ -219,6 +291,7 @@ pub fn run_sleep_cycle(
             env_mse = per_region_mse[1],
             visual_mse = per_region_mse[2],
             symbolic_mse = per_region_mse[3],
+            warm_recall_l2 = ?warm_recall_l2,
             "REM self-probe complete"
         );
     }
@@ -249,8 +322,10 @@ pub fn run_sleep_cycle(
     Ok(SleepStats {
         traces_replayed,
         mean_train_loss,
+        mean_output_mse,
         per_region_mse,
         regions_grown,
         was_interrupted,
+        warm_recall_l2,
     })
 }

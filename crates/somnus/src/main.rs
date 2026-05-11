@@ -539,6 +539,8 @@ async fn main() -> Result<()> {
                 Ok(stats) => info!(
                     traces_replayed = stats.traces_replayed,
                     mean_loss = stats.mean_train_loss,
+                    mean_output_mse = stats.mean_output_mse,
+                    warm_recall_l2 = ?stats.warm_recall_l2,
                     interrupted = stats.was_interrupted,
                     "sleep cycle complete"
                 ),
