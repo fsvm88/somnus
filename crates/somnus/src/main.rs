@@ -73,6 +73,16 @@ struct Args {
     /// output_mse has converged; random heads inject noise if enabled too early.
     #[arg(long, default_value = "0.0")]
     prior_beta: f32,
+
+    /// Number of settling iterations per episode (0 = disabled). Enable only
+    /// after output_mse has converged; random heads distort settling inputs (ADR 0011).
+    #[arg(long, default_value = "0")]
+    settle_steps: usize,
+
+    /// Settling blend weight β: fraction of output-head prediction mixed into
+    /// settling inputs. 0.0 = raw only (no-op loop); 1.0 = pure prediction.
+    #[arg(long, default_value = "0.5")]
+    settle_beta: f32,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -272,8 +282,12 @@ async fn main() -> Result<()> {
         Err(e) => anyhow::bail!("perception processor init failed: {e}"),
     };
     perception.set_prior_beta(args.prior_beta);
+    perception.set_settle_steps(args.settle_steps);
+    perception.set_settle_beta(args.settle_beta);
     info!(
         prior_beta = args.prior_beta,
+        settle_steps = args.settle_steps,
+        settle_beta = args.settle_beta,
         "perception processor initialised (n=1024, k=20, cpu)"
     );
 
@@ -285,9 +299,11 @@ async fn main() -> Result<()> {
     };
 
     // Restore from snapshot if available; otherwise start fresh.
+    let mut snapshot_found = false;
     let (mut episodic, semantic) =
         match load_snapshot(&args.memory_dir, args.episodic_capacity, EPISODE_DIM) {
             Ok(Some((ep, sem))) => {
+                snapshot_found = true;
                 info!(
                     episodic_len = ep.len(),
                     semantic_len = sem.len(),
@@ -321,6 +337,14 @@ async fn main() -> Result<()> {
                 )
             }
         };
+
+    if args.settle_steps > 0 && !snapshot_found {
+        tracing::warn!(
+            settle_steps = args.settle_steps,
+            "settling active but no prior snapshot — output heads are random; \
+             settle noise expected until output_mse converges"
+        );
+    }
 
     let mut recall = RecollectionLayer::new(semantic, cold);
     info!(

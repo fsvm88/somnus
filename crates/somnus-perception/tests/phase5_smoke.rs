@@ -186,6 +186,46 @@ mod tests {
         Ok(())
     }
 
+    // ── Test 6: settling loop — runs without error, returns finite episode ────────
+    #[test]
+    fn settling_loop_produces_finite_episode() -> candle_core::Result<()> {
+        use somnus_perception::{PerceptionProcessor, REGION_DIMS};
+
+        let mut proc =
+            PerceptionProcessor::new(Device::Cpu).expect("PerceptionProcessor::new failed");
+        proc.set_settle_steps(3);
+        proc.set_settle_beta(0.5);
+
+        // Ingest enough regions to trigger binding (all four must have activations).
+        let speech_v: Vec<f32> = (0..REGION_DIMS[0])
+            .map(|i| i as f32 / REGION_DIMS[0] as f32)
+            .collect();
+        let env_v: Vec<f32> = (0..REGION_DIMS[1])
+            .map(|i| i as f32 / REGION_DIMS[1] as f32)
+            .collect();
+        let visual_v: Vec<f32> = (0..REGION_DIMS[2])
+            .map(|i| i as f32 / REGION_DIMS[2] as f32)
+            .collect();
+
+        // Ingest all three encoder types — speech also populates the symbolic region.
+        let out_s = proc.ingest_speech(&speech_v).expect("ingest_speech failed");
+        let out_e = proc.ingest_env(&env_v).expect("ingest_env failed");
+        let out_v = proc.ingest_visual(&visual_v).expect("ingest_visual failed");
+
+        let episode = out_s
+            .episode
+            .or(out_e.episode)
+            .or(out_v.episode)
+            .expect("expected an episode after all regions populated");
+        assert_eq!(episode.0.len(), 512, "episode must be EPISODE_DIM=512");
+        assert!(
+            episode.0.iter().all(|v| v.is_finite()),
+            "settled episode contains non-finite values"
+        );
+        println!("Test 6 PASS: settling loop produced a finite 512-dim episode");
+        Ok(())
+    }
+
     // ── Test 5: top-down priors — blend applied and prior updated after episode ─
     #[test]
     fn top_down_prior_applied() -> candle_core::Result<()> {

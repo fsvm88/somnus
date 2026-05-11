@@ -25,6 +25,10 @@ impl Default for TrainConfig {
 /// Per-region input dimensions (encoder output sizes).
 pub const REGION_DIMS: [usize; 4] = [384, 512, 384, 384];
 
+/// L2 delta below which the settling loop is considered converged (ADR 0011).
+/// Needs calibration once real episode vector magnitudes are observed.
+const SETTLE_EPS: f32 = 1.0;
+
 /// Reconstruction errors for each region updated in a single `ingest_*` call.
 pub struct PerceptionOutput {
     /// Reconstruction errors for regions updated this call (region, MSE).
@@ -67,6 +71,11 @@ pub struct PerceptionProcessor {
     latest: [Option<SparseActivation>; 4],
     /// Latest raw encoder input per region; None until first embedding arrives.
     latest_inputs: [Option<Vec<f32>>; 4],
+
+    /// Max settling iterations per episode (ADR 0011). 0 = disabled.
+    settle_steps: usize,
+    /// Fraction of output-head prediction blended into settling inputs (ADR 0011).
+    settle_beta: f32,
 
     /// Holds all trainable parameters; needed for optimizer, save, and load.
     varmap: VarMap,
@@ -149,6 +158,8 @@ impl PerceptionProcessor {
             prior_beta: 0.0,
             latest: [None, None, None, None],
             latest_inputs: [None, None, None, None],
+            settle_steps: 0,
+            settle_beta: 0.5,
             varmap,
             optimizer,
             device,
@@ -184,9 +195,18 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::Symbolic.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        if let Some(ref ep) = episode {
-            self.update_prior_predictions(&ep.0)?;
-        }
+        let episode = if let Some(ep) = episode {
+            let refined = if self.settle_steps > 0 {
+                let (r, _) = self.settle_episode(&ep)?;
+                r
+            } else {
+                ep
+            };
+            self.update_prior_predictions(&refined.0)?;
+            Some(refined)
+        } else {
+            None
+        };
         Ok(PerceptionOutput {
             recon_errors: vec![
                 (RegionId::AudioSpeech, speech_err),
@@ -209,9 +229,18 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        if let Some(ref ep) = episode {
-            self.update_prior_predictions(&ep.0)?;
-        }
+        let episode = if let Some(ep) = episode {
+            let refined = if self.settle_steps > 0 {
+                let (r, _) = self.settle_episode(&ep)?;
+                r
+            } else {
+                ep
+            };
+            self.update_prior_predictions(&refined.0)?;
+            Some(refined)
+        } else {
+            None
+        };
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::AudioEnv, err)],
             episode,
@@ -231,9 +260,18 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        if let Some(ref ep) = episode {
-            self.update_prior_predictions(&ep.0)?;
-        }
+        let episode = if let Some(ep) = episode {
+            let refined = if self.settle_steps > 0 {
+                let (r, _) = self.settle_episode(&ep)?;
+                r
+            } else {
+                ep
+            };
+            self.update_prior_predictions(&refined.0)?;
+            Some(refined)
+        } else {
+            None
+        };
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::Visual, err)],
             episode,
@@ -503,6 +541,87 @@ impl PerceptionProcessor {
     /// Set the prior blend weight β. 0.0 disables prior injection (default).
     pub fn set_prior_beta(&mut self, beta: f32) {
         self.prior_beta = beta;
+    }
+
+    /// Set the number of settling iterations per episode (ADR 0011). 0 = disabled.
+    pub fn set_settle_steps(&mut self, steps: usize) {
+        self.settle_steps = steps;
+    }
+
+    /// Set the settle blend weight β (fraction of output-head prediction vs. raw input).
+    pub fn set_settle_beta(&mut self, beta: f32) {
+        self.settle_beta = beta;
+    }
+
+    /// Iteratively refine an episode by cycling output-head predictions back through
+    /// the k-WTA layers (without updating duty cycles) and re-binding (ADR 0011).
+    ///
+    /// Returns the refined episode and the number of iterations actually run.
+    fn settle_episode(&self, ep: &EpisodeVector) -> PerceptionResult<(EpisodeVector, usize)> {
+        let dev = &self.device;
+        let mut current = ep.clone();
+
+        for iter in 0..self.settle_steps {
+            let cur_t = Tensor::from_slice(&current.0, (1, current.0.len()), dev)?;
+
+            // Generate per-region predictions from the current episode (no grad needed).
+            let mut preds: [Vec<f32>; 4] = [vec![], vec![], vec![], vec![]];
+            for (i, pred) in preds.iter_mut().enumerate() {
+                *pred = self.output_heads[i]
+                    .forward(&cur_t)?
+                    .squeeze(0)?
+                    .to_vec1()?;
+            }
+
+            // Blend each prediction with the raw encoder input, then run k-WTA (no DC update).
+            let mut acts: [Option<SparseActivation>; 4] = [None, None, None, None];
+            for i in 0..4 {
+                if let Some(raw) = &self.latest_inputs[i] {
+                    let blended: Vec<f32> = raw
+                        .iter()
+                        .zip(&preds[i])
+                        .map(|(&r, &p)| (1.0 - self.settle_beta) * r + self.settle_beta * p)
+                        .collect();
+                    acts[i] = Some(self.layer_forward_settling(i, &blended)?);
+                }
+            }
+
+            let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
+                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                _ => break, // not all regions present — can't rebind
+            };
+
+            let refined = self.binding.forward(&[a0, a1, a2, a3])?;
+            let delta: f32 = current
+                .0
+                .iter()
+                .zip(&refined.0)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            tracing::info!(iter, delta, "settle delta");
+            let converged = delta < SETTLE_EPS;
+            current = refined;
+            if converged {
+                return Ok((current, iter + 1));
+            }
+        }
+
+        Ok((current, self.settle_steps))
+    }
+
+    fn layer_forward_settling(
+        &self,
+        idx: usize,
+        input: &[f32],
+    ) -> PerceptionResult<SparseActivation> {
+        match idx {
+            0 => self.speech_layer.forward_no_dc(input),
+            1 => self.env_layer.forward_no_dc(input),
+            2 => self.visual_layer.forward_no_dc(input),
+            3 => self.symbolic_layer.forward_no_dc(input),
+            _ => unreachable!(),
+        }
     }
 
     /// Blend `values` with the stored prior prediction for `idx` if β > 0 and

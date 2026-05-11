@@ -96,6 +96,17 @@ impl KWtaLayer {
         self.select_top_k(z_vec)
     }
 
+    /// Forward pass without updating the duty-cycle moving average.
+    ///
+    /// Use during settling iterations so that multiple passes per encoder input
+    /// do not inflate the effective duty-cycle learning rate (ADR 0011).
+    pub fn forward_no_dc(&self, input: &[f32]) -> PerceptionResult<SparseActivation> {
+        let t = Tensor::from_vec(input.to_vec(), (1, input.len()), &self.device)?;
+        let z = self.linear.forward(&t)?.squeeze(0)?;
+        let z_vec: Vec<f32> = z.to_vec1()?;
+        self.select_top_k_no_dc(z_vec)
+    }
+
     /// Forward pass that also returns the intermediate tracked tensor `z` for backprop.
     /// Returns `(activation, z_tensor)` where z_tensor has shape `[n_units]`.
     pub fn forward_tracked(
@@ -136,6 +147,30 @@ impl KWtaLayer {
                 (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
         }
 
+        Ok(SparseActivation {
+            region: self.region,
+            indices: pairs.iter().map(|(i, _)| *i).collect(),
+            values: pairs.iter().map(|(_, v)| *v).collect(),
+            n_units: n,
+        })
+    }
+
+    /// Same selection logic as `select_top_k` but does not update duty cycles.
+    fn select_top_k_no_dc(&self, z_vec: Vec<f32>) -> PerceptionResult<SparseActivation> {
+        let n = self.n_units;
+        let target_dc = K_ACTIVE as f32 / n as f32;
+        let mut boosted = z_vec.clone();
+        for (i, dc) in self.duty_cycle.iter().enumerate() {
+            boosted[i] += BOOST_STRENGTH * (target_dc - dc);
+        }
+        let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
+        let split = n - K_ACTIVE;
+        indexed.select_nth_unstable_by(split, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let top_k = &indexed[split..];
+        let mut pairs: Vec<(u16, f32)> = top_k.iter().map(|&(i, _)| (i as u16, z_vec[i])).collect();
+        pairs.sort_unstable_by_key(|(i, _)| *i);
         Ok(SparseActivation {
             region: self.region,
             indices: pairs.iter().map(|(i, _)| *i).collect(),
