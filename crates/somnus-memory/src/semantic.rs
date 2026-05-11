@@ -53,6 +53,16 @@ impl SemanticStore {
             .collect()
     }
 
+    /// Like `query` but also returns the L2 distance for each result.
+    pub fn query_with_dist(&self, cue: &[f32], k: usize) -> Vec<(f32, &EpisodeRecord)> {
+        debug_assert_eq!(cue.len(), self.dim);
+        let neighbours = self.index.search(cue, k, SEARCH_EF);
+        neighbours
+            .iter()
+            .filter_map(|n| self.records.get(&n.d_id).map(|r| (n.distance, r)))
+            .collect()
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }

@@ -287,8 +287,8 @@ async fn main() -> Result<()> {
                 // Restore perception weights; pre-grow regions if they grew last session.
                 let w_path = weights_path(&args.memory_dir);
                 if w_path.exists() {
-                    let sizes = load_region_sizes(&args.memory_dir)
-                        .unwrap_or([somnus_perception::N_UNITS; 4]);
+                    let sizes =
+                        load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 4]);
                     if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
                         tracing::warn!(?e, "weight restore failed — starting with fresh weights");
                     } else {
@@ -602,9 +602,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// ── recollection constants ────────────────────────────────────────────────────
+
+/// Blend weight for the retrieved episode: `α*retrieved + (1-α)*current`.
+/// 0.1 means recalled memory contributes 10% to the stored episode.
+/// Intentional feedback loop: recall shapes future recall (memory-of-memory).
+const RECALL_BLEND_ALPHA: f32 = 0.1;
+
+/// L2 distance below which we blend the retrieved episode into the current one.
+/// Needs calibration once real distances are observed in logs. Start generous.
+const RECALL_BLEND_THRESHOLD: f32 = 50.0;
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Push an episode into the hot buffer (without touching warm tier — sleep does that).
+/// Queries warm memory first; blends the top-1 retrieved vector into the stored
+/// episode when it is within RECALL_BLEND_THRESHOLD (L2).
 fn record_episode(
     out: &somnus_perception::PerceptionOutput,
     ts: &Timestamp,
@@ -618,31 +631,51 @@ fn record_episode(
     }
     if let Some(ep) = &out.episode {
         let ts_secs = wall_secs(&ts.wall);
-        tracing::info!(dim = ep.0.len(), "episode vector");
 
         let regional = out
             .regional_inputs
             .clone()
             .unwrap_or([vec![], vec![], vec![], vec![]]);
 
-        let id = episodic.push(ts_secs, ep.0.clone(), regional);
-
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let neighbours = recall.query_warm(&ep.0, top_k);
-            tracing::debug!(
-                episode_id = id,
+        // Recollection: find similar past episodes from warm memory.
+        let neighbours = recall.query_warm_with_dist(&ep.0, top_k);
+        let (episode_vec, blended) = if let Some(&(dist, rec)) = neighbours.first() {
+            tracing::info!(
+                top1_id = rec.id,
+                top1_timestamp_secs = rec.timestamp_secs,
+                l2_dist = dist,
                 retrieved = neighbours.len(),
-                top1_id = neighbours.first().map(|r| r.id),
-                "memory retrieval"
+                "recollection"
             );
-        }
+            if dist < RECALL_BLEND_THRESHOLD {
+                let v: Vec<f32> = ep
+                    .0
+                    .iter()
+                    .zip(rec.values.iter())
+                    .map(|(&cur, &ret)| (1.0 - RECALL_BLEND_ALPHA) * cur + RECALL_BLEND_ALPHA * ret)
+                    .collect();
+                (v, true)
+            } else {
+                (ep.0.clone(), false)
+            }
+        } else {
+            (ep.0.clone(), false)
+        };
+
+        let id = episodic.push(ts_secs, episode_vec.clone(), regional);
+        tracing::info!(
+            dim = episode_vec.len(),
+            episode_id = id,
+            blended,
+            "episode vector"
+        );
 
         let line = serde_json::json!({
             "type":           "episode",
             "id":             id,
             "timestamp_secs": ts_secs,
-            "dim":            ep.0.len(),
-            "values":         ep.0,
+            "dim":            episode_vec.len(),
+            "values":         episode_vec,
         })
         .to_string();
         sink_write(sink, &line);

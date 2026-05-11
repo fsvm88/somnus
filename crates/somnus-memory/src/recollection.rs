@@ -18,6 +18,11 @@ impl RecollectionLayer {
         self.warm.query(cue, k)
     }
 
+    /// Like `query_warm` but also returns L2 distance for each result.
+    pub fn query_warm_with_dist(&self, cue: &[f32], k: usize) -> Vec<(f32, &EpisodeRecord)> {
+        self.warm.query_with_dist(cue, k)
+    }
+
     /// Locate a cold record by id and insert it into warm semantic memory.
     ///
     /// Linear scan over the cold archive — acceptable for Phase 5 (cold len < 10k).
