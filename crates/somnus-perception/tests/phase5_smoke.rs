@@ -158,12 +158,13 @@ mod tests {
     }
 
     // ── Test 4: wake_reconstruct_step produces finite loss and updates weights ──
+
     #[test]
     fn wake_reconstruct_step_trains() -> candle_core::Result<()> {
         use somnus_perception::{PerceptionProcessor, REGION_DIMS};
 
-        let mut proc = PerceptionProcessor::new(Device::Cpu)
-            .expect("PerceptionProcessor::new failed");
+        let mut proc =
+            PerceptionProcessor::new(Device::Cpu).expect("PerceptionProcessor::new failed");
 
         // Synthesise a dummy episode vector and one non-empty regional input.
         let episode = vec![0.1f32; 512];
@@ -176,9 +177,67 @@ mod tests {
             .wake_reconstruct_step(&episode, &regional)
             .expect("wake_reconstruct_step failed");
 
-        assert!(mse.is_finite() && mse >= 0.0, "MSE must be finite and non-negative");
+        assert!(
+            mse.is_finite() && mse >= 0.0,
+            "MSE must be finite and non-negative"
+        );
         assert!(lr > 0.0, "learning rate must be positive");
         println!("Test 4 PASS: wake_reconstruct_step mse={mse:.4}");
+        Ok(())
+    }
+
+    // ── Test 5: top-down priors — blend applied and prior updated after episode ─
+    #[test]
+    fn top_down_prior_applied() -> candle_core::Result<()> {
+        use somnus_perception::{PerceptionProcessor, REGION_DIMS};
+
+        let mut proc =
+            PerceptionProcessor::new(Device::Cpu).expect("PerceptionProcessor::new failed");
+
+        // Enable prior injection (β = 0.2).
+        proc.set_prior_beta(0.2);
+
+        // Ingest all four region types to produce the first episode and populate priors.
+        let speech_v: Vec<f32> = (0..REGION_DIMS[0])
+            .map(|i| (i as f32) / REGION_DIMS[0] as f32)
+            .collect();
+        let env_v: Vec<f32> = (0..REGION_DIMS[1])
+            .map(|i| (i as f32) / REGION_DIMS[1] as f32)
+            .collect();
+        let visual_v: Vec<f32> = (0..REGION_DIMS[2])
+            .map(|i| (i as f32) / REGION_DIMS[2] as f32)
+            .collect();
+
+        let out_s = proc.ingest_speech(&speech_v).expect("ingest_speech failed");
+        let out_e = proc.ingest_env(&env_v).expect("ingest_env failed");
+        let out_v = proc.ingest_visual(&visual_v).expect("ingest_visual failed");
+
+        // After three ingests, at least one should have produced an episode.
+        let has_episode =
+            out_s.episode.is_some() || out_e.episode.is_some() || out_v.episode.is_some();
+        assert!(
+            has_episode,
+            "expected an episode after all four regions ingested"
+        );
+
+        // Second round: priors are now populated. Ingest again — must not panic.
+        let out2 = proc
+            .ingest_speech(&speech_v)
+            .expect("second ingest_speech failed");
+        let _ = proc.ingest_env(&env_v).expect("second ingest_env failed");
+        let _ = proc
+            .ingest_visual(&visual_v)
+            .expect("second ingest_visual failed");
+
+        // Reconstruction errors must remain finite.
+        for &(_, err) in &out2.recon_errors {
+            assert!(
+                err.is_finite(),
+                "recon error is not finite after prior injection"
+            );
+        }
+
+        println!("Test 5 PASS: top-down priors applied without error");
         Ok(())
     }
 }

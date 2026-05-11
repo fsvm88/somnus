@@ -68,6 +68,11 @@ struct Args {
     /// Maximum wake duration in seconds before a sleep cycle is forced.
     #[arg(long, default_value = "600")]
     max_wake_secs: u64,
+
+    /// Top-down prior blend weight β (0.0 = disabled). Enable only after
+    /// output_mse has converged; random heads inject noise if enabled too early.
+    #[arg(long, default_value = "0.0")]
+    prior_beta: f32,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -266,7 +271,11 @@ async fn main() -> Result<()> {
         Ok(p) => p,
         Err(e) => anyhow::bail!("perception processor init failed: {e}"),
     };
-    info!("perception processor initialised (n=1024, k=20, cpu)");
+    perception.set_prior_beta(args.prior_beta);
+    info!(
+        prior_beta = args.prior_beta,
+        "perception processor initialised (n=1024, k=20, cpu)"
+    );
 
     // ── memory hierarchy ──────────────────────────────────────────────────────
     std::fs::create_dir_all(&args.memory_dir)?;

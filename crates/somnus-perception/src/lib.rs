@@ -53,8 +53,15 @@ pub struct PerceptionProcessor {
     binding: BindingArea,
 
     /// Per-region output heads: EPISODE_DIM → encoder_dim. Predict encoder
-    /// embeddings from the episode vector (ADR 0009).
+    /// embeddings from the episode vector (ADR 0009). Also serve as the
+    /// top-down feedback path (ADR 0010).
     output_heads: [Linear; 4],
+
+    /// Predicted encoder embeddings from the previous episode (ADR 0010).
+    /// None until the first episode is produced. Updated after every episode.
+    prior_predictions: [Option<Vec<f32>>; 4],
+    /// Blend weight β for top-down prior injection. 0.0 = disabled (default).
+    prior_beta: f32,
 
     /// Latest sparse activation per region; None until first embedding arrives.
     latest: [Option<SparseActivation>; 4],
@@ -138,6 +145,8 @@ impl PerceptionProcessor {
             symbolic_decoder,
             binding,
             output_heads,
+            prior_predictions: [None, None, None, None],
+            prior_beta: 0.0,
             latest: [None, None, None, None],
             latest_inputs: [None, None, None, None],
             varmap,
@@ -149,8 +158,17 @@ impl PerceptionProcessor {
     /// Ingest a 384-dim Whisper speech embedding.
     /// Updates AudioSpeech and Symbolic regions (same input, independent weights).
     pub fn ingest_speech(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let speech_act = self.speech_layer.forward(values)?;
-        let symbolic_act = self.symbolic_layer.forward(values)?;
+        let (speech_input, speech_cos) = self.blend_with_prior(values, 0);
+        let (symbolic_input, symbolic_cos) = self.blend_with_prior(values, 3);
+        if let Some(c) = speech_cos {
+            tracing::info!(region = "speech", prior_cosine = c, "top-down prior");
+        }
+        if let Some(c) = symbolic_cos {
+            tracing::info!(region = "symbolic", prior_cosine = c, "top-down prior");
+        }
+
+        let speech_act = self.speech_layer.forward(&speech_input)?;
+        let symbolic_act = self.symbolic_layer.forward(&symbolic_input)?;
 
         let speech_err = self
             .speech_decoder
@@ -161,10 +179,14 @@ impl PerceptionProcessor {
 
         self.latest[RegionId::AudioSpeech.as_index()] = Some(speech_act);
         self.latest[RegionId::Symbolic.as_index()] = Some(symbolic_act);
+        // Store raw encoder inputs; training targets must be unbiased (ADR 0010).
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
         self.latest_inputs[RegionId::Symbolic.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
+        if let Some(ref ep) = episode {
+            self.update_prior_predictions(&ep.0)?;
+        }
         Ok(PerceptionOutput {
             recon_errors: vec![
                 (RegionId::AudioSpeech, speech_err),
@@ -177,12 +199,19 @@ impl PerceptionProcessor {
 
     /// Ingest a 512-dim CLAP env embedding.
     pub fn ingest_env(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let act = self.env_layer.forward(values)?;
+        let (input, cosine) = self.blend_with_prior(values, 1);
+        if let Some(c) = cosine {
+            tracing::info!(region = "env", prior_cosine = c, "top-down prior");
+        }
+        let act = self.env_layer.forward(&input)?;
         let err = self.env_decoder.reconstruction_error(values, &act)?;
         self.latest[RegionId::AudioEnv.as_index()] = Some(act);
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
+        if let Some(ref ep) = episode {
+            self.update_prior_predictions(&ep.0)?;
+        }
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::AudioEnv, err)],
             episode,
@@ -192,12 +221,19 @@ impl PerceptionProcessor {
 
     /// Ingest a 384-dim DINOv2 visual embedding.
     pub fn ingest_visual(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let act = self.visual_layer.forward(values)?;
+        let (input, cosine) = self.blend_with_prior(values, 2);
+        if let Some(c) = cosine {
+            tracing::info!(region = "visual", prior_cosine = c, "top-down prior");
+        }
+        let act = self.visual_layer.forward(&input)?;
         let err = self.visual_decoder.reconstruction_error(values, &act)?;
         self.latest[RegionId::Visual.as_index()] = Some(act);
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
+        if let Some(ref ep) = episode {
+            self.update_prior_predictions(&ep.0)?;
+        }
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::Visual, err)],
             episode,
@@ -460,6 +496,58 @@ impl PerceptionProcessor {
         } else {
             Ok(0.0)
         }
+    }
+
+    // ── Top-down prior helpers (ADR 0010) ───────────────────────────────────────
+
+    /// Set the prior blend weight β. 0.0 disables prior injection (default).
+    pub fn set_prior_beta(&mut self, beta: f32) {
+        self.prior_beta = beta;
+    }
+
+    /// Blend `values` with the stored prior prediction for `idx` if β > 0 and
+    /// a prior exists. Returns the (possibly biased) input and the cosine
+    /// similarity between raw and prior (Some only when a prior was applied).
+    fn blend_with_prior(&self, values: &[f32], idx: usize) -> (Vec<f32>, Option<f32>) {
+        if self.prior_beta <= 0.0 {
+            return (values.to_vec(), None);
+        }
+        match &self.prior_predictions[idx] {
+            None => (values.to_vec(), None),
+            Some(prior) => {
+                let cosine = Self::cosine_sim(values, prior);
+                let beta = self.prior_beta;
+                let blended = values
+                    .iter()
+                    .zip(prior)
+                    .map(|(&r, &p)| (1.0 - beta) * r + beta * p)
+                    .collect();
+                (blended, Some(cosine))
+            }
+        }
+    }
+
+    fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na < 1e-9 || nb < 1e-9 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    }
+
+    /// Run the four output heads on `episode` in inference mode and store the
+    /// predictions as the priors for the next ingest call.
+    fn update_prior_predictions(&mut self, episode: &[f32]) -> PerceptionResult<()> {
+        let dev = self.device.clone();
+        let ep_t = Tensor::from_slice(episode, (1, episode.len()), &dev)?;
+        for i in 0..4 {
+            let pred_vec: Vec<f32> = self.output_heads[i].forward(&ep_t)?.squeeze(0)?.to_vec1()?;
+            self.prior_predictions[i] = Some(pred_vec);
+        }
+        Ok(())
     }
 
     /// Current n_units per region: [speech, env, visual, symbolic].
