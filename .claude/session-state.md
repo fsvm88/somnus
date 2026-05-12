@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-12
-> **Last commit on main:** 4ac3475 — *Implement ADR 0012: action decoder (region-token projection + Qwen2.5-0.5B)*
+> **Last commit on main:** 695c8fb — *ADR 0012 smoke test: fix dtype mismatch, tracing, lossless forwarding, query drain*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -112,8 +112,16 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 **Also done (2026-05-12):**
 - Action loop designed and documented (ADR 0012): region-token projection (linear 512→4×LM_HIDDEN) + frozen Qwen2.5-0.5B. Dual function: (a) per-episode LLM self-attention over 4 region tokens → per-region gain multipliers applied to k-WTA inputs of next episode; (b) full autoregressive decode on stdin query → stdout JSON. Text-bypass targets stored on EpisodeRecord train the projection during NREM (separate LR 1e-4, not subject to neuromodulation schedule). Architecture doc and decisions README updated.
 
+**Also done (2026-05-12):**
+- ADR 0012 end-to-end verified. Fixed four issues found during smoke test:
+  - Qwen2.5-0.5B must be exported with `torch_dtype=float32` (bf16 default causes ORT dtype mismatch)
+  - tracing subscriber redirected to stderr (was corrupting stdout JSON)
+  - File sources use blocking `forward_frames_blocking` (prevents Whisper buffer starvation under CPU load)
+  - Pre-sleep query drain via `try_recv()` loop at top of main loop (prevents query starvation when episodes accumulate rapidly)
+- Observed: query → ~2.4s inference → 25-token JSON response; output is repetitive (expected — projection is randomly initialized, no training yet)
+- Gain updates fire per-episode with varied values in [0.5, 2.0] range across 4 regions ✓
+
 **Next (queued):**
-- Export Qwen2.5-0.5B: run `scripts/export_models.py` to generate `qwen25_lm.onnx`, `qwen25_embed_table.safetensors`, `qwen25_tokenizer.json` in `models/`. Then test end-to-end with `--action` flag: verify gain logs appear, query via stdin produces JSON response.
 - Calibration targets: `RECALL_BLEND_THRESHOLD=50.0`, `prior_beta`, `settle_beta`, `WARM_RECALL_GROWTH_THRESHOLD=100.0` — all need multi-session runs.
 - Remaining Phase 6+ items: sample-level audio mixing, language as additional modality.
 
