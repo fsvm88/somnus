@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-11
-> **Last commit on main:** e4fbf1c — *Fix pending_embs underflow + replay_checkpoint on error*
+> **Last updated:** 2026-05-12
+> **Last commit on main:** (pending) — *ADR 0012: action loop — region-token decoder + gain modulation*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -106,8 +106,14 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `pending_embs.fetch_sub()` could underflow to `usize::MAX` when sleep resets the counter to 0 mid-flight. Both consume sites (audio + video arms in `main.rs`) now use `fetch_update` + `saturating_sub(1)`.
   - `replay_checkpoint` in the NREM loop only advanced inside the `Ok` arm. A broken trace would be retried on every sleep restart. Moved increment outside the match so errored traces are always skipped.
 
+**Also done (2026-05-11):**
+- Predictive-coding settling loop (ADR 0011): `KWtaLayer::forward_no_dc` skips duty-cycle update; `settle_episode` iterates up to `settle_steps` times — runs output heads on current episode, blends predictions with raw inputs via `settle_beta`, re-runs k-WTA (no DC update), rebinds, logs L2 delta at INFO, stops when delta < SETTLE_EPS=1.0 or steps exhausted. All three `ingest_*` methods call it when episode is produced. `set_settle_steps` / `set_settle_beta` public setters. `--settle-steps` / `--settle-beta` CLI args (defaults 0 / 0.5). Startup WARN when settle_steps > 0 and no snapshot found. 54 tests pass.
+
+**Also done (2026-05-12):**
+- Action loop designed and documented (ADR 0012): region-token projection (linear 512→4×LM_HIDDEN) + frozen Qwen2.5-0.5B. Dual function: (a) per-episode LLM self-attention over 4 region tokens → per-region gain multipliers applied to k-WTA inputs of next episode; (b) full autoregressive decode on stdin query → stdout JSON. Text-bypass targets stored on EpisodeRecord train the projection during NREM (separate LR 1e-4, not subject to neuromodulation schedule). Architecture doc and decisions README updated.
+
 **Next (queued):**
-4. **Phase 6 roadmap** — remaining Phase 6+ items not yet done: predictive-coding settling loop (iterative refinement replacing single-pass), sample-level audio mixing (mic + file waveform summing), action loop, language as additional modality. ADR-first for any of these.
+- **Implement ADR 0012**: export Qwen2.5-0.5B to ONNX (`scripts/export_models.py`), add `ActionDecoder` struct, wire gain modulation into `PerceptionProcessor`, wire stdin query loop in `main.rs`, add text_target to EpisodeRecord, add NREM projection training pass in `sleep.rs`.
 
 ## Open architectural questions
 

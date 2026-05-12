@@ -55,3 +55,12 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0001](0001-rust-workspace-layout.md) | Rust workspace layout | accepted |
 | [0002](0002-phase1-sensory-types.md) | Phase 1 sensory pipeline: concrete types and interfaces | accepted |
 | [0003](0003-phase2-encoder-selection.md) | Phase 2 encoder selection: Whisper-tiny + CLAP + DINOv2-S/14 | accepted |
+| [0004](0004-phase2-encoding-types.md) | Phase 2 encoding types and ORT integration | accepted |
+| [0005](0005-phase3-perception.md) | Phase 3 perception: k-WTA sparse coding + binding | accepted |
+| [0006](0006-phase4-memory-hierarchy.md) | Phase 4 memory hierarchy: EpisodicBuffer + SemanticStore + ColdArchive | accepted |
+| [0007](0007-phase5-sleep-cycle.md) | Phase 5 sleep cycle: NREM replay + REM growth + snapshot | accepted |
+| [0008](0008-cross-attention-binding.md) | Cross-attention binding area | accepted |
+| [0009](0009-output-reconstruction-channel.md) | Output / reconstruction channel | accepted |
+| [0010](0010-bidirectional-top-down-priors.md) | Bidirectional top-down priors | accepted |
+| [0011](0011-predictive-coding-settling-loop.md) | Predictive-coding settling loop | accepted |
+| [0012](0012-action-loop-decoder.md) | Action loop: region-token decoder + gain modulation | accepted |

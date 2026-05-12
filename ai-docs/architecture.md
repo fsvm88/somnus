@@ -63,6 +63,17 @@ The carve-up is revisable; what matters is that subsystems are *replaceable* and
 
            ↕ neuromodulation (global gain & state)
            ↕ sleep/wake controller (mode + growth + compression)
+
+                  ┌──────────────────────────────────────┐
+                  │  ActionDecoder                        │
+                  │  projection (512 → 4×896) +           │
+                  │  frozen Qwen2.5-0.5B                 │
+                  │                                      │
+                  │  every episode: attn weights →        │
+                  │    per-region gain (k-WTA input)      │
+                  │  on query (stdin): autoregressive     │
+                  │    text → stdout JSON                 │
+                  └──────────────────────────────────────┘
 ```
 
 ## Frontend: encoders and bypass
@@ -187,6 +198,6 @@ Tracked here so they don't get lost. Resolutions become ADRs.
 - **Compression strategy.** Quantization, structured pruning, knowledge distillation, or layered combination? When is content moved cold vs. dropped?
 - ~~**Sparse-coding scheme.**~~ Resolved in ADR 0005: k-WTA with per-unit duty-cycle boosting, n=1024, k=20 (2% sparsity). Per-region weights; shared hyperparameters.
 - **Sleep-cycle time budget.** How to split a sleep cycle between NREM-like work (replay, homeostatic downscaling, compression) and REM-like work (generative replay, self-probe, growth, future creative recombination), and how to schedule within each stage.
-- **Action loop.** Does the system have one in early phases? Effector — internal state only, or external (audio out, motor)?
+- ~~**Action loop.**~~ Resolved in ADR 0012: region-token projection (linear 512→4×896) + frozen Qwen2.5-0.5B. Per-episode LLM attention weights drive per-region gain modulation; full autoregressive decode on stdin query. Text-bypass provides decoder training signal during NREM.
 - **Scheduling.** Async tasks, dedicated threads, event loop? How do real-time wake constraints coexist with batch sleep work?
 - **Tensor representation.** Single shared tensor type across subsystems, or each subsystem picks its own?
