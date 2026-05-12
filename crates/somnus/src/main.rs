@@ -269,6 +269,7 @@ async fn main() -> Result<()> {
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
@@ -456,8 +457,7 @@ async fn main() -> Result<()> {
     if let Some(rx) = file_audio_rx {
         audio_metric_handles.push(file_audio_metrics.unwrap());
         let tx = audio_cb_tx.clone();
-        let drain = audio_drain.clone();
-        std::thread::spawn(move || forward_frames(rx, tx, drain));
+        std::thread::spawn(move || forward_frames_blocking(rx, tx));
     }
 
     if args.mic || args.file.is_none() {
@@ -478,8 +478,7 @@ async fn main() -> Result<()> {
     if let Some(rx) = file_video_rx {
         video_metrics_handle = file_video_metrics.unwrap();
         let tx = video_cb_tx.clone();
-        let drain = video_drain.clone();
-        std::thread::spawn(move || forward_frames(rx, tx, drain));
+        std::thread::spawn(move || forward_frames_blocking(rx, tx));
     } else {
         let mut cam = VideoCapture::open(args.webcam)?;
         video_metrics_handle = Arc::clone(&cam.metrics);
@@ -608,6 +607,48 @@ async fn main() -> Result<()> {
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
 
     loop {
+        // ── drain any pending queries before potentially sleeping ─────────────
+        // This ensures queries are never blocked behind a sleep cycle.
+        while let Ok(query) = query_rx.try_recv() {
+            tracing::info!(query = %query, "query received (pre-sleep drain)");
+            let ep_vec = episodic.iter_traces().last().map(|t| t.record.values.clone());
+            match ep_vec {
+                None => {
+                    println!("{}", serde_json::json!({"type":"action_response","error":"no episode yet"}));
+                }
+                Some(ep) => {
+                    if let Some(ref mut dec) = decoder {
+                        if let Ok(ids) = dec.tokenize(&query) {
+                            episodic.set_last_text_target(ids);
+                        }
+                        tracing::info!("starting generation (pre-sleep)");
+                        let ep_clone = ep.clone();
+                        let query_clone = query.clone();
+                        let max_tokens = args.action_max_tokens;
+                        let result = tokio::task::block_in_place(|| {
+                            dec.generate(&ep_clone, &query_clone, max_tokens)
+                        });
+                        match result {
+                            Ok(response) => {
+                                let ts_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis())
+                                    .unwrap_or(0);
+                                tracing::info!(tokens = response.split_whitespace().count(), "generation complete");
+                                println!("{}", serde_json::json!({
+                                    "type": "action_response",
+                                    "ts": ts_ms,
+                                    "query": query,
+                                    "response": response,
+                                }));
+                            }
+                            Err(e) => tracing::warn!(?e, "generation failed"),
+                        }
+                    }
+                }
+            }
+        }
+
         // ── sleep trigger check ───────────────────────────────────────────────
         let should_sleep = episodic.len() >= high_water || wake_start.elapsed() >= max_wake;
 
@@ -732,6 +773,7 @@ async fn main() -> Result<()> {
             Some(query) = query_rx.recv() => {
                 // Query: generate a response using the current episode as context (ADR 0012).
                 // The query text is also stored as text_target on the latest episode for NREM training.
+                tracing::info!(query = %query, "query received");
                 let ep_vec = episodic.iter_traces().last().map(|t| t.record.values.clone());
                 match ep_vec {
                     None => {
@@ -743,12 +785,23 @@ async fn main() -> Result<()> {
                             if let Ok(ids) = dec.tokenize(&query) {
                                 episodic.set_last_text_target(ids);
                             }
-                            match dec.generate(&ep, &query, args.action_max_tokens) {
+                            tracing::info!("starting generation");
+                            // Run generation in a blocking thread so we don't stall the async runtime.
+                            let ep_clone = ep.clone();
+                            let query_clone = query.clone();
+                            let max_tokens = args.action_max_tokens;
+                            // SAFETY: ActionDecoder is not Send. We run generation synchronously
+                            // here (blocking the current async task via block_in_place).
+                            let result = tokio::task::block_in_place(|| {
+                                dec.generate(&ep_clone, &query_clone, max_tokens)
+                            });
+                            match result {
                                 Ok(response) => {
                                     let ts_ms = SystemTime::now()
                                         .duration_since(UNIX_EPOCH)
                                         .map(|d| d.as_millis())
                                         .unwrap_or(0);
+                                    tracing::info!(tokens = response.split_whitespace().count(), "generation complete");
                                     println!("{}", serde_json::json!({
                                         "type": "action_response",
                                         "ts": ts_ms,
@@ -854,6 +907,8 @@ fn record_episode(
     }
 }
 
+/// Lossy forward: drops oldest frame when channel is full. Used for live sources
+/// (microphone, webcam) where falling behind means the data is stale anyway.
 fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
     while let Ok(frame) = src.recv() {
         match tx.try_send(frame) {
@@ -865,6 +920,16 @@ fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
                 }
             }
             Err(TrySendError::Disconnected(_)) => break,
+        }
+    }
+}
+
+/// Lossless forward: blocks until the downstream channel has room. Used for file
+/// sources where every frame is needed and there is no notion of "stale data".
+fn forward_frames_blocking<T: Send>(src: Receiver<T>, tx: Sender<T>) {
+    while let Ok(frame) = src.recv() {
+        if tx.send(frame).is_err() {
+            break;
         }
     }
 }

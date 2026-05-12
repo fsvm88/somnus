@@ -35,7 +35,7 @@ REVISIONS = {
     "clap":    ("laion/clap-htsat-unfused", "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"),
     "dinov2":  ("facebook/dinov2-small",    "ed25f3a31f01632728cabb09d1542f84ab7b0056"),
     # Qwen2.5-0.5B: revision should be pinned after first export; None = current main.
-    "qwen25":  ("Qwen/Qwen2.5-0.5B", None),
+    "qwen25":  ("Qwen/Qwen2.5-0.5B", "060db6499f32faf8b98477b0a26969ef7d8b9987"),
 }
 
 
@@ -214,7 +214,7 @@ def export_qwen25() -> None:
 
     repo, rev = REVISIONS["qwen25"]
     print(f"  loading {repo} @ {rev or 'main'}…")
-    model = Qwen2ForCausalLM.from_pretrained(repo, revision=rev).eval()
+    model = Qwen2ForCausalLM.from_pretrained(repo, revision=rev, torch_dtype=torch.float32).eval()
     tokenizer = AutoTokenizer.from_pretrained(repo, revision=rev)
 
     hidden_size = model.config.hidden_size  # 896 for Qwen2.5-0.5B
