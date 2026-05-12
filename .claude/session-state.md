@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-12
-> **Last commit on main:** (pending) — *ADR 0012: action loop — region-token decoder + gain modulation*
+> **Last commit on main:** 4ac3475 — *Implement ADR 0012: action decoder (region-token projection + Qwen2.5-0.5B)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -113,7 +113,9 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - Action loop designed and documented (ADR 0012): region-token projection (linear 512→4×LM_HIDDEN) + frozen Qwen2.5-0.5B. Dual function: (a) per-episode LLM self-attention over 4 region tokens → per-region gain multipliers applied to k-WTA inputs of next episode; (b) full autoregressive decode on stdin query → stdout JSON. Text-bypass targets stored on EpisodeRecord train the projection during NREM (separate LR 1e-4, not subject to neuromodulation schedule). Architecture doc and decisions README updated.
 
 **Next (queued):**
-- **Implement ADR 0012**: export Qwen2.5-0.5B to ONNX (`scripts/export_models.py`), add `ActionDecoder` struct, wire gain modulation into `PerceptionProcessor`, wire stdin query loop in `main.rs`, add text_target to EpisodeRecord, add NREM projection training pass in `sleep.rs`.
+- Export Qwen2.5-0.5B: run `scripts/export_models.py` to generate `qwen25_lm.onnx`, `qwen25_embed_table.safetensors`, `qwen25_tokenizer.json` in `models/`. Then test end-to-end with `--action` flag: verify gain logs appear, query via stdin produces JSON response.
+- Calibration targets: `RECALL_BLEND_THRESHOLD=50.0`, `prior_beta`, `settle_beta`, `WARM_RECALL_GROWTH_THRESHOLD=100.0` — all need multi-session runs.
+- Remaining Phase 6+ items: sample-level audio mixing, language as additional modality.
 
 ## Open architectural questions
 
