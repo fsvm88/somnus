@@ -21,3 +21,6 @@ serde_json         = { workspace = true }
 somnus-perception     = { path = "../somnus-perception" }
 somnus-memory         = { path = "../somnus-memory" }
 candle-core        = { workspace = true }
+candle-nn          = { workspace = true }
+ndarray            = { workspace = true }
+tokenizers         = "0.21"

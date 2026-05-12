@@ -16,6 +16,8 @@ use somnus_memory::{
 };
 use somnus_perception::{PerceptionProcessor, RegionId};
 
+use crate::action::ActionDecoder;
+
 const DECAY_RATE: f32 = 1e-4;
 const GROWTH_THRESHOLD: f32 = 0.1;
 const GROWTH_MIN_SAMPLES: usize = 16;
@@ -79,6 +81,11 @@ pub struct SleepStats {
     /// Mean L2 distance to nearest warm-memory neighbor during REM probe.
     /// Some only when warm had pre-spill entries (cross-cycle/cross-session signal).
     pub warm_recall_l2: Option<f32>,
+    /// Mean surrogate loss from projection training steps (ADR 0012).
+    /// None when no text-target traces were present.
+    pub mean_proj_loss: Option<f32>,
+    /// Number of traces that had a text_target and were used to train the projection.
+    pub decoder_trainable_records: usize,
 }
 
 /// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
@@ -91,6 +98,7 @@ pub fn run_sleep_cycle(
     memory_dir: &Path,
     interrupt: Arc<AtomicBool>,
     pending_embs: Arc<AtomicUsize>,
+    decoder: &mut Option<ActionDecoder>,
 ) -> Result<SleepStats> {
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
 
@@ -99,23 +107,28 @@ pub fn run_sleep_cycle(
     let mut total_output_mse = 0.0f32;
     let mut output_mse_n = 0usize;
     let mut was_interrupted = false;
+    let mut total_proj_loss = 0.0f32;
+    let mut proj_loss_n = 0usize;
 
     // Snapshot warm size before spill so REM can detect cross-cycle entries.
     let pre_spill_warm_len = recall.warm.len();
 
     // ── NREM-like: replay + train ─────────────────────────────────────────────
-    // Collect (episode_vec, regional) snapshots; avoids borrowing episodic during training.
-    let traces: Vec<(Vec<f32>, [Vec<f32>; 4])> = episodic
+    // Collect snapshots; avoids borrowing episodic during training.
+    let traces: Vec<(Vec<f32>, [Vec<f32>; 4], Option<Vec<u32>>)> = episodic
         .iter_traces()
         .skip(episodic.replay_checkpoint)
-        .map(|t| (t.record.values.clone(), t.regional.clone()))
+        .map(|t| (t.record.values.clone(), t.regional.clone(), t.text_target.clone()))
         .collect();
 
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
 
-    for (step, (episode_vec, regional)) in traces.iter().enumerate() {
+    let decoder_trainable_records = traces.iter().filter(|(_, _, t)| t.is_some()).count();
+    tracing::info!(decoder_trainable_records, "NREM: decoder-trainable traces");
+
+    for (step, (episode_vec, regional, text_target)) in traces.iter().enumerate() {
         let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD;
         if interrupt.load(Ordering::Relaxed) || salient {
             if salient {
@@ -158,6 +171,19 @@ pub fn run_sleep_cycle(
             }
             Err(e) => tracing::warn!(?e, "output head replay error"),
         }
+
+        // Projection training: surrogate MSE loss for traces that carry a text target (ADR 0012).
+        if let Some(ref mut dec) = decoder {
+            if let Some(ids) = text_target {
+                match dec.projection_step(episode_vec, ids) {
+                    Ok(loss) => {
+                        total_proj_loss += loss;
+                        proj_loss_n += 1;
+                    }
+                    Err(e) => tracing::warn!(?e, "projection_step error"),
+                }
+            }
+        }
     }
 
     // Restore base lr so grow_region's optimizer reset starts from a known point.
@@ -177,6 +203,11 @@ pub fn run_sleep_cycle(
         total_output_mse / output_mse_n as f32
     } else {
         0.0
+    };
+    let mean_proj_loss = if proj_loss_n > 0 {
+        Some(total_proj_loss / proj_loss_n as f32)
+    } else {
+        None
     };
 
     tracing::info!(
@@ -328,5 +359,7 @@ pub fn run_sleep_cycle(
         regions_grown,
         was_interrupted,
         warm_recall_l2,
+        mean_proj_loss,
+        decoder_trainable_records,
     })
 }

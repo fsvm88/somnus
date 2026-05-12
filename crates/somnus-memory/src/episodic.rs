@@ -44,8 +44,19 @@ impl EpisodicBuffer {
                 values,
             },
             regional,
+            text_target: None,
         });
         id
+    }
+
+    /// Attach a text-bypass token sequence to the most recently pushed trace.
+    ///
+    /// Called when the user submits a query while a given episode is current;
+    /// the query text serves as the decoder projection training target (ADR 0012).
+    pub fn set_last_text_target(&mut self, target: Vec<u32>) {
+        if let Some(trace) = self.buf.back_mut() {
+            trace.text_target = Some(target);
+        }
     }
 
     pub fn iter_traces(&self) -> impl Iterator<Item = &EpisodeTrace> {
@@ -95,6 +106,7 @@ impl EpisodicBuffer {
                 values,
             },
             regional,
+            text_target: None,
         });
     }
 

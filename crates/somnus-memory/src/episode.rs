@@ -15,9 +15,14 @@ pub struct EpisodeRecord {
 ///   0 = AudioSpeech (384-dim), 1 = AudioEnv (512-dim), 2 = Visual (384-dim), 3 = Symbolic (384-dim).
 /// Empty vecs are stored for regions that had no input when the episode was created.
 ///
+/// `text_target` carries token IDs from a text-bypass query received while this episode was
+/// current. Used as the decoder projection training signal during NREM (ADR 0012).
+/// Not persisted to the cold archive or snapshot; lost on restart (hot-tier only).
+///
 /// The cold archive stores EpisodeRecord only; per-region encoder inputs are hot-tier data.
 #[derive(Debug, Clone)]
 pub struct EpisodeTrace {
     pub record: EpisodeRecord,
     pub regional: [Vec<f32>; 4],
+    pub text_target: Option<Vec<u32>>,
 }

@@ -77,6 +77,11 @@ pub struct PerceptionProcessor {
     /// Fraction of output-head prediction blended into settling inputs (ADR 0011).
     settle_beta: f32,
 
+    /// Per-region gain multipliers applied to raw encoder inputs before k-WTA (ADR 0012).
+    /// Derived from the ActionDecoder's LM attention over region tokens each episode.
+    /// Reset to 1.0 at sleep entry. Default: [1.0; 4] (no-op).
+    region_gain: [f32; 4],
+
     /// Holds all trainable parameters; needed for optimizer, save, and load.
     varmap: VarMap,
     /// AdamW optimizer over all k-WTA + SAE + binding weights.
@@ -160,6 +165,7 @@ impl PerceptionProcessor {
             latest_inputs: [None, None, None, None],
             settle_steps: 0,
             settle_beta: 0.5,
+            region_gain: [1.0; 4],
             varmap,
             optimizer,
             device,
@@ -169,8 +175,11 @@ impl PerceptionProcessor {
     /// Ingest a 384-dim Whisper speech embedding.
     /// Updates AudioSpeech and Symbolic regions (same input, independent weights).
     pub fn ingest_speech(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let (speech_input, speech_cos) = self.blend_with_prior(values, 0);
-        let (symbolic_input, symbolic_cos) = self.blend_with_prior(values, 3);
+        // Apply region gain before prior blending (ADR 0012). Raw `values` kept for recon targets.
+        let gained_speech = apply_gain(values, self.region_gain[0]);
+        let gained_symbolic = apply_gain(values, self.region_gain[3]);
+        let (speech_input, speech_cos) = self.blend_with_prior(&gained_speech, 0);
+        let (symbolic_input, symbolic_cos) = self.blend_with_prior(&gained_symbolic, 3);
         if let Some(c) = speech_cos {
             tracing::info!(region = "speech", prior_cosine = c, "top-down prior");
         }
@@ -219,7 +228,8 @@ impl PerceptionProcessor {
 
     /// Ingest a 512-dim CLAP env embedding.
     pub fn ingest_env(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let (input, cosine) = self.blend_with_prior(values, 1);
+        let gained = apply_gain(values, self.region_gain[1]);
+        let (input, cosine) = self.blend_with_prior(&gained, 1);
         if let Some(c) = cosine {
             tracing::info!(region = "env", prior_cosine = c, "top-down prior");
         }
@@ -250,7 +260,8 @@ impl PerceptionProcessor {
 
     /// Ingest a 384-dim DINOv2 visual embedding.
     pub fn ingest_visual(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let (input, cosine) = self.blend_with_prior(values, 2);
+        let gained = apply_gain(values, self.region_gain[2]);
+        let (input, cosine) = self.blend_with_prior(&gained, 2);
         if let Some(c) = cosine {
             tracing::info!(region = "visual", prior_cosine = c, "top-down prior");
         }
@@ -537,6 +548,17 @@ impl PerceptionProcessor {
     }
 
     // ── Top-down prior helpers (ADR 0010) ───────────────────────────────────────
+
+    /// Set per-region gain multipliers from the ActionDecoder (ADR 0012).
+    /// Applied to raw encoder inputs before prior blending and k-WTA.
+    pub fn set_region_gain(&mut self, gain: [f32; 4]) {
+        self.region_gain = gain;
+    }
+
+    /// Reset all region gains to 1.0 (no-op). Called at sleep entry.
+    pub fn reset_region_gain(&mut self) {
+        self.region_gain = [1.0; 4];
+    }
 
     /// Set the prior blend weight β. 0.0 disables prior injection (default).
     pub fn set_prior_beta(&mut self, beta: f32) {
@@ -841,4 +863,13 @@ impl PerceptionProcessor {
             RegionId::Symbolic => (&mut self.symbolic_layer, &mut self.symbolic_decoder),
         }
     }
+}
+
+/// Multiply every element of `values` by `gain`. Returns a new Vec.
+/// Used to apply per-region gain before prior blending (ADR 0012).
+fn apply_gain(values: &[f32], gain: f32) -> Vec<f32> {
+    if (gain - 1.0).abs() < 1e-6 {
+        return values.to_vec(); // fast path: no-op gain
+    }
+    values.iter().map(|&x| x * gain).collect()
 }

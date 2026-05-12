@@ -1,4 +1,7 @@
+mod action;
 mod sleep;
+
+use action::ActionDecoder;
 
 use anyhow::Result;
 use candle_core::Device as CandleDevice;
@@ -83,6 +86,20 @@ struct Args {
     /// settling inputs. 0.0 = raw only (no-op loop); 1.0 = pure prediction.
     #[arg(long, default_value = "0.5")]
     settle_beta: f32,
+
+    /// Enable ActionDecoder: per-episode LM forward for gain modulation + stdin generation (ADR 0012).
+    /// Requires qwen25_lm.onnx, qwen25_embed_table.safetensors, qwen25_tokenizer.json in --models-dir.
+    #[arg(long, default_value = "false")]
+    action: bool,
+
+    /// Enable per-region gain modulation from LM attention (ADR 0012).
+    /// Only effective when --action is set.
+    #[arg(long, default_value = "true")]
+    action_gain: bool,
+
+    /// Maximum tokens to generate per query (ADR 0012).
+    #[arg(long, default_value = "128")]
+    action_max_tokens: usize,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -346,6 +363,35 @@ async fn main() -> Result<()> {
         );
     }
 
+    // ── action decoder ────────────────────────────────────────────────────────
+    let mut decoder: Option<ActionDecoder> = if args.action {
+        match ActionDecoder::new(&args.models_dir, CandleDevice::Cpu) {
+            Ok(mut d) => {
+                let dec_w = args.memory_dir.join("snapshot").join("decoder_weights.safetensors");
+                if dec_w.exists() {
+                    if let Err(e) = d.load_weights(&dec_w) {
+                        tracing::warn!(?e, "decoder weight restore failed — starting fresh");
+                    } else {
+                        info!("decoder projection weights restored");
+                    }
+                } else if snapshot_found {
+                    tracing::warn!(
+                        "snapshot found but no decoder_weights.safetensors — \
+                         projection starts fresh; generation incoherent until trained"
+                    );
+                }
+                info!("action decoder ready");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!(?e, "action decoder init failed — decoder disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut recall = RecollectionLayer::new(semantic, cold);
     info!(
         episodic_capacity = args.episodic_capacity,
@@ -363,6 +409,22 @@ async fn main() -> Result<()> {
     // Counts embeddings produced by encoder tasks but not yet consumed by the main loop.
     // Sleep monitors this to detect external salience while the system is consolidating.
     let pending_embs = Arc::new(AtomicUsize::new(0));
+
+    // ── stdin query channel (ADR 0012) ────────────────────────────────────────
+    // Each line on stdin is a query: triggers generation + stores text_target on current episode.
+    let (query_tx, mut query_rx) = tokio::sync::mpsc::channel::<String>(8);
+    if decoder.is_some() {
+        let tx = query_tx;
+        tokio::task::spawn_blocking(move || {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines().flatten() {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() && tx.blocking_send(trimmed).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // ── open file once; destructure both streams ──────────────────────────────
     let (file_audio_rx, file_video_rx, file_audio_metrics, file_video_metrics) = match args
@@ -551,7 +613,8 @@ async fn main() -> Result<()> {
 
         if should_sleep && !episodic.is_empty() {
             interrupt.store(false, Ordering::Relaxed);
-            pending_embs.store(0, Ordering::Relaxed); // reset; encoders will re-accumulate during sleep
+            pending_embs.store(0, Ordering::Relaxed);
+            perception.reset_region_gain(); // stale gain must not carry across sleep boundary
             match sleep::run_sleep_cycle(
                 &mut perception,
                 &mut episodic,
@@ -559,15 +622,27 @@ async fn main() -> Result<()> {
                 &args.memory_dir,
                 Arc::clone(&interrupt_sleep),
                 Arc::clone(&pending_embs),
+                &mut decoder,
             ) {
-                Ok(stats) => info!(
-                    traces_replayed = stats.traces_replayed,
-                    mean_loss = stats.mean_train_loss,
-                    mean_output_mse = stats.mean_output_mse,
-                    warm_recall_l2 = ?stats.warm_recall_l2,
-                    interrupted = stats.was_interrupted,
-                    "sleep cycle complete"
-                ),
+                Ok(stats) => {
+                    info!(
+                        traces_replayed = stats.traces_replayed,
+                        mean_loss = stats.mean_train_loss,
+                        mean_output_mse = stats.mean_output_mse,
+                        warm_recall_l2 = ?stats.warm_recall_l2,
+                        mean_proj_loss = ?stats.mean_proj_loss,
+                        decoder_trainable = stats.decoder_trainable_records,
+                        interrupted = stats.was_interrupted,
+                        "sleep cycle complete"
+                    );
+                    // Save decoder projection weights alongside perception weights.
+                    if let Some(ref dec) = decoder {
+                        let dec_w = args.memory_dir.join("snapshot").join("decoder_weights.safetensors");
+                        if let Err(e) = dec.save_weights(&dec_w) {
+                            tracing::warn!(?e, "decoder weights snapshot failed");
+                        }
+                    }
+                }
                 Err(e) => tracing::warn!(?e, "sleep cycle error"),
             }
             wake_start = std::time::Instant::now();
@@ -590,6 +665,17 @@ async fn main() -> Result<()> {
                             }
                         }
                         record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                        // Update per-region gain from LM attention on the new episode (ADR 0012).
+                        if args.action_gain {
+                            if let Some(ep) = &out.episode {
+                                if let Some(ref mut dec) = decoder {
+                                    match dec.update_gain(&ep.0) {
+                                        Ok(()) => perception.set_region_gain(dec.gain),
+                                        Err(e) => tracing::warn!(?e, "gain update failed"),
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => tracing::error!(?e, "perception error (audio)"),
                 }
@@ -606,6 +692,16 @@ async fn main() -> Result<()> {
                             }
                         }
                         record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                        if args.action_gain {
+                            if let Some(ep) = &out.episode {
+                                if let Some(ref mut dec) = decoder {
+                                    match dec.update_gain(&ep.0) {
+                                        Ok(()) => perception.set_region_gain(dec.gain),
+                                        Err(e) => tracing::warn!(?e, "gain update failed"),
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => tracing::error!(?e, "perception error (video)"),
                 }
@@ -632,6 +728,39 @@ async fn main() -> Result<()> {
                     cold_len     = recall.cold.len(),
                     "memory metrics"
                 );
+            }
+            Some(query) = query_rx.recv() => {
+                // Query: generate a response using the current episode as context (ADR 0012).
+                // The query text is also stored as text_target on the latest episode for NREM training.
+                let ep_vec = episodic.iter_traces().last().map(|t| t.record.values.clone());
+                match ep_vec {
+                    None => {
+                        println!("{}", serde_json::json!({"type":"action_response","error":"no episode yet"}));
+                    }
+                    Some(ep) => {
+                        if let Some(ref mut dec) = decoder {
+                            // Store query as text_target before generation so it's available for NREM.
+                            if let Ok(ids) = dec.tokenize(&query) {
+                                episodic.set_last_text_target(ids);
+                            }
+                            match dec.generate(&ep, &query, args.action_max_tokens) {
+                                Ok(response) => {
+                                    let ts_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_millis())
+                                        .unwrap_or(0);
+                                    println!("{}", serde_json::json!({
+                                        "type": "action_response",
+                                        "ts": ts_ms,
+                                        "query": query,
+                                        "response": response,
+                                    }));
+                                }
+                                Err(e) => tracing::warn!(?e, "generation failed"),
+                            }
+                        }
+                    }
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 interrupt.store(true, Ordering::Relaxed);

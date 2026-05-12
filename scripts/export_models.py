@@ -34,6 +34,8 @@ REVISIONS = {
     "whisper": ("openai/whisper-tiny", "169d4a4341b33bc18d8881c4b69c2e104e1cc0af"),
     "clap":    ("laion/clap-htsat-unfused", "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"),
     "dinov2":  ("facebook/dinov2-small",    "ed25f3a31f01632728cabb09d1542f84ab7b0056"),
+    # Qwen2.5-0.5B: revision should be pinned after first export; None = current main.
+    "qwen25":  ("Qwen/Qwen2.5-0.5B", None),
 }
 
 
@@ -175,6 +177,82 @@ def export_dinov2() -> None:
     report(out)
 
 
+# ── Qwen2.5-0.5B wrappers (ADR 0012) ──────────────────────────────────────────
+
+class Qwen25LMWrapper(torch.nn.Module):
+    """Qwen2Model (base transformer) + LM head.
+
+    Input:  inputs_embeds (1, n, hidden_size)
+    Output: (last_hidden_state (1, n, hidden_size), logits (1, n, vocab_size))
+
+    Used for both per-episode gain computation (4-token forward) and
+    autoregressive generation (growing sequence).
+    """
+    def __init__(self, model_instance):
+        super().__init__()
+        self.model = model_instance.model   # Qwen2Model
+        self.lm_head = model_instance.lm_head
+
+    def forward(self, inputs_embeds):
+        out = self.model(inputs_embeds=inputs_embeds)
+        last_hidden = out.last_hidden_state          # (1, n, hidden_size)
+        logits = self.lm_head(last_hidden)           # (1, n, vocab_size)
+        return last_hidden, logits
+
+
+def export_qwen25() -> None:
+    lm_out = MODELS_DIR / "qwen25_lm.onnx"
+    embed_out = MODELS_DIR / "qwen25_embed_table.safetensors"
+    tok_out = MODELS_DIR / "qwen25_tokenizer.json"
+
+    if lm_out.exists() and embed_out.exists() and tok_out.exists():
+        print(f"  skip: qwen25 artifacts already present")
+        return
+
+    from transformers import Qwen2ForCausalLM, AutoTokenizer
+    import safetensors.torch as st
+
+    repo, rev = REVISIONS["qwen25"]
+    print(f"  loading {repo} @ {rev or 'main'}…")
+    model = Qwen2ForCausalLM.from_pretrained(repo, revision=rev).eval()
+    tokenizer = AutoTokenizer.from_pretrained(repo, revision=rev)
+
+    hidden_size = model.config.hidden_size  # 896 for Qwen2.5-0.5B
+
+    if not lm_out.exists():
+        wrapper = Qwen25LMWrapper(model).eval()
+        # Export with dynamic sequence length (batch fixed at 1).
+        dummy = torch.zeros(1, 4, hidden_size)
+        print(f"  exporting qwen25_lm.onnx (hidden_size={hidden_size})…")
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                dummy,
+                str(lm_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state", "logits"],
+                dynamic_axes={
+                    "inputs_embeds":      {0: "batch", 1: "seq_len"},
+                    "last_hidden_state":  {0: "batch", 1: "seq_len"},
+                    "logits":             {0: "batch", 1: "seq_len"},
+                },
+                opset_version=17,
+            )
+        report(lm_out)
+
+    if not embed_out.exists():
+        print(f"  saving qwen25_embed_table.safetensors…")
+        embed_weight = model.model.embed_tokens.weight.detach().float()
+        st.save_file({"embed_tokens.weight": embed_weight}, str(embed_out))
+        print(f"  {embed_out.stat().st_size / 1e6:.1f} MB  "
+              f"shape={list(embed_weight.shape)}")
+
+    if not tok_out.exists():
+        print(f"  saving qwen25_tokenizer.json…")
+        tokenizer.backend_tokenizer.save(str(tok_out))
+        print(f"  {tok_out.stat().st_size / 1e6:.2f} MB")
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -188,6 +266,9 @@ if __name__ == "__main__":
 
     print("=== DINOv2-ViT-S/14 ===")
     export_dinov2()
+
+    print("=== Qwen2.5-0.5B (action decoder) ===")
+    export_qwen25()
 
     print("\nAll exports complete:")
     for f in sorted(MODELS_DIR.glob("*.onnx")):
