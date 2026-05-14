@@ -100,6 +100,13 @@ struct Args {
     /// Maximum tokens to generate per query (ADR 0012).
     #[arg(long, default_value = "128")]
     action_max_tokens: usize,
+
+    /// Loop the input file indefinitely. Restarts from the beginning each time
+    /// the file ends, keeping warm memory alive across iterations. Useful for
+    /// calibration runs where a single file is too short to trigger multiple
+    /// sleep cycles.
+    #[arg(long, default_value = "false")]
+    file_loop: bool,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -427,37 +434,65 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── open file once; destructure both streams ──────────────────────────────
-    let (file_audio_rx, file_video_rx, file_audio_metrics, file_video_metrics) = match args
-        .file
-        .as_ref()
-        .map(|p| MediaFile::open(p).and_then(|mf| mf.start()))
-        .transpose()?
-    {
-        Some(MediaFileStreams {
-            audio,
-            video,
-            audio_metrics,
-            video_metrics,
-            ..
-        }) => (
-            Some(audio),
-            Some(video),
-            Some(audio_metrics),
-            Some(video_metrics),
-        ),
-        None => (None, None, None, None),
-    };
-
     // ── audio fan-in ──────────────────────────────────────────────────────────
     let (audio_cb_tx, audio_cb_rx) = bounded::<AudioFrame>(256);
     let audio_drain = audio_cb_rx.clone();
     let mut audio_metric_handles: Vec<Arc<SensorMetrics>> = Vec::new();
 
-    if let Some(rx) = file_audio_rx {
-        audio_metric_handles.push(file_audio_metrics.unwrap());
-        let tx = audio_cb_tx.clone();
-        std::thread::spawn(move || forward_frames_blocking(rx, tx));
+    // ── video setup ───────────────────────────────────────────────────────────
+    let (video_cb_tx, video_cb_rx) = bounded::<VideoFrame>(16);
+    let video_drain = video_cb_rx.clone();
+    let mut video_metrics_handle: Arc<SensorMetrics>;
+
+    if let Some(ref file_path) = args.file {
+        if args.file_loop {
+            // Looping file source: restart from the beginning each time the
+            // file ends, keeping the same downstream channels (and therefore
+            // warm memory) alive across iterations.
+            let path = file_path.clone();
+            let atx = audio_cb_tx.clone();
+            let vtx = video_cb_tx.clone();
+            std::thread::spawn(move || loop {
+                let streams = match MediaFile::open(&path).and_then(|mf| mf.start()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(?e, "file loop: failed to (re)open file");
+                        break;
+                    }
+                };
+                let atx2 = atx.clone();
+                let vtx2 = vtx.clone();
+                let ah = std::thread::spawn(move || forward_frames_blocking(streams.audio, atx2));
+                let vh = std::thread::spawn(move || forward_frames_blocking(streams.video, vtx2));
+                let a_normal = ah.join().unwrap_or(false);
+                let v_normal = vh.join().unwrap_or(false);
+                // If downstream closed, stop looping.
+                if !a_normal || !v_normal {
+                    break;
+                }
+                tracing::info!("file loop: restarting from beginning");
+            });
+            // Use a dummy metrics handle for loop mode (per-iteration metrics not tracked).
+            video_metrics_handle = Arc::new(SensorMetrics::default());
+        } else {
+            // One-shot file source.
+            let MediaFileStreams {
+                audio,
+                video,
+                audio_metrics,
+                video_metrics,
+                ..
+            } = MediaFile::open(file_path).and_then(|mf| mf.start())?;
+            audio_metric_handles.push(audio_metrics);
+            video_metrics_handle = video_metrics;
+            let atx = audio_cb_tx.clone();
+            let vtx = video_cb_tx.clone();
+            std::thread::spawn(move || forward_frames_blocking(audio, atx));
+            std::thread::spawn(move || forward_frames_blocking(video, vtx));
+        }
+    } else {
+        // No file — fall through to mic/webcam paths below.
+        video_metrics_handle = Arc::new(SensorMetrics::default()); // placeholder, overwritten below
     }
 
     if args.mic || args.file.is_none() {
@@ -470,16 +505,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── video setup ───────────────────────────────────────────────────────────
-    let (video_cb_tx, video_cb_rx) = bounded::<VideoFrame>(16);
-    let video_drain = video_cb_rx.clone();
-    let video_metrics_handle: Arc<SensorMetrics>;
-
-    if let Some(rx) = file_video_rx {
-        video_metrics_handle = file_video_metrics.unwrap();
-        let tx = video_cb_tx.clone();
-        std::thread::spawn(move || forward_frames_blocking(rx, tx));
-    } else {
+    if args.file.is_none() {
         let mut cam = VideoCapture::open(args.webcam)?;
         video_metrics_handle = Arc::clone(&cam.metrics);
         let tx = video_cb_tx.clone();
@@ -835,8 +861,10 @@ async fn main() -> Result<()> {
 const RECALL_BLEND_ALPHA: f32 = 0.1;
 
 /// L2 distance below which we blend the retrieved episode into the current one.
-/// Needs calibration once real distances are observed in logs. Start generous.
-const RECALL_BLEND_THRESHOLD: f32 = 50.0;
+/// Calibrated 2026-05-14: wake-time recall L2 on same-content (single looped video) has
+/// p95=4.1 and max=5.3. Threshold of 5.5 covers the same-content distribution; any episode
+/// beyond this distance is dissimilar enough that blending would inject noise.
+const RECALL_BLEND_THRESHOLD: f32 = 5.5;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -926,10 +954,14 @@ fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
 
 /// Lossless forward: blocks until the downstream channel has room. Used for file
 /// sources where every frame is needed and there is no notion of "stale data".
-fn forward_frames_blocking<T: Send>(src: Receiver<T>, tx: Sender<T>) {
+/// Returns `true` if the source was exhausted normally, `false` if the
+/// downstream channel closed first (used by the file-loop thread to decide
+/// whether to restart or exit).
+fn forward_frames_blocking<T: Send>(src: Receiver<T>, tx: Sender<T>) -> bool {
     while let Ok(frame) = src.recv() {
         if tx.send(frame).is_err() {
-            break;
+            return false; // downstream closed
         }
     }
+    true // source exhausted normally
 }

@@ -26,8 +26,10 @@ const GROWTH_BATCH: usize = 64;
 const SALIENCE_THRESHOLD: usize = 16;
 /// Mean warm-recall L2 above this threshold supplements the MSE growth signal.
 /// Only applied when warm had pre-spill entries (i.e., cross-cycle/cross-session data).
-/// Needs calibration once real distances are observed. 100.0 is a conservative starting point.
-const WARM_RECALL_GROWTH_THRESHOLD: f32 = 100.0;
+/// Calibrated 2026-05-14: same-content (single looped video) warm-recall L2 ranges 1.6–3.5
+/// (median 2.3, max 3.5). Threshold of 15.0 gives ~4× margin above that maximum, so same-content
+/// cycling never triggers growth while genuinely novel input (expected L2 >> 5) will.
+const WARM_RECALL_GROWTH_THRESHOLD: f32 = 15.0;
 
 /// Neuromodulated learning rate schedule for NREM replay.
 ///
@@ -224,6 +226,40 @@ pub fn run_sleep_cycle(
         }
     }
 
+    // ── REM pre-spill: warm recall probe ─────────────────────────────────────
+    // Run BEFORE spill so warm only contains prior-cycle entries. Querying after
+    // spill would find exact matches (L2=0) from the just-inserted current records.
+    let mut per_region_mse = [0.0f32; 4];
+    let mut per_region_count = [0usize; 4];
+    let mut regions_grown: Vec<RegionId> = Vec::new();
+    let mut warm_recall_l2: Option<f32> = None;
+
+    // Collect traces once for reuse in both warm probe and MSE measurement.
+    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 4])> = if !was_interrupted {
+        episodic
+            .iter_traces()
+            .map(|t| (t.record.values.clone(), t.regional.clone()))
+            .collect()
+    } else {
+        vec![]
+    };
+
+    if !was_interrupted && pre_spill_warm_len > 0 {
+        let mut total_l2 = 0.0f32;
+        let mut n_probed = 0usize;
+        for (ep_vec, _) in &traces_for_rem {
+            if let Some(&(dist, _)) = recall.warm.query_with_dist(ep_vec, 1).first() {
+                total_l2 += dist;
+                n_probed += 1;
+            }
+        }
+        if n_probed > 0 {
+            let mean_l2 = total_l2 / n_probed as f32;
+            warm_recall_l2 = Some(mean_l2);
+            tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
+        }
+    }
+
     // ── Compression: spill hot → cold; consolidate into warm ─────────────────
     if !was_interrupted {
         let mut spilled = 0usize;
@@ -238,19 +274,8 @@ pub fn run_sleep_cycle(
         tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
     }
 
-    // ── REM-like: measure MSE + warm recall, trigger growth ──────────────────
-    let mut per_region_mse = [0.0f32; 4];
-    let mut per_region_count = [0usize; 4];
-    let mut regions_grown: Vec<RegionId> = Vec::new();
-    let mut warm_recall_l2: Option<f32> = None;
-
+    // ── REM-like: measure MSE + trigger growth ────────────────────────────────
     if !was_interrupted {
-        // Collect (episode_vec, regional) — same shape as NREM traces.
-        let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 4])> = episodic
-            .iter_traces()
-            .map(|t| (t.record.values.clone(), t.regional.clone()))
-            .collect();
-
         // Measure SAE reconstruction quality without updating weights.
         for (_, regional) in &traces_for_rem {
             match perception.measure_mse(regional) {
@@ -269,25 +294,6 @@ pub fn run_sleep_cycle(
         for i in 0..4 {
             if per_region_count[i] > 0 {
                 per_region_mse[i] /= per_region_count[i] as f32;
-            }
-        }
-
-        // Warm recall probe: query warm memory with each episode vector (ADR 0010 item 3).
-        // Only meaningful when warm had entries from a prior cycle before this spill.
-        // Self-distances from same-cycle records are near-zero and uninformative.
-        if pre_spill_warm_len > 0 {
-            let mut total_l2 = 0.0f32;
-            let mut n_probed = 0usize;
-            for (ep_vec, _) in &traces_for_rem {
-                if let Some(&(dist, _)) = recall.warm.query_with_dist(ep_vec, 1).first() {
-                    total_l2 += dist;
-                    n_probed += 1;
-                }
-            }
-            if n_probed > 0 {
-                let mean_l2 = total_l2 / n_probed as f32;
-                warm_recall_l2 = Some(mean_l2);
-                tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
             }
         }
 
