@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-12
-> **Last commit on main:** 695c8fb — *ADR 0012 smoke test: fix dtype mismatch, tracing, lossless forwarding, query drain*
+> **Last updated:** 2026-05-15
+> **Last commit on main:** e8dccf5 — *Calibration run: --file-loop, warm probe ordering fix, calibrated thresholds*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -121,9 +121,19 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - Observed: query → ~2.4s inference → 25-token JSON response; output is repetitive (expected — projection is randomly initialized, no training yet)
 - Gain updates fire per-episode with varied values in [0.5, 2.0] range across 4 regions ✓
 
+**Also done (2026-05-15):**
+- Calibration run completed. Two bugs fixed and two thresholds set from real data:
+  - **Bug fix**: warm recall probe was running AFTER hot→cold spill, so HNSW always found exact matches (L2=0.0). Fixed by moving probe before spill.
+  - **Bug fix**: `forward_frames_blocking` had no return value; changed to return `bool` (true=source exhausted, false=downstream closed) so the file-loop thread can distinguish normal EOF from disconnection.
+  - **`--file-loop` flag added** to `main.rs`: restarts MediaFile in-process on EOF, keeping warm memory alive across iterations. Enables multi-cycle calibration from a single short clip.
+  - **`RECALL_BLEND_THRESHOLD`**: 50.0 → **5.5**. Calibrated from 933 wake-time recall measurements (same-content looped video): p95=4.1, max=5.3. Threshold 5.5 blends familiar content, suppresses noise from dissimilar episodes.
+  - **`WARM_RECALL_GROWTH_THRESHOLD`**: 100.0 → **15.0**. Calibrated from 17 sleep cycles: same-content warm L2 ranged 1.6–3.5 (median 2.3, max 3.5). Threshold 15.0 gives ×4 safety margin; genuinely novel content expected at L2 >> 5.
+  - `prior_beta` and `settle_steps` remain 0.0/0 — output_mse is stable (~0.013–0.020) but dataset is too homogeneous (one looped video) to calibrate these safely.
+
 **Next (queued):**
-- Calibration targets: `RECALL_BLEND_THRESHOLD=50.0`, `prior_beta`, `settle_beta`, `WARM_RECALL_GROWTH_THRESHOLD=100.0` — all need multi-session runs.
 - Remaining Phase 6+ items: sample-level audio mixing, language as additional modality.
+- Re-calibrate `prior_beta` and `settle_steps` once diverse multi-video content is available.
+- HNSW persistence across restarts (warm memory is session-local due to lifetime constraints, ADR 0007) — would unlock true multi-session recall and cross-session threshold validation.
 
 ## Open architectural questions
 
