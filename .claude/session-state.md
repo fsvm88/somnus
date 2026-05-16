@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-16
-> **Last commit on main:** 19f0e10 — *Fix ID collision + cross-session threshold validation*
+> **Last updated:** 2026-05-17 (novel-content calibration + file-mode exit fix)
+> **Last commit on main:** TBD
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -144,9 +144,37 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - Quantization noise (INT8 cold → dequant) does NOT push L2 past 5.5 ✓
   - **Verdict: both calibrated thresholds hold cross-session. RECALL_BLEND_THRESHOLD=5.5 and WARM_RECALL_GROWTH_THRESHOLD=15.0 are confirmed stable.**
 
+**Also done (2026-05-16) — prior_beta baseline calibration:**
+- Ran `--prior-beta 0.1 --settle-steps 3` on existing test.mp4 memory (2600 cold records, weights backed up to `memory/snapshot/weights.safetensors.bak`).
+- **prior_cosine results** (n=1029 episodes):
+  - visual: mean=0.9886, min=0.8930 (dominant modality, 751 samples)
+  - speech: mean=0.9879, min=0.9589 (55 samples)
+  - symbolic: mean=0.9879, min=0.9582 (55 samples)
+  - env: mean=0.8055, min=0.4576 (168 samples, most stochastic)
+  - Overall mean=0.9586. Output heads confirmed working — near-perfect prediction on familiar content.
+- **settle delta convergence** (SETTLE_EPS=1.0, 3 steps, iter=0 mean delta=2.006):
+  - 35.0% converge at iter=0, 26.6% at iter=1, 5.7% at iter=2, **32.7% still not converged after 3 steps**.
+  - Conclusion: familiar content has prior_cosine ≈ 0.99 so settling has little marginal benefit. The real test for settle_steps requires novel content where prior_cosine is 0.3–0.5.
+- **warm_recall_l2**: 1.5–3.8 across all sleep cycles — within calibrated thresholds. ✓
+- **output_mse**: mean=0.0412, range 0.007–0.533.
+- **β=0.1 confirmed safe to use**; calibration on novel content still needed to set final value and settle_steps.
+
+**Also done (2026-05-17):**
+- Two latent bugs fixed in file-mode exit:
+  - `audio_cb_tx`/`video_cb_tx` originals were never dropped after spawning one-shot file forwarding threads, so the crossbeam→tokio bridge tasks looped forever and embedding channels never closed.
+  - Main `select!` loop had no exit path when both emb channels closed; only broke on Ctrl-C. Added `audio_emb_closed`/`video_emb_closed` guards + a `file_mode && both_closed` break after the select.
+  - These bugs caused the binary to hang indefinitely after file EOF. Now exits naturally with "file source exhausted" log.
+
+- Novel-content calibration complete (4 clips: talking_head, nature, animation, urban):
+  - **prior_cosine on novel content**: visual 0.71–0.89 (vs 0.99 familiar), env 0.39–0.49 (vs 0.90 familiar). Novelty detection works — env is the sharpest discriminator.
+  - **SETTLE_EPS recalibrated**: 1.0 → **4.0**. Original value was unreachable; familiar content has mean delta ~3.8 at iter=0 (and diverges slightly with more steps); novel content (talking_head) has mean 6.1→3.5 over 3 steps. 4.0 allows early exit on the lower tail of novel content.
+  - **Settling behavior**: 42% delta reduction iter0→2 on talking_head (novel), but -7% on familiar (settling is slightly counterproductive when prior is near-perfect). Settling is useful for novel content, neutral-to-harmful for familiar. A prior_cosine-gated settle (only settle when prior_cosine < ~0.85) would be cleaner — deferred.
+  - **settle_steps=3** kept as "3 fixed passes of top-down prior feedback" rather than a convergence criterion.
+  - **prior_beta=0.1** confirmed safe across all novel clips.
+
 **Next (queued):**
-- Remaining Phase 6+ items: sample-level audio mixing, language as additional modality.
-- Re-calibrate `prior_beta` and `settle_steps` once diverse multi-video content is available (warm cross-session recall is now reliable enough to use as a test oracle).
+- Consider prior_cosine-gated settling (only activate settle loop when prior_cosine < 0.85): avoids counterproductive settling on familiar content.
+- Language as additional modality (Phase 6+): deferred.
 
 ## Open architectural questions
 

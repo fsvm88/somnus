@@ -27,7 +27,11 @@ pub const REGION_DIMS: [usize; 4] = [384, 512, 384, 384];
 
 /// L2 delta below which the settling loop is considered converged (ADR 0011).
 /// Needs calibration once real episode vector magnitudes are observed.
-const SETTLE_EPS: f32 = 1.0;
+// Calibrated 2026-05-17: familiar content has mean settle delta ~3.8 at iter=0 and
+// diverges slightly with iterations; novel content (talking_head) has mean 6.1→3.5
+// over 3 steps. 4.0 allows early exit on the lower tail of novel content without
+// triggering on familiar content where settling is counterproductive.
+const SETTLE_EPS: f32 = 4.0;
 
 /// Reconstruction errors for each region updated in a single `ingest_*` call.
 pub struct PerceptionOutput {

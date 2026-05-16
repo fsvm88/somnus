@@ -530,6 +530,12 @@ async fn main() -> Result<()> {
         });
     }
 
+    // All source threads have their own clones of the cb senders. Drop the
+    // originals now so that when every source thread finishes (e.g. file EOF),
+    // the bridge tasks below see channel closure and exit cleanly.
+    drop(audio_cb_tx);
+    drop(video_cb_tx);
+
     // ── async bridges ─────────────────────────────────────────────────────────
     let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>(64);
     tokio::task::spawn_blocking(move || {
@@ -631,6 +637,11 @@ async fn main() -> Result<()> {
 
     // ── main loop ─────────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
+    // In file (non-loop) mode the embedding channels close when the file is
+    // exhausted.  Track closure so we can exit cleanly without Ctrl-C.
+    let file_mode = args.file.is_some() && !args.file_loop;
+    let mut audio_emb_closed = false;
+    let mut video_emb_closed = false;
 
     loop {
         // ── drain any pending queries before potentially sleeping ─────────────
@@ -716,61 +727,70 @@ async fn main() -> Result<()> {
         }
 
         tokio::select! {
-            Some(emb) = audio_emb_rx.recv() => {
-                let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
-                sink_write(&mut sink, &audio_emb_json(&emb));
-                let result = match emb.source {
-                    AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
-                    AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
-                };
-                match result {
-                    Ok(out) => {
-                        if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                            match perception.wake_reconstruct_step(&ep.0, regional) {
-                                Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
-                                Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
-                            }
-                        }
-                        record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
-                        // Update per-region gain from LM attention on the new episode (ADR 0012).
-                        if args.action_gain {
-                            if let Some(ep) = &out.episode {
-                                if let Some(ref mut dec) = decoder {
-                                    match dec.update_gain(&ep.0) {
-                                        Ok(()) => perception.set_region_gain(dec.gain),
-                                        Err(e) => tracing::warn!(?e, "gain update failed"),
+            maybe = audio_emb_rx.recv(), if !audio_emb_closed => {
+                match maybe {
+                    Some(emb) => {
+                        let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
+                        sink_write(&mut sink, &audio_emb_json(&emb));
+                        let result = match emb.source {
+                            AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
+                            AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
+                        };
+                        match result {
+                            Ok(out) => {
+                                if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+                                    match perception.wake_reconstruct_step(&ep.0, regional) {
+                                        Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
+                                        Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
+                                    }
+                                }
+                                record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                if args.action_gain {
+                                    if let Some(ep) = &out.episode {
+                                        if let Some(ref mut dec) = decoder {
+                                            match dec.update_gain(&ep.0) {
+                                                Ok(()) => perception.set_region_gain(dec.gain),
+                                                Err(e) => tracing::warn!(?e, "gain update failed"),
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => tracing::error!(?e, "perception error (audio)"),
                         }
                     }
-                    Err(e) => tracing::error!(?e, "perception error (audio)"),
+                    None => { audio_emb_closed = true; }
                 }
             }
-            Some(emb) = video_emb_rx.recv() => {
-                let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
-                sink_write(&mut sink, &video_emb_json(&emb));
-                match perception.ingest_visual(&emb.values) {
-                    Ok(out) => {
-                        if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                            match perception.wake_reconstruct_step(&ep.0, regional) {
-                                Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
-                                Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
-                            }
-                        }
-                        record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
-                        if args.action_gain {
-                            if let Some(ep) = &out.episode {
-                                if let Some(ref mut dec) = decoder {
-                                    match dec.update_gain(&ep.0) {
-                                        Ok(()) => perception.set_region_gain(dec.gain),
-                                        Err(e) => tracing::warn!(?e, "gain update failed"),
+            maybe = video_emb_rx.recv(), if !video_emb_closed => {
+                match maybe {
+                    Some(emb) => {
+                        let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
+                        sink_write(&mut sink, &video_emb_json(&emb));
+                        match perception.ingest_visual(&emb.values) {
+                            Ok(out) => {
+                                if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+                                    match perception.wake_reconstruct_step(&ep.0, regional) {
+                                        Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
+                                        Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
+                                    }
+                                }
+                                record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                if args.action_gain {
+                                    if let Some(ep) = &out.episode {
+                                        if let Some(ref mut dec) = decoder {
+                                            match dec.update_gain(&ep.0) {
+                                                Ok(()) => perception.set_region_gain(dec.gain),
+                                                Err(e) => tracing::warn!(?e, "gain update failed"),
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            Err(e) => tracing::error!(?e, "perception error (video)"),
                         }
                     }
-                    Err(e) => tracing::error!(?e, "perception error (video)"),
+                    None => { video_emb_closed = true; }
                 }
             }
             _ = metrics_tick.tick() => {
@@ -847,6 +867,12 @@ async fn main() -> Result<()> {
                 info!("shutting down");
                 break;
             }
+        }
+
+        if file_mode && audio_emb_closed && video_emb_closed {
+            sink_flush(&mut sink);
+            info!("file source exhausted — exiting");
+            break;
         }
     }
 
