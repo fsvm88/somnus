@@ -111,6 +111,10 @@ impl EpisodicBuffer {
     }
 
     /// Override the next-id counter (used when restoring from snapshot).
+    pub(crate) fn next_id_counter(&self) -> u64 {
+        self.next_id
+    }
+
     pub(crate) fn set_next_id(&mut self, next: u64) {
         self.next_id = next;
     }

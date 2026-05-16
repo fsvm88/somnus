@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-16
-> **Last commit on main:** 1d96599 — *Warm HNSW persistence: rebuild from cold archive on restore*
+> **Last commit on main:** (pending) — *Cross-session validation: next_id persistence + threshold confirmation*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -131,12 +131,22 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - `prior_beta` and `settle_steps` remain 0.0/0 — output_mse is stable (~0.013–0.020) but dataset is too homogeneous (one looped video) to calibrate these safely.
 
 **Also done (2026-05-16):**
-- Warm HNSW persistence across restarts. Root cause: sleep calls `episodic.clear()` before `save_snapshot`, so the snapshot's episodic buffer is empty; `load_snapshot` rebuilt warm from that empty buffer → zero cross-session recall. Fix: `load_snapshot` now opens the cold archive and inserts all historically spilled records first, then any remaining hot-buffer records. Cold records have lower IDs by construction so no ID collisions occur in normal operation. New test `warm_rebuilt_from_cold_after_hot_cleared` verifies the fix. ADR 0007 updated: documents the rebuild-from-cold approach and explains why native `hnsw_rs` file persistence was not used (lifetime/unsafe complexity; acceptable for Phase 5 cold-archive sizes). 58 workspace tests pass.
+- Warm HNSW persistence across restarts. Root cause: sleep calls `episodic.clear()` before `save_snapshot`, so the snapshot's episodic buffer is empty; `load_snapshot` rebuilt warm from that empty buffer → zero cross-session recall. Fix: `load_snapshot` now opens the cold archive and inserts all historically spilled records first, then any remaining hot-buffer records. Cold records have lower IDs by construction so no ID collisions occur in normal operation. New test `warm_rebuilt_from_cold_after_hot_cleared` verifies the fix. ADR 0007 updated.
+
+- **ID collision bug fixed**: when episodic buffer is empty (post-sleep), `load_episodic` set `next_id=1`, causing every new session to reuse IDs from the cold archive (discovered during validation run: 4611 cold records → only 1782 unique in warm sidecar). Fix: `save_snapshot` now writes `next_id.bin` (8B u64 LE); `load_snapshot` restores `next_id` as `max(file_value, max_cold_id+1, hot_counter)`. Verified: session 2 shows `next_id=1300` continuing from session 1.
+
+- **Cross-session threshold validation complete** (clean 2-session experiment, test.mp4 × 2):
+  - Session 2 startup: `warm HNSW rebuilt: cold_records=1300 hot_records=0 total=1300 next_id=1300` ✓
+  - Session 2 `semantic_len=1300` matches cold archive size exactly ✓ (no ID collisions)
+  - Cross-session `warm_recall_l2` on first complete sleep cycle: **1.40** — well below calibrated `WARM_RECALL_GROWTH_THRESHOLD=15.0` ✓
+  - All subsequent cycles: 1.0–3.5 (consistent with within-session range from calibration) ✓
+  - Growth correctly suppressed on all cycles (familiar content recognized cross-session) ✓
+  - Quantization noise (INT8 cold → dequant) does NOT push L2 past 5.5 ✓
+  - **Verdict: both calibrated thresholds hold cross-session. RECALL_BLEND_THRESHOLD=5.5 and WARM_RECALL_GROWTH_THRESHOLD=15.0 are confirmed stable.**
 
 **Next (queued):**
 - Remaining Phase 6+ items: sample-level audio mixing, language as additional modality.
-- Re-calibrate `prior_beta` and `settle_steps` once diverse multi-video content is available.
-- True cross-session threshold validation (now unblocked: warm HNSW persists across restarts).
+- Re-calibrate `prior_beta` and `settle_steps` once diverse multi-video content is available (warm cross-session recall is now reliable enough to use as a test oracle).
 
 ## Open architectural questions
 

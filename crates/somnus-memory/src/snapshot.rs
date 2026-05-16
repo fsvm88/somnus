@@ -119,6 +119,12 @@ pub fn save_snapshot(episodic: &EpisodicBuffer, memory_dir: &Path) -> MemoryResu
 
     fs::create_dir_all(&tmp)?;
     save_episodic(episodic, &tmp.join("episodic.bin"))?;
+    // Persist the global next_id so IDs remain monotonic across restarts even
+    // when the hot buffer is cleared (which would otherwise reset next_id to 1).
+    fs::write(
+        tmp.join("next_id.bin"),
+        episodic.next_id_counter().to_le_bytes(),
+    )?;
 
     if snap.exists() {
         fs::remove_dir_all(&snap)?;
@@ -180,17 +186,22 @@ pub fn load_snapshot(
         return Ok(None);
     }
 
-    let episodic = load_episodic(&episodic_path, episodic_capacity)?;
+    let mut episodic = load_episodic(&episodic_path, episodic_capacity)?;
     let mut semantic = SemanticStore::new(episode_dim);
 
     // Rebuild warm from cold archive first (all historically spilled records).
+    // Track the max cold ID to keep next_id globally monotonic.
     let mut cold_count = 0usize;
+    let mut max_cold_id: u64 = 0;
     match ColdArchive::open(memory_dir) {
         Ok(archive) => match archive.iter() {
             Ok(iter) => {
                 for result in iter {
                     match result {
                         Ok(record) => {
+                            if record.id > max_cold_id {
+                                max_cold_id = record.id;
+                            }
                             semantic.insert(record);
                             cold_count += 1;
                         }
@@ -212,9 +223,33 @@ pub fn load_snapshot(
         hot_count += 1;
     }
 
+    // Restore the globally monotonic next_id: take the max of
+    // (persisted next_id from file), (max cold ID + 1), (current counter from hot).
+    // This prevents ID collisions when the hot buffer was cleared before snapshot.
+    let persisted_next_id = {
+        let path = snap.join("next_id.bin");
+        fs::read(&path)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0)
+    };
+    let floor = [
+        persisted_next_id,
+        if cold_count > 0 { max_cold_id + 1 } else { 0 },
+        episodic.next_id_counter(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    if floor > episodic.next_id_counter() {
+        episodic.set_next_id(floor);
+    }
+
     log::info!(
-        "warm HNSW rebuilt: cold_records={cold_count} hot_records={hot_count} total={}",
-        cold_count + hot_count
+        "warm HNSW rebuilt: cold_records={cold_count} hot_records={hot_count} total={} next_id={}",
+        cold_count + hot_count,
+        episodic.next_id_counter(),
     );
 
     Ok(Some((episodic, semantic)))
@@ -312,6 +347,8 @@ mod tests {
         let (restored_buf, restored_sem) = result.unwrap();
         assert_eq!(restored_buf.len(), 2);
         assert_eq!(restored_sem.len(), 2);
+        // next_id should be at least 2 (the two records had ids 0 and 1).
+        assert!(restored_buf.next_id_counter() >= 2);
     }
 
     #[test]
@@ -344,6 +381,11 @@ mod tests {
             restored_sem.len(),
             3,
             "warm HNSW should contain all 3 cold records"
+        );
+        // next_id must be above the max cold ID (2) so new records don't collide.
+        assert!(
+            restored_buf.next_id_counter() > 2,
+            "next_id should be above max cold ID"
         );
     }
 }
