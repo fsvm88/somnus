@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-15
-> **Last commit on main:** e8dccf5 — *Calibration run: --file-loop, warm probe ordering fix, calibrated thresholds*
+> **Last updated:** 2026-05-16
+> **Last commit on main:** (pending commit) — *Warm HNSW persistence: rebuild from cold archive on restore*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -130,10 +130,13 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - **`WARM_RECALL_GROWTH_THRESHOLD`**: 100.0 → **15.0**. Calibrated from 17 sleep cycles: same-content warm L2 ranged 1.6–3.5 (median 2.3, max 3.5). Threshold 15.0 gives ×4 safety margin; genuinely novel content expected at L2 >> 5.
   - `prior_beta` and `settle_steps` remain 0.0/0 — output_mse is stable (~0.013–0.020) but dataset is too homogeneous (one looped video) to calibrate these safely.
 
+**Also done (2026-05-16):**
+- Warm HNSW persistence across restarts. Root cause: sleep calls `episodic.clear()` before `save_snapshot`, so the snapshot's episodic buffer is empty; `load_snapshot` rebuilt warm from that empty buffer → zero cross-session recall. Fix: `load_snapshot` now opens the cold archive and inserts all historically spilled records first, then any remaining hot-buffer records. Cold records have lower IDs by construction so no ID collisions occur in normal operation. New test `warm_rebuilt_from_cold_after_hot_cleared` verifies the fix. ADR 0007 updated: documents the rebuild-from-cold approach and explains why native `hnsw_rs` file persistence was not used (lifetime/unsafe complexity; acceptable for Phase 5 cold-archive sizes). 58 workspace tests pass.
+
 **Next (queued):**
 - Remaining Phase 6+ items: sample-level audio mixing, language as additional modality.
 - Re-calibrate `prior_beta` and `settle_steps` once diverse multi-video content is available.
-- HNSW persistence across restarts (warm memory is session-local due to lifetime constraints, ADR 0007) — would unlock true multi-session recall and cross-session threshold validation.
+- True cross-session threshold validation (now unblocked: warm HNSW persists across restarts).
 
 ## Open architectural questions
 

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 hnsw_rs   = { workspace = true }
+log       = "0.4"
 memmap2   = { workspace = true }
 thiserror = { workspace = true }
 

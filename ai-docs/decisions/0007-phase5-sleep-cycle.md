@@ -128,18 +128,21 @@ Snapshot directory: `memory/snapshot/`. Write atomically:
 
 1. Write to `memory/snapshot.tmp/`:
    - `episodic.bin` — custom binary: u64 count, then per-trace: EpisodeRecord bytes (same layout as cold archive per-record) + 4 × `[u16 len; f32 values...]` for regional embeddings.
-   - `semantic.hnsw` — `hnsw_rs::Hnsw::file_dump("semantic", dir)`.
    - `weights.safetensors` — `varmap.save(path)`.
 2. `std::fs::rename("memory/snapshot.tmp", "memory/snapshot")` — atomic on Linux (same filesystem).
 
 On startup, if `memory/snapshot/` exists, restore:
 1. Load `episodic.bin` into `EpisodicBuffer`.
-2. Load `semantic.hnsw` via `hnsw_rs::Hnsw::load("semantic", dir)`.
+2. Rebuild warm `SemanticStore` by inserting records from:
+   - Cold archive (`memory/episodes.cold`) — all historically spilled episodes from all past sessions.
+   - Hot episodic buffer — any records not yet spilled (typically empty after a completed sleep).
 3. Load `weights.safetensors` via `varmap.load(path)`.
 
 `EpisodeTrace` ids from the previous session are restored verbatim; the `next_id` counter is set to `max(restored_ids) + 1`.
 
-**Note on `hnsw_rs::Hnsw::file_dump/load`:** these methods write/read two files per call: `name.hnsw.data` and `name.hnsw.graph`. Both are written to the snapshot directory.
+**Why rebuild instead of persisting the HNSW file?** `hnsw_rs::Hnsw::load_hnsw` has a lifetime tied to the `HnswIo` loader (to support mmap). Storing `Hnsw<'static>` in `SemanticStore` while also persisting across calls would require unsafe lifetime erasure. Rebuilding from the cold archive (which is already durable) sidesteps the problem cleanly. The rebuild is O(N log N) in cold-archive size; at Phase 5 scale (< 10K records) this is fast enough on startup. If cold archives grow to 100K+ records, HNSW file persistence becomes worth the unsafe complexity — defer to that milestone.
+
+**Quantization note:** cold archive vectors are INT8-quantised with per-vector scale. Dequantised L2 distances will differ slightly (~0.1 per 512-dim vector) from the original f32 values. This is well below the calibrated `RECALL_BLEND_THRESHOLD=5.5`, so existing thresholds remain valid.
 
 ### 10. Eager insert removed from wake path
 

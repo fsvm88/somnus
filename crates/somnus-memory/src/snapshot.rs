@@ -6,9 +6,14 @@
 ///     weights.safetensors   — perception weights (written by the somnus binary)
 ///     region_sizes.bin      — 4 × u64 LE: n_units per region after growth
 ///
-/// The SemanticStore (warm HNSW) is NOT persisted. On restore it is rebuilt
-/// by reinserting all episode records from the loaded hot buffer. This avoids
-/// the hnsw_rs lifetime constraints on deserialization.
+/// The SemanticStore (warm HNSW) is NOT persisted as a file. On restore it is
+/// rebuilt by reinserting records from (a) the cold archive (all historically
+/// spilled episodes) and (b) the hot episodic buffer (any records not yet
+/// spilled). Cold records are inserted first (lower IDs), hot after.
+///
+/// After a completed sleep cycle the hot buffer is cleared before the snapshot
+/// is saved, so on restore the episodic buffer is typically empty and warm
+/// recall coverage comes entirely from the cold archive.
 ///
 /// Written atomically: temp dir → rename.
 use std::{
@@ -18,6 +23,7 @@ use std::{
 };
 
 use crate::{
+    cold::ColdArchive,
     episodic::EpisodicBuffer,
     error::{MemoryError, MemoryResult},
     semantic::SemanticStore,
@@ -158,7 +164,11 @@ pub fn load_region_sizes(memory_dir: &Path) -> Option<[usize; 4]> {
 }
 
 /// Restore episodic buffer + rebuild SemanticStore from `memory_dir/snapshot/`.
-/// Returns None if no snapshot exists.
+///
+/// Warm HNSW is rebuilt by inserting cold-archive records first (all historical
+/// spilled episodes), then hot-buffer records (anything not yet spilled).
+/// Cold records have lower IDs by construction; inserting cold first avoids ID
+/// collisions in the common case. Returns None if no snapshot exists.
 pub fn load_snapshot(
     memory_dir: &Path,
     episodic_capacity: usize,
@@ -171,12 +181,41 @@ pub fn load_snapshot(
     }
 
     let episodic = load_episodic(&episodic_path, episodic_capacity)?;
-
-    // Rebuild warm tier from hot buffer's episode records.
     let mut semantic = SemanticStore::new(episode_dim);
+
+    // Rebuild warm from cold archive first (all historically spilled records).
+    let mut cold_count = 0usize;
+    match ColdArchive::open(memory_dir) {
+        Ok(archive) => match archive.iter() {
+            Ok(iter) => {
+                for result in iter {
+                    match result {
+                        Ok(record) => {
+                            semantic.insert(record);
+                            cold_count += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("skipping corrupt cold record during warm rebuild: {e}");
+                        }
+                    }
+                }
+            }
+            Err(e) => log::warn!("could not iterate cold archive during warm rebuild: {e}"),
+        },
+        Err(e) => log::warn!("could not open cold archive during warm rebuild: {e}"),
+    }
+
+    // Then insert hot-buffer records (not yet spilled; typically empty after sleep).
+    let mut hot_count = 0usize;
     for record in episodic.iter_records() {
         semantic.insert(record.clone());
+        hot_count += 1;
     }
+
+    log::info!(
+        "warm HNSW rebuilt: cold_records={cold_count} hot_records={hot_count} total={}",
+        cold_count + hot_count
+    );
 
     Ok(Some((episodic, semantic)))
 }
@@ -273,5 +312,38 @@ mod tests {
         let (restored_buf, restored_sem) = result.unwrap();
         assert_eq!(restored_buf.len(), 2);
         assert_eq!(restored_sem.len(), 2);
+    }
+
+    #[test]
+    fn warm_rebuilt_from_cold_after_hot_cleared() {
+        use crate::cold::{ColdArchive, COLD_DIM};
+        let dir = TempDir::new().unwrap();
+        let dim = COLD_DIM;
+
+        // Simulate: records spilled to cold, then hot buffer cleared, snapshot saved empty.
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        for i in 0..3u64 {
+            archive
+                .append(&crate::episode::EpisodeRecord {
+                    id: i,
+                    timestamp_secs: i as f64,
+                    values: vec![i as f32 * 0.1; dim],
+                })
+                .unwrap();
+        }
+        // Save snapshot with an empty hot buffer (post-clear state).
+        let empty_buf = EpisodicBuffer::new(4);
+        save_snapshot(&empty_buf, dir.path()).unwrap();
+
+        let result = load_snapshot(dir.path(), 4, dim).unwrap();
+        assert!(result.is_some());
+        let (restored_buf, restored_sem) = result.unwrap();
+        assert_eq!(restored_buf.len(), 0, "hot buffer should be empty");
+        // Warm HNSW must be populated from cold records despite empty hot buffer.
+        assert_eq!(
+            restored_sem.len(),
+            3,
+            "warm HNSW should contain all 3 cold records"
+        );
     }
 }
