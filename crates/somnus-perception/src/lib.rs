@@ -25,6 +25,12 @@ impl Default for TrainConfig {
 /// Per-region input dimensions (encoder output sizes).
 pub const REGION_DIMS: [usize; 4] = [384, 512, 384, 384];
 
+/// prior_cosine below this threshold activates the settling loop (ADR 0011).
+/// Calibrated 2026-05-17: familiar visual prior_cosine min=0.977, novel min=0.06–0.16.
+/// 0.85 sits well below the familiar floor so settling never fires on known content,
+/// while catching all genuinely novel episodes where settling reduces delta by ~42%.
+const SETTLE_COSINE_GATE: f32 = 0.85;
+
 /// L2 delta below which the settling loop is considered converged (ADR 0011).
 /// Needs calibration once real episode vector magnitudes are observed.
 // Calibrated 2026-05-17: familiar content has mean settle delta ~3.8 at iter=0 and
@@ -80,6 +86,9 @@ pub struct PerceptionProcessor {
     settle_steps: usize,
     /// Fraction of output-head prediction blended into settling inputs (ADR 0011).
     settle_beta: f32,
+    /// Most recent visual prior_cosine; used to gate settling (ADR 0011).
+    /// None until the first visual embedding with β>0 is processed.
+    last_visual_cosine: Option<f32>,
 
     /// Per-region gain multipliers applied to raw encoder inputs before k-WTA (ADR 0012).
     /// Derived from the ActionDecoder's LM attention over region tokens each episode.
@@ -169,6 +178,7 @@ impl PerceptionProcessor {
             latest_inputs: [None, None, None, None],
             settle_steps: 0,
             settle_beta: 0.5,
+            last_visual_cosine: None,
             region_gain: [1.0; 4],
             varmap,
             optimizer,
@@ -209,7 +219,9 @@ impl PerceptionProcessor {
 
         let (episode, regional_inputs) = self.try_bind()?;
         let episode = if let Some(ep) = episode {
-            let refined = if self.settle_steps > 0 {
+            let should_settle = self.settle_steps > 0
+                && self.last_visual_cosine.map_or(true, |c| c < SETTLE_COSINE_GATE);
+            let refined = if should_settle {
                 let (r, _) = self.settle_episode(&ep)?;
                 r
             } else {
@@ -244,7 +256,9 @@ impl PerceptionProcessor {
 
         let (episode, regional_inputs) = self.try_bind()?;
         let episode = if let Some(ep) = episode {
-            let refined = if self.settle_steps > 0 {
+            let should_settle = self.settle_steps > 0
+                && self.last_visual_cosine.map_or(true, |c| c < SETTLE_COSINE_GATE);
+            let refined = if should_settle {
                 let (r, _) = self.settle_episode(&ep)?;
                 r
             } else {
@@ -268,6 +282,7 @@ impl PerceptionProcessor {
         let (input, cosine) = self.blend_with_prior(&gained, 2);
         if let Some(c) = cosine {
             tracing::info!(region = "visual", prior_cosine = c, "top-down prior");
+            self.last_visual_cosine = Some(c);
         }
         let act = self.visual_layer.forward(&input)?;
         let err = self.visual_decoder.reconstruction_error(values, &act)?;
@@ -276,7 +291,9 @@ impl PerceptionProcessor {
 
         let (episode, regional_inputs) = self.try_bind()?;
         let episode = if let Some(ep) = episode {
-            let refined = if self.settle_steps > 0 {
+            let should_settle = self.settle_steps > 0
+                && self.last_visual_cosine.map_or(true, |c| c < SETTLE_COSINE_GATE);
+            let refined = if should_settle {
                 let (r, _) = self.settle_episode(&ep)?;
                 r
             } else {
