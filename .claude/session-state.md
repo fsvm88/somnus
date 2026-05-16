@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-16
-> **Last commit on main:** (pending commit) — *Warm HNSW persistence: rebuild from cold archive on restore*
+> **Last commit on main:** 1d96599 — *Warm HNSW persistence: rebuild from cold archive on restore*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
