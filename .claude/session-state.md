@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-17 (novel-content calibration + file-mode exit fix)
-> **Last commit on main:** TBD
+> **Last commit on main:** 27a26a1 — *Fix file-mode hang + novel-content calibration (SETTLE_EPS 1.0→4.0)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
