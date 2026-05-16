@@ -12,7 +12,8 @@ pub struct EpisodeRecord {
 /// Hot-tier episode trace: the episode record plus the raw encoder inputs for all regions.
 ///
 /// `regional[i]` is the encoder embedding that was fed into region i's k-WTA layer:
-///   0 = AudioSpeech (384-dim), 1 = AudioEnv (512-dim), 2 = Visual (384-dim), 3 = Symbolic (384-dim).
+///   0 = AudioSpeech (384-dim), 1 = AudioEnv (512-dim), 2 = Visual (384-dim),
+///   3 = Symbolic (384-dim), 4 = Language (896-dim, empty when no text was present).
 /// Empty vecs are stored for regions that had no input when the episode was created.
 ///
 /// `text_target` carries token IDs from a text-bypass query received while this episode was
@@ -23,6 +24,6 @@ pub struct EpisodeRecord {
 #[derive(Debug, Clone)]
 pub struct EpisodeTrace {
     pub record: EpisodeRecord,
-    pub regional: [Vec<f32>; 4],
+    pub regional: [Vec<f32>; 5],
     pub text_target: Option<Vec<u32>>,
 }

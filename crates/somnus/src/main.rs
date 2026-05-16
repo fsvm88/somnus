@@ -338,7 +338,7 @@ async fn main() -> Result<()> {
                 let w_path = weights_path(&args.memory_dir);
                 if w_path.exists() {
                     let sizes =
-                        load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 4]);
+                        load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
                     if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
                         tracing::warn!(?e, "weight restore failed — starting with fresh weights");
                     } else {
@@ -425,7 +425,7 @@ async fn main() -> Result<()> {
         let tx = query_tx;
         tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
-            for line in std::io::stdin().lock().lines().flatten() {
+            for line in std::io::stdin().lock().lines().map_while(Result::ok) {
                 let trimmed = line.trim().to_string();
                 if !trimmed.is_empty() && tx.blocking_send(trimmed).is_err() {
                     break;
@@ -914,7 +914,7 @@ fn record_episode(
         let regional = out
             .regional_inputs
             .clone()
-            .unwrap_or([vec![], vec![], vec![], vec![]]);
+            .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
 
         // Recollection: find similar past episodes from warm memory.
         let neighbours = recall.query_warm_with_dist(&ep.0, top_k);

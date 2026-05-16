@@ -12,9 +12,11 @@ use crate::{
 };
 
 /// Dimension of episode vectors — must match `somnus-perception::binding::EPISODE_DIM`.
-pub const COLD_DIM: usize = 512;
+/// Bumped to 640 (5 regions × 128) in Phase 6 (ADR 0013). Old 512-dim archives
+/// are incompatible; MAGIC bumped so they fail gracefully.
+pub const COLD_DIM: usize = 640;
 
-const MAGIC: &[u8; 8] = b"SMNCOLD\0";
+const MAGIC: &[u8; 8] = b"SMNCOLD1";
 
 // Per-record layout (little-endian):
 //   id:        u64   8 B

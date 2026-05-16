@@ -23,7 +23,8 @@ impl Default for TrainConfig {
 }
 
 /// Per-region input dimensions (encoder output sizes).
-pub const REGION_DIMS: [usize; 4] = [384, 512, 384, 384];
+/// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
+pub const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 896];
 
 /// prior_cosine below this threshold activates the settling loop (ADR 0011).
 /// Calibrated 2026-05-17: familiar visual prior_cosine min=0.977, novel min=0.06–0.16.
@@ -32,7 +33,6 @@ pub const REGION_DIMS: [usize; 4] = [384, 512, 384, 384];
 const SETTLE_COSINE_GATE: f32 = 0.85;
 
 /// L2 delta below which the settling loop is considered converged (ADR 0011).
-/// Needs calibration once real episode vector magnitudes are observed.
 // Calibrated 2026-05-17: familiar content has mean settle delta ~3.8 at iter=0 and
 // diverges slightly with iterations; novel content (talking_head) has mean 6.1→3.5
 // over 3 steps. 4.0 allows early exit on the lower tail of novel content without
@@ -43,44 +43,47 @@ const SETTLE_EPS: f32 = 4.0;
 pub struct PerceptionOutput {
     /// Reconstruction errors for regions updated this call (region, MSE).
     pub recon_errors: Vec<(RegionId, f32)>,
-    /// Episode vector from the binding area, produced once all four regions
-    /// have at least one activation.
+    /// Episode vector from the binding area, produced once all four non-language
+    /// regions have at least one activation.
     pub episode: Option<EpisodeVector>,
     /// Raw encoder inputs per region that produced this episode (Some when episode is Some).
-    /// Order: [AudioSpeech(384), AudioEnv(512), Visual(384), Symbolic(384)].
-    pub regional_inputs: Option<[Vec<f32>; 4]>,
+    /// Order: [AudioSpeech(384), AudioEnv(512), Visual(384), Symbolic(384), Language(896)].
+    /// Language slot is empty vec when no language input has been received.
+    pub regional_inputs: Option<[Vec<f32>; 5]>,
 }
 
-/// Owns the full cognitive-layer forward pass: four k-WTA layers, four SAE
+/// Owns the full cognitive-layer forward pass: five k-WTA layers, five SAE
 /// decoders, and the binding area.
 pub struct PerceptionProcessor {
     speech_layer: KWtaLayer,
     env_layer: KWtaLayer,
     visual_layer: KWtaLayer,
     symbolic_layer: KWtaLayer,
+    language_layer: KWtaLayer,
 
     speech_decoder: SaeDecoder,
     env_decoder: SaeDecoder,
     visual_decoder: SaeDecoder,
     symbolic_decoder: SaeDecoder,
+    language_decoder: SaeDecoder,
 
     binding: BindingArea,
 
     /// Per-region output heads: EPISODE_DIM → encoder_dim. Predict encoder
     /// embeddings from the episode vector (ADR 0009). Also serve as the
     /// top-down feedback path (ADR 0010).
-    output_heads: [Linear; 4],
+    output_heads: [Linear; 5],
 
     /// Predicted encoder embeddings from the previous episode (ADR 0010).
     /// None until the first episode is produced. Updated after every episode.
-    prior_predictions: [Option<Vec<f32>>; 4],
+    prior_predictions: [Option<Vec<f32>>; 5],
     /// Blend weight β for top-down prior injection. 0.0 = disabled (default).
     prior_beta: f32,
 
     /// Latest sparse activation per region; None until first embedding arrives.
-    latest: [Option<SparseActivation>; 4],
+    latest: [Option<SparseActivation>; 5],
     /// Latest raw encoder input per region; None until first embedding arrives.
-    latest_inputs: [Option<Vec<f32>>; 4],
+    latest_inputs: [Option<Vec<f32>>; 5],
 
     /// Max settling iterations per episode (ADR 0011). 0 = disabled.
     settle_steps: usize,
@@ -92,8 +95,8 @@ pub struct PerceptionProcessor {
 
     /// Per-region gain multipliers applied to raw encoder inputs before k-WTA (ADR 0012).
     /// Derived from the ActionDecoder's LM attention over region tokens each episode.
-    /// Reset to 1.0 at sleep entry. Default: [1.0; 4] (no-op).
-    region_gain: [f32; 4],
+    /// Reset to 1.0 at sleep entry. Default: [1.0; 5] (no-op).
+    region_gain: [f32; 5],
 
     /// Holds all trainable parameters; needed for optimizer, save, and load.
     varmap: VarMap,
@@ -125,6 +128,12 @@ impl PerceptionProcessor {
             vb("symbolic_layer"),
             device.clone(),
         )?;
+        let language_layer = KWtaLayer::new(
+            RegionId::Language,
+            896,
+            vb("language_layer"),
+            device.clone(),
+        )?;
 
         let speech_decoder = SaeDecoder::new(
             RegionId::AudioSpeech,
@@ -142,15 +151,22 @@ impl PerceptionProcessor {
             vb("symbolic_decoder"),
             device.clone(),
         )?;
+        let language_decoder = SaeDecoder::new(
+            RegionId::Language,
+            896,
+            vb("language_decoder"),
+            device.clone(),
+        )?;
 
         let binding = BindingArea::new(vb("binding"), device.clone())?;
 
         let vb_out = vb("output_heads");
         let output_heads = [
-            linear_no_bias(EPISODE_DIM, REGION_DIMS[0], vb_out.pp("0"))?, // speech: 512→384
-            linear_no_bias(EPISODE_DIM, REGION_DIMS[1], vb_out.pp("1"))?, // env: 512→512
-            linear_no_bias(EPISODE_DIM, REGION_DIMS[2], vb_out.pp("2"))?, // visual: 512→384
-            linear_no_bias(EPISODE_DIM, REGION_DIMS[3], vb_out.pp("3"))?, // symbolic: 512→384
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[0], vb_out.pp("0"))?, // speech: 640→384
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[1], vb_out.pp("1"))?, // env: 640→512
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[2], vb_out.pp("2"))?, // visual: 640→384
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[3], vb_out.pp("3"))?, // symbolic: 640→384
+            linear_no_bias(EPISODE_DIM, REGION_DIMS[4], vb_out.pp("4"))?, // language: 640→896
         ];
 
         let optimizer = AdamW::new(
@@ -166,20 +182,22 @@ impl PerceptionProcessor {
             env_layer,
             visual_layer,
             symbolic_layer,
+            language_layer,
             speech_decoder,
             env_decoder,
             visual_decoder,
             symbolic_decoder,
+            language_decoder,
             binding,
             output_heads,
-            prior_predictions: [None, None, None, None],
+            prior_predictions: [None, None, None, None, None],
             prior_beta: 0.0,
-            latest: [None, None, None, None],
-            latest_inputs: [None, None, None, None],
+            latest: [None, None, None, None, None],
+            latest_inputs: [None, None, None, None, None],
             settle_steps: 0,
             settle_beta: 0.5,
             last_visual_cosine: None,
-            region_gain: [1.0; 4],
+            region_gain: [1.0; 5],
             varmap,
             optimizer,
             device,
@@ -189,7 +207,6 @@ impl PerceptionProcessor {
     /// Ingest a 384-dim Whisper speech embedding.
     /// Updates AudioSpeech and Symbolic regions (same input, independent weights).
     pub fn ingest_speech(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        // Apply region gain before prior blending (ADR 0012). Raw `values` kept for recon targets.
         let gained_speech = apply_gain(values, self.region_gain[0]);
         let gained_symbolic = apply_gain(values, self.region_gain[3]);
         let (speech_input, speech_cos) = self.blend_with_prior(&gained_speech, 0);
@@ -213,25 +230,11 @@ impl PerceptionProcessor {
 
         self.latest[RegionId::AudioSpeech.as_index()] = Some(speech_act);
         self.latest[RegionId::Symbolic.as_index()] = Some(symbolic_act);
-        // Store raw encoder inputs; training targets must be unbiased (ADR 0010).
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
         self.latest_inputs[RegionId::Symbolic.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        let episode = if let Some(ep) = episode {
-            let should_settle = self.settle_steps > 0
-                && self.last_visual_cosine.map_or(true, |c| c < SETTLE_COSINE_GATE);
-            let refined = if should_settle {
-                let (r, _) = self.settle_episode(&ep)?;
-                r
-            } else {
-                ep
-            };
-            self.update_prior_predictions(&refined.0)?;
-            Some(refined)
-        } else {
-            None
-        };
+        let episode = self.maybe_settle_and_update(episode)?;
         Ok(PerceptionOutput {
             recon_errors: vec![
                 (RegionId::AudioSpeech, speech_err),
@@ -255,20 +258,7 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        let episode = if let Some(ep) = episode {
-            let should_settle = self.settle_steps > 0
-                && self.last_visual_cosine.map_or(true, |c| c < SETTLE_COSINE_GATE);
-            let refined = if should_settle {
-                let (r, _) = self.settle_episode(&ep)?;
-                r
-            } else {
-                ep
-            };
-            self.update_prior_predictions(&refined.0)?;
-            Some(refined)
-        } else {
-            None
-        };
+        let episode = self.maybe_settle_and_update(episode)?;
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::AudioEnv, err)],
             episode,
@@ -290,20 +280,7 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        let episode = if let Some(ep) = episode {
-            let should_settle = self.settle_steps > 0
-                && self.last_visual_cosine.map_or(true, |c| c < SETTLE_COSINE_GATE);
-            let refined = if should_settle {
-                let (r, _) = self.settle_episode(&ep)?;
-                r
-            } else {
-                ep
-            };
-            self.update_prior_predictions(&refined.0)?;
-            Some(refined)
-        } else {
-            None
-        };
+        let episode = self.maybe_settle_and_update(episode)?;
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::Visual, err)],
             episode,
@@ -311,8 +288,56 @@ impl PerceptionProcessor {
         })
     }
 
+    /// Ingest a 896-dim Qwen language embedding (mean-pooled token embeddings).
+    ///
+    /// Language is optional: episodes are produced from regions 0–3; this region
+    /// zero-pads the binding area's language slot when absent (ADR 0013).
+    pub fn ingest_language(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
+        let gained = apply_gain(values, self.region_gain[4]);
+        let (input, cosine) = self.blend_with_prior(&gained, 4);
+        if let Some(c) = cosine {
+            tracing::info!(region = "language", prior_cosine = c, "top-down prior");
+        }
+        let act = self.language_layer.forward(&input)?;
+        let err = self.language_decoder.reconstruction_error(values, &act)?;
+        self.latest[RegionId::Language.as_index()] = Some(act);
+        self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
+
+        let (episode, regional_inputs) = self.try_bind()?;
+        let episode = self.maybe_settle_and_update(episode)?;
+        Ok(PerceptionOutput {
+            recon_errors: vec![(RegionId::Language, err)],
+            episode,
+            regional_inputs,
+        })
+    }
+
+    fn maybe_settle_and_update(
+        &mut self,
+        episode: Option<EpisodeVector>,
+    ) -> PerceptionResult<Option<EpisodeVector>> {
+        if let Some(ep) = episode {
+            let should_settle = self.settle_steps > 0
+                && self.last_visual_cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
+            let refined = if should_settle {
+                let (r, _) = self.settle_episode(&ep)?;
+                r
+            } else {
+                ep
+            };
+            self.update_prior_predictions(&refined.0)?;
+            Ok(Some(refined))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Attempt to produce an episode vector.
+    ///
+    /// Regions 0–3 (AudioSpeech, AudioEnv, Visual, Symbolic) must all be present.
+    /// Region 4 (Language) is optional: a zero SparseActivation is used when absent.
     #[allow(clippy::type_complexity)]
-    fn try_bind(&self) -> PerceptionResult<(Option<EpisodeVector>, Option<[Vec<f32>; 4]>)> {
+    fn try_bind(&self) -> PerceptionResult<(Option<EpisodeVector>, Option<[Vec<f32>; 5]>)> {
         match (
             self.latest[0].as_ref(),
             self.latest[1].as_ref(),
@@ -320,12 +345,20 @@ impl PerceptionProcessor {
             self.latest[3].as_ref(),
         ) {
             (Some(sp), Some(en), Some(vi), Some(sy)) => {
-                let ep = self.binding.forward(&[sp, en, vi, sy])?;
+                let lang_zero = SparseActivation {
+                    region: RegionId::Language,
+                    indices: vec![],
+                    values: vec![],
+                    n_units: N_UNITS,
+                };
+                let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
+                let ep = self.binding.forward(&[sp, en, vi, sy, lang])?;
                 let regional = [
                     self.latest_inputs[0].clone().unwrap_or_default(),
                     self.latest_inputs[1].clone().unwrap_or_default(),
                     self.latest_inputs[2].clone().unwrap_or_default(),
                     self.latest_inputs[3].clone().unwrap_or_default(),
+                    self.latest_inputs[4].clone().unwrap_or_default(),
                 ];
                 Ok((Some(ep), Some(regional)))
             }
@@ -340,12 +373,11 @@ impl PerceptionProcessor {
     /// Computes SAE reconstruction MSE for each region using the stored encoder
     /// inputs, accumulates into a combined loss, and calls `optimizer.backward_step`.
     /// Returns mean MSE across regions (for monitoring).
-    pub fn replay_step(&mut self, regional: &[Vec<f32>; 4]) -> PerceptionResult<f32> {
+    pub fn replay_step(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<f32> {
         let dev = self.device.clone();
         let mut total_loss: Option<Tensor> = None;
         let mut n_regions = 0usize;
 
-        // Each region processed separately to avoid mixed mutable/immutable borrows.
         for (idx, input) in regional.iter().enumerate() {
             if input.is_empty() {
                 continue;
@@ -387,6 +419,7 @@ impl PerceptionProcessor {
             1 => self.env_layer.forward_tracked(input),
             2 => self.visual_layer.forward_tracked(input),
             3 => self.symbolic_layer.forward_tracked(input),
+            4 => self.language_layer.forward_tracked(input),
             _ => unreachable!(),
         }
     }
@@ -402,14 +435,15 @@ impl PerceptionProcessor {
             1 => self.env_decoder.mse_loss_tensor(input, sparse_z),
             2 => self.visual_decoder.mse_loss_tensor(input, sparse_z),
             3 => self.symbolic_decoder.mse_loss_tensor(input, sparse_z),
+            4 => self.language_decoder.mse_loss_tensor(input, sparse_z),
             _ => unreachable!(),
         }
     }
 
     /// Measure SAE reconstruction MSE per region without updating weights.
-    /// Returns per-region MSE: [speech, env, visual, symbolic].
-    pub fn measure_mse(&mut self, regional: &[Vec<f32>; 4]) -> PerceptionResult<[f32; 4]> {
-        let mut result = [0.0f32; 4];
+    /// Returns per-region MSE: [speech, env, visual, symbolic, language].
+    pub fn measure_mse(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<[f32; 5]> {
+        let mut result = [0.0f32; 5];
         for (idx, input) in regional.iter().enumerate() {
             if input.is_empty() {
                 continue;
@@ -430,6 +464,7 @@ impl PerceptionProcessor {
             1 => self.env_layer.forward(input),
             2 => self.visual_layer.forward(input),
             3 => self.symbolic_layer.forward(input),
+            4 => self.language_layer.forward(input),
             _ => unreachable!(),
         }
     }
@@ -445,12 +480,12 @@ impl PerceptionProcessor {
             1 => self.env_decoder.reconstruction_error(input, act),
             2 => self.visual_decoder.reconstruction_error(input, act),
             3 => self.symbolic_decoder.reconstruction_error(input, act),
+            4 => self.language_decoder.reconstruction_error(input, act),
             _ => unreachable!(),
         }
     }
 
     /// Apply global weight decay to all k-WTA and SAE Linear weights.
-    /// Each weight element is multiplied by `(1 - rate)`.
     pub fn homeostatic_decay(&mut self, rate: f32) -> PerceptionResult<()> {
         let scale = 1.0 - rate;
         let vars = self.varmap.all_vars();
@@ -462,10 +497,6 @@ impl PerceptionProcessor {
     }
 
     /// Grow a region by appending `n_new` units with small random weights.
-    ///
-    /// Updates the k-WTA layer and SAE decoder weights in the VarMap,
-    /// rebuilds their Linear layers, extends duty_cycle, and resets the
-    /// optimizer with the updated var list.
     pub fn grow_region(&mut self, region: RegionId, n_new: usize) -> PerceptionResult<()> {
         let idx = region.as_index();
         let (enc_key, dec_key) = Self::layer_keys(region);
@@ -475,7 +506,6 @@ impl PerceptionProcessor {
         let old_n = layer.n_units;
         let new_n = old_n + n_new;
 
-        // Expand encoder weight: [old_n, n_in] → [new_n, n_in]
         {
             let old_w = {
                 let data = self.varmap.data().lock().unwrap();
@@ -496,7 +526,6 @@ impl PerceptionProcessor {
             layer.duty_cycle.extend(vec![0.0f32; n_new]);
         }
 
-        // Expand SAE decoder weight: [n_in, old_n] → [n_in, new_n]
         {
             let old_w = {
                 let data = self.varmap.data().lock().unwrap();
@@ -515,7 +544,6 @@ impl PerceptionProcessor {
             decoder.replace_linear(Linear::new(new_tensor, None), new_n);
         }
 
-        // Reset optimizer with updated var list.
         self.optimizer = AdamW::new(
             self.varmap.all_vars(),
             ParamsAdamW {
@@ -529,14 +557,10 @@ impl PerceptionProcessor {
     }
 
     /// Run one wake-time reconstruction step on a just-produced episode.
-    ///
-    /// For each non-empty region, runs the output head forward on `episode` and
-    /// computes MSE against the actual encoder input. Backprops through the heads
-    /// and the binding area. Returns mean MSE over active regions.
     pub fn wake_reconstruct_step(
         &mut self,
         episode: &[f32],
-        regional: &[Vec<f32>; 4],
+        regional: &[Vec<f32>; 5],
     ) -> PerceptionResult<f32> {
         let dev = self.device.clone();
         let ep_t = Tensor::from_slice(episode, (1, episode.len()), &dev)?;
@@ -548,7 +572,7 @@ impl PerceptionProcessor {
             if input.is_empty() {
                 continue;
             }
-            let pred = self.output_heads[i].forward(&ep_t)?.squeeze(0)?; // [dim]
+            let pred = self.output_heads[i].forward(&ep_t)?.squeeze(0)?;
             let target = Tensor::from_slice(input.as_slice(), (input.len(),), &dev)?;
             let diff = (pred - target)?;
             let loss = diff.sqr()?.mean_all()?;
@@ -571,14 +595,13 @@ impl PerceptionProcessor {
     // ── Top-down prior helpers (ADR 0010) ───────────────────────────────────────
 
     /// Set per-region gain multipliers from the ActionDecoder (ADR 0012).
-    /// Applied to raw encoder inputs before prior blending and k-WTA.
-    pub fn set_region_gain(&mut self, gain: [f32; 4]) {
+    pub fn set_region_gain(&mut self, gain: [f32; 5]) {
         self.region_gain = gain;
     }
 
     /// Reset all region gains to 1.0 (no-op). Called at sleep entry.
     pub fn reset_region_gain(&mut self) {
-        self.region_gain = [1.0; 4];
+        self.region_gain = [1.0; 5];
     }
 
     /// Set the prior blend weight β. 0.0 disables prior injection (default).
@@ -607,8 +630,7 @@ impl PerceptionProcessor {
         for iter in 0..self.settle_steps {
             let cur_t = Tensor::from_slice(&current.0, (1, current.0.len()), dev)?;
 
-            // Generate per-region predictions from the current episode (no grad needed).
-            let mut preds: [Vec<f32>; 4] = [vec![], vec![], vec![], vec![]];
+            let mut preds: [Vec<f32>; 5] = [vec![], vec![], vec![], vec![], vec![]];
             for (i, pred) in preds.iter_mut().enumerate() {
                 *pred = self.output_heads[i]
                     .forward(&cur_t)?
@@ -616,9 +638,8 @@ impl PerceptionProcessor {
                     .to_vec1()?;
             }
 
-            // Blend each prediction with the raw encoder input, then run k-WTA (no DC update).
-            let mut acts: [Option<SparseActivation>; 4] = [None, None, None, None];
-            for i in 0..4 {
+            let mut acts: [Option<SparseActivation>; 5] = [None, None, None, None, None];
+            for i in 0..5 {
                 if let Some(raw) = &self.latest_inputs[i] {
                     let blended: Vec<f32> = raw
                         .iter()
@@ -629,12 +650,20 @@ impl PerceptionProcessor {
                 }
             }
 
+            // Regions 0–3 required; region 4 (language) optional.
             let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
                 (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-                _ => break, // not all regions present — can't rebind
+                _ => break,
             };
+            let lang_zero = SparseActivation {
+                region: RegionId::Language,
+                indices: vec![],
+                values: vec![],
+                n_units: N_UNITS,
+            };
+            let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
 
-            let refined = self.binding.forward(&[a0, a1, a2, a3])?;
+            let refined = self.binding.forward(&[a0, a1, a2, a3, a4])?;
             let delta: f32 = current
                 .0
                 .iter()
@@ -663,13 +692,11 @@ impl PerceptionProcessor {
             1 => self.env_layer.forward_no_dc(input),
             2 => self.visual_layer.forward_no_dc(input),
             3 => self.symbolic_layer.forward_no_dc(input),
+            4 => self.language_layer.forward_no_dc(input),
             _ => unreachable!(),
         }
     }
 
-    /// Blend `values` with the stored prior prediction for `idx` if β > 0 and
-    /// a prior exists. Returns the (possibly biased) input and the cosine
-    /// similarity between raw and prior (Some only when a prior was applied).
     fn blend_with_prior(&self, values: &[f32], idx: usize) -> (Vec<f32>, Option<f32>) {
         if self.prior_beta <= 0.0 {
             return (values.to_vec(), None);
@@ -700,25 +727,24 @@ impl PerceptionProcessor {
         }
     }
 
-    /// Run the four output heads on `episode` in inference mode and store the
-    /// predictions as the priors for the next ingest call.
     fn update_prior_predictions(&mut self, episode: &[f32]) -> PerceptionResult<()> {
         let dev = self.device.clone();
         let ep_t = Tensor::from_slice(episode, (1, episode.len()), &dev)?;
-        for i in 0..4 {
+        for i in 0..5 {
             let pred_vec: Vec<f32> = self.output_heads[i].forward(&ep_t)?.squeeze(0)?.to_vec1()?;
             self.prior_predictions[i] = Some(pred_vec);
         }
         Ok(())
     }
 
-    /// Current n_units per region: [speech, env, visual, symbolic].
-    pub fn region_sizes(&self) -> [usize; 4] {
+    /// Current n_units per region: [speech, env, visual, symbolic, language].
+    pub fn region_sizes(&self) -> [usize; 5] {
         [
             self.speech_layer.n_units,
             self.env_layer.n_units,
             self.visual_layer.n_units,
             self.symbolic_layer.n_units,
+            self.language_layer.n_units,
         ]
     }
 
@@ -739,28 +765,23 @@ impl PerceptionProcessor {
     }
 
     /// Load weights from a safetensors file.
-    ///
-    /// `Var::set` does not update Tensor clones already held by layers, so
-    /// `rebuild_linears` is called after load to propagate the new values.
     pub fn load_weights(&mut self, path: &std::path::Path) -> PerceptionResult<()> {
         self.varmap.load(path)?;
         self.rebuild_linears()
     }
 
     /// Pre-grow regions to `sizes`, load weights, then rebuild all layer Linears.
-    ///
-    /// Call this on restore when region sizes from a prior session differ from
-    /// the default `N_UNITS`; `sizes` comes from `load_region_sizes`.
     pub fn load_weights_with_sizes(
         &mut self,
         path: &std::path::Path,
-        sizes: [usize; 4],
+        sizes: [usize; 5],
     ) -> PerceptionResult<()> {
         let regions = [
             RegionId::AudioSpeech,
             RegionId::AudioEnv,
             RegionId::Visual,
             RegionId::Symbolic,
+            RegionId::Language,
         ];
         let current = self.region_sizes();
         for (i, &region) in regions.iter().enumerate() {
@@ -772,37 +793,16 @@ impl PerceptionProcessor {
         self.rebuild_linears()
     }
 
-    /// Rebuild all layer Linear objects from the current VarMap contents.
-    ///
-    /// Required because `Var::set` (called inside `varmap.load`) writes new data
-    /// into the Var but does not update Tensor handles cloned before the set.
-    /// Grown layers (n_units > N_UNITS) have no bias; unmodified layers keep theirs.
     fn rebuild_linears(&mut self) -> PerceptionResult<()> {
-        // Collect tensors with the lock held, then drop it before mutating layers.
         let (
-            sw,
-            sb,
-            dw_s,
-            ew,
-            eb,
-            dw_e,
-            vw,
-            vb_t,
-            dw_v,
-            yw,
-            yb,
-            dw_y,
-            brp0,
-            brp1,
-            brp2,
-            brp3,
-            bwq,
-            bwk,
-            bwv,
-            oh0,
-            oh1,
-            oh2,
-            oh3,
+            sw, sb, dw_s,
+            ew, eb, dw_e,
+            vw, vb_t, dw_v,
+            yw, yb, dw_y,
+            lw, lb, dw_l,
+            brp0, brp1, brp2, brp3, brp4,
+            bwq, bwk, bwv,
+            oh0, oh1, oh2, oh3, oh4,
         ) = {
             let data = self.varmap.data().lock().unwrap();
             (
@@ -816,13 +816,16 @@ impl PerceptionProcessor {
                 data.get("visual_layer.bias").map(|v| v.as_tensor().clone()),
                 data["visual_decoder.weight"].as_tensor().clone(),
                 data["symbolic_layer.weight"].as_tensor().clone(),
-                data.get("symbolic_layer.bias")
-                    .map(|v| v.as_tensor().clone()),
+                data.get("symbolic_layer.bias").map(|v| v.as_tensor().clone()),
                 data["symbolic_decoder.weight"].as_tensor().clone(),
+                data["language_layer.weight"].as_tensor().clone(),
+                data.get("language_layer.bias").map(|v| v.as_tensor().clone()),
+                data["language_decoder.weight"].as_tensor().clone(),
                 data["binding.region_0.weight"].as_tensor().clone(),
                 data["binding.region_1.weight"].as_tensor().clone(),
                 data["binding.region_2.weight"].as_tensor().clone(),
                 data["binding.region_3.weight"].as_tensor().clone(),
+                data["binding.region_4.weight"].as_tensor().clone(),
                 data["binding.attn_q.weight"].as_tensor().clone(),
                 data["binding.attn_k.weight"].as_tensor().clone(),
                 data["binding.attn_v.weight"].as_tensor().clone(),
@@ -830,13 +833,13 @@ impl PerceptionProcessor {
                 data["output_heads.1.weight"].as_tensor().clone(),
                 data["output_heads.2.weight"].as_tensor().clone(),
                 data["output_heads.3.weight"].as_tensor().clone(),
+                data["output_heads.4.weight"].as_tensor().clone(),
             )
         };
 
         let sn = self.speech_layer.n_units;
         self.speech_layer.linear = Linear::new(sw, if sn == N_UNITS { sb } else { None });
-        self.speech_decoder
-            .replace_linear(Linear::new(dw_s, None), sn);
+        self.speech_decoder.replace_linear(Linear::new(dw_s, None), sn);
 
         let en = self.env_layer.n_units;
         self.env_layer.linear = Linear::new(ew, if en == N_UNITS { eb } else { None });
@@ -844,18 +847,21 @@ impl PerceptionProcessor {
 
         let vn = self.visual_layer.n_units;
         self.visual_layer.linear = Linear::new(vw, if vn == N_UNITS { vb_t } else { None });
-        self.visual_decoder
-            .replace_linear(Linear::new(dw_v, None), vn);
+        self.visual_decoder.replace_linear(Linear::new(dw_v, None), vn);
 
         let yn = self.symbolic_layer.n_units;
         self.symbolic_layer.linear = Linear::new(yw, if yn == N_UNITS { yb } else { None });
-        self.symbolic_decoder
-            .replace_linear(Linear::new(dw_y, None), yn);
+        self.symbolic_decoder.replace_linear(Linear::new(dw_y, None), yn);
+
+        let ln = self.language_layer.n_units;
+        self.language_layer.linear = Linear::new(lw, if ln == N_UNITS { lb } else { None });
+        self.language_decoder.replace_linear(Linear::new(dw_l, None), ln);
 
         self.binding.region_projs[0] = Linear::new(brp0, None);
         self.binding.region_projs[1] = Linear::new(brp1, None);
         self.binding.region_projs[2] = Linear::new(brp2, None);
         self.binding.region_projs[3] = Linear::new(brp3, None);
+        self.binding.region_projs[4] = Linear::new(brp4, None);
         self.binding.w_q = Linear::new(bwq, None);
         self.binding.w_k = Linear::new(bwk, None);
         self.binding.w_v = Linear::new(bwv, None);
@@ -864,6 +870,7 @@ impl PerceptionProcessor {
         self.output_heads[1] = Linear::new(oh1, None);
         self.output_heads[2] = Linear::new(oh2, None);
         self.output_heads[3] = Linear::new(oh3, None);
+        self.output_heads[4] = Linear::new(oh4, None);
         Ok(())
     }
 
@@ -873,6 +880,7 @@ impl PerceptionProcessor {
             RegionId::AudioEnv => ("env_layer.weight", "env_decoder.weight"),
             RegionId::Visual => ("visual_layer.weight", "visual_decoder.weight"),
             RegionId::Symbolic => ("symbolic_layer.weight", "symbolic_decoder.weight"),
+            RegionId::Language => ("language_layer.weight", "language_decoder.weight"),
         }
     }
 
@@ -882,15 +890,15 @@ impl PerceptionProcessor {
             RegionId::AudioEnv => (&mut self.env_layer, &mut self.env_decoder),
             RegionId::Visual => (&mut self.visual_layer, &mut self.visual_decoder),
             RegionId::Symbolic => (&mut self.symbolic_layer, &mut self.symbolic_decoder),
+            RegionId::Language => (&mut self.language_layer, &mut self.language_decoder),
         }
     }
 }
 
 /// Multiply every element of `values` by `gain`. Returns a new Vec.
-/// Used to apply per-region gain before prior blending (ADR 0012).
 fn apply_gain(values: &[f32], gain: f32) -> Vec<f32> {
     if (gain - 1.0).abs() < 1e-6 {
-        return values.to_vec(); // fast path: no-op gain
+        return values.to_vec();
     }
     values.iter().map(|&x| x * gain).collect()
 }

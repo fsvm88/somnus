@@ -26,7 +26,7 @@ impl EpisodicBuffer {
 
     /// Push a trace; returns the assigned id.
     /// `regional` contains the per-region encoder embeddings for this episode.
-    pub fn push(&mut self, timestamp_secs: f64, values: Vec<f32>, regional: [Vec<f32>; 4]) -> u64 {
+    pub fn push(&mut self, timestamp_secs: f64, values: Vec<f32>, regional: [Vec<f32>; 5]) -> u64 {
         if self.buf.len() == self.capacity {
             self.buf.pop_front();
             // Adjust checkpoint: if the evicted element was before the checkpoint,
@@ -91,7 +91,7 @@ impl EpisodicBuffer {
         id: u64,
         timestamp_secs: f64,
         values: Vec<f32>,
-        regional: [Vec<f32>; 4],
+        regional: [Vec<f32>; 5],
     ) {
         if self.buf.len() == self.capacity {
             self.buf.pop_front();
@@ -133,9 +133,9 @@ impl EpisodicBuffer {
 mod tests {
     use super::*;
 
-    fn make_trace(id_hint: usize) -> (f64, Vec<f32>, [Vec<f32>; 4]) {
+    fn make_trace(id_hint: usize) -> (f64, Vec<f32>, [Vec<f32>; 5]) {
         let v = id_hint as f32;
-        (v as f64, vec![v; 4], [vec![v; 4], vec![], vec![], vec![]])
+        (v as f64, vec![v; 4], [vec![v; 4], vec![], vec![], vec![], vec![]])
     }
 
     #[test]
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn regional_stored_correctly() {
         let mut buf = EpisodicBuffer::new(10);
-        let regional = [vec![1.0f32; 4], vec![2.0f32; 5], vec![], vec![]];
+        let regional = [vec![1.0f32; 4], vec![2.0f32; 5], vec![], vec![], vec![]];
         buf.push(0.0, vec![0.0; 4], regional.clone());
         let trace = buf.iter_traces().next().unwrap();
         assert_eq!(trace.regional[0], vec![1.0f32; 4]);

@@ -15,6 +15,7 @@ pub enum RegionId {
     AudioEnv,
     Visual,
     Symbolic,
+    Language,
 }
 
 impl RegionId {
@@ -24,6 +25,7 @@ impl RegionId {
             RegionId::AudioEnv => 1,
             RegionId::Visual => 2,
             RegionId::Symbolic => 3,
+            RegionId::Language => 4,
         }
     }
 }

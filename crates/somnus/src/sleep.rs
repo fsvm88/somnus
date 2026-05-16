@@ -77,7 +77,7 @@ pub struct SleepStats {
     pub mean_train_loss: f32,
     /// Mean MSE of output-head reconstruction during NREM replay (ADR 0010).
     pub mean_output_mse: f32,
-    pub per_region_mse: [f32; 4],
+    pub per_region_mse: [f32; 5],
     pub regions_grown: Vec<RegionId>,
     pub was_interrupted: bool,
     /// Mean L2 distance to nearest warm-memory neighbor during REM probe.
@@ -117,7 +117,8 @@ pub fn run_sleep_cycle(
 
     // ── NREM-like: replay + train ─────────────────────────────────────────────
     // Collect snapshots; avoids borrowing episodic during training.
-    let traces: Vec<(Vec<f32>, [Vec<f32>; 4], Option<Vec<u32>>)> = episodic
+    type TraceSnapshot = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>);
+    let traces: Vec<TraceSnapshot> = episodic
         .iter_traces()
         .skip(episodic.replay_checkpoint)
         .map(|t| (t.record.values.clone(), t.regional.clone(), t.text_target.clone()))
@@ -229,13 +230,13 @@ pub fn run_sleep_cycle(
     // ── REM pre-spill: warm recall probe ─────────────────────────────────────
     // Run BEFORE spill so warm only contains prior-cycle entries. Querying after
     // spill would find exact matches (L2=0) from the just-inserted current records.
-    let mut per_region_mse = [0.0f32; 4];
-    let mut per_region_count = [0usize; 4];
+    let mut per_region_mse = [0.0f32; 5];
+    let mut per_region_count = [0usize; 5];
     let mut regions_grown: Vec<RegionId> = Vec::new();
     let mut warm_recall_l2: Option<f32> = None;
 
     // Collect traces once for reuse in both warm probe and MSE measurement.
-    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 4])> = if !was_interrupted {
+    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5])> = if !was_interrupted {
         episodic
             .iter_traces()
             .map(|t| (t.record.values.clone(), t.regional.clone()))
@@ -280,7 +281,7 @@ pub fn run_sleep_cycle(
         for (_, regional) in &traces_for_rem {
             match perception.measure_mse(regional) {
                 Ok(mse) => {
-                    for i in 0..4 {
+                    for i in 0..5 {
                         if !regional[i].is_empty() {
                             per_region_mse[i] += mse[i];
                             per_region_count[i] += 1;
@@ -291,7 +292,7 @@ pub fn run_sleep_cycle(
             }
         }
 
-        for i in 0..4 {
+        for i in 0..5 {
             if per_region_count[i] > 0 {
                 per_region_mse[i] /= per_region_count[i] as f32;
             }
@@ -306,6 +307,7 @@ pub fn run_sleep_cycle(
             RegionId::AudioEnv,
             RegionId::Visual,
             RegionId::Symbolic,
+            RegionId::Language,
         ];
         for (i, &region) in region_ids.iter().enumerate() {
             if per_region_count[i] >= GROWTH_MIN_SAMPLES
@@ -329,6 +331,7 @@ pub fn run_sleep_cycle(
             env_mse = per_region_mse[1],
             visual_mse = per_region_mse[2],
             symbolic_mse = per_region_mse[3],
+            language_mse = per_region_mse[4],
             warm_recall_l2 = ?warm_recall_l2,
             "REM self-probe complete"
         );

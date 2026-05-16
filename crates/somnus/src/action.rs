@@ -15,8 +15,8 @@ use ort::{session::Session, value::TensorRef};
 use tokenizers::Tokenizer;
 
 pub const LM_HIDDEN: usize = 896; // Qwen2.5-0.5B hidden dimension
-pub const N_REGIONS: usize = 4;
-const EPISODE_DIM: usize = 512;
+pub const N_REGIONS: usize = 5;
+const EPISODE_DIM: usize = 640;
 const PROJ_LR: f64 = 1e-4;
 const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
 
@@ -29,7 +29,7 @@ pub struct ActionDecoder {
     lm_session: Session,
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
-    pub gain: [f32; 4],
+    pub gain: [f32; 5],
     device: Device,
 }
 
@@ -74,7 +74,7 @@ impl ActionDecoder {
             embed_table,
             lm_session,
             tokenizer,
-            gain: [1.0; 4],
+            gain: [1.0; 5],
             device,
         })
     }
@@ -95,15 +95,15 @@ impl ActionDecoder {
         let hidden = data.to_vec();
 
         // L2 norm of each region position's hidden vector → softmax → clipped gain
-        let norms: [f32; 4] = std::array::from_fn(|i| {
+        let norms: [f32; 5] = std::array::from_fn(|i| {
             let row = &hidden[i * LM_HIDDEN..(i + 1) * LM_HIDDEN];
             row.iter().map(|x| x * x).sum::<f32>().sqrt()
         });
         let max_n = norms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp: [f32; 4] = norms.map(|n| ((n - max_n) / 10.0).exp()); // temperature = 10
+        let exp: [f32; 5] = norms.map(|n| ((n - max_n) / 10.0).exp()); // temperature = 10
         let sum_e: f32 = exp.iter().sum();
         let attn = exp.map(|e| e / sum_e);
-        self.gain = attn.map(|a| (a * 4.0).clamp(0.5, 2.0));
+        self.gain = attn.map(|a| (a * 5.0).clamp(0.5, 2.0));
         tracing::info!(gain = ?self.gain, norms = ?norms, "action gain updated");
         Ok(())
     }
@@ -125,6 +125,7 @@ impl ActionDecoder {
 
         let mut generated: Vec<u32> = Vec::new();
 
+        #[allow(clippy::explicit_counter_loop)]
         for _ in 0..max_tokens {
             // Scope the ORT call so SessionOutputs (and its internal borrow of lm_session)
             // is dropped before embed_flat borrows self again.

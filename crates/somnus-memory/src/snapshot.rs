@@ -34,9 +34,11 @@ use crate::{
 // Header: magic(8B) + count(u64,8B) = 16B
 // Per trace (little-endian):
 //   id(u64,8) + ts(f64,8) + n_ep_vals(u32,4) + ep_values([f32; n_ep_vals]) +
-//   for each of 4 regions: n_reg_vals(u16,2) + reg_values([f32; n_reg_vals])
-
-const EPISODIC_MAGIC: &[u8; 8] = b"SMNHOT\0\0";
+//   for each of 5 regions: n_reg_vals(u16,2) + reg_values([f32; n_reg_vals])
+//
+// Bumped to SMNHOT01 in Phase 6 (ADR 0013) to distinguish 4-region (Phase 5)
+// from 5-region (Phase 6) snapshots. Old snapshots fail with BadMagic.
+const EPISODIC_MAGIC: &[u8; 8] = b"SMNHOT01";
 
 pub fn save_episodic(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {
     let file = fs::File::create(path)?;
@@ -87,7 +89,7 @@ pub fn load_episodic(path: &Path, capacity: usize) -> MemoryResult<EpisodicBuffe
         let n = read_u32(&mut r)? as usize;
         let ep_values = read_f32_vec(&mut r, n)?;
 
-        let mut regional: [Vec<f32>; 4] = [vec![], vec![], vec![], vec![]];
+        let mut regional: [Vec<f32>; 5] = [vec![], vec![], vec![], vec![], vec![]];
         for slot in regional.iter_mut() {
             let rn = read_u16(&mut r)? as usize;
             *slot = read_f32_vec(&mut r, rn)?;
@@ -143,11 +145,11 @@ pub fn region_sizes_path(memory_dir: &Path) -> PathBuf {
     memory_dir.join("snapshot").join("region_sizes.bin")
 }
 
-/// Save per-region n_units (4 × u64 LE). Written after growth so the next
+/// Save per-region n_units (5 × u64 LE). Written after growth so the next
 /// restore knows which regions to pre-expand before loading weights.
-pub fn save_region_sizes(sizes: [usize; 4], memory_dir: &Path) -> MemoryResult<()> {
+pub fn save_region_sizes(sizes: [usize; 5], memory_dir: &Path) -> MemoryResult<()> {
     let path = region_sizes_path(memory_dir);
-    let mut buf = [0u8; 32];
+    let mut buf = [0u8; 40];
     for (i, &s) in sizes.iter().enumerate() {
         buf[i * 8..i * 8 + 8].copy_from_slice(&(s as u64).to_le_bytes());
     }
@@ -156,12 +158,12 @@ pub fn save_region_sizes(sizes: [usize; 4], memory_dir: &Path) -> MemoryResult<(
 }
 
 /// Load per-region n_units. Returns None if the file is absent or malformed.
-pub fn load_region_sizes(memory_dir: &Path) -> Option<[usize; 4]> {
+pub fn load_region_sizes(memory_dir: &Path) -> Option<[usize; 5]> {
     let data = fs::read(region_sizes_path(memory_dir)).ok()?;
-    if data.len() < 32 {
+    if data.len() < 40 {
         return None;
     }
-    let mut sizes = [0usize; 4];
+    let mut sizes = [0usize; 5];
     for (i, s) in sizes.iter_mut().enumerate() {
         let bytes: [u8; 8] = data[i * 8..i * 8 + 8].try_into().ok()?;
         *s = u64::from_le_bytes(bytes) as usize;
@@ -304,13 +306,13 @@ mod tests {
         let mut buf = EpisodicBuffer::new(10);
         buf.push(
             1.0,
-            vec![0.1f32; 512],
-            [vec![1.0f32; 384], vec![2.0f32; 512], vec![], vec![]],
+            vec![0.1f32; 640],
+            [vec![1.0f32; 384], vec![2.0f32; 512], vec![], vec![], vec![]],
         );
         buf.push(
             2.0,
-            vec![0.2f32; 512],
-            [vec![], vec![], vec![3.0f32; 384], vec![4.0f32; 384]],
+            vec![0.2f32; 640],
+            [vec![], vec![], vec![3.0f32; 384], vec![4.0f32; 384], vec![]],
         );
 
         save_episodic(&buf, &path).unwrap();
@@ -333,12 +335,12 @@ mod tests {
         buf.push(
             1.0,
             vec![0.1f32; 4],
-            [vec![1.0f32; 2], vec![], vec![], vec![]],
+            [vec![1.0f32; 2], vec![], vec![], vec![], vec![]],
         );
         buf.push(
             2.0,
             vec![0.2f32; 4],
-            [vec![], vec![2.0f32; 2], vec![], vec![]],
+            [vec![], vec![2.0f32; 2], vec![], vec![], vec![]],
         );
 
         save_snapshot(&buf, dir.path()).unwrap();

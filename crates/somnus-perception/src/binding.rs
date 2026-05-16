@@ -6,12 +6,12 @@ use crate::{
     region::{SparseActivation, N_UNITS},
 };
 
-pub const EPISODE_DIM: usize = 512;
+pub const EPISODE_DIM: usize = 640;
 
-/// Per-region projection dim. 4 × D_PROJ == EPISODE_DIM, so the attention
+/// Per-region projection dim. 5 × D_PROJ == EPISODE_DIM, so the attention
 /// output can be flattened directly to the episode vector — no final linear.
 const D_PROJ: usize = 128;
-const _: () = assert!(4 * D_PROJ == EPISODE_DIM);
+const _: () = assert!(5 * D_PROJ == EPISODE_DIM);
 
 /// Fixed-size episode vector produced by the binding area.
 /// Always EPISODE_DIM elements (f32).
@@ -20,16 +20,18 @@ pub struct EpisodeVector(pub Vec<f32>);
 
 /// Cross-attention binding area.
 ///
-/// Each region's dense activation is first projected from N_UNITS → D_PROJ,
-/// forming a sequence of 4 tokens. Single-head scaled dot-product self-attention
+/// Each region's dense activation is projected from N_UNITS → D_PROJ,
+/// forming a sequence of 5 tokens. Single-head scaled dot-product self-attention
 /// lets every region attend to every other region. The attention output
-/// [4, D_PROJ] is flattened to [512] = EPISODE_DIM without a final linear.
+/// [5, D_PROJ] is flattened to [640] = EPISODE_DIM without a final linear.
 ///
 /// Input is always clamped to N_UNITS via `to_dense_n` so the binding area
 /// remains fixed-size regardless of how much the regional k-WTA layers have grown.
+/// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
+/// The Language slot is zero-padded when no text embedding is available.
 pub struct BindingArea {
     /// Per-region input projection: N_UNITS → D_PROJ.
-    pub(crate) region_projs: [Linear; 4],
+    pub(crate) region_projs: [Linear; 5],
     pub(crate) w_q: Linear,
     pub(crate) w_k: Linear,
     pub(crate) w_v: Linear,
@@ -43,6 +45,7 @@ impl BindingArea {
             linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_1"))?,
             linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_2"))?,
             linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_3"))?,
+            linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_4"))?,
         ];
         let w_q = linear_no_bias(D_PROJ, D_PROJ, vb.pp("attn_q"))?;
         let w_k = linear_no_bias(D_PROJ, D_PROJ, vb.pp("attn_k"))?;
@@ -56,9 +59,10 @@ impl BindingArea {
         })
     }
 
-    /// Produce an episode vector from four sparse activations (one per region).
-    /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic].
-    pub fn forward(&self, acts: &[&SparseActivation; 4]) -> PerceptionResult<EpisodeVector> {
+    /// Produce an episode vector from five sparse activations (one per region).
+    /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
+    /// Language may be a zero SparseActivation when no text is available.
+    pub fn forward(&self, acts: &[&SparseActivation; 5]) -> PerceptionResult<EpisodeVector> {
         // Project each region: N_UNITS → D_PROJ
         let projected: Vec<Tensor> = acts
             .iter()
@@ -70,21 +74,21 @@ impl BindingArea {
             })
             .collect::<PerceptionResult<_>>()?;
 
-        // Stack to [4, D_PROJ]
+        // Stack to [5, D_PROJ]
         let x = Tensor::stack(&projected, 0)?;
 
-        // Q, K, V projections — all [4, D_PROJ]
+        // Q, K, V projections — all [5, D_PROJ]
         let q = self.w_q.forward(&x)?;
         let k = self.w_k.forward(&x)?;
         let v = self.w_v.forward(&x)?;
 
         // Scaled dot-product attention
         let scale = 1.0 / (D_PROJ as f64).sqrt();
-        let scores = q.matmul(&k.t()?)?.affine(scale, 0.0)?; // [4, 4]
-        let attn = softmax(&scores, 1)?; // normalize over keys → [4, 4]
-        let out = attn.matmul(&v)?; // [4, D_PROJ]
+        let scores = q.matmul(&k.t()?)?.affine(scale, 0.0)?; // [5, 5]
+        let attn = softmax(&scores, 1)?; // normalize over keys → [5, 5]
+        let out = attn.matmul(&v)?; // [5, D_PROJ]
 
-        // Flatten [4, D_PROJ] → [EPISODE_DIM]
+        // Flatten [5, D_PROJ] → [EPISODE_DIM]
         Ok(EpisodeVector(out.flatten_all()?.to_vec1()?))
     }
 }
@@ -112,6 +116,15 @@ mod tests {
         }
     }
 
+    fn zero_act(region: RegionId) -> SparseActivation {
+        SparseActivation {
+            region,
+            indices: vec![],
+            values: vec![],
+            n_units: N_UNITS,
+        }
+    }
+
     #[test]
     fn output_is_episode_dim() {
         let area = make_area();
@@ -120,6 +133,7 @@ mod tests {
             &dummy_act(RegionId::AudioEnv),
             &dummy_act(RegionId::Visual),
             &dummy_act(RegionId::Symbolic),
+            &dummy_act(RegionId::Language),
         ];
         let ep = area.forward(&acts).unwrap();
         assert_eq!(ep.0.len(), EPISODE_DIM);
@@ -127,14 +141,25 @@ mod tests {
     }
 
     #[test]
+    fn zero_language_slot_is_finite() {
+        let area = make_area();
+        let ep = area
+            .forward(&[
+                &dummy_act(RegionId::AudioSpeech),
+                &dummy_act(RegionId::AudioEnv),
+                &dummy_act(RegionId::Visual),
+                &dummy_act(RegionId::Symbolic),
+                &zero_act(RegionId::Language),
+            ])
+            .unwrap();
+        assert_eq!(ep.0.len(), EPISODE_DIM);
+        assert!(ep.0.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn output_differs_with_different_inputs() {
         let area = make_area();
-        let zero = SparseActivation {
-            region: RegionId::Visual,
-            indices: vec![],
-            values: vec![],
-            n_units: N_UNITS,
-        };
+        let zero = zero_act(RegionId::Visual);
         let active = dummy_act(RegionId::Visual);
 
         let ep_zero = area
@@ -143,6 +168,7 @@ mod tests {
                 &dummy_act(RegionId::AudioEnv),
                 &zero,
                 &dummy_act(RegionId::Symbolic),
+                &zero_act(RegionId::Language),
             ])
             .unwrap();
         let ep_active = area
@@ -151,11 +177,9 @@ mod tests {
                 &dummy_act(RegionId::AudioEnv),
                 &active,
                 &dummy_act(RegionId::Symbolic),
+                &zero_act(RegionId::Language),
             ])
             .unwrap();
-        assert_ne!(
-            ep_zero.0, ep_active.0,
-            "attention should produce different outputs"
-        );
+        assert_ne!(ep_zero.0, ep_active.0, "attention should produce different outputs");
     }
 }
