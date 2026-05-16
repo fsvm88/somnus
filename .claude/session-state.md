@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-16
-> **Last commit on main:** (pending) — *Cross-session validation: next_id persistence + threshold confirmation*
+> **Last commit on main:** 19f0e10 — *Fix ID collision + cross-session threshold validation*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
