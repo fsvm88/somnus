@@ -998,6 +998,8 @@ async fn main() -> Result<()> {
                             "lang_ingest_count": lang_ingest_count,
                             "mean_output_mse_wake": mean_mse_wake,
                             "prior_cosine_mean": prior_cosine_mean,
+                            "mean_proj_loss":    stats.mean_proj_loss,
+                            "decoder_trainable": stats.decoder_trainable_records,
                         })
                         .to_string();
                         use std::io::Write as _;
