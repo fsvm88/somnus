@@ -48,11 +48,14 @@ impl AudioEncoder {
     }
 
     /// Encode 480 000 f32 samples @ 16 kHz → 384-dim speech embedding.
+    ///
+    /// Also returns the raw encoder hidden state (1500 × 384, row-major) so the
+    /// caller can optionally run Whisper greedy decoding for ASR (ADR 0013).
     pub fn encode_speech(
         &mut self,
         pcm_16k: &[f32],
         ts: Timestamp,
-    ) -> EncodingResult<AudioEmbedding> {
+    ) -> EncodingResult<(AudioEmbedding, Vec<f32>)> {
         debug_assert_eq!(pcm_16k.len(), WHISPER_SAMPLES);
         if pcm_16k.len() != WHISPER_SAMPLES {
             return Err(EncodingError::WrongLength {
@@ -79,13 +82,16 @@ impl AudioEncoder {
             });
         }
 
-        let flat = data.to_vec();
-        let values = mean_pool_2d(&flat, 1500, 384);
-        Ok(AudioEmbedding {
-            source: AudioEncoderSource::Speech,
-            values,
-            timestamp: ts,
-        })
+        let hidden_flat = data.to_vec(); // [1500 * 384] for optional ASR
+        let values = mean_pool_2d(&hidden_flat, 1500, 384);
+        Ok((
+            AudioEmbedding {
+                source: AudioEncoderSource::Speech,
+                values,
+                timestamp: ts,
+            },
+            hidden_flat,
+        ))
     }
 
     /// Encode 480 000 f32 samples @ 48 kHz → 512-dim env embedding.

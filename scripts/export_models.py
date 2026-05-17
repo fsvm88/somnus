@@ -177,6 +177,75 @@ def export_dinov2() -> None:
     report(out)
 
 
+# ── Whisper-tiny decoder wrapper (ADR 0013) ────────────────────────────────────
+
+class WhisperDecoderWrapper(torch.nn.Module):
+    """Whisper-tiny decoder + LM head; only projects the last token position.
+
+    Input:
+      encoder_hidden_states  (1, 1500, 384) f32  — from whisper_tiny_encoder.onnx
+      decoder_input_ids      (1, seq_len)   int64 — prefix + generated so far
+    Output:
+      logits                 (1, 1, 51865) f32   — logits for position [-1] only
+    """
+    def __init__(self, model_instance):
+        super().__init__()
+        self.decoder = model_instance.model.decoder
+        self.lm_head = model_instance.lm_head
+
+    def forward(self, encoder_hidden_states, decoder_input_ids):
+        out = self.decoder(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=encoder_hidden_states,
+        )
+        last = out.last_hidden_state[:, -1:, :]   # (1, 1, 384)
+        return self.lm_head(last)                  # (1, 1, 51865)
+
+
+def export_whisper_decoder() -> None:
+    lm_out = MODELS_DIR / "whisper_tiny_decoder.onnx"
+    tok_out = MODELS_DIR / "whisper_tokenizer.json"
+
+    if lm_out.exists() and tok_out.exists():
+        print(f"  skip: whisper decoder artifacts already present")
+        return
+
+    from transformers import WhisperForConditionalGeneration, AutoTokenizer
+
+    repo, rev = REVISIONS["whisper"]
+    print(f"  loading {repo} @ {rev[:12]}…")
+    model = WhisperForConditionalGeneration.from_pretrained(
+        repo, revision=rev, torch_dtype=torch.float32
+    ).eval()
+
+    if not lm_out.exists():
+        wrapper = WhisperDecoderWrapper(model).eval()
+        dummy_enc = torch.zeros(1, 1500, 384)
+        dummy_dec = torch.zeros(1, 4, dtype=torch.long)   # 4-token prefix
+        print("  exporting whisper_tiny_decoder.onnx…")
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                (dummy_enc, dummy_dec),
+                str(lm_out),
+                input_names=["encoder_hidden_states", "decoder_input_ids"],
+                output_names=["logits"],
+                dynamic_axes={
+                    "encoder_hidden_states": {0: "batch"},
+                    "decoder_input_ids":     {0: "batch", 1: "seq_len"},
+                    "logits":                {0: "batch"},
+                },
+                opset_version=17,
+            )
+        report(lm_out)
+
+    if not tok_out.exists():
+        print("  saving whisper_tokenizer.json…")
+        tokenizer = AutoTokenizer.from_pretrained(repo, revision=rev, use_fast=True)
+        tokenizer.backend_tokenizer.save(str(tok_out))
+        print(f"  {tok_out.stat().st_size / 1e6:.2f} MB")
+
+
 # ── Qwen2.5-0.5B wrappers (ADR 0012) ──────────────────────────────────────────
 
 class Qwen25LMWrapper(torch.nn.Module):
@@ -266,6 +335,9 @@ if __name__ == "__main__":
 
     print("=== DINOv2-ViT-S/14 ===")
     export_dinov2()
+
+    print("=== Whisper-tiny decoder (ASR, ADR 0013) ===")
+    export_whisper_decoder()
 
     print("=== Qwen2.5-0.5B (action decoder) ===")
     export_qwen25()

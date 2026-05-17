@@ -1,7 +1,9 @@
 mod action;
 mod sleep;
+mod whisper_asr;
 
 use action::ActionDecoder;
+use whisper_asr::WhisperDecoder;
 
 use anyhow::Result;
 use candle_core::{Device as CandleDevice, Tensor};
@@ -135,10 +137,19 @@ struct AudioProcessor {
     buf_48k: Vec<f32>,
     ts_16k: Option<Timestamp>,
     ts_48k: Option<Timestamp>,
+    /// Optional Whisper ASR decoder (Stage B, ADR 0013). Present when --language is set
+    /// and whisper_tiny_decoder.onnx / whisper_tokenizer.json exist in --models-dir.
+    whisper_dec: Option<WhisperDecoder>,
+    /// Channel to forward ASR transcriptions to the language ingest path.
+    lang_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl AudioProcessor {
-    fn new(models_dir: &std::path::Path) -> Result<Self> {
+    fn new(
+        models_dir: &std::path::Path,
+        whisper_dec: Option<WhisperDecoder>,
+        lang_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<Self> {
         Ok(Self {
             encoder: AudioEncoder::new(models_dir)?,
             r16k: None,
@@ -149,6 +160,8 @@ impl AudioProcessor {
             buf_48k: Vec::new(),
             ts_16k: None,
             ts_48k: None,
+            whisper_dec,
+            lang_tx,
         })
     }
 
@@ -205,12 +218,23 @@ impl AudioProcessor {
             let pcm: Vec<f32> = self.buf_16k.drain(..WHISPER_SAMPLES).collect();
             let ts = self.ts_16k.take().unwrap();
             let start = std::time::Instant::now();
-            let emb = self.encoder.encode_speech(&pcm, ts)?;
+            let (emb, hidden_flat) = self.encoder.encode_speech(&pcm, ts)?;
             tracing::info!(
                 dim = emb.values.len(),
                 encode_ms = start.elapsed().as_millis(),
                 "speech embedding"
             );
+            // ASR: greedy decode from encoder hidden state when Whisper decoder is available.
+            if let (Some(ref mut dec), Some(ref tx)) = (&mut self.whisper_dec, &self.lang_tx) {
+                match dec.decode_greedy(&hidden_flat, 200) {
+                    Ok(text) if !text.is_empty() => {
+                        tracing::info!(chars = text.len(), "whisper ASR");
+                        let _ = tx.blocking_send(text);
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(?e, "whisper ASR failed"),
+                }
+            }
             embs.push(emb);
         }
 
@@ -488,18 +512,36 @@ async fn main() -> Result<()> {
     // Sleep monitors this to detect external salience while the system is consolidating.
     let pending_embs = Arc::new(AtomicUsize::new(0));
 
+    // ── Whisper ASR decoder (Stage B, ADR 0013) ──────────────────────────────
+    // Soft failure: if the decoder ONNX is absent, ASR is silently disabled.
+    let whisper_dec: Option<WhisperDecoder> = if args.language {
+        match WhisperDecoder::new(&args.models_dir) {
+            Ok(d) => {
+                info!("whisper ASR decoder ready");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!(?e, "whisper ASR decoder not available — text-only language ingestion");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── stdin channels ────────────────────────────────────────────────────────
     // query_rx: stdin lines routed to ActionDecoder for generation (ADR 0012).
     // lang_rx:  stdin lines routed to language region ingestion (ADR 0013).
-    // When both --action and --language are set, each line feeds both paths:
-    // the text becomes a language embedding AND triggers generation.
+    //   Sources: (a) stdin reader task, (b) audio encoder task via Whisper ASR.
+    // When both --action and --language are set, each stdin line feeds both paths.
     let (query_tx, mut query_rx) = tokio::sync::mpsc::channel::<String>(8);
-    let (lang_tx, mut lang_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (lang_tx, mut lang_rx) = tokio::sync::mpsc::channel::<String>(64);
     {
         let needs_stdin = decoder.is_some() || lang_embedder.is_some();
         if needs_stdin {
             let qtx = if decoder.is_some() { Some(query_tx) } else { None };
-            let ltx = if lang_embedder.is_some() { Some(lang_tx) } else { None };
+            // Clone lang_tx for the stdin reader; the original stays in scope for the audio task.
+            let ltx_stdin = if lang_embedder.is_some() { Some(lang_tx.clone()) } else { None };
             tokio::task::spawn_blocking(move || {
                 use std::io::BufRead;
                 for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -507,7 +549,7 @@ async fn main() -> Result<()> {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    if let Some(ref l) = ltx {
+                    if let Some(ref l) = ltx_stdin {
                         let _ = l.blocking_send(trimmed.clone());
                     }
                     if let Some(ref q) = qtx {
@@ -647,8 +689,11 @@ async fn main() -> Result<()> {
         let models_dir = args.models_dir.clone();
         let mut audio_rx = audio_rx;
         let pending = Arc::clone(&pending_embs);
+        // ASR: pass whisper_dec and a lang_tx clone so the audio task can send
+        // transcriptions to the language ingest path without blocking the main loop.
+        let lang_asr_tx = whisper_dec.as_ref().map(|_| lang_tx.clone());
         tokio::task::spawn_blocking(move || {
-            let mut proc = match AudioProcessor::new(&models_dir) {
+            let mut proc = match AudioProcessor::new(&models_dir, whisper_dec, lang_asr_tx) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(?e, "audio encoder init failed");
@@ -671,6 +716,10 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // Original lang_tx is no longer needed; clones are held by stdin reader and audio task.
+    // Dropping it here ensures lang_rx closes once both senders finish.
+    drop(lang_tx);
 
     // ── video encoder task ────────────────────────────────────────────────────
     let (video_emb_tx, mut video_emb_rx) = mpsc::channel::<VideoEmbedding>(16);
