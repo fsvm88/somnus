@@ -4,7 +4,7 @@ mod sleep;
 use action::ActionDecoder;
 
 use anyhow::Result;
-use candle_core::Device as CandleDevice;
+use candle_core::{Device as CandleDevice, Tensor};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use somnus_encoding::{
@@ -20,6 +20,7 @@ use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
     VideoFrame,
 };
+use tokenizers::Tokenizer;
 use std::{
     io::{BufWriter, Write},
     path::PathBuf,
@@ -107,6 +108,15 @@ struct Args {
     /// sleep cycles.
     #[arg(long, default_value = "false")]
     file_loop: bool,
+
+    /// Enable language region (ADR 0013, Stage A). Reads text from stdin; each
+    /// line is tokenized via Qwen2.5 BPE, mean-pooled through the frozen embed
+    /// table, and ingested into the language k-WTA region.
+    /// Requires qwen25_embed_table.safetensors and qwen25_tokenizer.json in
+    /// --models-dir. When combined with --action, the same stdin line is also
+    /// routed to the query channel for generation.
+    #[arg(long, default_value = "false")]
+    language: bool,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -221,6 +231,47 @@ impl AudioProcessor {
     }
 }
 
+// ── language embedder ─────────────────────────────────────────────────────────
+
+const LANG_DIM: usize = 896; // Qwen2.5 hidden / embedding dimension
+
+struct LangEmbedder {
+    tokenizer: Tokenizer,
+    embed_table: Tensor, // [vocab_size, LANG_DIM], frozen
+    device: CandleDevice,
+}
+
+impl LangEmbedder {
+    fn new(models_dir: &std::path::Path, device: CandleDevice) -> Result<Self> {
+        let embed_path = models_dir.join("qwen25_embed_table.safetensors");
+        let tok_path = models_dir.join("qwen25_tokenizer.json");
+        let mut embed_tensors = candle_core::safetensors::load(&embed_path, &device)?;
+        let embed_table = embed_tensors
+            .remove("embed_tokens.weight")
+            .ok_or_else(|| anyhow::anyhow!("embed_tokens.weight missing in embed table"))?;
+        let tokenizer = Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
+        info!(vocab = embed_table.dim(0)?, "language embedder ready");
+        Ok(Self { tokenizer, embed_table, device })
+    }
+
+    /// Tokenize `text` → mean-pool token embeddings → 896-dim Vec<f32>.
+    /// Empty or all-whitespace input returns a zero vector (filtered upstream).
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let enc = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
+        let ids = enc.get_ids();
+        if ids.is_empty() {
+            return Ok(vec![0.0f32; LANG_DIM]);
+        }
+        let idx = Tensor::from_vec(ids.to_vec(), (ids.len(),), &self.device)?;
+        let embeds = self.embed_table.index_select(&idx, 0)?; // [n, 896]
+        Ok(embeds.mean(0)?.to_vec1()?)
+    }
+}
+
 // ── NDJSON sink helpers ───────────────────────────────────────────────────────
 
 fn wall_secs(t: &SystemTime) -> f64 {
@@ -290,6 +341,15 @@ async fn main() -> Result<()> {
         let p = args.models_dir.join(name);
         if !p.exists() {
             anyhow::bail!("model file not found: {}", p.display());
+        }
+    }
+
+    if args.language {
+        for name in &["qwen25_embed_table.safetensors", "qwen25_tokenizer.json"] {
+            let p = args.models_dir.join(name);
+            if !p.exists() {
+                anyhow::bail!("language model file not found: {}", p.display());
+            }
         }
     }
 
@@ -400,6 +460,16 @@ async fn main() -> Result<()> {
         None
     };
 
+    // ── language embedder ─────────────────────────────────────────────────────
+    let lang_embedder: Option<LangEmbedder> = if args.language {
+        match LangEmbedder::new(&args.models_dir, CandleDevice::Cpu) {
+            Ok(le) => Some(le),
+            Err(e) => anyhow::bail!("language embedder init failed: {e}"),
+        }
+    } else {
+        None
+    };
+
     let mut recall = RecollectionLayer::new(semantic, cold);
     info!(
         episodic_capacity = args.episodic_capacity,
@@ -418,20 +488,36 @@ async fn main() -> Result<()> {
     // Sleep monitors this to detect external salience while the system is consolidating.
     let pending_embs = Arc::new(AtomicUsize::new(0));
 
-    // ── stdin query channel (ADR 0012) ────────────────────────────────────────
-    // Each line on stdin is a query: triggers generation + stores text_target on current episode.
+    // ── stdin channels ────────────────────────────────────────────────────────
+    // query_rx: stdin lines routed to ActionDecoder for generation (ADR 0012).
+    // lang_rx:  stdin lines routed to language region ingestion (ADR 0013).
+    // When both --action and --language are set, each line feeds both paths:
+    // the text becomes a language embedding AND triggers generation.
     let (query_tx, mut query_rx) = tokio::sync::mpsc::channel::<String>(8);
-    if decoder.is_some() {
-        let tx = query_tx;
-        tokio::task::spawn_blocking(move || {
-            use std::io::BufRead;
-            for line in std::io::stdin().lock().lines().map_while(Result::ok) {
-                let trimmed = line.trim().to_string();
-                if !trimmed.is_empty() && tx.blocking_send(trimmed).is_err() {
-                    break;
+    let (lang_tx, mut lang_rx) = tokio::sync::mpsc::channel::<String>(8);
+    {
+        let needs_stdin = decoder.is_some() || lang_embedder.is_some();
+        if needs_stdin {
+            let qtx = if decoder.is_some() { Some(query_tx) } else { None };
+            let ltx = if lang_embedder.is_some() { Some(lang_tx) } else { None };
+            tokio::task::spawn_blocking(move || {
+                use std::io::BufRead;
+                for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+                    let trimmed = line.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Some(ref l) = ltx {
+                        let _ = l.blocking_send(trimmed.clone());
+                    }
+                    if let Some(ref q) = qtx {
+                        if q.blocking_send(trimmed).is_err() {
+                            break;
+                        }
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     // ── audio fan-in ──────────────────────────────────────────────────────────
@@ -642,6 +728,10 @@ async fn main() -> Result<()> {
     let file_mode = args.file.is_some() && !args.file_loop;
     let mut audio_emb_closed = false;
     let mut video_emb_closed = false;
+    // lang_rx is from stdin, not from a file, so it does not participate in the
+    // file_mode exit check. Pre-close the guard when language is disabled so the
+    // select arm is never polled (avoids a perpetually-ready None future).
+    let mut lang_closed = !args.language;
 
     loop {
         // ── drain any pending queries before potentially sleeping ─────────────
@@ -682,6 +772,27 @@ async fn main() -> Result<()> {
                             Err(e) => tracing::warn!(?e, "generation failed"),
                         }
                     }
+                }
+            }
+        }
+
+        // ── drain pending language lines before potentially sleeping ──────────
+        while !lang_closed {
+            match lang_rx.try_recv() {
+                Ok(text) => ingest_language_line(
+                    &text,
+                    &lang_embedder,
+                    &mut perception,
+                    &mut sink,
+                    &mut episodic,
+                    args.top_k,
+                    &recall,
+                    args.action_gain,
+                    &mut decoder,
+                ),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    lang_closed = true;
                 }
             }
         }
@@ -793,6 +904,22 @@ async fn main() -> Result<()> {
                     None => { video_emb_closed = true; }
                 }
             }
+            maybe = lang_rx.recv(), if !lang_closed => {
+                match maybe {
+                    Some(text) => ingest_language_line(
+                        &text,
+                        &lang_embedder,
+                        &mut perception,
+                        &mut sink,
+                        &mut episodic,
+                        args.top_k,
+                        &recall,
+                        args.action_gain,
+                        &mut decoder,
+                    ),
+                    None => { lang_closed = true; }
+                }
+            }
             _ = metrics_tick.tick() => {
                 sink_flush(&mut sink);
                 let v = video_metrics_handle.snapshot();
@@ -891,6 +1018,53 @@ const RECALL_BLEND_ALPHA: f32 = 0.1;
 /// p95=4.1 and max=5.3. Threshold of 5.5 covers the same-content distribution; any episode
 /// beyond this distance is dissimilar enough that blending would inject noise.
 const RECALL_BLEND_THRESHOLD: f32 = 5.5;
+
+// ── language ingest helper ────────────────────────────────────────────────────
+
+/// Embed one stdin line and run the full episode lifecycle through `ingest_language`.
+/// No-op when `lang_embedder` is None (--language not set).
+#[allow(clippy::too_many_arguments)]
+fn ingest_language_line(
+    text: &str,
+    lang_embedder: &Option<LangEmbedder>,
+    perception: &mut PerceptionProcessor,
+    sink: &mut Option<BufWriter<std::fs::File>>,
+    episodic: &mut EpisodicBuffer,
+    top_k: usize,
+    recall: &RecollectionLayer,
+    action_gain: bool,
+    decoder: &mut Option<ActionDecoder>,
+) {
+    let Some(le) = lang_embedder else { return };
+    let emb = match le.embed(text) {
+        Ok(v) => v,
+        Err(e) => { tracing::warn!(?e, "language embed failed"); return; }
+    };
+    tracing::info!(chars = text.len(), "language ingest");
+    match perception.ingest_language(&emb) {
+        Ok(out) => {
+            let ts = Timestamp::now();
+            if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+                match perception.wake_reconstruct_step(&ep.0, regional) {
+                    Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
+                    Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                }
+            }
+            record_episode(&out, &ts, sink, episodic, top_k, recall);
+            if action_gain {
+                if let Some(ep) = &out.episode {
+                    if let Some(dec) = decoder.as_mut() {
+                        match dec.update_gain(&ep.0) {
+                            Ok(()) => perception.set_region_gain(dec.gain),
+                            Err(e) => tracing::warn!(?e, "gain update failed"),
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::error!(?e, "perception error (language)"),
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
