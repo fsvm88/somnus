@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-17 (Phase 6 language region scaffolding)
-> **Last commit on main:** 5e1a954 — *Phase 6: Language as fifth region (ADR 0013, Stage A scaffolding)*
+> **Last updated:** 2026-05-17 (Phase 6 Stage A wiring complete)
+> **Last commit on main:** eb11731 — *Phase 6 Stage A: wire ingest_language() in main.rs*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -177,16 +177,24 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - EPISODE_DIM 512→640 (5 regions × D_PROJ=128); COLD_DIM 512→640; magic bytes bumped (SMNCOLD1, SMNHOT01) to reject old archives.
 - All [4]-wide arrays promoted to [5] throughout: regional, gain, prior_predictions, output_heads, region_sizes, per_region_mse.
 - `try_bind()` zero-pads language SparseActivation when region 4 absent — episodes still form from regions 0–3 alone.
-- `ingest_language()` public entry point in PerceptionProcessor; not yet wired in main.rs (Stage A = scaffolding, Stage B = Whisper→text→Qwen pipeline).
+- `ingest_language()` public entry point in PerceptionProcessor.
 - `save/load_region_sizes` updated to 5×u64 LE (40 B); old 4-region files return None.
-- Prior_cosine-gated settling implemented: SETTLE_COSINE_GATE=0.85, only settle when prior_cosine < 0.85. Avoids counterproductive settling on familiar content.
+- Prior_cosine-gated settling implemented: SETTLE_COSINE_GATE=0.85, only settle when prior_cosine < 0.85.
 - Deleted incompatible memory/ directory; new session will start fresh.
 - All 59 workspace tests pass; clippy clean.
 
+**Also done (2026-05-17) — Phase 6 Stage A wiring:**
+- `LangEmbedder` struct in `main.rs`: loads `qwen25_embed_table.safetensors` + `qwen25_tokenizer.json`; `embed()` tokenizes text via Qwen2.5 BPE, mean-pools token embeddings → 896-dim vec.
+- `--language` CLI flag; language model file existence checked at startup.
+- Single unified stdin reader: routes each line to `lang_tx` (if `--language`) and `query_tx` (if `--action`); combined use feeds both paths (text becomes region input AND action query text_target).
+- Full episode lifecycle in the language arm: `ingest_language` → `wake_reconstruct_step` (when episode produced) → `record_episode` → gain update.
+- Pre-sleep `lang_rx` drain mirrors the existing query drain.
+- `lang_closed` guard prevents perpetual polling of the select arm when `--language` is off.
+- 59 tests pass; clippy clean.
+
 **Next (queued):**
-- Stage A: wire `ingest_language()` in main.rs — read text from stdin, tokenize via Qwen tokenizer, embed via embed_table (frozen), mean-pool, call ingest_language().
 - Stage B: Whisper decoder ONNX greedy decode → text → Qwen re-tokenize → embed → ingest_language() (requires re-exporting Whisper with decoder exposed).
-- Write ADR 0013 (Phase 6 language region design and staging rationale).
+- Calibrate language region: run with `--language` + test clip + stdin text lines; observe `prior_cosine` for language region and `output_mse` for the language output head.
 
 ## Open architectural questions
 
