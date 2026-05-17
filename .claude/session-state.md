@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-17 (Phase 6 calibration + observability + settling gate fix)
-> **Last commit on main:** d775549 — *Per-region prior_cosine-gated settling (ADR 0011 refinement)*
+> **Last updated:** 2026-05-17 (Phase 7 auto-grounding + NDJSON fix + calibration)
+> **Last commit on main:** 2148048 — *Fix NDJSON metrics: add mean_proj_loss and decoder_trainable fields*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -241,10 +241,36 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   (~0.9) would take ~30+ sessions on this clip. In continuous mic use the rate would be much higher.
 - Metrics written to memory/metrics.jsonl; status.py confirmed working.
 
+**Also done (2026-05-17) — Phase 7: auto-grounding via language text targets (ADR 0014):**
+- `ingest_language_line()` in `main.rs` now auto-sets `text_target` on every language-ingest episode
+  (ASR transcription or stdin) when `--action --language` are both set. The text is tokenized via
+  `ActionDecoder::tokenize()` and stored with `episodic.set_last_text_target(ids)`.
+- Previously: `decoder_trainable_records = 0` in every session (projection trained only on manual
+  queries, which nobody typed). Now: ~135–166 trainable records per cycle from ASR alone.
+- ADR 0014 written covering the design, target placement rationale, and expected dynamics.
+- NDJSON metrics bug fixed: `mean_proj_loss` and `decoder_trainable_records` were computed and
+  logged but missing from the `serde_json::json!` block. Now included (commit 2148048).
+
+**Phase 7 calibration results (memory/metrics_p7s2.jsonl, 2 sessions × 3 cycles):**
+- S1C1: traces=3276 asr=166 trainable=166 proj_loss=0.09858 (first cycle, random-ish projection)
+- S1C2: interrupted (traces=12), proj_loss=None
+- S1C3: traces=3268 trainable=141 proj_loss=0.02169 (4.5× reduction within session 1 ✓)
+- S2C1: traces=3276 trainable=151 proj_loss=1160.5 ← **spike; projection diverged between sessions**
+- S2C2: interrupted (traces=20), proj_loss=0.08434
+- S2C3: traces=3260 trainable=135 proj_loss=0.07824 (recovered)
+- Session 3 was killed mid-run (SIGTERM), no data written.
+
+**Key observation on S2C1 spike:** Projection loss jumped from 0.022 (S1C3) to 1160 at the start
+of session 2, then recovered to ~0.08 by cycle 3. Likely cause: projection overfit to the session-1
+episode distribution; session-2 episodes (rebuilt from a larger cold archive) look different and the
+projection weight norms exploded. Worth investigating gradient clipping or weight decay on the
+projection LR path in Phase 8.
+
 **Next (queued):**
-- Phase 7 direction discussion with user.
-- Optionally: run 3 more sessions (S4–S6) to confirm S2C2 mse_sleep spike was transient and
-  lang_pc continues rising toward 0.10–0.15 range.
+- Phase 8 direction: generation evaluation (zero code — run interactively, query ActionDecoder,
+  check if output tokens relate to clip speech after ~500 training examples).
+- Investigate S2C1 projection spike: add gradient clipping or weight decay to projection optimizer,
+  or add projection weight norm logging to catch divergence early.
 
 ## Open architectural questions
 
