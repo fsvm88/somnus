@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-17 (novel-content calibration + file-mode exit fix)
-> **Last commit on main:** 27a26a1 — *Fix file-mode hang + novel-content calibration (SETTLE_EPS 1.0→4.0)*
+> **Last updated:** 2026-05-17 (Phase 6 language region scaffolding)
+> **Last commit on main:** 5e1a954 — *Phase 6: Language as fifth region (ADR 0013, Stage A scaffolding)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -172,9 +172,21 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - **settle_steps=3** kept as "3 fixed passes of top-down prior feedback" rather than a convergence criterion.
   - **prior_beta=0.1** confirmed safe across all novel clips.
 
+**Also done (2026-05-17) — Phase 6 Language region (Stage A scaffolding):**
+- Language added as the 5th region: 896-dim Qwen2.5 embeddings, k-WTA layer + SAE decoder, output head (640→896).
+- EPISODE_DIM 512→640 (5 regions × D_PROJ=128); COLD_DIM 512→640; magic bytes bumped (SMNCOLD1, SMNHOT01) to reject old archives.
+- All [4]-wide arrays promoted to [5] throughout: regional, gain, prior_predictions, output_heads, region_sizes, per_region_mse.
+- `try_bind()` zero-pads language SparseActivation when region 4 absent — episodes still form from regions 0–3 alone.
+- `ingest_language()` public entry point in PerceptionProcessor; not yet wired in main.rs (Stage A = scaffolding, Stage B = Whisper→text→Qwen pipeline).
+- `save/load_region_sizes` updated to 5×u64 LE (40 B); old 4-region files return None.
+- Prior_cosine-gated settling implemented: SETTLE_COSINE_GATE=0.85, only settle when prior_cosine < 0.85. Avoids counterproductive settling on familiar content.
+- Deleted incompatible memory/ directory; new session will start fresh.
+- All 59 workspace tests pass; clippy clean.
+
 **Next (queued):**
-- Consider prior_cosine-gated settling (only activate settle loop when prior_cosine < 0.85): avoids counterproductive settling on familiar content.
-- Language as additional modality (Phase 6+): deferred.
+- Stage A: wire `ingest_language()` in main.rs — read text from stdin, tokenize via Qwen tokenizer, embed via embed_table (frozen), mean-pool, call ingest_language().
+- Stage B: Whisper decoder ONNX greedy decode → text → Qwen re-tokenize → embed → ingest_language() (requires re-exporting Whisper with decoder exposed).
+- Write ADR 0013 (Phase 6 language region design and staging rationale).
 
 ## Open architectural questions
 
