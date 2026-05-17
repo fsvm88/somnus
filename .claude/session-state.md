@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-17 (Phase 7 auto-grounding + NDJSON fix + calibration)
-> **Last commit on main:** 2148048 — *Fix NDJSON metrics: add mean_proj_loss and decoder_trainable fields*
+> **Last updated:** 2026-05-17 (Phase 8 generation evaluation + diagnostics)
+> **Last commit on main:** 1ce11a8 — *Phase 8: generation evaluation, diagnostics, repetition penalty (ADR 0015)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -263,14 +263,34 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 **Key observation on S2C1 spike:** Projection loss jumped from 0.022 (S1C3) to 1160 at the start
 of session 2, then recovered to ~0.08 by cycle 3. Likely cause: projection overfit to the session-1
 episode distribution; session-2 episodes (rebuilt from a larger cold archive) look different and the
-projection weight norms exploded. Worth investigating gradient clipping or weight decay on the
-projection LR path in Phase 8.
+projection weight norms exploded. AdamW's second-moment normalization means loss-scaling is NOT an
+effective gradient clip — advised against it. `proj_loss_max` added to diagnose on next session.
+
+**Also done (2026-05-17) — Phase 8: generation evaluation + diagnostics (ADR 0015):**
+- `--query TEXT` CLI arg: one-shot generation after first episode; used for non-interactive evaluation.
+- `proj_loss_max: Option<f32>` added to `SleepStats` and NDJSON metrics (distinguishes sustained shift
+  from catastrophic-step spikes — helps post-mortem the S2C1 anomaly on next run).
+- `proj_weight_norm()` on `ActionDecoder`; logged after NREM completes.
+- Repetition penalty 1.3 in `generate()`: `penalized[id] /= 1.3` for each previously generated token.
+  Eliminates degenerate echo loops in greedy decoding.
+- hnsw_rs 0.3.4 has `println!(" setting number of points… ")` in its source — pollutes stdout. Known
+  issue; work around with `grep '"type":...'` in evaluation scripts.
+
+**Generation evaluation results (~700 training examples, proj_loss ≈ 0.078):**
+- Pre-penalty: all 3 queries produced degenerate loops (echo or n-gram repetition).
+- Post-penalty (repetition_penalty=1.3): coherent, grammatical, topically relevant to query — but
+  NOT grounded to clip content (expected; language prior_cosine ≈ 0.05 vs. 0.9 goal).
+  - "what is being said?" → discourse about saying/doing (query-guided, no clip signal)
+  - "describe what you observe" → discourse about observation and change
+  - "hello" → "John Doe" book-author narrative (consistent across runs → region prefix IS doing something)
+- Projection convergence expected to take 30+ sessions on one clip. On live mic: much faster.
 
 **Next (queued):**
-- Phase 8 direction: generation evaluation (zero code — run interactively, query ActionDecoder,
-  check if output tokens relate to clip speech after ~500 training examples).
-- Investigate S2C1 projection spike: add gradient clipping or weight decay to projection optimizer,
-  or add projection weight norm logging to catch divergence early.
+- Run more training sessions with the new diagnostics (`proj_loss_max`, weight norm) to characterize
+  the S2C1 spike pattern.
+- Decide on spike fix from data: if max ≈ mean (sustained shift), no fix needed; if max >> mean
+  (catastrophic steps), consider true gradient clipping via backward()+step() split.
+- Language prior_cosine tracking: target 0.1–0.2 within 10 sessions.
 
 ## Open architectural questions
 
