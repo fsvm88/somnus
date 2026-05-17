@@ -50,6 +50,10 @@ pub struct PerceptionOutput {
     /// Order: [AudioSpeech(384), AudioEnv(512), Visual(384), Symbolic(384), Language(896)].
     /// Language slot is empty vec when no language input has been received.
     pub regional_inputs: Option<[Vec<f32>; 5]>,
+    /// Cosine similarity of the top-down prior prediction vs the incoming encoder
+    /// embedding, per region updated this call. Only Some when `prior_beta > 0`
+    /// and a prior prediction exists for that region. Indexed by region id (0–4).
+    pub prior_cosines: [Option<f32>; 5],
 }
 
 /// Owns the full cognitive-layer forward pass: five k-WTA layers, five SAE
@@ -235,6 +239,9 @@ impl PerceptionProcessor {
 
         let (episode, regional_inputs) = self.try_bind()?;
         let episode = self.maybe_settle_and_update(episode)?;
+        let mut prior_cosines = [None; 5];
+        prior_cosines[0] = speech_cos;
+        prior_cosines[3] = symbolic_cos;
         Ok(PerceptionOutput {
             recon_errors: vec![
                 (RegionId::AudioSpeech, speech_err),
@@ -242,6 +249,7 @@ impl PerceptionProcessor {
             ],
             episode,
             regional_inputs,
+            prior_cosines,
         })
     }
 
@@ -259,10 +267,13 @@ impl PerceptionProcessor {
 
         let (episode, regional_inputs) = self.try_bind()?;
         let episode = self.maybe_settle_and_update(episode)?;
+        let mut prior_cosines = [None; 5];
+        prior_cosines[1] = cosine;
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::AudioEnv, err)],
             episode,
             regional_inputs,
+            prior_cosines,
         })
     }
 
@@ -281,10 +292,13 @@ impl PerceptionProcessor {
 
         let (episode, regional_inputs) = self.try_bind()?;
         let episode = self.maybe_settle_and_update(episode)?;
+        let mut prior_cosines = [None; 5];
+        prior_cosines[2] = cosine;
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::Visual, err)],
             episode,
             regional_inputs,
+            prior_cosines,
         })
     }
 
@@ -305,10 +319,13 @@ impl PerceptionProcessor {
 
         let (episode, regional_inputs) = self.try_bind()?;
         let episode = self.maybe_settle_and_update(episode)?;
+        let mut prior_cosines = [None; 5];
+        prior_cosines[4] = cosine;
         Ok(PerceptionOutput {
             recon_errors: vec![(RegionId::Language, err)],
             episode,
             regional_inputs,
+            prior_cosines,
         })
     }
 

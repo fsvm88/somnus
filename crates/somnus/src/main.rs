@@ -119,6 +119,29 @@ struct Args {
     /// routed to the query channel for generation.
     #[arg(long, default_value = "false")]
     language: bool,
+
+    /// Write tracing logs directly to this file instead of stderr.
+    /// Avoids the broken-pipe issue when running under `cargo run` and
+    /// redirecting stderr (cargo's internal pipe breaks when cargo exits).
+    /// Prefer `scripts/run.sh` which builds and execs the binary directly.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+
+    /// Exit cleanly after this many sleep cycles (0 = run indefinitely).
+    /// Useful for deterministic calibration runs.
+    #[arg(long, default_value = "0")]
+    max_sleep_cycles: usize,
+
+    /// Append one NDJSON metrics line per sleep cycle to this file.
+    /// Contains: cycle, ts, traces_replayed, mean_loss, mean_output_mse,
+    /// warm_recall_l2, was_interrupted, region_sizes, grew, wake_episodes,
+    /// asr_count, lang_ingest_count, mean_output_mse_wake, prior_cosine_mean.
+    #[arg(long)]
+    metrics_file: Option<PathBuf>,
+
+    /// Write the process PID to this file on startup (for status scripts).
+    #[arg(long)]
+    pid_file: Option<PathBuf>,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -142,6 +165,8 @@ struct AudioProcessor {
     whisper_dec: Option<WhisperDecoder>,
     /// Channel to forward ASR transcriptions to the language ingest path.
     lang_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Count of successful ASR transcriptions; shared with main loop for metrics.
+    asr_count: Arc<AtomicUsize>,
 }
 
 impl AudioProcessor {
@@ -149,6 +174,7 @@ impl AudioProcessor {
         models_dir: &std::path::Path,
         whisper_dec: Option<WhisperDecoder>,
         lang_tx: Option<tokio::sync::mpsc::Sender<String>>,
+        asr_count: Arc<AtomicUsize>,
     ) -> Result<Self> {
         Ok(Self {
             encoder: AudioEncoder::new(models_dir)?,
@@ -162,6 +188,7 @@ impl AudioProcessor {
             ts_48k: None,
             whisper_dec,
             lang_tx,
+            asr_count,
         })
     }
 
@@ -229,6 +256,7 @@ impl AudioProcessor {
                 match dec.decode_greedy(&hidden_flat, 200) {
                     Ok(text) if !text.is_empty() => {
                         tracing::info!(chars = text.len(), "whisper ASR");
+                        self.asr_count.fetch_add(1, Ordering::Relaxed);
                         let _ = tx.blocking_send(text);
                     }
                     Ok(_) => {}
@@ -348,14 +376,32 @@ fn video_emb_json(emb: &VideoEmbedding) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Init tracing before ort so startup errors are captured.
+    // When --log-file is set, write directly to that file to avoid the
+    // broken-pipe problem that occurs when running under `cargo run` and
+    // redirecting stderr (cargo's internal pipe breaks when cargo exits).
+    {
+        use tracing_subscriber::fmt::writer::BoxMakeWriter;
+        let writer: BoxMakeWriter = if let Some(ref path) = args.log_file {
+            let f = std::fs::File::create(path)?;
+            BoxMakeWriter::new(std::sync::Mutex::new(f))
+        } else {
+            BoxMakeWriter::new(std::io::stderr)
+        };
+        tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
+    }
+
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
 
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
-    let args = Args::parse();
+    // Write PID file for status scripts.
+    if let Some(ref pid_path) = args.pid_file {
+        std::fs::write(pid_path, format!("{}\n", std::process::id()))?;
+    }
 
     for name in &[
         "whisper_tiny_encoder.onnx",
@@ -511,6 +557,25 @@ async fn main() -> Result<()> {
     // Counts embeddings produced by encoder tasks but not yet consumed by the main loop.
     // Sleep monitors this to detect external salience while the system is consolidating.
     let pending_embs = Arc::new(AtomicUsize::new(0));
+
+    // ── metrics infrastructure ────────────────────────────────────────────────
+    let mut metrics_sink: Option<std::fs::File> = if let Some(ref path) = args.metrics_file {
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        info!(path = %path.display(), "metrics file opened");
+        Some(f)
+    } else {
+        None
+    };
+    let mut sleep_cycle_count: usize = 0;
+    // Per-wake-cycle counters — reset after each sleep cycle.
+    let mut wake_episodes: usize = 0;
+    let mut wake_output_mse_sum: f64 = 0.0;
+    let mut wake_output_mse_n: usize = 0;
+    let mut prior_cosine_sums: [f64; 5] = [0.0; 5];
+    let mut prior_cosine_counts: [usize; 5] = [0; 5];
+    let mut lang_ingest_count: usize = 0;
+    // ASR count shared with the audio encoder task.
+    let asr_count = Arc::new(AtomicUsize::new(0));
 
     // ── Whisper ASR decoder (Stage B, ADR 0013) ──────────────────────────────
     // Soft failure: if the decoder ONNX is absent, ASR is silently disabled.
@@ -692,8 +757,9 @@ async fn main() -> Result<()> {
         // ASR: pass whisper_dec and a lang_tx clone so the audio task can send
         // transcriptions to the language ingest path without blocking the main loop.
         let lang_asr_tx = whisper_dec.as_ref().map(|_| lang_tx.clone());
+        let asr_cnt = Arc::clone(&asr_count);
         tokio::task::spawn_blocking(move || {
-            let mut proc = match AudioProcessor::new(&models_dir, whisper_dec, lang_asr_tx) {
+            let mut proc = match AudioProcessor::new(&models_dir, whisper_dec, lang_asr_tx, asr_cnt) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(?e, "audio encoder init failed");
@@ -828,17 +894,24 @@ async fn main() -> Result<()> {
         // ── drain pending language lines before potentially sleeping ──────────
         while !lang_closed {
             match lang_rx.try_recv() {
-                Ok(text) => ingest_language_line(
-                    &text,
-                    &lang_embedder,
-                    &mut perception,
-                    &mut sink,
-                    &mut episodic,
-                    args.top_k,
-                    &recall,
-                    args.action_gain,
-                    &mut decoder,
-                ),
+                Ok(text) => {
+                    if let Some((ep, mse, cosines)) = ingest_language_line(
+                        &text,
+                        &lang_embedder,
+                        &mut perception,
+                        &mut sink,
+                        &mut episodic,
+                        args.top_k,
+                        &recall,
+                        args.action_gain,
+                        &mut decoder,
+                    ) {
+                        lang_ingest_count += 1;
+                        if ep { wake_episodes += 1; }
+                        if let Some(m) = mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
+                        accumulate_cosines(&cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                    }
+                }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     lang_closed = true;
@@ -863,14 +936,20 @@ async fn main() -> Result<()> {
                 &mut decoder,
             ) {
                 Ok(stats) => {
+                    sleep_cycle_count += 1;
+                    let cycle_asr = asr_count.swap(0, Ordering::Relaxed);
                     info!(
+                        cycle         = sleep_cycle_count,
                         traces_replayed = stats.traces_replayed,
-                        mean_loss = stats.mean_train_loss,
+                        mean_loss     = stats.mean_train_loss,
                         mean_output_mse = stats.mean_output_mse,
                         warm_recall_l2 = ?stats.warm_recall_l2,
                         mean_proj_loss = ?stats.mean_proj_loss,
                         decoder_trainable = stats.decoder_trainable_records,
-                        interrupted = stats.was_interrupted,
+                        interrupted   = stats.was_interrupted,
+                        wake_episodes,
+                        asr_count     = cycle_asr,
+                        lang_ingest   = lang_ingest_count,
                         "sleep cycle complete"
                     );
                     // Save decoder projection weights alongside perception weights.
@@ -880,10 +959,70 @@ async fn main() -> Result<()> {
                             tracing::warn!(?e, "decoder weights snapshot failed");
                         }
                     }
+                    // Write metrics NDJSON line.
+                    if let Some(ref mut mf) = metrics_sink {
+                        let region_sizes = perception.region_sizes();
+                        let grew = !stats.regions_grown.is_empty();
+                        let mean_mse_wake = if wake_output_mse_n > 0 {
+                            Some(wake_output_mse_sum / wake_output_mse_n as f64)
+                        } else {
+                            None
+                        };
+                        let prior_cosine_mean: Vec<Option<f64>> = (0..5)
+                            .map(|i| {
+                                if prior_cosine_counts[i] > 0 {
+                                    Some(prior_cosine_sums[i] / prior_cosine_counts[i] as f64)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0);
+                        let line = serde_json::json!({
+                            "cycle":             sleep_cycle_count,
+                            "ts":                ts,
+                            "traces_replayed":   stats.traces_replayed,
+                            "mean_loss":         stats.mean_train_loss,
+                            "mean_output_mse":   stats.mean_output_mse,
+                            "per_region_mse":    stats.per_region_mse,
+                            "warm_recall_l2":    stats.warm_recall_l2,
+                            "was_interrupted":   stats.was_interrupted,
+                            "region_sizes":      region_sizes,
+                            "grew":              grew,
+                            "regions_grown":     stats.regions_grown.iter().map(|r| r.as_index()).collect::<Vec<_>>(),
+                            "wake_episodes":     wake_episodes,
+                            "asr_count":         cycle_asr,
+                            "lang_ingest_count": lang_ingest_count,
+                            "mean_output_mse_wake": mean_mse_wake,
+                            "prior_cosine_mean": prior_cosine_mean,
+                        })
+                        .to_string();
+                        use std::io::Write as _;
+                        if let Err(e) = writeln!(mf, "{line}") {
+                            tracing::warn!(?e, "metrics write failed");
+                        }
+                    }
+                    // Reset per-wake-cycle counters.
+                    wake_episodes = 0;
+                    wake_output_mse_sum = 0.0;
+                    wake_output_mse_n = 0;
+                    prior_cosine_sums = [0.0; 5];
+                    prior_cosine_counts = [0; 5];
+                    lang_ingest_count = 0;
                 }
                 Err(e) => tracing::warn!(?e, "sleep cycle error"),
             }
             wake_start = std::time::Instant::now();
+
+            // Exit after N sleep cycles if requested.
+            if args.max_sleep_cycles > 0 && sleep_cycle_count >= args.max_sleep_cycles {
+                info!(cycles = sleep_cycle_count, "max-sleep-cycles reached — exiting");
+                sink_flush(&mut sink);
+                break;
+            }
         }
 
         tokio::select! {
@@ -898,11 +1037,17 @@ async fn main() -> Result<()> {
                         };
                         match result {
                             Ok(out) => {
+                                accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     match perception.wake_reconstruct_step(&ep.0, regional) {
-                                        Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
-                                        Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
+                                        Ok(mse) => {
+                                            wake_output_mse_sum += mse as f64;
+                                            wake_output_mse_n += 1;
+                                            tracing::info!(output_mse = mse, "wake reconstruction");
+                                        }
+                                        Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                     }
+                                    wake_episodes += 1;
                                 }
                                 record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if args.action_gain {
@@ -929,11 +1074,17 @@ async fn main() -> Result<()> {
                         sink_write(&mut sink, &video_emb_json(&emb));
                         match perception.ingest_visual(&emb.values) {
                             Ok(out) => {
+                                accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     match perception.wake_reconstruct_step(&ep.0, regional) {
-                                        Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
-                                        Err(e)  => tracing::warn!(?e, "wake reconstruct error"),
+                                        Ok(mse) => {
+                                            wake_output_mse_sum += mse as f64;
+                                            wake_output_mse_n += 1;
+                                            tracing::info!(output_mse = mse, "wake reconstruction");
+                                        }
+                                        Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                     }
+                                    wake_episodes += 1;
                                 }
                                 record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if args.action_gain {
@@ -955,17 +1106,24 @@ async fn main() -> Result<()> {
             }
             maybe = lang_rx.recv(), if !lang_closed => {
                 match maybe {
-                    Some(text) => ingest_language_line(
-                        &text,
-                        &lang_embedder,
-                        &mut perception,
-                        &mut sink,
-                        &mut episodic,
-                        args.top_k,
-                        &recall,
-                        args.action_gain,
-                        &mut decoder,
-                    ),
+                    Some(text) => {
+                        if let Some((ep, mse, cosines)) = ingest_language_line(
+                            &text,
+                            &lang_embedder,
+                            &mut perception,
+                            &mut sink,
+                            &mut episodic,
+                            args.top_k,
+                            &recall,
+                            args.action_gain,
+                            &mut decoder,
+                        ) {
+                            lang_ingest_count += 1;
+                            if ep { wake_episodes += 1; }
+                            if let Some(m) = mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
+                            accumulate_cosines(&cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                        }
+                    }
                     None => { lang_closed = true; }
                 }
             }
@@ -1071,7 +1229,8 @@ const RECALL_BLEND_THRESHOLD: f32 = 5.5;
 // ── language ingest helper ────────────────────────────────────────────────────
 
 /// Embed one stdin line and run the full episode lifecycle through `ingest_language`.
-/// No-op when `lang_embedder` is None (--language not set).
+/// No-op (returns false) when `lang_embedder` is None.
+/// Returns (episode_produced, output_mse, prior_cosines).
 #[allow(clippy::too_many_arguments)]
 fn ingest_language_line(
     text: &str,
@@ -1083,22 +1242,29 @@ fn ingest_language_line(
     recall: &RecollectionLayer,
     action_gain: bool,
     decoder: &mut Option<ActionDecoder>,
-) {
-    let Some(le) = lang_embedder else { return };
+) -> Option<(bool, Option<f32>, [Option<f32>; 5])> {
+    let Some(le) = lang_embedder else { return None };
     let emb = match le.embed(text) {
         Ok(v) => v,
-        Err(e) => { tracing::warn!(?e, "language embed failed"); return; }
+        Err(e) => { tracing::warn!(?e, "language embed failed"); return None; }
     };
     tracing::info!(chars = text.len(), "language ingest");
     match perception.ingest_language(&emb) {
         Ok(out) => {
             let ts = Timestamp::now();
-            if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+            let ep_produced = out.episode.is_some();
+            let cosines = out.prior_cosines;
+            let mse = if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                 match perception.wake_reconstruct_step(&ep.0, regional) {
-                    Ok(mse) => tracing::info!(output_mse = mse, "wake reconstruction"),
-                    Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                    Ok(mse) => {
+                        tracing::info!(output_mse = mse, "wake reconstruction");
+                        Some(mse)
+                    }
+                    Err(e) => { tracing::warn!(?e, "wake reconstruct error"); None }
                 }
-            }
+            } else {
+                None
+            };
             record_episode(&out, &ts, sink, episodic, top_k, recall);
             if action_gain {
                 if let Some(ep) = &out.episode {
@@ -1110,8 +1276,9 @@ fn ingest_language_line(
                     }
                 }
             }
+            Some((ep_produced, mse, cosines))
         }
-        Err(e) => tracing::error!(?e, "perception error (language)"),
+        Err(e) => { tracing::error!(?e, "perception error (language)"); None }
     }
 }
 
@@ -1181,6 +1348,16 @@ fn record_episode(
         })
         .to_string();
         sink_write(sink, &line);
+    }
+}
+
+/// Accumulate per-region prior cosines into running sums/counts for metrics.
+fn accumulate_cosines(cosines: &[Option<f32>; 5], sums: &mut [f64; 5], counts: &mut [usize; 5]) {
+    for (i, c) in cosines.iter().enumerate() {
+        if let Some(v) = c {
+            sums[i] += *v as f64;
+            counts[i] += 1;
+        }
     }
 }
 
