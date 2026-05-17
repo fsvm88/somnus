@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-17 (Phase 6 Stage A wiring complete)
-> **Last commit on main:** eb11731 — *Phase 6 Stage A: wire ingest_language() in main.rs*
+> **Last updated:** 2026-05-17 (Phase 6 Stage B complete — Whisper ASR → language region)
+> **Last commit on main:** af99a04 — *Phase 6 Stage B: Whisper ASR → language region (ADR 0013)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -192,9 +192,19 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - `lang_closed` guard prevents perpetual polling of the select arm when `--language` is off.
 - 59 tests pass; clippy clean.
 
+**Also done (2026-05-17) — Phase 6 Stage B (Whisper ASR → language region):**
+- `scripts/export_models.py`: `export_whisper_decoder()` — `WhisperDecoderWrapper` (last-token-only LM head, ~10× speedup), exports `whisper_tiny_decoder.onnx` + `whisper_tokenizer.json`.
+- `crates/somnus/src/whisper_asr.rs`: `WhisperDecoder::decode_greedy()` — SOT/EN/TRANSCRIBE/NO_TIMESTAMPS prefix, EOT stop, text filter `id < 50257`, tokenizer decode.
+- `crates/somnus-encoding/src/audio.rs`: `encode_speech()` now returns `(AudioEmbedding, Vec<f32>)` — Vec is raw (1500×384) encoder hidden state for ASR.
+- `main.rs`: `AudioProcessor` gains `whisper_dec: Option<WhisperDecoder>` + `lang_tx: Option<Sender<String>>`; ASR runs synchronously in audio encoder task after each speech embedding; `lang_tx` restructured (clone for stdin reader + clone for audio task + drop original).
+- Soft failure: missing decoder ONNX → warn + ASR disabled; Stage A stdin ingestion unaffected.
+- ADR 0013 written covering Stage A + Stage B.
+- 59 tests pass; clippy clean.
+
 **Next (queued):**
-- Stage B: Whisper decoder ONNX greedy decode → text → Qwen re-tokenize → embed → ingest_language() (requires re-exporting Whisper with decoder exposed).
-- Calibrate language region: run with `--language` + test clip + stdin text lines; observe `prior_cosine` for language region and `output_mse` for the language output head.
+- Run `scripts/export_models.py` to export `whisper_tiny_decoder.onnx` + `whisper_tokenizer.json`.
+- Calibrate language region: run `--language` with a clip that has speech; observe ASR transcriptions in logs, `prior_cosine` for language region, and `output_mse` for the language output head.
+- Decide whether to add `--language-asr` as a separate flag (currently ASR auto-enables when both `--language` and the decoder ONNX are present).
 
 ## Open architectural questions
 
