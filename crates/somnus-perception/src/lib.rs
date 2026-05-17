@@ -93,9 +93,6 @@ pub struct PerceptionProcessor {
     settle_steps: usize,
     /// Fraction of output-head prediction blended into settling inputs (ADR 0011).
     settle_beta: f32,
-    /// Most recent visual prior_cosine; used to gate settling (ADR 0011).
-    /// None until the first visual embedding with β>0 is processed.
-    last_visual_cosine: Option<f32>,
 
     /// Per-region gain multipliers applied to raw encoder inputs before k-WTA (ADR 0012).
     /// Derived from the ActionDecoder's LM attention over region tokens each episode.
@@ -200,7 +197,6 @@ impl PerceptionProcessor {
             latest_inputs: [None, None, None, None, None],
             settle_steps: 0,
             settle_beta: 0.5,
-            last_visual_cosine: None,
             region_gain: [1.0; 5],
             varmap,
             optimizer,
@@ -238,7 +234,8 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::Symbolic.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        let episode = self.maybe_settle_and_update(episode)?;
+        let min_cos = min_cosine_2(speech_cos, symbolic_cos);
+        let episode = self.maybe_settle_and_update(episode, min_cos)?;
         let mut prior_cosines = [None; 5];
         prior_cosines[0] = speech_cos;
         prior_cosines[3] = symbolic_cos;
@@ -266,7 +263,7 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        let episode = self.maybe_settle_and_update(episode)?;
+        let episode = self.maybe_settle_and_update(episode, cosine)?;
         let mut prior_cosines = [None; 5];
         prior_cosines[1] = cosine;
         Ok(PerceptionOutput {
@@ -283,7 +280,6 @@ impl PerceptionProcessor {
         let (input, cosine) = self.blend_with_prior(&gained, 2);
         if let Some(c) = cosine {
             tracing::info!(region = "visual", prior_cosine = c, "top-down prior");
-            self.last_visual_cosine = Some(c);
         }
         let act = self.visual_layer.forward(&input)?;
         let err = self.visual_decoder.reconstruction_error(values, &act)?;
@@ -291,7 +287,7 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        let episode = self.maybe_settle_and_update(episode)?;
+        let episode = self.maybe_settle_and_update(episode, cosine)?;
         let mut prior_cosines = [None; 5];
         prior_cosines[2] = cosine;
         Ok(PerceptionOutput {
@@ -318,7 +314,7 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
 
         let (episode, regional_inputs) = self.try_bind()?;
-        let episode = self.maybe_settle_and_update(episode)?;
+        let episode = self.maybe_settle_and_update(episode, cosine)?;
         let mut prior_cosines = [None; 5];
         prior_cosines[4] = cosine;
         Ok(PerceptionOutput {
@@ -329,13 +325,16 @@ impl PerceptionProcessor {
         })
     }
 
+    /// `cosine` is the minimum prior_cosine computed in this ingest call (across
+    /// all regions updated). None means no prior exists yet → settle permissively.
     fn maybe_settle_and_update(
         &mut self,
         episode: Option<EpisodeVector>,
+        cosine: Option<f32>,
     ) -> PerceptionResult<Option<EpisodeVector>> {
         if let Some(ep) = episode {
             let should_settle = self.settle_steps > 0
-                && self.last_visual_cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
+                && cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
             let refined = if should_settle {
                 let (r, _) = self.settle_episode(&ep)?;
                 r
@@ -909,6 +908,17 @@ impl PerceptionProcessor {
             RegionId::Symbolic => (&mut self.symbolic_layer, &mut self.symbolic_decoder),
             RegionId::Language => (&mut self.language_layer, &mut self.language_decoder),
         }
+    }
+}
+
+/// Return the minimum of two `Option<f32>` cosine values.
+/// Both None → None (no prior yet, settle permissively).
+/// One Some → that value. Both Some → minimum (most-novel signal gates settling).
+fn min_cosine_2(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (Some(x), Some(y)) => Some(x.min(y)),
     }
 }
 
