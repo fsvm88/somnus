@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-17 (Phase 6 Stage B complete — Whisper ASR → language region)
-> **Last commit on main:** af99a04 — *Phase 6 Stage B: Whisper ASR → language region (ADR 0013)*
+> **Last updated:** 2026-05-17 (Phase 6 calibration + observability + settling gate fix)
+> **Last commit on main:** d775549 — *Per-region prior_cosine-gated settling (ADR 0011 refinement)*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -213,9 +213,38 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
   - **Structural**: language ~4% of replay buffer (16/409). Two 30s speech windows per 70s file loop vs ~30 visual. Language output head trains slowly — expected; mirrors Phase 5 session-1 behavior for all regions.
   - **Verdict**: Stage B correct. Prior_cosine will rise toward 0.8–0.9 across sessions as language output head accumulates training.
 
+**Also done (2026-05-17) — observability + settling gate:**
+- `--log-file`, `--max-sleep-cycles`, `--metrics-file`, `--pid-file` CLI args added to `somnus`.
+- `prior_cosines: [Option<f32>; 5]` added to `PerceptionOutput`; per-region cosines now flow to main for metrics.
+- `asr_count` shared via `Arc<AtomicUsize>` between audio task and main; included in per-cycle NDJSON.
+- `scripts/run.sh`: build release + `exec` binary — avoids cargo broken-pipe issue.
+- `scripts/status.py`: process info (PID, uptime, CPU, RSS), cold archive stats, snapshot, last N sleep cycles.
+- `sleep cycle complete` log now includes cycle number, wake_episodes, asr_count, lang_ingest_count.
+- Per-region prior_cosine-gated settling: replaced stale `last_visual_cosine` field with per-call
+  `cosine` parameter passed into `maybe_settle_and_update`. Each `ingest_*` now passes its own
+  cosine(s); `ingest_speech` passes `min(speech_cos, symbolic_cos)`. More granular: env episode with
+  env cosine=0.3 now correctly triggers settling even if the last visual cosine was 0.99.
+
+**Also done (2026-05-17) — multi-session language calibration (3 sessions × 3 cycles):**
+- Ran talking_head.mp4 looped with --language --prior-beta 0.1 --settle-steps 3 --max-sleep-cycles 3
+  for 3 consecutive sessions, each using the same memory/ directory (weights accumulate across sessions).
+- Language prior_cosine trajectory (full-replay cycles only):
+    S1C2: 0.019  →  S2C2: 0.064  →  S3C2: 0.058
+- Baseline was ~0.011 (random head); 0.064 after 2 full replay sessions = 3.4× above baseline. ✓
+- Visual prior_cosine stable at 0.90 throughout (familiar content, expected). ✓
+- No growth triggered (familiar content, warm_recall_l2 ≈ 2.0, well below 15.0). ✓
+- Anomaly: S2C2 mse_sleep spiked to 1.92 (vs 0.08–0.11 elsewhere) — language head briefly
+  destabilised. Resolved by S3C2 (0.058). Worth watching in future sessions.
+- Salience-interrupt pattern: cycles 1 and 3 replay only 4–11 traces (file-loop fills buffer at CPU
+  speed, pending_embs > SALIENCE_THRESHOLD). Expected file-mode behaviour.
+- Projection: at ~90 ASR/3276-episode density (3%), full convergence to visual-level prior_cosine
+  (~0.9) would take ~30+ sessions on this clip. In continuous mic use the rate would be much higher.
+- Metrics written to memory/metrics.jsonl; status.py confirmed working.
+
 **Next (queued):**
-- Multi-session run (3+ sessions, same clip) to confirm language prior_cosine rising from ~0.03 toward 0.5+.
-- Or discuss Phase 7 direction with user.
+- Phase 7 direction discussion with user.
+- Optionally: run 3 more sessions (S4–S6) to confirm S2C2 mse_sleep spike was transient and
+  lang_pc continues rising toward 0.10–0.15 range.
 
 ## Open architectural questions
 
