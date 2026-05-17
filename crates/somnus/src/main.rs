@@ -1266,6 +1266,17 @@ fn ingest_language_line(
                 None
             };
             record_episode(&out, &ts, sink, episodic, top_k, recall);
+            // Auto-grounding (ADR 0014): every language ingest (stdin or ASR) becomes
+            // a text_target on the episode that was just pushed. This trains the
+            // ActionDecoder projection during NREM without requiring manual queries.
+            if out.episode.is_some() {
+                if let Some(dec) = decoder.as_ref() {
+                    match dec.tokenize(text) {
+                        Ok(ids) => { episodic.set_last_text_target(ids); }
+                        Err(e) => tracing::warn!(?e, "auto-ground tokenize failed"),
+                    }
+                }
+            }
             if action_gain {
                 if let Some(ep) = &out.episode {
                     if let Some(dec) = decoder.as_mut() {
