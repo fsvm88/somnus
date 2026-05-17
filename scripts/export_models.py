@@ -191,7 +191,7 @@ class WhisperDecoderWrapper(torch.nn.Module):
     def __init__(self, model_instance):
         super().__init__()
         self.decoder = model_instance.model.decoder
-        self.lm_head = model_instance.lm_head
+        self.proj_out = model_instance.proj_out   # Whisper uses proj_out, not lm_head
 
     def forward(self, encoder_hidden_states, decoder_input_ids):
         out = self.decoder(
@@ -199,7 +199,7 @@ class WhisperDecoderWrapper(torch.nn.Module):
             encoder_hidden_states=encoder_hidden_states,
         )
         last = out.last_hidden_state[:, -1:, :]   # (1, 1, 384)
-        return self.lm_head(last)                  # (1, 1, 51865)
+        return self.proj_out(last)                 # (1, 1, 51865)
 
 
 def export_whisper_decoder() -> None:

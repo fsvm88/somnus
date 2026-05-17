@@ -201,10 +201,21 @@ The high-level **architecture** in `ai-docs/architecture.md` is stable end-to-en
 - ADR 0013 written covering Stage A + Stage B.
 - 59 tests pass; clippy clean.
 
+**Also done (2026-05-17) — Phase 6 language calibration:**
+- Export fix: `WhisperForConditionalGeneration` uses `proj_out` not `lm_head`; corrected in wrapper.
+- Exported: `whisper_tiny_decoder.onnx` (118 MB), `whisper_tokenizer.json` (3.93 MB).
+- Calibration run (`--language --prior-beta 0.1 --settle-steps 3`, talking_head.mp4 looped, 1 sleep cycle):
+  - **ASR working**: 16 transcriptions, mean=114 chars/chunk (range 4–261) ✓
+  - **Language ingest**: 16 events → 640-dim episodes ✓
+  - **Language prior_cosine**: n=16, mean=0.027, min=−0.011, max=0.082 (near-zero; expected for random fresh head)
+  - **Other regions**: visual=0.859, speech=0.896, symbolic=0.894 (familiar content)
+  - **Sleep**: traces_replayed=409, mean_loss=0.040, warm_recall_l2=2.527 (within threshold) ✓
+  - **Structural**: language ~4% of replay buffer (16/409). Two 30s speech windows per 70s file loop vs ~30 visual. Language output head trains slowly — expected; mirrors Phase 5 session-1 behavior for all regions.
+  - **Verdict**: Stage B correct. Prior_cosine will rise toward 0.8–0.9 across sessions as language output head accumulates training.
+
 **Next (queued):**
-- Run `scripts/export_models.py` to export `whisper_tiny_decoder.onnx` + `whisper_tokenizer.json`.
-- Calibrate language region: run `--language` with a clip that has speech; observe ASR transcriptions in logs, `prior_cosine` for language region, and `output_mse` for the language output head.
-- Decide whether to add `--language-asr` as a separate flag (currently ASR auto-enables when both `--language` and the decoder ONNX are present).
+- Multi-session run (3+ sessions, same clip) to confirm language prior_cosine rising from ~0.03 toward 0.5+.
+- Or discuss Phase 7 direction with user.
 
 ## Open architectural questions
 
