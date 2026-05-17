@@ -135,7 +135,11 @@ mod tests {
 
     fn make_trace(id_hint: usize) -> (f64, Vec<f32>, [Vec<f32>; 5]) {
         let v = id_hint as f32;
-        (v as f64, vec![v; 4], [vec![v; 4], vec![], vec![], vec![], vec![]])
+        (
+            v as f64,
+            vec![v; 4],
+            [vec![v; 4], vec![], vec![], vec![], vec![]],
+        )
     }
 
     #[test]

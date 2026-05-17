@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn wake_reconstruct_step_trains() -> candle_core::Result<()> {
-        use somnus_perception::{PerceptionProcessor, REGION_DIMS, EPISODE_DIM};
+        use somnus_perception::{PerceptionProcessor, EPISODE_DIM, REGION_DIMS};
 
         let mut proc =
             PerceptionProcessor::new(Device::Cpu).expect("PerceptionProcessor::new failed");
@@ -217,12 +217,19 @@ mod tests {
             .or(out_e.episode)
             .or(out_v.episode)
             .expect("expected an episode after all regions populated");
-        assert_eq!(episode.0.len(), somnus_perception::EPISODE_DIM, "episode must be EPISODE_DIM");
+        assert_eq!(
+            episode.0.len(),
+            somnus_perception::EPISODE_DIM,
+            "episode must be EPISODE_DIM"
+        );
         assert!(
             episode.0.iter().all(|v| v.is_finite()),
             "settled episode contains non-finite values"
         );
-        println!("Test 6 PASS: settling loop produced a finite {}-dim episode", somnus_perception::EPISODE_DIM);
+        println!(
+            "Test 6 PASS: settling loop produced a finite {}-dim episode",
+            somnus_perception::EPISODE_DIM
+        );
         Ok(())
     }
 

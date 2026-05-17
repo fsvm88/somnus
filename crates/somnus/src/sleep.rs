@@ -86,6 +86,8 @@ pub struct SleepStats {
     /// Mean surrogate loss from projection training steps (ADR 0012).
     /// None when no text-target traces were present.
     pub mean_proj_loss: Option<f32>,
+    /// Max per-step projection loss seen during NREM (useful for diagnosing spikes).
+    pub proj_loss_max: Option<f32>,
     /// Number of traces that had a text_target and were used to train the projection.
     pub decoder_trainable_records: usize,
 }
@@ -111,6 +113,7 @@ pub fn run_sleep_cycle(
     let mut was_interrupted = false;
     let mut total_proj_loss = 0.0f32;
     let mut proj_loss_n = 0usize;
+    let mut proj_loss_max = 0.0f32;
 
     // Snapshot warm size before spill so REM can detect cross-cycle entries.
     let pre_spill_warm_len = recall.warm.len();
@@ -121,7 +124,13 @@ pub fn run_sleep_cycle(
     let traces: Vec<TraceSnapshot> = episodic
         .iter_traces()
         .skip(episodic.replay_checkpoint)
-        .map(|t| (t.record.values.clone(), t.regional.clone(), t.text_target.clone()))
+        .map(|t| {
+            (
+                t.record.values.clone(),
+                t.regional.clone(),
+                t.text_target.clone(),
+            )
+        })
         .collect();
 
     let n_traces = traces.len();
@@ -182,10 +191,24 @@ pub fn run_sleep_cycle(
                     Ok(loss) => {
                         total_proj_loss += loss;
                         proj_loss_n += 1;
+                        if loss > proj_loss_max {
+                            proj_loss_max = loss;
+                        }
                     }
                     Err(e) => tracing::warn!(?e, "projection_step error"),
                 }
             }
+        }
+    }
+
+    // Log projection weight norm after NREM for cross-session spike diagnostics.
+    if let Some(ref dec) = decoder {
+        match dec.proj_weight_norm() {
+            Ok(n) => tracing::info!(
+                proj_weight_norm = n,
+                "NREM complete: projection weight norm"
+            ),
+            Err(e) => tracing::warn!(?e, "proj_weight_norm failed"),
         }
     }
 
@@ -209,6 +232,11 @@ pub fn run_sleep_cycle(
     };
     let mean_proj_loss = if proj_loss_n > 0 {
         Some(total_proj_loss / proj_loss_n as f32)
+    } else {
+        None
+    };
+    let proj_loss_max_opt = if proj_loss_n > 0 {
+        Some(proj_loss_max)
     } else {
         None
     };
@@ -369,6 +397,7 @@ pub fn run_sleep_cycle(
         was_interrupted,
         warm_recall_l2,
         mean_proj_loss,
+        proj_loss_max: proj_loss_max_opt,
         decoder_trainable_records,
     })
 }

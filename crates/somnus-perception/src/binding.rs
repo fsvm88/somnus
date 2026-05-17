@@ -180,6 +180,9 @@ mod tests {
                 &zero_act(RegionId::Language),
             ])
             .unwrap();
-        assert_ne!(ep_zero.0, ep_active.0, "attention should produce different outputs");
+        assert_ne!(
+            ep_zero.0, ep_active.0,
+            "attention should produce different outputs"
+        );
     }
 }

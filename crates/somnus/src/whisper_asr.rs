@@ -44,9 +44,11 @@ impl WhisperDecoder {
     /// `encoder_hidden`: flat slice of length 1500 * 384 = 576 000.
     /// Returns decoded text (trimmed), or empty string for silence/noise.
     pub fn decode_greedy(&mut self, encoder_hidden: &[f32], max_tokens: usize) -> Result<String> {
-        let enc_arr =
-            Array3::from_shape_vec((1, WHISPER_ENC_SEQ, WHISPER_ENC_DIM), encoder_hidden.to_vec())
-                .map_err(|e| anyhow::anyhow!("encoder hidden shape error: {e}"))?;
+        let enc_arr = Array3::from_shape_vec(
+            (1, WHISPER_ENC_SEQ, WHISPER_ENC_DIM),
+            encoder_hidden.to_vec(),
+        )
+        .map_err(|e| anyhow::anyhow!("encoder hidden shape error: {e}"))?;
 
         // Fixed English-transcription prefix: SOT, EN, TRANSCRIBE, NO_TIMESTAMPS
         let mut tokens: Vec<i64> = vec![SOT, EN, TRANSCRIBE, NO_TIMESTAMPS];

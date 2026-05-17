@@ -22,7 +22,6 @@ use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
     VideoFrame,
 };
-use tokenizers::Tokenizer;
 use std::{
     io::{BufWriter, Write},
     path::PathBuf,
@@ -32,6 +31,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -142,6 +142,11 @@ struct Args {
     /// Write the process PID to this file on startup (for status scripts).
     #[arg(long)]
     pid_file: Option<PathBuf>,
+
+    /// Fire a one-shot generation query after the first episode is recorded.
+    /// Requires --action. Useful for non-interactive evaluation runs.
+    #[arg(long)]
+    query: Option<String>,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -304,7 +309,11 @@ impl LangEmbedder {
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
         info!(vocab = embed_table.dim(0)?, "language embedder ready");
-        Ok(Self { tokenizer, embed_table, device })
+        Ok(Self {
+            tokenizer,
+            embed_table,
+            device,
+        })
     }
 
     /// Tokenize `text` → mean-pool token embeddings → 896-dim Vec<f32>.
@@ -505,7 +514,10 @@ async fn main() -> Result<()> {
     let mut decoder: Option<ActionDecoder> = if args.action {
         match ActionDecoder::new(&args.models_dir, CandleDevice::Cpu) {
             Ok(mut d) => {
-                let dec_w = args.memory_dir.join("snapshot").join("decoder_weights.safetensors");
+                let dec_w = args
+                    .memory_dir
+                    .join("snapshot")
+                    .join("decoder_weights.safetensors");
                 if dec_w.exists() {
                     if let Err(e) = d.load_weights(&dec_w) {
                         tracing::warn!(?e, "decoder weight restore failed — starting fresh");
@@ -560,13 +572,18 @@ async fn main() -> Result<()> {
 
     // ── metrics infrastructure ────────────────────────────────────────────────
     let mut metrics_sink: Option<std::fs::File> = if let Some(ref path) = args.metrics_file {
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         info!(path = %path.display(), "metrics file opened");
         Some(f)
     } else {
         None
     };
     let mut sleep_cycle_count: usize = 0;
+    // Tracks whether the --query one-shot generation has already fired.
+    let mut startup_query_fired = false;
     // Per-wake-cycle counters — reset after each sleep cycle.
     let mut wake_episodes: usize = 0;
     let mut wake_output_mse_sum: f64 = 0.0;
@@ -586,7 +603,10 @@ async fn main() -> Result<()> {
                 Some(d)
             }
             Err(e) => {
-                tracing::warn!(?e, "whisper ASR decoder not available — text-only language ingestion");
+                tracing::warn!(
+                    ?e,
+                    "whisper ASR decoder not available — text-only language ingestion"
+                );
                 None
             }
         }
@@ -604,9 +624,17 @@ async fn main() -> Result<()> {
     {
         let needs_stdin = decoder.is_some() || lang_embedder.is_some();
         if needs_stdin {
-            let qtx = if decoder.is_some() { Some(query_tx) } else { None };
+            let qtx = if decoder.is_some() {
+                Some(query_tx)
+            } else {
+                None
+            };
             // Clone lang_tx for the stdin reader; the original stays in scope for the audio task.
-            let ltx_stdin = if lang_embedder.is_some() { Some(lang_tx.clone()) } else { None };
+            let ltx_stdin = if lang_embedder.is_some() {
+                Some(lang_tx.clone())
+            } else {
+                None
+            };
             tokio::task::spawn_blocking(move || {
                 use std::io::BufRead;
                 for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -759,7 +787,8 @@ async fn main() -> Result<()> {
         let lang_asr_tx = whisper_dec.as_ref().map(|_| lang_tx.clone());
         let asr_cnt = Arc::clone(&asr_count);
         tokio::task::spawn_blocking(move || {
-            let mut proc = match AudioProcessor::new(&models_dir, whisper_dec, lang_asr_tx, asr_cnt) {
+            let mut proc = match AudioProcessor::new(&models_dir, whisper_dec, lang_asr_tx, asr_cnt)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(?e, "audio encoder init failed");
@@ -853,10 +882,16 @@ async fn main() -> Result<()> {
         // This ensures queries are never blocked behind a sleep cycle.
         while let Ok(query) = query_rx.try_recv() {
             tracing::info!(query = %query, "query received (pre-sleep drain)");
-            let ep_vec = episodic.iter_traces().last().map(|t| t.record.values.clone());
+            let ep_vec = episodic
+                .iter_traces()
+                .last()
+                .map(|t| t.record.values.clone());
             match ep_vec {
                 None => {
-                    println!("{}", serde_json::json!({"type":"action_response","error":"no episode yet"}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"action_response","error":"no episode yet"})
+                    );
                 }
                 Some(ep) => {
                     if let Some(ref mut dec) = decoder {
@@ -876,13 +911,19 @@ async fn main() -> Result<()> {
                                     .duration_since(UNIX_EPOCH)
                                     .map(|d| d.as_millis())
                                     .unwrap_or(0);
-                                tracing::info!(tokens = response.split_whitespace().count(), "generation complete");
-                                println!("{}", serde_json::json!({
-                                    "type": "action_response",
-                                    "ts": ts_ms,
-                                    "query": query,
-                                    "response": response,
-                                }));
+                                tracing::info!(
+                                    tokens = response.split_whitespace().count(),
+                                    "generation complete"
+                                );
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "type": "action_response",
+                                        "ts": ts_ms,
+                                        "query": query,
+                                        "response": response,
+                                    })
+                                );
                             }
                             Err(e) => tracing::warn!(?e, "generation failed"),
                         }
@@ -907,9 +948,18 @@ async fn main() -> Result<()> {
                         &mut decoder,
                     ) {
                         lang_ingest_count += 1;
-                        if ep { wake_episodes += 1; }
-                        if let Some(m) = mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
-                        accumulate_cosines(&cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                        if ep {
+                            wake_episodes += 1;
+                        }
+                        if let Some(m) = mse {
+                            wake_output_mse_sum += m as f64;
+                            wake_output_mse_n += 1;
+                        }
+                        accumulate_cosines(
+                            &cosines,
+                            &mut prior_cosine_sums,
+                            &mut prior_cosine_counts,
+                        );
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -954,7 +1004,10 @@ async fn main() -> Result<()> {
                     );
                     // Save decoder projection weights alongside perception weights.
                     if let Some(ref dec) = decoder {
-                        let dec_w = args.memory_dir.join("snapshot").join("decoder_weights.safetensors");
+                        let dec_w = args
+                            .memory_dir
+                            .join("snapshot")
+                            .join("decoder_weights.safetensors");
                         if let Err(e) = dec.save_weights(&dec_w) {
                             tracing::warn!(?e, "decoder weights snapshot failed");
                         }
@@ -999,6 +1052,7 @@ async fn main() -> Result<()> {
                             "mean_output_mse_wake": mean_mse_wake,
                             "prior_cosine_mean": prior_cosine_mean,
                             "mean_proj_loss":    stats.mean_proj_loss,
+                            "proj_loss_max":     stats.proj_loss_max,
                             "decoder_trainable": stats.decoder_trainable_records,
                         })
                         .to_string();
@@ -1021,7 +1075,10 @@ async fn main() -> Result<()> {
 
             // Exit after N sleep cycles if requested.
             if args.max_sleep_cycles > 0 && sleep_cycle_count >= args.max_sleep_cycles {
-                info!(cycles = sleep_cycle_count, "max-sleep-cycles reached — exiting");
+                info!(
+                    cycles = sleep_cycle_count,
+                    "max-sleep-cycles reached — exiting"
+                );
                 sink_flush(&mut sink);
                 break;
             }
@@ -1052,6 +1109,9 @@ async fn main() -> Result<()> {
                                     wake_episodes += 1;
                                 }
                                 record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                if !startup_query_fired && out.episode.is_some() {
+                                    startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
+                                }
                                 if args.action_gain {
                                     if let Some(ep) = &out.episode {
                                         if let Some(ref mut dec) = decoder {
@@ -1089,6 +1149,9 @@ async fn main() -> Result<()> {
                                     wake_episodes += 1;
                                 }
                                 record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                if !startup_query_fired && out.episode.is_some() {
+                                    startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
+                                }
                                 if args.action_gain {
                                     if let Some(ep) = &out.episode {
                                         if let Some(ref mut dec) = decoder {
@@ -1248,7 +1311,10 @@ fn ingest_language_line(
     let Some(le) = lang_embedder else { return None };
     let emb = match le.embed(text) {
         Ok(v) => v,
-        Err(e) => { tracing::warn!(?e, "language embed failed"); return None; }
+        Err(e) => {
+            tracing::warn!(?e, "language embed failed");
+            return None;
+        }
     };
     tracing::info!(chars = text.len(), "language ingest");
     match perception.ingest_language(&emb) {
@@ -1262,7 +1328,10 @@ fn ingest_language_line(
                         tracing::info!(output_mse = mse, "wake reconstruction");
                         Some(mse)
                     }
-                    Err(e) => { tracing::warn!(?e, "wake reconstruct error"); None }
+                    Err(e) => {
+                        tracing::warn!(?e, "wake reconstruct error");
+                        None
+                    }
                 }
             } else {
                 None
@@ -1274,7 +1343,9 @@ fn ingest_language_line(
             if out.episode.is_some() {
                 if let Some(dec) = decoder.as_ref() {
                     match dec.tokenize(text) {
-                        Ok(ids) => { episodic.set_last_text_target(ids); }
+                        Ok(ids) => {
+                            episodic.set_last_text_target(ids);
+                        }
                         Err(e) => tracing::warn!(?e, "auto-ground tokenize failed"),
                     }
                 }
@@ -1291,11 +1362,56 @@ fn ingest_language_line(
             }
             Some((ep_produced, mse, cosines))
         }
-        Err(e) => { tracing::error!(?e, "perception error (language)"); None }
+        Err(e) => {
+            tracing::error!(?e, "perception error (language)");
+            None
+        }
     }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Fire the --query one-shot generation. Returns true if the query was sent (caller should set
+/// startup_query_fired). No-ops when query is None or decoder is absent.
+fn maybe_startup_query(
+    query: &Option<String>,
+    decoder: &mut Option<ActionDecoder>,
+    episodic: &EpisodicBuffer,
+    max_tokens: usize,
+) -> bool {
+    let Some(ref q) = query else { return false };
+    let Some(ref mut dec) = decoder else {
+        return false;
+    };
+    let Some(ep) = episodic
+        .iter_traces()
+        .last()
+        .map(|t| t.record.values.clone())
+    else {
+        return false;
+    };
+    let q_clone = q.clone();
+    let result = tokio::task::block_in_place(|| dec.generate(&ep, &q_clone, max_tokens));
+    match result {
+        Ok(response) => {
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type":     "startup_query_response",
+                    "ts":       ts_ms,
+                    "query":    q_clone,
+                    "response": response,
+                })
+            );
+        }
+        Err(e) => tracing::warn!(?e, "startup query generation failed"),
+    }
+    true
+}
 
 /// Push an episode into the hot buffer (without touching warm tier — sleep does that).
 /// Queries warm memory first; blends the top-1 retrieved vector into the stored
@@ -1314,10 +1430,10 @@ fn record_episode(
     if let Some(ep) = &out.episode {
         let ts_secs = wall_secs(&ts.wall);
 
-        let regional = out
-            .regional_inputs
-            .clone()
-            .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
+        let regional =
+            out.regional_inputs
+                .clone()
+                .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
 
         // Recollection: find similar past episodes from warm memory.
         let neighbours = recall.query_warm_with_dist(&ep.0, top_k);

@@ -333,8 +333,8 @@ impl PerceptionProcessor {
         cosine: Option<f32>,
     ) -> PerceptionResult<Option<EpisodeVector>> {
         if let Some(ep) = episode {
-            let should_settle = self.settle_steps > 0
-                && cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
+            let should_settle =
+                self.settle_steps > 0 && cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
             let refined = if should_settle {
                 let (r, _) = self.settle_episode(&ep)?;
                 r
@@ -811,14 +811,34 @@ impl PerceptionProcessor {
 
     fn rebuild_linears(&mut self) -> PerceptionResult<()> {
         let (
-            sw, sb, dw_s,
-            ew, eb, dw_e,
-            vw, vb_t, dw_v,
-            yw, yb, dw_y,
-            lw, lb, dw_l,
-            brp0, brp1, brp2, brp3, brp4,
-            bwq, bwk, bwv,
-            oh0, oh1, oh2, oh3, oh4,
+            sw,
+            sb,
+            dw_s,
+            ew,
+            eb,
+            dw_e,
+            vw,
+            vb_t,
+            dw_v,
+            yw,
+            yb,
+            dw_y,
+            lw,
+            lb,
+            dw_l,
+            brp0,
+            brp1,
+            brp2,
+            brp3,
+            brp4,
+            bwq,
+            bwk,
+            bwv,
+            oh0,
+            oh1,
+            oh2,
+            oh3,
+            oh4,
         ) = {
             let data = self.varmap.data().lock().unwrap();
             (
@@ -832,10 +852,12 @@ impl PerceptionProcessor {
                 data.get("visual_layer.bias").map(|v| v.as_tensor().clone()),
                 data["visual_decoder.weight"].as_tensor().clone(),
                 data["symbolic_layer.weight"].as_tensor().clone(),
-                data.get("symbolic_layer.bias").map(|v| v.as_tensor().clone()),
+                data.get("symbolic_layer.bias")
+                    .map(|v| v.as_tensor().clone()),
                 data["symbolic_decoder.weight"].as_tensor().clone(),
                 data["language_layer.weight"].as_tensor().clone(),
-                data.get("language_layer.bias").map(|v| v.as_tensor().clone()),
+                data.get("language_layer.bias")
+                    .map(|v| v.as_tensor().clone()),
                 data["language_decoder.weight"].as_tensor().clone(),
                 data["binding.region_0.weight"].as_tensor().clone(),
                 data["binding.region_1.weight"].as_tensor().clone(),
@@ -855,7 +877,8 @@ impl PerceptionProcessor {
 
         let sn = self.speech_layer.n_units;
         self.speech_layer.linear = Linear::new(sw, if sn == N_UNITS { sb } else { None });
-        self.speech_decoder.replace_linear(Linear::new(dw_s, None), sn);
+        self.speech_decoder
+            .replace_linear(Linear::new(dw_s, None), sn);
 
         let en = self.env_layer.n_units;
         self.env_layer.linear = Linear::new(ew, if en == N_UNITS { eb } else { None });
@@ -863,15 +886,18 @@ impl PerceptionProcessor {
 
         let vn = self.visual_layer.n_units;
         self.visual_layer.linear = Linear::new(vw, if vn == N_UNITS { vb_t } else { None });
-        self.visual_decoder.replace_linear(Linear::new(dw_v, None), vn);
+        self.visual_decoder
+            .replace_linear(Linear::new(dw_v, None), vn);
 
         let yn = self.symbolic_layer.n_units;
         self.symbolic_layer.linear = Linear::new(yw, if yn == N_UNITS { yb } else { None });
-        self.symbolic_decoder.replace_linear(Linear::new(dw_y, None), yn);
+        self.symbolic_decoder
+            .replace_linear(Linear::new(dw_y, None), yn);
 
         let ln = self.language_layer.n_units;
         self.language_layer.linear = Linear::new(lw, if ln == N_UNITS { lb } else { None });
-        self.language_decoder.replace_linear(Linear::new(dw_l, None), ln);
+        self.language_decoder
+            .replace_linear(Linear::new(dw_l, None), ln);
 
         self.binding.region_projs[0] = Linear::new(brp0, None);
         self.binding.region_projs[1] = Linear::new(brp1, None);

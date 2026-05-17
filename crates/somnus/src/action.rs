@@ -49,9 +49,9 @@ impl ActionDecoder {
         let lm_session = Session::builder()?.commit_from_file(&lm_path)?;
 
         let mut embed_tensors = candle_core::safetensors::load(&embed_path, &device)?;
-        let embed_table = embed_tensors
-            .remove("embed_tokens.weight")
-            .ok_or_else(|| anyhow::anyhow!("embed_tokens.weight missing in {}", embed_path.display()))?;
+        let embed_table = embed_tensors.remove("embed_tokens.weight").ok_or_else(|| {
+            anyhow::anyhow!("embed_tokens.weight missing in {}", embed_path.display())
+        })?;
 
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
@@ -87,7 +87,9 @@ impl ActionDecoder {
         let inputs = Array3::from_shape_vec((1, N_REGIONS, LM_HIDDEN), proj_flat)
             .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
         let tensor = TensorRef::from_array_view(&inputs)?;
-        let outputs = self.lm_session.run(ort::inputs!["inputs_embeds" => tensor])?;
+        let outputs = self
+            .lm_session
+            .run(ort::inputs!["inputs_embeds" => tensor])?;
         let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
         if shape.len() < 3 || shape[1] != N_REGIONS as i64 {
             bail!("unexpected last_hidden_state shape: {:?}", shape);
@@ -133,11 +135,20 @@ impl ActionDecoder {
                 let input = Array3::from_shape_vec((1, seq_len, LM_HIDDEN), all_embeds.clone())
                     .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
                 let tensor = TensorRef::from_array_view(&input)?;
-                let outputs = self.lm_session.run(ort::inputs!["inputs_embeds" => tensor])?;
+                let outputs = self
+                    .lm_session
+                    .run(ort::inputs!["inputs_embeds" => tensor])?;
                 let (_shape, logits_data) = outputs["logits"].try_extract_tensor::<f32>()?;
                 let logits_flat = logits_data.to_vec();
                 let vocab_size = logits_flat.len() / seq_len;
-                argmax(&logits_flat[(seq_len - 1) * vocab_size..])
+                let last_logits = &logits_flat[(seq_len - 1) * vocab_size..];
+                // Repetition penalty: divide logit by 1.3 for each previously generated token.
+                // Prevents degenerate loops common in greedy decoding.
+                let mut penalized: Vec<f32> = last_logits.to_vec();
+                for &id in &generated {
+                    penalized[id as usize] /= 1.3;
+                }
+                argmax(&penalized)
                 // outputs dropped here; lm_session borrow released
             };
 
@@ -190,6 +201,14 @@ impl ActionDecoder {
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("tokenize failed: {e}"))?;
         Ok(enc.get_ids().to_vec())
+    }
+
+    /// Frobenius norm of the projection weight matrix (monitoring, Phase 8).
+    #[allow(dead_code)]
+    pub fn proj_weight_norm(&self) -> Result<f32> {
+        let data = self.varmap.data().lock().unwrap();
+        let w = data["projection.weight"].as_tensor();
+        Ok(w.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt())
     }
 
     /// Save projection weights to a safetensors file.
