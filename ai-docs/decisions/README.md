@@ -64,3 +64,9 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0010](0010-bidirectional-top-down-priors.md) | Bidirectional top-down priors | accepted |
 | [0011](0011-predictive-coding-settling-loop.md) | Predictive-coding settling loop | accepted |
 | [0012](0012-action-loop-decoder.md) | Action loop: region-token decoder + gain modulation | accepted |
+| [0013](0013-phase6-language-region.md) | Phase 6 language region: Qwen2.5 embeddings + ASR | accepted |
+| [0014](0014-phase7-auto-grounding.md) | Phase 7 auto-grounding: ASR text targets for projection | accepted |
+| [0015](0015-phase8-generation-evaluation.md) | Phase 8 generation evaluation: cosine alignment loss | accepted |
+| [0016](0016-phase12a-eval-harness.md) | Phase 12a metrics eval harness | accepted |
+| [0017](0017-phase12b-hnsw-persistence.md) | Phase 12b HNSW warm-index persistence | accepted |
+| [0018](0018-phase12c-regional-distillation.md) | Phase 12c regional unit pruning | accepted |

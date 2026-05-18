@@ -202,3 +202,64 @@ Generative episode stitching: combine fragments from different episodes into syn
 - NREM replay of synthetics deferred (exit criterion met without it).
 
 **Exit criterion:** ✓ synthetic episodes produced and logged; `mean_synthetic_output_mse` higher than `mean_real_inference_mse` confirms synthetics are genuinely novel to the trained output heads.
+
+## Phase 12 — Observability and scaling (medium priority)
+
+Three independent improvements that pay dividends across all future work. Ordered by
+dependency: 12a (eval harness) should land first because 12c (distillation) requires its
+output to validate correctness. 12b (HNSW persistence) has no dependencies.
+
+### 12a — Metrics eval harness ✗
+
+Every sleep cycle writes a JSON line to `memory/metrics_*.jsonl`. There is currently no
+tooling to answer the four recurring analysis questions without ad-hoc scripting.
+
+- `scripts/eval_metrics.py`: positional args = one or more JSONL paths; writes four PNGs
+  to `--out-dir` (default: same dir as first input file).
+  1. **Language trajectory** — `prior_cosine_mean[4]` per cycle, all five regions overlaid.
+  2. **Growth timeline** — scatter of cycles where `grew=true`, annotated with
+     `regions_grown` and post-sleep `region_sizes`.
+  3. **Per-region output_mse** — `per_region_mse[0..4]` across all cycles.
+  4. **Sleep trigger distribution** — bar chart of `sleep_trigger` counts; secondary axis
+     for `nrem_exit_reason`.
+- Requirements: `matplotlib` + `numpy` only; skip missing fields; sort chronologically.
+- ADR 0016.
+
+**Exit criterion:** all four charts generated from a single invocation on any `metrics_*.jsonl`.
+
+### 12b — HNSW warm-index persistence ✗
+
+On every restart `load_snapshot` rebuilds warm HNSW from the full cold archive. At 164 k
+records this takes ~3 minutes and grows linearly with archive size.
+
+- `SemanticStore::dump(dir)`: calls `hnsw.file_dump` + bincode-serialises the
+  `records: HashMap<u64, EpisodeRecord>` sidecar to `warm/records.bin`.
+- `SemanticStore::load_warm(dir)`: `Box::leak`s the `HnswIo` allocation so the returned
+  `Hnsw` is effectively `'static`; deserialises sidecar; falls back to cold-rebuild on
+  missing/corrupt/version-mismatched files.
+- Version tag: `warm/version` (6 bytes: magic `SMNWARM` + u16 LE); bump when
+  `EPISODE_DIM`, `HNSW_M`, or `HNSW_MAX_LAYERS` change.
+- Dump written on every sleep (after hot→cold spill, before snapshot).
+- ADR 0017. Lifetime trap: `load_hnsw` returns non-`'static` Hnsw; `Box::leak` is the
+  chosen resolution (one-time per process, no double-leak risk).
+
+**Exit criterion:** restart time < 5 s for a ≥ 100 k-record store (vs. current ~3 min).
+
+### 12c — Regional unit pruning ✗
+
+`grow_region` accumulates units without bound. Units above `N_UNITS=1024` are clamped by
+`to_dense_n` and do not enter the episode vector, making them safe to prune without
+breaking snapshot compatibility.
+
+- Trigger: during REM, after growth check, when `region_sizes[i] > 1024 + prune_min_grown`
+  AND `gist_recall_rate ≥ 0.8` (not currently struggling).
+- Selection: rank grown units (index ≥ 1024) by L1 norm of encoder weight row; remove
+  bottom `--prune-fraction` (default 0.5).
+- Rebuild: new encoder Var, SAE decoder, output head (He-init for shape change), reset
+  optimizer moments for that region; update `region_sizes[i]`.
+- `--prune-fraction f32` (default 0.5); `--prune-min-grown usize` (default 64).
+- Requires Phase 12a to validate that `per_region_mse` does not regress post-prune.
+- ADR 0018.
+
+**Exit criterion:** after pruning 50% of grown units, `per_region_mse` stays within 5%
+of the pre-prune baseline across the next sleep cycle (verified via eval harness).

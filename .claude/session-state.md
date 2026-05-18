@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a, 11b complete)
-> **Last commit on main:** (see git log) — Phase 11b: REM creative recombination
+> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a, 11b complete; Phase 12 planned)
+> **Last commit on main:** (see git log) — Phase 12 plan: ADRs 0016–0018 + roadmap
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -389,7 +389,15 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
   - All three new fields in `SleepStats` + NDJSON metrics.
 - Roadmap 11b marked ✓.
 
-**Next (queued): Phase 9b (real mic/webcam end-to-end)**
+**Also done (2026-05-18) — Phase 12 planning:**
+- Three Phase 12 candidates researched and planned: eval harness (12a), HNSW persistence (12b), regional pruning (12c).
+- ADR 0016 (eval harness): `scripts/eval_metrics.py`, 4 PNGs, matplotlib+numpy only.
+- ADR 0017 (HNSW persistence): `Box::leak` lifetime resolution; sidecar bincode; `warm/version` tag; < 5s restart goal.
+- ADR 0018 (regional pruning): grown units above 1024 only; L1 magnitude selection; gist_recall_rate ≥ 0.8 trigger; 5% MSE regression limit.
+- Roadmap Phase 12 section added with all three sub-items.
+
+**Next (queued): Phase 12a (eval harness) → 12b (HNSW persistence) → 12c (pruning)**
+Phase 9b (real mic/webcam) deferred until hardware available.
 
 ## Open architectural questions
 
