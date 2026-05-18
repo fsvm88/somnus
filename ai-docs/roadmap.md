@@ -209,7 +209,7 @@ Three independent improvements that pay dividends across all future work. Ordere
 dependency: 12a (eval harness) should land first because 12c (distillation) requires its
 output to validate correctness. 12b (HNSW persistence) has no dependencies.
 
-### 12a — Metrics eval harness ✗
+### 12a — Metrics eval harness ✓
 
 Every sleep cycle writes a JSON line to `memory/metrics_*.jsonl`. There is currently no
 tooling to answer the four recurring analysis questions without ad-hoc scripting.
@@ -227,7 +227,7 @@ tooling to answer the four recurring analysis questions without ad-hoc scripting
 
 **Exit criterion:** all four charts generated from a single invocation on any `metrics_*.jsonl`.
 
-### 12b — HNSW warm-index persistence ✗
+### 12b — HNSW warm-index persistence ✓
 
 On every restart `load_snapshot` rebuilds warm HNSW from the full cold archive. At 164 k
 records this takes ~3 minutes and grows linearly with archive size.
@@ -245,7 +245,7 @@ records this takes ~3 minutes and grows linearly with archive size.
 
 **Exit criterion:** restart time < 5 s for a ≥ 100 k-record store (vs. current ~3 min).
 
-### 12c — Regional unit pruning ✗
+### 12c — Regional unit pruning ✓
 
 `grow_region` accumulates units without bound. Units above `N_UNITS=1024` are clamped by
 `to_dense_n` and do not enter the episode vector, making them safe to prune without

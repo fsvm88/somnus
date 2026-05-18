@@ -174,6 +174,17 @@ struct Args {
     /// Exit is logged as "time_budget" in the sleep summary.
     #[arg(long, default_value = "0")]
     sleep_max_secs: u64,
+
+    /// Fraction of grown units to prune per region during REM (0.0 = disabled).
+    /// Only units above the N_UNITS=1024 baseline are candidates. Pruning fires
+    /// when gist_recall_rate ≥ 0.8 (familiar content; system not struggling).
+    #[arg(long, default_value = "0.0")]
+    prune_fraction: f32,
+
+    /// Minimum number of grown units a region must have before pruning is attempted.
+    /// Avoids thrashing on small growth steps.
+    #[arg(long, default_value = "64")]
+    prune_min_grown: usize,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -1101,6 +1112,8 @@ async fn main() -> Result<()> {
                 &mut decoder,
                 args.sleep_loss_target,
                 args.sleep_max_secs,
+                args.prune_fraction,
+                args.prune_min_grown,
             ) {
                 Ok(stats) => {
                     sleep_cycle_count += 1;
@@ -1178,6 +1191,8 @@ async fn main() -> Result<()> {
                             "synthetics_produced":        stats.synthetics_produced,
                             "mean_real_inference_mse":    stats.mean_real_inference_mse,
                             "mean_synthetic_output_mse":  stats.mean_synthetic_output_mse,
+                            "regions_pruned":             stats.regions_pruned.len(),
+                            "total_units_pruned":         stats.total_units_pruned,
                         })
                         .to_string();
                         use std::io::Write as _;

@@ -15,7 +15,7 @@ use anyhow::Result;
 use somnus_memory::{
     save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, RecollectionLayer,
 };
-use somnus_perception::{PerceptionProcessor, RegionId};
+use somnus_perception::{PerceptionProcessor, RegionId, N_UNITS};
 
 use crate::action::ActionDecoder;
 
@@ -104,6 +104,10 @@ pub struct SleepStats {
     /// Mean output-head MSE on real episodes measured post-NREM (inference mode).
     /// None when traces_for_rem is empty.
     pub mean_real_inference_mse: Option<f32>,
+    /// Regions that had grown units pruned during REM (12c).
+    pub regions_pruned: Vec<RegionId>,
+    /// Total grown units removed across all pruned regions.
+    pub total_units_pruned: usize,
 }
 
 /// Number of gist clusters for REM self-probe (10c).
@@ -116,6 +120,8 @@ const GIST_MAX_ITER: usize = 20;
 const GIST_MIN_WARM: usize = GIST_K;
 /// Growth fires when gist-recall rate is below this fraction.
 const GIST_GROWTH_THRESHOLD: f32 = 0.5;
+/// Minimum gist recall rate for pruning to be considered safe (12c).
+const PRUNE_GIST_THRESHOLD: f32 = 0.8;
 
 /// Interpolation weight for REM creative blending (11b). α=0.5 → equal mix.
 const REM_SYNTH_ALPHA: f32 = 0.5;
@@ -203,6 +209,8 @@ pub fn run_sleep_cycle(
     decoder: &mut Option<ActionDecoder>,
     sleep_loss_target: f32,
     sleep_max_secs: u64,
+    prune_fraction: f32,
+    prune_min_grown: usize,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -389,6 +397,8 @@ pub fn run_sleep_cycle(
     let mut per_region_mse = [0.0f32; 5];
     let mut per_region_count = [0usize; 5];
     let mut regions_grown: Vec<RegionId> = Vec::new();
+    let mut regions_pruned: Vec<RegionId> = Vec::new();
+    let mut total_units_pruned: usize = 0;
     let mut warm_recall_l2: Option<f32> = None;
     let mut gist_recall_rate: Option<f32> = None;
 
@@ -542,6 +552,41 @@ pub fn run_sleep_cycle(
         );
     }
 
+    // ── REM pruning of grown units (12c) ─────────────────────────────────────
+    // Prune only when gist recall is high (system not struggling) and prune_fraction > 0.
+    if !was_interrupted && prune_fraction > 0.0 {
+        let prune_ok = gist_recall_rate.is_some_and(|r| r >= PRUNE_GIST_THRESHOLD);
+        if prune_ok {
+            let region_ids = [
+                RegionId::AudioSpeech,
+                RegionId::AudioEnv,
+                RegionId::Visual,
+                RegionId::Symbolic,
+                RegionId::Language,
+            ];
+            for (i, &region) in region_ids.iter().enumerate() {
+                let n_grown = perception.region_sizes()[i].saturating_sub(N_UNITS);
+                if n_grown >= prune_min_grown {
+                    match perception.prune_region(region, prune_fraction) {
+                        Ok(n) if n > 0 => {
+                            regions_pruned.push(region);
+                            total_units_pruned += n;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(?e, region = ?region, "prune_region error"),
+                    }
+                }
+            }
+        }
+        if !regions_pruned.is_empty() {
+            tracing::info!(
+                regions_pruned = ?regions_pruned,
+                total_units_pruned,
+                "REM pruning complete"
+            );
+        }
+    }
+
     // ── REM creative recombination (11b) ─────────────────────────────────────
     // After NREM training completes, measure inference-mode output MSE on both
     // real and synthetic (blended) episodes to confirm synthetics are novel to
@@ -668,5 +713,7 @@ pub fn run_sleep_cycle(
         synthetics_produced,
         mean_synthetic_output_mse,
         mean_real_inference_mse,
+        regions_pruned,
+        total_units_pruned,
     })
 }

@@ -591,6 +591,116 @@ impl PerceptionProcessor {
         Ok(())
     }
 
+    /// Prune low-magnitude grown units from a region (Phase 12c).
+    ///
+    /// Only removes units with index ≥ N_UNITS (added by `grow_region`). Baseline
+    /// units 0..N_UNITS are never touched — preserves snapshot compatibility and the
+    /// fixed episode-vector contribution from `to_dense_n(N_UNITS)`.
+    ///
+    /// Selection: rank grown units by L1 norm of their encoder weight row ascending;
+    /// remove the bottom `prune_fraction`. Rebuilds optimizer after reshape.
+    ///
+    /// Returns `Ok(0)` when there are no grown units to prune.
+    pub fn prune_region(
+        &mut self,
+        region: RegionId,
+        prune_fraction: f32,
+    ) -> PerceptionResult<usize> {
+        let (enc_key, dec_key) = Self::layer_keys(region);
+
+        let current_n = self.layer_mut(region).0.n_units;
+        let n_grown = current_n.saturating_sub(N_UNITS);
+        if n_grown == 0 {
+            return Ok(0);
+        }
+
+        let n_prune = ((n_grown as f32 * prune_fraction).round() as usize).min(n_grown);
+        if n_prune == 0 {
+            return Ok(0);
+        }
+
+        // Compute L1 norms for grown rows (indices N_UNITS..current_n)
+        let enc_w_vec: Vec<Vec<f32>> = {
+            let data = self.varmap.data().lock().unwrap();
+            data[enc_key].as_tensor().to_vec2::<f32>()?
+        };
+        let mut grown_norms: Vec<(usize, f32)> = (N_UNITS..current_n)
+            .map(|i| {
+                let norm: f32 = enc_w_vec[i].iter().map(|&x| x.abs()).sum();
+                (i, norm)
+            })
+            .collect();
+        grown_norms.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Indices to remove: lowest-norm grown units
+        let remove: std::collections::HashSet<usize> =
+            grown_norms[..n_prune].iter().map(|&(i, _)| i).collect();
+        let keep: Vec<usize> = (0..current_n).filter(|i| !remove.contains(i)).collect();
+        let new_n = keep.len();
+
+        let keep_t = Tensor::from_vec(
+            keep.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+            (keep.len(),),
+            &self.device,
+        )?;
+
+        // Slice encoder rows → [new_n, n_in]
+        let enc_w = {
+            let data = self.varmap.data().lock().unwrap();
+            data[enc_key].as_tensor().clone()
+        };
+        let new_enc_w = enc_w.index_select(&keep_t, 0)?;
+        let new_enc_var = Var::from_tensor(&new_enc_w)?;
+        let new_enc_t = new_enc_var.as_tensor().clone();
+        self.varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert(enc_key.to_string(), new_enc_var);
+
+        // Slice decoder columns → [n_in, new_n]
+        let dec_w = {
+            let data = self.varmap.data().lock().unwrap();
+            data[dec_key].as_tensor().clone()
+        };
+        let new_dec_w = dec_w.index_select(&keep_t, 1)?;
+        let new_dec_var = Var::from_tensor(&new_dec_w)?;
+        let new_dec_t = new_dec_var.as_tensor().clone();
+        self.varmap
+            .data()
+            .lock()
+            .unwrap()
+            .insert(dec_key.to_string(), new_dec_var);
+
+        // Update layer
+        {
+            let (layer, decoder) = self.layer_mut(region);
+            layer.linear = Linear::new(new_enc_t, None);
+            let old_dc = layer.duty_cycle.clone();
+            layer.duty_cycle = keep.iter().map(|&i| old_dc[i]).collect();
+            layer.n_units = new_n;
+            decoder.replace_linear(Linear::new(new_dec_t, None), new_n);
+        }
+
+        // Rebuild optimizer (moment buffers are stale after shape change)
+        self.optimizer = AdamW::new(
+            self.varmap.all_vars(),
+            ParamsAdamW {
+                lr: TrainConfig::default().lr,
+                ..Default::default()
+            },
+        )?;
+
+        tracing::info!(
+            region = ?region,
+            old_n = current_n,
+            new_n,
+            n_pruned = n_prune,
+            "region pruned"
+        );
+        Ok(n_prune)
+    }
+
     /// Run one wake-time reconstruction step on a just-produced episode.
     pub fn wake_reconstruct_step(
         &mut self,

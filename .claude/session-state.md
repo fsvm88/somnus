@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a, 11b complete; Phase 12 planned)
-> **Last commit on main:** (see git log) — Phase 12 plan: ADRs 0016–0018 + roadmap
+> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a, 11b, 12a, 12b, 12c complete)
+> **Last commit on main:** (see git log) — Phase 12c: regional unit pruning
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -389,15 +389,17 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
   - All three new fields in `SleepStats` + NDJSON metrics.
 - Roadmap 11b marked ✓.
 
-**Also done (2026-05-18) — Phase 12 planning:**
-- Three Phase 12 candidates researched and planned: eval harness (12a), HNSW persistence (12b), regional pruning (12c).
-- ADR 0016 (eval harness): `scripts/eval_metrics.py`, 4 PNGs, matplotlib+numpy only.
-- ADR 0017 (HNSW persistence): `Box::leak` lifetime resolution; sidecar bincode; `warm/version` tag; < 5s restart goal.
-- ADR 0018 (regional pruning): grown units above 1024 only; L1 magnitude selection; gist_recall_rate ≥ 0.8 trigger; 5% MSE regression limit.
-- Roadmap Phase 12 section added with all three sub-items.
+**Also done (2026-05-18) — Phase 12 complete:**
+- **12a (eval harness)**: `scripts/eval_metrics.py` — 4 PNGs from a single invocation; matplotlib+numpy only; missing-field-safe; validated on all 24 existing metrics lines.
+- **12b (HNSW persistence)**: `SemanticStore::dump` / `load_warm`; `Box::leak` lifetime resolution; bincode sidecar; `warm/version` tag; fast-path in `load_snapshot`; dump called at end of every sleep cycle. 21/21 somnus-memory tests pass.
+- **12c (regional pruning)**: `PerceptionProcessor::prune_region` — L1 magnitude selection; grown units above N_UNITS=1024 only; `--prune-fraction` (default 0.0) + `--prune-min-grown` (default 64) CLI args; trigger when `gist_recall_rate ≥ 0.8`; optimizer reset after prune; `regions_pruned` + `total_units_pruned` in SleepStats + NDJSON.
+- All three new ADRs (0016–0018) written; roadmap Phase 12 marked ✓.
+- Full workspace builds clean; clippy clean; all tests pass.
 
-**Next (queued): Phase 12a (eval harness) → 12b (HNSW persistence) → 12c (pruning)**
-Phase 9b (real mic/webcam) deferred until hardware available.
+**Next (queued): No specific next phase queued. Candidates:**
+- More calibration runs to test 12b restart speedup and 12c trigger in practice.
+- Phase 9b (real mic/webcam) — deferred until hardware available.
+- Any new phase the user proposes.
 
 ## Open architectural questions
 
