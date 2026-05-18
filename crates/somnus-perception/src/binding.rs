@@ -62,7 +62,15 @@ impl BindingArea {
     /// Produce an episode vector from five sparse activations (one per region).
     /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
     /// Language may be a zero SparseActivation when no text is available.
-    pub fn forward(&self, acts: &[&SparseActivation; 5]) -> PerceptionResult<EpisodeVector> {
+    ///
+    /// `wm_context`: optional EPISODE_DIM-dim working-memory mean vector (10d).
+    /// When present it is reshaped to [5, D_PROJ] and appended to K and V, giving
+    /// the region queries temporal context without adding new learned weights.
+    pub fn forward(
+        &self,
+        acts: &[&SparseActivation; 5],
+        wm_context: Option<&[f32]>,
+    ) -> PerceptionResult<EpisodeVector> {
         // Project each region: N_UNITS → D_PROJ
         let projected: Vec<Tensor> = acts
             .iter()
@@ -74,18 +82,28 @@ impl BindingArea {
             })
             .collect::<PerceptionResult<_>>()?;
 
-        // Stack to [5, D_PROJ]
+        // Stack current region tokens: [5, D_PROJ]
         let x = Tensor::stack(&projected, 0)?;
 
-        // Q, K, V projections — all [5, D_PROJ]
+        // Q from current regions only: [5, D_PROJ]
         let q = self.w_q.forward(&x)?;
-        let k = self.w_k.forward(&x)?;
-        let v = self.w_v.forward(&x)?;
 
-        // Scaled dot-product attention
+        // K and V from current regions + optional working-memory context.
+        // When context is present the wm vector [EPISODE_DIM] is reshaped to
+        // [5, D_PROJ] and concatenated, extending K/V to [10, D_PROJ].
+        let (k, v) = if let Some(wm) = wm_context {
+            debug_assert_eq!(wm.len(), EPISODE_DIM);
+            let wm_t = Tensor::from_slice(wm, (5, D_PROJ), &self.device)?;
+            let x_ext = Tensor::cat(&[&x, &wm_t], 0)?; // [10, D_PROJ]
+            (self.w_k.forward(&x_ext)?, self.w_v.forward(&x_ext)?)
+        } else {
+            (self.w_k.forward(&x)?, self.w_v.forward(&x)?)
+        };
+
+        // Scaled dot-product attention: Q [5,D] × K^T [D,5or10] → scores [5,5or10]
         let scale = 1.0 / (D_PROJ as f64).sqrt();
-        let scores = q.matmul(&k.t()?)?.affine(scale, 0.0)?; // [5, 5]
-        let attn = softmax(&scores, 1)?; // normalize over keys → [5, 5]
+        let scores = q.matmul(&k.t()?)?.affine(scale, 0.0)?;
+        let attn = softmax(&scores, 1)?;
         let out = attn.matmul(&v)?; // [5, D_PROJ]
 
         // Flatten [5, D_PROJ] → [EPISODE_DIM]
@@ -135,7 +153,7 @@ mod tests {
             &dummy_act(RegionId::Symbolic),
             &dummy_act(RegionId::Language),
         ];
-        let ep = area.forward(&acts).unwrap();
+        let ep = area.forward(&acts, None).unwrap();
         assert_eq!(ep.0.len(), EPISODE_DIM);
         assert!(ep.0.iter().all(|v| v.is_finite()));
     }
@@ -150,7 +168,7 @@ mod tests {
                 &dummy_act(RegionId::Visual),
                 &dummy_act(RegionId::Symbolic),
                 &zero_act(RegionId::Language),
-            ])
+            ], None)
             .unwrap();
         assert_eq!(ep.0.len(), EPISODE_DIM);
         assert!(ep.0.iter().all(|v| v.is_finite()));
@@ -169,7 +187,7 @@ mod tests {
                 &zero,
                 &dummy_act(RegionId::Symbolic),
                 &zero_act(RegionId::Language),
-            ])
+            ], None)
             .unwrap();
         let ep_active = area
             .forward(&[
@@ -178,7 +196,7 @@ mod tests {
                 &active,
                 &dummy_act(RegionId::Symbolic),
                 &zero_act(RegionId::Language),
-            ])
+            ], None)
             .unwrap();
         assert_ne!(
             ep_zero.0, ep_active.0,

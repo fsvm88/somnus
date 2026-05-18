@@ -92,6 +92,12 @@ struct Args {
     #[arg(long, default_value = "0.5")]
     settle_beta: f32,
 
+    /// Working-memory ring size: number of recent episode vectors to carry as
+    /// cross-attention context in the binding area (ADR 0010/10d). 0 = disabled (default).
+    /// Cleared at sleep entry (wake-local by design).
+    #[arg(long, default_value = "0")]
+    working_memory_size: usize,
+
     /// Enable ActionDecoder: per-episode LM forward for gain modulation + stdin generation (ADR 0012).
     /// Requires qwen25_lm.onnx, qwen25_embed_table.safetensors, qwen25_tokenizer.json in --models-dir.
     #[arg(long, default_value = "false")]
@@ -472,10 +478,12 @@ async fn main() -> Result<()> {
     perception.set_prior_beta(args.prior_beta);
     perception.set_settle_steps(args.settle_steps);
     perception.set_settle_beta(args.settle_beta);
+    perception.set_wm_size(args.working_memory_size);
     info!(
         prior_beta = args.prior_beta,
         settle_steps = args.settle_steps,
         settle_beta = args.settle_beta,
+        working_memory_size = args.working_memory_size,
         "perception processor initialised (n=1024, k=20, cpu)"
     );
 
@@ -1082,6 +1090,7 @@ async fn main() -> Result<()> {
             interrupt.store(false, Ordering::Relaxed);
             pending_embs.store(0, Ordering::Relaxed);
             perception.reset_region_gain(); // stale gain must not carry across sleep boundary
+            perception.clear_working_memory(); // working memory is wake-local
             match sleep::run_sleep_cycle(
                 &mut perception,
                 &mut episodic,

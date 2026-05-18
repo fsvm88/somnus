@@ -10,6 +10,7 @@ pub use sae::SaeDecoder;
 
 use candle_core::{DType, Device, Module, Tensor, Var};
 use candle_nn::{linear_no_bias, AdamW, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use std::collections::VecDeque;
 
 /// Hyperparameters for sleep-time training.
 pub struct TrainConfig {
@@ -98,6 +99,11 @@ pub struct PerceptionProcessor {
     /// Derived from the ActionDecoder's LM attention over region tokens each episode.
     /// Reset to 1.0 at sleep entry. Default: [1.0; 5] (no-op).
     region_gain: [f32; 5],
+
+    /// Fixed-capacity ring of recent episode vectors for cross-episode context.
+    /// Cleared at sleep entry. Disabled when wm_size == 0.
+    working_memory: VecDeque<Vec<f32>>,
+    wm_size: usize,
 
     /// Holds all trainable parameters; needed for optimizer, save, and load.
     varmap: VarMap,
@@ -198,6 +204,8 @@ impl PerceptionProcessor {
             settle_steps: 0,
             settle_beta: 0.5,
             region_gain: [1.0; 5],
+            working_memory: VecDeque::new(),
+            wm_size: 0,
             varmap,
             optimizer,
             device,
@@ -233,9 +241,11 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
         self.latest_inputs[RegionId::Symbolic.as_index()] = Some(values.to_vec());
 
-        let (episode, regional_inputs) = self.try_bind()?;
+        let wm = self.wm_mean_vec();
+        let (episode, regional_inputs) = self.try_bind(wm.as_deref())?;
         let min_cos = min_cosine_2(speech_cos, symbolic_cos);
         let episode = self.maybe_settle_and_update(episode, min_cos)?;
+        self.push_to_wm(&episode);
         let mut prior_cosines = [None; 5];
         prior_cosines[0] = speech_cos;
         prior_cosines[3] = symbolic_cos;
@@ -262,8 +272,10 @@ impl PerceptionProcessor {
         self.latest[RegionId::AudioEnv.as_index()] = Some(act);
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
-        let (episode, regional_inputs) = self.try_bind()?;
+        let wm = self.wm_mean_vec();
+        let (episode, regional_inputs) = self.try_bind(wm.as_deref())?;
         let episode = self.maybe_settle_and_update(episode, cosine)?;
+        self.push_to_wm(&episode);
         let mut prior_cosines = [None; 5];
         prior_cosines[1] = cosine;
         Ok(PerceptionOutput {
@@ -286,8 +298,10 @@ impl PerceptionProcessor {
         self.latest[RegionId::Visual.as_index()] = Some(act);
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
-        let (episode, regional_inputs) = self.try_bind()?;
+        let wm = self.wm_mean_vec();
+        let (episode, regional_inputs) = self.try_bind(wm.as_deref())?;
         let episode = self.maybe_settle_and_update(episode, cosine)?;
+        self.push_to_wm(&episode);
         let mut prior_cosines = [None; 5];
         prior_cosines[2] = cosine;
         Ok(PerceptionOutput {
@@ -313,8 +327,10 @@ impl PerceptionProcessor {
         self.latest[RegionId::Language.as_index()] = Some(act);
         self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
 
-        let (episode, regional_inputs) = self.try_bind()?;
+        let wm = self.wm_mean_vec();
+        let (episode, regional_inputs) = self.try_bind(wm.as_deref())?;
         let episode = self.maybe_settle_and_update(episode, cosine)?;
+        self.push_to_wm(&episode);
         let mut prior_cosines = [None; 5];
         prior_cosines[4] = cosine;
         Ok(PerceptionOutput {
@@ -353,7 +369,10 @@ impl PerceptionProcessor {
     /// Regions 0–3 (AudioSpeech, AudioEnv, Visual, Symbolic) must all be present.
     /// Region 4 (Language) is optional: a zero SparseActivation is used when absent.
     #[allow(clippy::type_complexity)]
-    fn try_bind(&self) -> PerceptionResult<(Option<EpisodeVector>, Option<[Vec<f32>; 5]>)> {
+    fn try_bind(
+        &self,
+        wm_context: Option<&[f32]>,
+    ) -> PerceptionResult<(Option<EpisodeVector>, Option<[Vec<f32>; 5]>)> {
         match (
             self.latest[0].as_ref(),
             self.latest[1].as_ref(),
@@ -368,7 +387,7 @@ impl PerceptionProcessor {
                     n_units: N_UNITS,
                 };
                 let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
-                let ep = self.binding.forward(&[sp, en, vi, sy, lang])?;
+                let ep = self.binding.forward(&[sp, en, vi, sy, lang], wm_context)?;
                 let regional = [
                     self.latest_inputs[0].clone().unwrap_or_default(),
                     self.latest_inputs[1].clone().unwrap_or_default(),
@@ -620,6 +639,44 @@ impl PerceptionProcessor {
         self.region_gain = [1.0; 5];
     }
 
+    /// Configure working-memory capacity. 0 disables working memory (default).
+    pub fn set_wm_size(&mut self, size: usize) {
+        self.wm_size = size;
+        self.working_memory.truncate(size);
+    }
+
+    /// Clear the working-memory ring. Called at sleep entry (wake-local by design).
+    pub fn clear_working_memory(&mut self) {
+        self.working_memory.clear();
+    }
+
+    fn wm_mean_vec(&self) -> Option<Vec<f32>> {
+        if self.wm_size == 0 || self.working_memory.is_empty() {
+            return None;
+        }
+        let n = self.working_memory.len() as f32;
+        let dim = EPISODE_DIM;
+        let mut mean = vec![0.0f32; dim];
+        for ep in &self.working_memory {
+            for (m, v) in mean.iter_mut().zip(ep.iter()) {
+                *m += v / n;
+            }
+        }
+        Some(mean)
+    }
+
+    fn push_to_wm(&mut self, episode: &Option<EpisodeVector>) {
+        if self.wm_size == 0 {
+            return;
+        }
+        if let Some(ep) = episode {
+            self.working_memory.push_back(ep.0.clone());
+            while self.working_memory.len() > self.wm_size {
+                self.working_memory.pop_front();
+            }
+        }
+    }
+
     /// Set the prior blend weight β. 0.0 disables prior injection (default).
     pub fn set_prior_beta(&mut self, beta: f32) {
         self.prior_beta = beta;
@@ -679,7 +736,7 @@ impl PerceptionProcessor {
             };
             let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
 
-            let refined = self.binding.forward(&[a0, a1, a2, a3, a4])?;
+            let refined = self.binding.forward(&[a0, a1, a2, a3, a4], None)?;
             let delta: f32 = current
                 .0
                 .iter()

@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phase 10a complete)
-> **Last commit on main:** d531201 — *Phase 10a: wake-performance degradation trigger*
+> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d complete)
+> **Last commit on main:** d531201 — *Phase 10a: wake-performance degradation trigger* (10b–10d pending commit)
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -348,7 +348,30 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - Validated: 5× talking_head establishes baseline=0.566; novel noise clip tanks EWMA to 0.505;
   `trigger="perf_degradation"` fires at wake_secs=22, buffer_len=38/500. ✓
 
-**Next (queued): Phase 10b — Adaptive sleep duration (loss-target exit)**
+**Also done (2026-05-18) — Phase 10b: Adaptive sleep duration:**
+- `--sleep-loss-target f32` (default 0.0): NREM exits early when loss EWMA < target; REM + spill + snapshot still run (`interrupted=false`).
+- `--sleep-max-secs u64` (default 0): sleep exits when wall time exceeds cap; treated as interrupted (no REM/spill/snapshot).
+- `nrem_exit_reason` field in SleepStats and NDJSON: `"traces_exhausted"`, `"loss_target_met"`, `"time_budget"`, `"salience"`.
+- Validated: target=2.0 on 29-trace buffer → exits after 2 traces (`nrem_exit="loss_target_met"`, `interrupted=false`). max-secs=5 on 55-trace buffer → exits after 4 traces (`nrem_exit="time_budget"`, `interrupted=true`).
+
+**Also done (2026-05-18) — Phase 10c: Gist-level self-probe in REM:**
+- k-means (k=32, Lloyd's, up to 2048-record sample) on warm episode vectors during REM.
+- Each probe episode and its top-1 warm neighbor are assigned to nearest centroid.
+- `gist_recall_rate` = fraction of probe episodes whose neighbor is in the same cluster.
+- Activates when warm store ≥ GIST_K=32 records; falls back to SAE MSE when unavailable.
+- Growth trigger uses gist when available: grow when `gist_recall_rate < 0.5`.
+- `gist_recall_rate: Option<f32>` added to SleepStats and NDJSON metrics.
+- Validated: cycle 2 shows `gist_recall_rate=0.932` on 41 warm records × 59 probe episodes; growth correctly suppressed.
+
+**Also done (2026-05-18) — Phase 10d: Working memory:**
+- `--working-memory-size usize` (default 0 = disabled).
+- Fixed-capacity VecDeque of recent episode vectors on `PerceptionProcessor`.
+- During binding: WM mean ([EPISODE_DIM]) reshaped to [5, D_PROJ], appended to K and V (Q stays [5, D_PROJ] → output fixed at 640 with no new weights).
+- Settling loop uses `None` for WM context (settling is within-episode iteration, not temporal).
+- Cleared at sleep entry (`clear_working_memory()`).
+- Validated: model trained with WM=8 on talking_head clip; re-running WITH WM=8 vs WITHOUT (WM=0) on same snapshot — output_mse consistently 40–50% lower with WM (e.g., episode 6: 0.29 vs 0.58). Output heads learned to predict from WM-augmented episodes.
+
+**Next (queued): Phase 9 or 11 (continuous operation gaps or memory scaling)**
 
 ## Open architectural questions
 
