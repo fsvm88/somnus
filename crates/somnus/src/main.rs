@@ -752,38 +752,50 @@ async fn main() -> Result<()> {
     }
 
     if args.mic || args.file.is_empty() {
-        let mic = AudioCapture::start(None)?;
-        audio_metric_handles.push(Arc::clone(&mic.metrics));
-        let tx = audio_cb_tx.clone();
-        let drain = audio_drain.clone();
-        std::thread::spawn(move || {
-            forward_frames(mic.receiver, tx, drain);
-        });
+        match AudioCapture::start(None) {
+            Ok(mic) => {
+                audio_metric_handles.push(Arc::clone(&mic.metrics));
+                let tx = audio_cb_tx.clone();
+                let drain = audio_drain.clone();
+                std::thread::spawn(move || {
+                    forward_frames(mic.receiver, tx, drain);
+                });
+            }
+            Err(e) => {
+                tracing::warn!(?e, "microphone unavailable — running without mic audio");
+            }
+        }
     }
 
     if args.file.is_empty() {
-        let mut cam = VideoCapture::open(args.webcam)?;
-        video_metrics_handle = Arc::clone(&cam.metrics);
-        let tx = video_cb_tx.clone();
-        let drain = video_drain.clone();
-        std::thread::spawn(move || loop {
-            match cam.next_frame() {
-                Ok(frame) => match tx.try_send(frame) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(frame)) => {
-                        let _ = drain.try_recv();
-                        if tx.try_send(frame).is_err() {
+        match VideoCapture::open(args.webcam) {
+            Ok(mut cam) => {
+                video_metrics_handle = Arc::clone(&cam.metrics);
+                let tx = video_cb_tx.clone();
+                let drain = video_drain.clone();
+                std::thread::spawn(move || loop {
+                    match cam.next_frame() {
+                        Ok(frame) => match tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(frame)) => {
+                                let _ = drain.try_recv();
+                                if tx.try_send(frame).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(TrySendError::Disconnected(_)) => break,
+                        },
+                        Err(e) => {
+                            tracing::error!(?e, "video capture error");
                             break;
                         }
                     }
-                    Err(TrySendError::Disconnected(_)) => break,
-                },
-                Err(e) => {
-                    tracing::error!(?e, "video capture error");
-                    break;
-                }
+                });
             }
-        });
+            Err(e) => {
+                tracing::warn!(?e, webcam = args.webcam, "webcam unavailable — running audio-only");
+            }
+        }
     }
 
     // All source threads have their own clones of the cb senders. Drop the
@@ -1005,9 +1017,19 @@ async fn main() -> Result<()> {
         }
 
         // ── sleep trigger check ───────────────────────────────────────────────
-        let should_sleep = episodic.len() >= high_water || wake_start.elapsed() >= max_wake;
+        let high_water_hit = episodic.len() >= high_water;
+        let schedule_hit = wake_start.elapsed() >= max_wake;
+        let should_sleep = high_water_hit || schedule_hit;
+        let sleep_trigger = if high_water_hit { "high_water" } else { "schedule" };
 
         if should_sleep && !episodic.is_empty() {
+            info!(
+                trigger       = sleep_trigger,
+                buffer_len    = episodic.len(),
+                buffer_cap    = args.episodic_capacity,
+                wake_secs     = wake_start.elapsed().as_secs(),
+                "entering sleep"
+            );
             interrupt.store(false, Ordering::Relaxed);
             pending_embs.store(0, Ordering::Relaxed);
             perception.reset_region_gain(); // stale gain must not carry across sleep boundary
@@ -1072,6 +1094,7 @@ async fn main() -> Result<()> {
                         let line = serde_json::json!({
                             "cycle":             sleep_cycle_count,
                             "ts":                ts,
+                            "sleep_trigger":     sleep_trigger,
                             "traces_replayed":   stats.traces_replayed,
                             "mean_loss":         stats.mean_train_loss,
                             "mean_output_mse":   stats.mean_output_mse,

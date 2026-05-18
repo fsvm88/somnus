@@ -106,15 +106,20 @@ The mic and webcam code paths exist from Phase 1 but have never been exercised w
 
 **Exit criterion:** one complete wake → sleep → restore cycle from live mic + webcam input with no crashes or hung threads.
 
-### 9c — Cold→warm promotion on cache miss
+### 9c — Cold→warm promotion on cache miss ✗ (not needed)
 
-Currently warm HNSW is rebuilt from the full cold archive on every restart. During a long session the cold archive grows unboundedly while warm stays at rebuild-time size. The recollection layer was designed to promote cold records into warm on demand (ADR 0006 stubs this). Without it, recall degrades silently as the session ages.
+Investigated 2026-05-18. Warm is already kept in sync with cold at all times:
 
-- On a warm HNSW miss (top-1 L2 > threshold), query the cold archive directly.
-- Promote the top hit into the warm HNSW (insert + track promotion count).
-- Log promotion events at DEBUG; expose `promotions_since_restart` in metrics.
+- `load_snapshot` rebuilds warm from the full cold archive on every restart.
+- During each sleep cycle, hot→cold spill also inserts every spilled record into warm
+  (sleep.rs line 300: `recall.warm.insert(record.clone())`).
 
-**Exit criterion:** a cold-miss event is observable in logs; the promoted record appears in subsequent warm queries.
+So warm == cold union (not-yet-spilled hot) at all points in normal operation. The scenario
+this item was designed to fix (warm being a stale subset of cold) does not arise.
+
+The real scaling concern is HNSW rebuild time: 164k records took ~3 minutes at restart.
+That is Phase 11 territory (HNSW persistence or lazy cold index), not runtime promotion.
+The `promote()` stub in `RecollectionLayer` remains for future use but is not needed now.
 
 ## Phase 10 — Sleep fidelity (medium priority)
 
