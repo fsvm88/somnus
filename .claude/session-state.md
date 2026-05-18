@@ -1,6 +1,6 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (multi-clip training)
+> **Last updated:** 2026-05-18 (multi-clip calibration session 1)
 > **Last commit on main:** 99f3389 — *Multi-clip training: --file accepts multiple paths*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
@@ -315,11 +315,24 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - Single-file usage (`--file foo.mp4`) is unchanged.
 - 59 tests pass; clippy clean.
 
+**Also done (2026-05-18) — multi-clip calibration session 1 (metrics_multiclip_c1.jsonl):**
+- Rotation: talking_head → urban → animation → nature (loop), 3 sleep cycles.
+- All 3 cycles ran to completion with no salience interruptions (4-clip pacing = evener episode
+  production vs. tight single-clip loop). All 3276 traces replayed each cycle.
+- Projection cosine loss stable: 0.00115→0.00085→0.00078, proj_max ≤ 0.0026. No divergence. ✓
+- Warm recall L2 4.16→3.98→2.44 (system recognises multi-clip content; well below threshold 15.0).
+- No growth triggered (familiar content; region_sizes=[1024,1024,1152,1024,1024] from prior session).
+- Key prior_cosine C3 values:
+  - speech: ~0.94, symbolic: ~0.94 (stable familiar content)
+  - visual: 0.795→0.766→0.865 (dipped on novelty, recovered by C3)
+  - env: 0.502→0.516→0.657 (steadily adapting to diverse audio)
+  - language: 0.021→0.019→0.043 (slow upward from baseline 0.011; 3.9× above baseline after session)
+
 **Next (queued):**
-- Run multi-clip training sessions (talking_head, nature, animation, urban) to accumulate language
-  prior_cosine toward the 0.1–0.2 milestone faster than single-clip repetition.
-- Generation re-evaluation: run `--query` after ~10 sessions to check if output becomes more
-  clip-grounded (broader ASR transcription variety should help).
+- Continue multi-clip training sessions (same 4-clip rotation) to push language prior_cosine
+  toward 0.1–0.2 milestone. Each session of 3 cycles adds ~0.01–0.02 to language cosine.
+- Generation re-evaluation: run `--query` after language cosine reaches ~0.1 to check
+  clip-grounded output.
 
 ## Open architectural questions
 
