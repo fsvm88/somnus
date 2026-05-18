@@ -12,79 +12,174 @@ The phases below are approximate and overlap. We do not need to finish a phase b
 
 **Exit criterion:** ✓ a new collaborator can answer "what is this project, and how do we work on it?" by reading `ai-docs/`.
 
-## Phase 1 — Sensory capture
+## Phase 1 — Sensory capture ✓
 
 Get raw audio and video flowing through Rust, end-to-end. Defined in ADRs 0001 and 0002.
 
-- **Input sources:**
-  - Microphone → `AudioFrame` stream (cpal, crossbeam callback bridge).
-  - Webcam → `VideoFrame` stream (nokhwa, pull model).
-  - Media file → both streams (ffmpeg-next `MediaFile`; primary test path since no camera is available).
-  - Mixed: mic + file audio fan-in via `Sender::clone` (e.g., movie + person speaking).
-- **Frame types:** `AudioFrame` (f32 PCM, interleaved channels), `VideoFrame` (packed pixels), dual `Timestamp` (monotonic + wall-clock).
-- **Backpressure:** bounded crossbeam channels, drop-oldest on overflow, per-source drop counter.
-- **Binary:** `--file <path>` / `--mic` / `--webcam <idx>` flags; tokio async main loop; periodic metrics log; Ctrl+C graceful shutdown.
-- **No encoding in this phase.** Frames are consumed by the logging loop only.
+- Microphone → `AudioFrame` (cpal, crossbeam callback bridge).
+- Webcam → `VideoFrame` (nokhwa, pull model).
+- Media file → both streams (ffmpeg-next `MediaFile`; primary test path).
+- Backpressure: bounded crossbeam channels, drop-oldest on overflow.
+- Binary: `--file` / `--mic` / `--webcam` flags; tokio async main; periodic metrics log.
 
-**Exit criterion:** a 10-minute run on a real video file completes without OOM, measurable frame-rate drift, or process leak. Audio and video drop rates logged.
+**Exit criterion:** ✓ 10-minute file run without OOM, frame-rate drift, or process leak.
 
-## Phase 2 — Encoding (frozen pretrained models)
+## Phase 2 — Encoding (frozen pretrained models) ✓
 
 Frames → continuous embeddings via frozen pretrained encoders.
 
-- Load and run frozen ONNX models via `ort`:
-  - **Audio-speech:** Whisper-tiny encoder (39 M params, 384-dim, ~10–25 ms per 30 s chunk).
-  - **Audio-env:** CLAP audio encoder (~86 M, 512-dim, parallel to speech encoder).
-  - **Visual:** DINOv2-S/14 (~21 M, 384-dim, ~4–8 ms/frame).
-- `AudioEmbedding` and `VideoEmbedding` types in `somnus-encoding`.
-- VRAM budget check: all three encoders + overhead ≤ 2 GB, leaving ≥ 12 GB for cognitive layers and episodic memory.
-- ADR for final encoder selection (one multi-task audio encoder vs. two specialized).
+- Whisper-tiny encoder (384-dim speech), CLAP-HTSAT-unfused (512-dim env), DINOv2-S/14 (384-dim visual).
+- `ort` 2.0 against system ORT 1.24.4; parity-tested against HuggingFace Python reference (≤1e-4).
+- ADRs 0003, 0004.
 
-**Exit criterion:** embeddings flowing for all three encoder streams in real time; latency ≤ the frame period for each modality.
+**Exit criterion:** ✓ embeddings flowing for all three streams in real time within frame-period latency.
 
-## Phase 3 — Perception (sparse coding + regional concept areas)
+## Phase 3 — Perception (sparse coding + binding) ✓
 
-Embeddings → sparse activations per region; first pass of multimodal binding.
+Embeddings → sparse activations per region; multimodal binding.
 
-- Regional concept areas (audio-speech, audio-env, visual, symbolic) implemented as k-WTA layers in `candle`.
-- `SparseActivation { indices: Vec<u16>, values: Vec<f32>, region: RegionId }`.
-- Simple binding area: concatenation + linear projection (Phase 3), upgradeable to cross-attention (Phase 4).
-- SAE reconstruction error wired as the growth-trigger signal and replay-priority signal.
-- `somnus-perception` crate created.
+- 5-region k-WTA (n=1024, k=20, 2% sparsity) + SAE decoder per region; `somnus-perception` crate.
+- Binding area: single-head cross-attention over region tokens → 640-dim episode vector (ADR 0008).
+- Output reconstruction heads + bidirectional top-down priors (ADRs 0009, 0010).
+- Predictive-coding settling loop with prior_cosine gate (ADR 0011).
+- ADR 0005.
 
-**Exit criterion:** sparse activations produced per frame; binding area outputs a fixed-size episode vector; reconstruction error is observable as a metric.
+**Exit criterion:** ✓ sparse activations per frame; binding outputs 640-dim episode vector; reconstruction error observable.
 
-## Phase 4 — Memory hierarchy
+## Phase 4 — Memory hierarchy ✓
 
 Episodic buffer, semantic store, cold archive, and recollection index.
 
-- **Hot (episodic):** bounded VRAM ring of recent episode vectors; `EpisodicBuffer`.
-- **Warm (semantic):** region-sharded sparse-coded representations in RAM; `usearch` HNSW index for retrieval; `SemanticStore`.
-- **Cold (archive):** INT8-quantized vectors written to disk via `memmap2`; `ColdArchive`.
-- Recollection layer: HNSW query returns top-k candidates; cold→warm promotion on cache miss.
-- `somnus-memory` crate created.
+- Hot: `EpisodicBuffer` (bounded ring); warm: `SemanticStore` (hnsw_rs HNSW, L2); cold: `ColdArchive` (INT8, memmap2).
+- HNSW rebuilt from cold archive on snapshot restore; cross-session recall confirmed stable (L2 1.0–3.5).
+- `somnus-memory` crate. ADR 0006.
 
-**Exit criterion:** given a cue (e.g., a replayed audio segment), the system retrieves the top-k most similar episodes from semantic memory.
+**Exit criterion:** ✓ top-k retrieval from semantic memory on a cued episode.
 
-## Phase 5 — Sleep cycle
+## Phase 5 — Sleep cycle ✓
 
-First wake/sleep transition; replay-driven consolidation.
+Wake/sleep transitions; replay-driven consolidation; growth.
 
-- Sleep triggers: episodic buffer high-water mark, reconstruction-error degradation, schedule fallback.
-- **NREM-like:** replay episodes from episodic buffer → update semantic memory weights; homeostatic weight downscaling; compress and spill old episodes to cold archive.
-- **REM-like:** generative self-probe; cascade-correlation growth where gist recall fails; HNSW index rebuild if tombstone fraction exceeds threshold.
-- Adaptive sleep duration: short (≈ 10–20 min GPU) if no growth triggered; long (≈ 1–4 h GPU) if growth runs.
-- `somnus-sleep` crate created.
+- Sleep trigger: episodic buffer high-water mark (80% capacity).
+- NREM: k-WTA + SAE replay with AdamW + cosine-annealed LR (neuromodulation); homeostatic decay; hot→cold spill.
+- REM: SAE MSE self-probe per region; cascade-correlation growth when MSE > threshold and warm recall poor.
+- Snapshot (weights + episodic binary + region_sizes + next_id) with restore on startup.
+- ADR 0007.
 
-**Exit criterion:** replay during sleep measurably changes wake-time reconstruction error on a held-out set of episodes. Growth triggered and confirmed by unit count increase in at least one region.
+**Exit criterion:** ✓ replay measurably reduces reconstruction error; growth confirmed by unit count increase.
 
-## Phase 6+ — TBD
+## Phase 6 — Language region ✓
 
-Placeholders, not commitments. Each gets researched in `research/` before being scoped:
+Language as the 5th perception region, grounding ASR transcriptions and text into the binding area.
 
-- Cross-attention binding (upgrade from concat) and bidirectional region ↔ binding top-down priors.
-- Neuromodulation as global gain control and learning-rate gate.
-- SAE reconstruction error → full predictive-coding settling loop (Phase 4+ of PC adoption).
-- Sample-level audio mixing (mic + file waveform summing with resampling).
-- Action loop, if and when we add one.
-- Language as an additional modality.
+- EPISODE_DIM 512→640; 5-region arrays throughout; Qwen2.5 embed table (896-dim mean-pooled).
+- Stage A: stdin text → language k-WTA → episode (ADR 0013).
+- Stage B: Whisper ASR → language region (Whisper decoder ONNX, last-token LM head wrapper).
+- Auto-grounding: ASR text stored as `text_target` for projection training (ADR 0014).
+- Action loop: region-token projection + frozen Qwen2.5-0.5B; per-episode gain modulation + autoregressive decode (ADR 0012).
+- Cosine alignment loss for projection (replaces MSE; prevents gradient explosion across sessions, ADR 0015).
+- Multi-clip training: `--file` accepts multiple paths, cycles in loop mode (commit 99f3389).
+
+**Exit criterion:** ✓ ASR transcriptions ingested; language prior_cosine trending upward across sessions (currently 0.043 after session 1, baseline 0.011).
+
+## Phase 9 — Continuous operation (high priority)
+
+Make the system viable for real, indefinite, unattended operation. Three parallel gaps must close.
+
+### 9a — Schedule fallback sleep trigger
+
+Currently sleep fires only when the episodic buffer hits its high-water mark. In real continuous operation (mic running indefinitely), the buffer may fill slowly depending on input rate. A max-wake-time cap ensures sleep fires on schedule even when the buffer does not fill, and provides a safety net for long quiet periods.
+
+- Add a wall-clock wake timer (e.g., `--max-wake-secs`, default 3600).
+- When elapsed wake time exceeds the cap, trigger sleep regardless of buffer occupancy.
+- Log trigger reason at sleep entry (`high_water` vs. `schedule`).
+
+**Exit criterion:** system sleeping on schedule during a quiet mic run where the buffer never fills.
+
+### 9b — Real mic/webcam end-to-end validation
+
+The mic and webcam code paths exist from Phase 1 but have never been exercised with the full cognitive stack (encoding → perception → memory → sleep). All calibration has been file-based.
+
+- Run `--mic --webcam 0` for at least one full sleep cycle.
+- Confirm: embeddings flow, episodes are recorded, sleep fires, snapshot is written and restored.
+- Identify and fix any bugs that only appear under live input (timing, buffer sizing, resampler state).
+
+**Exit criterion:** one complete wake → sleep → restore cycle from live mic + webcam input with no crashes or hung threads.
+
+### 9c — Cold→warm promotion on cache miss
+
+Currently warm HNSW is rebuilt from the full cold archive on every restart. During a long session the cold archive grows unboundedly while warm stays at rebuild-time size. The recollection layer was designed to promote cold records into warm on demand (ADR 0006 stubs this). Without it, recall degrades silently as the session ages.
+
+- On a warm HNSW miss (top-1 L2 > threshold), query the cold archive directly.
+- Promote the top hit into the warm HNSW (insert + track promotion count).
+- Log promotion events at DEBUG; expose `promotions_since_restart` in metrics.
+
+**Exit criterion:** a cold-miss event is observable in logs; the promoted record appears in subsequent warm queries.
+
+## Phase 10 — Sleep fidelity (medium priority)
+
+Improve the sleep cycle to match the architectural intent more closely.
+
+### 10a — Wake-performance degradation trigger
+
+Second sleep entry condition from the architecture. If prediction quality (prior_cosine mean across regions) drops below a calibrated floor during wake, enter sleep early without waiting for the buffer to fill or the schedule to fire.
+
+- Track a rolling EWMA of per-episode prior_cosine means during wake.
+- If EWMA drops below `--perf-sleep-threshold` (default: tune from calibration data), set a flag that triggers sleep at the next episode boundary.
+- Log trigger reason (`perf_degradation`).
+
+**Exit criterion:** sleep fires on a perf-degradation trigger in a controlled test (inject novel content to tank prior_cosine, observe early sleep entry).
+
+### 10b — Adaptive sleep duration
+
+Sleep currently runs for a fixed episode count (all traces in the buffer). The architecture specifies: run until consolidation goals are met, or a max-sleep-time cap. "Consolidation goals" = mean NREM loss below a threshold AND warm recall L2 below threshold after REM probe.
+
+- Add `--sleep-loss-target` (e.g., 0.01) and `--sleep-max-secs` (e.g., 7200).
+- NREM loop exits early when mean loss < target (current: always runs all traces).
+- Overall sleep exits when both targets are met or max time is reached.
+- Log which exit condition fired.
+
+**Exit criterion:** sleep exits early on a session where the buffer is small and loss converges quickly; full budget is spent when content is novel.
+
+### 10c — Gist-level self-probe in REM
+
+Current REM probe uses SAE reconstruction MSE — a low-level signal. The architecture describes gist-level comparison: right scene, right objects, right events even when details differ. A gist-level probe compares episode *class* rather than pixel-level reconstruction.
+
+- Cluster warm episodes offline (k-means on episode vectors, k~32) to form gist classes.
+- During REM probe: assign each replayed episode to its nearest centroid; check if the top warm recall hit falls in the same centroid cluster.
+- Gist-recall rate per region replaces SAE MSE as the growth trigger signal. Growth fires when gist recall rate < threshold.
+
+**Exit criterion:** gist-recall rate is logged per region during REM; growth trigger uses it instead of SAE MSE.
+
+### 10d — Working memory
+
+The architecture mentions working memory as a transient context buffer during wake — holding the current conversational or environmental context across episodes without writing to semantic memory. Currently each episode is processed independently.
+
+- Add a fixed-capacity ring of recent episode vectors (`--working-memory-size`, default 8).
+- During binding, concatenate the mean of working-memory episodes as a context prefix to the cross-attention input.
+- Working memory is cleared on sleep entry (it is wake-local by design).
+
+**Exit criterion:** prior_cosine or output_mse measurably improves when working memory is enabled on a session with temporally coherent content.
+
+## Phase 11 — Memory scaling (low priority)
+
+Address long-term scalability of the cold archive and semantic store.
+
+### 11a — Compression beyond INT8
+
+Cold archive currently stores INT8-quantized 640-dim vectors. At scale, this is still 640 bytes/record. Options: product quantization (PQ, ~64 bytes/record), pruning least-accessed records, or knowledge distillation into smaller regional models.
+
+- Research note in `ai-docs/research/memory-compression.md` already covers options.
+- Implement PQ compression for cold archive as the first step (most impact, least architectural change).
+
+**Exit criterion:** cold archive size per record reduced by ≥ 4× with L2 retrieval quality degradation < 10%.
+
+### 11b — Creative recombination in REM
+
+Generative episode stitching: combine fragments from different episodes into synthetic novel episodes, then replay those synthetics during NREM. The architectural locus for creativity in the recombinational sense.
+
+- During REM, sample pairs of episodes with low mutual L2 (different content) and high regional overlap (same scene type).
+- Blend their regional activations (interpolate sparse codes); pass the blend through the binding area to produce a synthetic episode vector.
+- Add synthetic to replay buffer with a lower salience weight (does not count toward growth trigger).
+
+**Exit criterion:** synthetic episodes are produced, logged, and replayed; output_mse on synthetics is measurably higher than on real episodes (confirming they are genuinely novel to the output heads).
