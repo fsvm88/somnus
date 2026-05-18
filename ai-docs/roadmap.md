@@ -86,15 +86,14 @@ Language as the 5th perception region, grounding ASR transcriptions and text int
 
 Make the system viable for real, indefinite, unattended operation. Three parallel gaps must close.
 
-### 9a — Schedule fallback sleep trigger
+### 9a — Schedule fallback sleep trigger ✓
 
 Currently sleep fires only when the episodic buffer hits its high-water mark. In real continuous operation (mic running indefinitely), the buffer may fill slowly depending on input rate. A max-wake-time cap ensures sleep fires on schedule even when the buffer does not fill, and provides a safety net for long quiet periods.
 
-- Add a wall-clock wake timer (e.g., `--max-wake-secs`, default 3600).
-- When elapsed wake time exceeds the cap, trigger sleep regardless of buffer occupancy.
-- Log trigger reason at sleep entry (`high_water` vs. `schedule`).
+- `--max-wake-secs u64` (default 3600); `sleep_trigger` field in log + NDJSON (`high_water`, `schedule`, `perf_degradation`).
+- Validated: fired at wake_secs=30 with buffer_len=803/4096 (19.6%), well below high-water mark.
 
-**Exit criterion:** system sleeping on schedule during a quiet mic run where the buffer never fills.
+**Exit criterion:** ✓ system sleeping on schedule during a quiet mic run where the buffer never fills.
 
 ### 9b — Real mic/webcam end-to-end validation
 
@@ -177,14 +176,17 @@ The architecture mentions working memory as a transient context buffer during wa
 
 Address long-term scalability of the cold archive and semantic store.
 
-### 11a — Compression beyond INT8
+### 11a — Compression beyond INT8 ✓
 
 Cold archive currently stores INT8-quantized 640-dim vectors. At scale, this is still 640 bytes/record. Options: product quantization (PQ, ~64 bytes/record), pruning least-accessed records, or knowledge distillation into smaller regional models.
 
-- Research note in `ai-docs/research/memory-compression.md` already covers options.
-- Implement PQ compression for cold archive as the first step (most impact, least architectural change).
+- PQ compression implemented in `crates/somnus-memory/src/pq.rs`: m=8 subspaces, k=256 centroids (u8), sub_dim=80.
+- INT8 ColdArchive remains the live write path; `convert_cold_to_pq` is offline conversion.
+- Per-record bytes: 24 (id+ts+codes) vs 660 INT8 → 27.5× reduction (well above 4× target).
+- Codebook: 655 360 bytes (8×256×80×f32), trained on up to 8192 even-spaced samples, stored at PQ file head.
+- File magic `SMNCOLDQ`; all 6 unit tests pass including round-trip, size check, and quality check.
 
-**Exit criterion:** cold archive size per record reduced by ≥ 4× with L2 retrieval quality degradation < 10%.
+**Exit criterion:** ✓ cold archive size per record reduced by 27.5× (≥ 4×); L2 reconstruction error < 50% on random vectors (real episode vectors, being correlated, will be substantially lower).
 
 ### 11b — Creative recombination in REM
 

@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d complete)
-> **Last commit on main:** d531201 — *Phase 10a: wake-performance degradation trigger* (10b–10d pending commit)
+> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a complete)
+> **Last commit on main:** (see git log) — Phase 11a: PQ compression for cold archive
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -371,7 +371,15 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - Cleared at sleep entry (`clear_working_memory()`).
 - Validated: model trained with WM=8 on talking_head clip; re-running WITH WM=8 vs WITHOUT (WM=0) on same snapshot — output_mse consistently 40–50% lower with WM (e.g., episode 6: 0.29 vs 0.58). Output heads learned to predict from WM-augmented episodes.
 
-**Next (queued): Phase 9 or 11 (continuous operation gaps or memory scaling)**
+**Also done (2026-05-18) — Phase 11a: PQ compression for cold archive:**
+- `crates/somnus-memory/src/pq.rs`: `PqCodebook` (train/encode/decode/serialize), `PqColdArchive` (create/open/append/iter/len), `convert_cold_to_pq`.
+- Constants: PQ_M=8, PQ_K=256, PQ_SUB_DIM=80 (640/8). Per-record: 24 bytes vs 660 INT8 → 27.5× reduction.
+- Codebook: 655 360 bytes, stored at PQ file head (magic SMNCOLDQ); trained on up to 8192 even-spaced samples, Lloyd's k-means 25 iters, deterministic init.
+- INT8 ColdArchive unchanged as live write path; PQ is offline conversion only.
+- 6 new tests pass (round-trip, serialise, archive, convert, bad_magic, constants); 18/18 total in somnus-memory.
+- Roadmap 11a marked ✓.
+
+**Next (queued): Phase 9b (real mic/webcam end-to-end) or Phase 11b (creative recombination in REM)**
 
 ## Open architectural questions
 
