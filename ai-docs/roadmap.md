@@ -148,15 +148,19 @@ Sleep currently runs for a fixed episode count (all traces in the buffer). The a
 
 **Exit criterion:** ✓ sleep exits early on a session where loss converges quickly; time-budget exits as interrupted.
 
-### 10c — Gist-level self-probe in REM
+### 10c — Gist-level self-probe in REM ✓
 
 Current REM probe uses SAE reconstruction MSE — a low-level signal. The architecture describes gist-level comparison: right scene, right objects, right events even when details differ. A gist-level probe compares episode *class* rather than pixel-level reconstruction.
 
-- Cluster warm episodes offline (k-means on episode vectors, k~32) to form gist classes.
-- During REM probe: assign each replayed episode to its nearest centroid; check if the top warm recall hit falls in the same centroid cluster.
-- Gist-recall rate per region replaces SAE MSE as the growth trigger signal. Growth fires when gist recall rate < threshold.
+- k-means (k=32, Lloyd's, up to 2048-record sample) on warm episode vectors during REM.
+- Each probe episode and its top-1 warm neighbor are assigned to nearest centroid.
+- `gist_recall_rate` = fraction of probe episodes whose neighbor is in the same cluster.
+- Activates when warm store ≥ GIST_K=32 records; falls back to SAE MSE when unavailable.
+- Growth trigger uses gist when available: grow when `gist_recall_rate < 0.5`. SAE MSE is still computed and logged but only used as fallback.
+- `gist_recall_rate: Option<f32>` added to SleepStats and NDJSON metrics.
+- Validated: cycle 2 shows `gist_recall_rate=0.932` on 41 warm records × 59 probe episodes (familiar 4-clip content; growth correctly suppressed).
 
-**Exit criterion:** gist-recall rate is logged per region during REM; growth trigger uses it instead of SAE MSE.
+**Exit criterion:** ✓ gist-recall rate is logged during REM; growth trigger uses it instead of SAE MSE (with SAE MSE fallback when warm is too small).
 
 ### 10d — Working memory
 

@@ -71,6 +71,20 @@ impl SemanticStore {
         self.records.is_empty()
     }
 
+    /// Return up to `max_n` episode vectors, evenly sampled from the records map.
+    /// Used to build k-means centroids for gist-level probing during REM.
+    pub fn sample_values(&self, max_n: usize) -> Vec<Vec<f32>> {
+        let records: Vec<&EpisodeRecord> = self.records.values().collect();
+        if records.len() <= max_n {
+            records.iter().map(|r| r.values.clone()).collect()
+        } else {
+            let step = records.len() / max_n;
+            (0..max_n)
+                .map(|i| records[i * step].values.clone())
+                .collect()
+        }
+    }
+
     /// Expose the underlying HNSW index (for snapshot serialisation).
     pub fn hnsw(&self) -> &Hnsw<'static, f32, DistL2> {
         &self.index

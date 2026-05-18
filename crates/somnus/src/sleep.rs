@@ -86,6 +86,9 @@ pub struct SleepStats {
     /// Mean L2 distance to nearest warm-memory neighbor during REM probe.
     /// Some only when warm had pre-spill entries (cross-cycle/cross-session signal).
     pub warm_recall_l2: Option<f32>,
+    /// Fraction of probe episodes whose top-1 warm neighbor is in the same k-means
+    /// gist cluster (10c). None when warm is too small to cluster (< GIST_K points).
+    pub gist_recall_rate: Option<f32>,
     /// Mean surrogate loss from projection training steps (ADR 0012).
     /// None when no text-target traces were present.
     pub mean_proj_loss: Option<f32>,
@@ -93,6 +96,82 @@ pub struct SleepStats {
     pub proj_loss_max: Option<f32>,
     /// Number of traces that had a text_target and were used to train the projection.
     pub decoder_trainable_records: usize,
+}
+
+/// Number of gist clusters for REM self-probe (10c).
+const GIST_K: usize = 32;
+/// Max warm-record sample for k-means (larger warm stores are subsampled).
+const GIST_SAMPLE: usize = 2048;
+/// k-means iteration cap.
+const GIST_MAX_ITER: usize = 20;
+/// Minimum warm-store size to attempt gist clustering.
+const GIST_MIN_WARM: usize = GIST_K;
+/// Growth fires when gist-recall rate is below this fraction.
+const GIST_GROWTH_THRESHOLD: f32 = 0.5;
+
+fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum()
+}
+
+fn nearest_centroid(centroids: &[Vec<f32>], point: &[f32]) -> usize {
+    centroids
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            l2_sq(point, a)
+                .partial_cmp(&l2_sq(point, b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Minimal Lloyd's k-means. Initialises centroids by even-index sampling (deterministic).
+fn kmeans(points: &[Vec<f32>], k: usize, max_iter: usize) -> Vec<Vec<f32>> {
+    if points.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let k = k.min(points.len());
+    let dim = points[0].len();
+
+    // Evenly-spaced initialisation — deterministic, no RNG.
+    let mut centroids: Vec<Vec<f32>> = (0..k)
+        .map(|i| points[i * points.len() / k].clone())
+        .collect();
+
+    let mut assignments = vec![0usize; points.len()];
+
+    for _ in 0..max_iter {
+        let mut changed = false;
+        for (j, p) in points.iter().enumerate() {
+            let best = nearest_centroid(&centroids, p);
+            if assignments[j] != best {
+                assignments[j] = best;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        // Recompute centroids.
+        let mut sums = vec![vec![0.0f32; dim]; k];
+        let mut counts = vec![0usize; k];
+        for (j, p) in points.iter().enumerate() {
+            let c = assignments[j];
+            counts[c] += 1;
+            for (s, v) in sums[c].iter_mut().zip(p.iter()) {
+                *s += v;
+            }
+        }
+        for (c_vec, (sum, cnt)) in centroids.iter_mut().zip(sums.iter().zip(counts.iter())) {
+            if *cnt > 0 {
+                for (cv, sv) in c_vec.iter_mut().zip(sum.iter()) {
+                    *cv = sv / *cnt as f32;
+                }
+            }
+        }
+    }
+    centroids
 }
 
 /// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
@@ -296,6 +375,7 @@ pub fn run_sleep_cycle(
     let mut per_region_count = [0usize; 5];
     let mut regions_grown: Vec<RegionId> = Vec::new();
     let mut warm_recall_l2: Option<f32> = None;
+    let mut gist_recall_rate: Option<f32> = None;
 
     // Collect traces once for reuse in both warm probe and MSE measurement.
     let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5])> = if !was_interrupted {
@@ -308,18 +388,61 @@ pub fn run_sleep_cycle(
     };
 
     if !was_interrupted && pre_spill_warm_len > 0 {
+        // ── Gist clustering (10c) ─────────────────────────────────────────────
+        // Build k-means centroids from a sample of the warm store, then use them
+        // during the warm probe to compute per-episode gist-recall.
+        let gist_centroids: Vec<Vec<f32>> = if pre_spill_warm_len >= GIST_MIN_WARM {
+            let sample = recall.warm.sample_values(GIST_SAMPLE);
+            tracing::debug!(sample_n = sample.len(), k = GIST_K, "gist: running k-means");
+            let t0 = Instant::now();
+            let centroids = kmeans(&sample, GIST_K, GIST_MAX_ITER);
+            tracing::debug!(
+                elapsed_ms = t0.elapsed().as_millis(),
+                "gist: k-means complete"
+            );
+            centroids
+        } else {
+            Vec::new()
+        };
+        let gist_available = !gist_centroids.is_empty();
+
         let mut total_l2 = 0.0f32;
         let mut n_probed = 0usize;
+        let mut gist_matches = 0usize;
+
         for (ep_vec, _) in &traces_for_rem {
-            if let Some(&(dist, _)) = recall.warm.query_with_dist(ep_vec, 1).first() {
+            if let Some((dist, neighbor)) =
+                recall.warm.query_with_dist(ep_vec, 1).into_iter().next()
+            {
                 total_l2 += dist;
                 n_probed += 1;
+                if gist_available {
+                    let probe_cluster = nearest_centroid(&gist_centroids, ep_vec);
+                    let neighbor_cluster = nearest_centroid(&gist_centroids, &neighbor.values);
+                    if probe_cluster == neighbor_cluster {
+                        gist_matches += 1;
+                    }
+                }
             }
         }
+
         if n_probed > 0 {
             let mean_l2 = total_l2 / n_probed as f32;
             warm_recall_l2 = Some(mean_l2);
-            tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
+            if gist_available {
+                let rate = gist_matches as f32 / n_probed as f32;
+                gist_recall_rate = Some(rate);
+                tracing::info!(
+                    mean_l2,
+                    pre_spill_warm_len,
+                    gist_recall_rate = rate,
+                    gist_matches,
+                    n_probed,
+                    "warm recall + gist probe"
+                );
+            } else {
+                tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
+            }
         }
     }
 
@@ -360,10 +483,10 @@ pub fn run_sleep_cycle(
             }
         }
 
-        // Growth: SAE MSE above threshold with sufficient samples.
-        // When cross-cycle warm data is available, also require poor warm recall
-        // to avoid growing when the model already recognises these patterns.
+        // Growth trigger: prefer gist-recall quality signal (10c); fall back to SAE MSE
+        // when warm store is too small to cluster (gist_recall_rate is None).
         let warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
+        let gist_poor = gist_recall_rate.is_none_or(|r| r < GIST_GROWTH_THRESHOLD);
         let region_ids = [
             RegionId::AudioSpeech,
             RegionId::AudioEnv,
@@ -372,13 +495,17 @@ pub fn run_sleep_cycle(
             RegionId::Language,
         ];
         for (i, &region) in region_ids.iter().enumerate() {
-            if per_region_count[i] >= GROWTH_MIN_SAMPLES
-                && per_region_mse[i] > GROWTH_THRESHOLD
-                && warm_recall_poor
-            {
+            // Quality signal: gist-recall when available, SAE MSE otherwise.
+            let quality_poor = if gist_recall_rate.is_some() {
+                gist_poor
+            } else {
+                per_region_mse[i] > GROWTH_THRESHOLD
+            };
+            if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor && warm_recall_poor {
                 tracing::info!(
                     region = ?region,
                     mse = per_region_mse[i],
+                    gist_recall_rate = ?gist_recall_rate,
                     "growing region"
                 );
                 match perception.grow_region(region, GROWTH_BATCH) {
@@ -395,6 +522,7 @@ pub fn run_sleep_cycle(
             symbolic_mse = per_region_mse[3],
             language_mse = per_region_mse[4],
             warm_recall_l2 = ?warm_recall_l2,
+            gist_recall_rate = ?gist_recall_rate,
             "REM self-probe complete"
         );
     }
@@ -431,6 +559,7 @@ pub fn run_sleep_cycle(
         was_interrupted,
         nrem_exit_reason,
         warm_recall_l2,
+        gist_recall_rate,
         mean_proj_loss,
         proj_loss_max: proj_loss_max_opt,
         decoder_trainable_records,

@@ -1152,6 +1152,7 @@ async fn main() -> Result<()> {
                             "mean_output_mse":   stats.mean_output_mse,
                             "per_region_mse":    stats.per_region_mse,
                             "warm_recall_l2":    stats.warm_recall_l2,
+                            "gist_recall_rate":  stats.gist_recall_rate,
                             "was_interrupted":   stats.was_interrupted,
                             "nrem_exit_reason":  stats.nrem_exit_reason,
                             "region_sizes":      region_sizes,
