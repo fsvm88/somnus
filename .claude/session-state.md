@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phase 9 complete)
-> **Last commit on main:** b0a05ed — *Phase 9: schedule trigger logging, graceful mic/webcam, 9c closed as non-issue*
+> **Last updated:** 2026-05-18 (Phase 10a complete)
+> **Last commit on main:** d531201 — *Phase 10a: wake-performance degradation trigger*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -339,11 +339,16 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
   sync with cold at all times (startup rebuild + spill+insert during sleep). Roadmap updated.
   Real scaling concern (HNSW rebuild time at 164k records → ~3min) deferred to Phase 11.
 
-**Next (queued): Phase 10 — Sleep fidelity (medium priority)**
-- 10a: Wake-performance degradation trigger (EWMA prior_cosine → early sleep entry)
-- 10b: Adaptive sleep duration (loss-target exit condition)
-- 10c: Gist-level self-probe in REM
-- 10d: Working memory (recent episode ring → binding context prefix)
+**Also done (2026-05-18) — Phase 10a: wake-performance degradation trigger:**
+- `--perf-sleep-threshold f64` CLI arg (default 0.0 = disabled). Requires `--prior-beta > 0`.
+- Per-wake EWMA (α=0.1) of mean prior_cosine per episode. Baseline = mean of first 20 episodes.
+- When EWMA drops > threshold below baseline → perf_sleep_flag = true → trigger at next sleep check.
+- Trigger reason = `"perf_degradation"` in log + NDJSON.
+- EWMA state reset at each sleep entry alongside other per-cycle counters.
+- Validated: 5× talking_head establishes baseline=0.566; novel noise clip tanks EWMA to 0.505;
+  `trigger="perf_degradation"` fires at wake_secs=22, buffer_len=38/500. ✓
+
+**Next (queued): Phase 10b — Adaptive sleep duration (loss-target exit)**
 
 ## Open architectural questions
 
