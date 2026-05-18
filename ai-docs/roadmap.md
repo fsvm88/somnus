@@ -263,3 +263,25 @@ breaking snapshot compatibility.
 
 **Exit criterion:** after pruning 50% of grown units, `per_region_mse` stays within 5%
 of the pre-prune baseline across the next sleep cycle (verified via eval harness).
+
+## Phase 13 — Continuous training campaign ✓
+
+Run enough sessions for the language region to meaningfully converge, and make
+multi-session runs operationally easy.
+
+- `--session N` CLI arg: written to every NDJSON metrics line so the eval harness can
+  label cycles as "S{n}C{m}" and draw vertical session-boundary lines.
+- `scripts/train_campaign.sh`: outer loop over N sessions, each running
+  `--max-sleep-cycles CYCLES` against the same `--memory-dir`. Appends to a single
+  `campaign_<ts>/metrics.jsonl`; runs `eval_metrics.py` automatically at the end.
+  Configurable via env: `SESSIONS`, `CYCLES`, `CLIPS`, `MEMORY_DIR`, `EXTRA_ARGS`.
+- `eval_metrics.py` updated: session-aware x-axis labels; vertical dashed lines at
+  session boundaries on all four charts.
+
+**Exit criterion:** ✓ `train_campaign.sh` runs end-to-end; charts show `S{n}C{m}` labels
+and session-boundary lines; language prior_cosine trajectory interpretable across
+multiple sessions from a single command.
+
+**Next step (not coded):** run `SESSIONS=20 CYCLES=3 scripts/train_campaign.sh` and
+observe whether language prior_cosine reaches 0.1–0.2 after 60 cycles (~30 sessions
+needed by Phase 8 estimate). Use eval harness output to confirm or revise the estimate.

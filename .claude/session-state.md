@@ -396,10 +396,13 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - All three new ADRs (0016–0018) written; roadmap Phase 12 marked ✓.
 - Full workspace builds clean; clippy clean; all tests pass.
 
-**Next (queued): No specific next phase queued. Candidates:**
-- More calibration runs to test 12b restart speedup and 12c trigger in practice.
-- Phase 9b (real mic/webcam) — deferred until hardware available.
-- Any new phase the user proposes.
+**Also done (2026-05-18) — Phase 13: continuous training campaign:**
+- `--session N` CLI arg; written to every NDJSON line so sessions are distinguishable.
+- `scripts/train_campaign.sh`: N sessions × CYCLES cycles, shared memory/, single metrics JSONL, auto-runs eval_metrics.py at the end. Configurable via SESSIONS/CYCLES/CLIPS/MEMORY_DIR/EXTRA_ARGS env vars.
+- `eval_metrics.py` updated: S{n}C{m} x-axis labels; vertical dashed session-boundary lines on all four charts.
+
+**Next (queued): Run `SESSIONS=20 CYCLES=3 scripts/train_campaign.sh`**
+Observe language prior_cosine trajectory. Expect ~30 sessions to reach 0.1–0.2 (Phase 8 estimate). Eval harness output will confirm or revise that estimate.
 
 ## Open architectural questions
 
