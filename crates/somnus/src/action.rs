@@ -170,8 +170,11 @@ impl ActionDecoder {
 
     /// Surrogate projection training step (ADR 0012, NREM).
     ///
-    /// Loss: MSE between mean(projected region tokens) and mean(text token embeddings).
-    /// Gradients flow through the projection only; embed_table is frozen (no Var).
+    /// Loss: cosine MSE — MSE between L2-normalised mean(projected region tokens) and
+    /// normalised mean(text token embeddings). Bounded in [0, 4]; magnitude-invariant.
+    /// Prevents loss explosion when the episode-vector distribution shifts between cycles
+    /// (observed: C3 MSE spike to 1.77e12 with unnormalised loss). Gradients flow through
+    /// the projection only; embed_table is frozen (no Var).
     pub fn projection_step(&mut self, episode: &[f32], target_ids: &[u32]) -> Result<f32> {
         if target_ids.is_empty() {
             return Ok(0.0);
@@ -181,7 +184,7 @@ impl ActionDecoder {
         let proj_out = self
             .projection
             .forward(&ep_t)?
-            .reshape((N_REGIONS, LM_HIDDEN))?; // [4, LM_HIDDEN]
+            .reshape((N_REGIONS, LM_HIDDEN))?; // [N_REGIONS, LM_HIDDEN]
         let proj_mean = proj_out.mean(0)?; // [LM_HIDDEN]
 
         // Frozen text embeddings; no gradient
@@ -189,7 +192,17 @@ impl ActionDecoder {
         let text_embeds = self.embed_table.index_select(&idx, 0)?.detach(); // [n, LM_HIDDEN]
         let text_mean = text_embeds.mean(0)?; // [LM_HIDDEN]
 
-        let loss = (proj_mean - text_mean)?.sqr()?.mean_all()?;
+        // Normalise proj_mean inside the graph so gradients flow through the normalisation.
+        // affine(1.0, eps) adds a small constant to prevent division by zero.
+        let proj_norm = proj_mean.sqr()?.sum_all()?.affine(1.0, 1e-8)?.sqrt()?;
+        let proj_unit = proj_mean.broadcast_div(&proj_norm)?;
+
+        // text_mean is frozen; scalar normalisation is fine (no need to keep in graph).
+        let text_norm = (text_mean.sqr()?.sum_all()?.to_scalar::<f32>()? as f64 + 1e-8).sqrt();
+        let text_unit = text_mean.affine(text_norm.recip(), 0.0)?;
+
+        // Cosine MSE = 2*(1 − cosine_similarity); bounded [0, 4].
+        let loss = (proj_unit - text_unit)?.sqr()?.mean_all()?;
         let loss_val = loss.to_scalar::<f32>()?;
         self.optimizer.backward_step(&loss)?;
         Ok(loss_val)
