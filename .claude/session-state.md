@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phase 8 cosine loss fix + spike investigation)
-> **Last commit on main:** 42c177c — *Fix projection loss explosion: cosine alignment loss + default log level*
+> **Last updated:** 2026-05-18 (multi-clip training)
+> **Last commit on main:** 99f3389 — *Multi-clip training: --file accepts multiple paths*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -305,11 +305,21 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - C1=0.023 → C2=0.011 (interrupted, 28 traces) → C3=0.040
 - Slow upward trend confirmed. Target 0.1–0.2 expected within ~10 more sessions.
 
+**Also done (2026-05-18) — multi-clip training:**
+- `--file` promoted from `Option<PathBuf>` to `Vec<PathBuf>` (`num_args = 1..`); may be specified
+  multiple times on the command line.
+- In `--file-loop` mode the thread now cycles through all files in order, restarting from the
+  first when the last finishes. Logs `file loop: opening <path>` at each rotation.
+- Without `--file-loop` the audio and video threads each stream all files in sequence then close
+  their channels, triggering the existing clean-exit logic.
+- Single-file usage (`--file foo.mp4`) is unchanged.
+- 59 tests pass; clippy clean.
+
 **Next (queued):**
-- Continue training sessions to accumulate language prior_cosine (track toward 0.1–0.2 milestone).
-- Generation re-evaluation: run `--query` after ~10 more sessions to check if output becomes
-  more clip-grounded (ASR transcriptions should start biasing generation topic).
-- Consider multi-clip training for faster language coverage vs. single-clip repetition.
+- Run multi-clip training sessions (talking_head, nature, animation, urban) to accumulate language
+  prior_cosine toward the 0.1–0.2 milestone faster than single-clip repetition.
+- Generation re-evaluation: run `--query` after ~10 sessions to check if output becomes more
+  clip-grounded (broader ASR transcription variety should help).
 
 ## Open architectural questions
 
