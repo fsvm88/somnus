@@ -19,7 +19,7 @@ use somnus_memory::{
 };
 use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
 use somnus_sensory::{
-    AudioCapture, AudioFrame, MediaFile, MediaFileStreams, SensorMetrics, Timestamp, VideoCapture,
+    AudioCapture, AudioFrame, MediaFile, SensorMetrics, Timestamp, VideoCapture,
     VideoFrame,
 };
 use std::{
@@ -40,8 +40,11 @@ use tracing::info;
 #[derive(Debug, Parser)]
 #[command(about = "somnus sensory + encoding + perception + memory + sleep pipeline — Phase 5")]
 struct Args {
-    #[arg(long)]
-    file: Option<PathBuf>,
+    /// One or more media files to use as input. May be specified multiple times.
+    /// In loop mode (--file-loop) the files cycle in order indefinitely.
+    /// Without --file-loop each file is played once and then the process exits.
+    #[arg(long, num_args = 1..)]
+    file: Vec<PathBuf>,
 
     #[arg(long)]
     mic: bool,
@@ -668,58 +671,87 @@ async fn main() -> Result<()> {
     let video_drain = video_cb_rx.clone();
     let mut video_metrics_handle: Arc<SensorMetrics>;
 
-    if let Some(ref file_path) = args.file {
+    if !args.file.is_empty() {
         if args.file_loop {
-            // Looping file source: restart from the beginning each time the
-            // file ends, keeping the same downstream channels (and therefore
-            // warm memory) alive across iterations.
-            let path = file_path.clone();
+            // Looping multi-file source: rotate through all files in order,
+            // cycling back to the first when the last finishes.
+            let paths = args.file.clone();
             let atx = audio_cb_tx.clone();
             let vtx = video_cb_tx.clone();
-            std::thread::spawn(move || loop {
-                let streams = match MediaFile::open(&path).and_then(|mf| mf.start()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(?e, "file loop: failed to (re)open file");
+            std::thread::spawn(move || {
+                let mut idx = 0usize;
+                loop {
+                    let path = &paths[idx % paths.len()];
+                    tracing::info!(file = ?path, "file loop: opening");
+                    let streams = match MediaFile::open(path).and_then(|mf| mf.start()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(?e, file = ?path, "file loop: failed to open");
+                            break;
+                        }
+                    };
+                    let atx2 = atx.clone();
+                    let vtx2 = vtx.clone();
+                    let ah =
+                        std::thread::spawn(move || forward_frames_blocking(streams.audio, atx2));
+                    let vh =
+                        std::thread::spawn(move || forward_frames_blocking(streams.video, vtx2));
+                    let a_normal = ah.join().unwrap_or(false);
+                    let v_normal = vh.join().unwrap_or(false);
+                    if !a_normal || !v_normal {
                         break;
                     }
-                };
-                let atx2 = atx.clone();
-                let vtx2 = vtx.clone();
-                let ah = std::thread::spawn(move || forward_frames_blocking(streams.audio, atx2));
-                let vh = std::thread::spawn(move || forward_frames_blocking(streams.video, vtx2));
-                let a_normal = ah.join().unwrap_or(false);
-                let v_normal = vh.join().unwrap_or(false);
-                // If downstream closed, stop looping.
-                if !a_normal || !v_normal {
-                    break;
+                    idx += 1;
                 }
-                tracing::info!("file loop: restarting from beginning");
             });
-            // Use a dummy metrics handle for loop mode (per-iteration metrics not tracked).
             video_metrics_handle = Arc::new(SensorMetrics::default());
         } else {
-            // One-shot file source.
-            let MediaFileStreams {
-                audio,
-                video,
-                audio_metrics,
-                video_metrics,
-                ..
-            } = MediaFile::open(file_path).and_then(|mf| mf.start())?;
-            audio_metric_handles.push(audio_metrics);
-            video_metrics_handle = video_metrics;
+            // One-shot: stream all files in order then let channels close.
+            let paths = args.file.clone();
             let atx = audio_cb_tx.clone();
             let vtx = video_cb_tx.clone();
-            std::thread::spawn(move || forward_frames_blocking(audio, atx));
-            std::thread::spawn(move || forward_frames_blocking(video, vtx));
+            // Open first file for metrics; remaining files are opened inside the thread.
+            let first = MediaFile::open(&paths[0]).and_then(|mf| mf.start())?;
+            audio_metric_handles.push(first.audio_metrics);
+            video_metrics_handle = first.video_metrics;
+            let first_audio = first.audio;
+            let first_video = first.video;
+            let paths_v = paths.clone();
+            std::thread::spawn(move || {
+                forward_frames_blocking(first_audio, atx.clone());
+                for path in &paths_v[1..] {
+                    tracing::info!(file = ?path, "file sequence: opening next");
+                    let streams = match MediaFile::open(path).and_then(|mf| mf.start()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(?e, file = ?path, "file sequence: failed to open");
+                            return;
+                        }
+                    };
+                    if !forward_frames_blocking(streams.audio, atx.clone()) {
+                        return;
+                    }
+                }
+            });
+            std::thread::spawn(move || {
+                forward_frames_blocking(first_video, vtx.clone());
+                for path in &paths[1..] {
+                    let streams = match MediaFile::open(path).and_then(|mf| mf.start()) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    if !forward_frames_blocking(streams.video, vtx.clone()) {
+                        return;
+                    }
+                }
+            });
         }
     } else {
         // No file — fall through to mic/webcam paths below.
         video_metrics_handle = Arc::new(SensorMetrics::default()); // placeholder, overwritten below
     }
 
-    if args.mic || args.file.is_none() {
+    if args.mic || args.file.is_empty() {
         let mic = AudioCapture::start(None)?;
         audio_metric_handles.push(Arc::clone(&mic.metrics));
         let tx = audio_cb_tx.clone();
@@ -729,7 +761,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    if args.file.is_none() {
+    if args.file.is_empty() {
         let mut cam = VideoCapture::open(args.webcam)?;
         video_metrics_handle = Arc::clone(&cam.metrics);
         let tx = video_cb_tx.clone();
@@ -872,7 +904,7 @@ async fn main() -> Result<()> {
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
     // In file (non-loop) mode the embedding channels close when the file is
     // exhausted.  Track closure so we can exit cleanly without Ctrl-C.
-    let file_mode = args.file.is_some() && !args.file_loop;
+    let file_mode = !args.file.is_empty() && !args.file_loop;
     let mut audio_emb_closed = false;
     let mut video_emb_closed = false;
     // lang_rx is from stdin, not from a file, so it does not participate in the
