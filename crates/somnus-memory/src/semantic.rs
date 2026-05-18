@@ -1,8 +1,12 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fs, path::Path};
 
-use hnsw_rs::prelude::{DistL2, Hnsw};
+use hnsw_rs::{api::AnnT, hnswio::HnswIo, prelude::{DistL2, Hnsw}};
 
 use crate::episode::EpisodeRecord;
+
+const WARM_MAGIC: &[u8; 4] = b"SMNW";
+// Bump when HNSW_M, HNSW_MAX_LAYERS, or the sidecar format changes.
+const WARM_VERSION: u16 = 1;
 
 const HNSW_M: usize = 16;
 const HNSW_MAX_ELEM: usize = 100_000;
@@ -100,6 +104,74 @@ impl SemanticStore {
             dim,
         }
     }
+
+    /// Persist the warm HNSW index and record sidecar to `warm_dir`.
+    ///
+    /// Writes three files:
+    ///   `version`      — 6-byte magic + u16 version tag
+    ///   `index.hnsw.data` / `index.hnsw.graph` — hnsw_rs graph dump
+    ///   `records.bin`  — bincode-encoded HashMap<usize, EpisodeRecord>
+    pub fn dump(&self, warm_dir: &Path) -> Result<(), std::io::Error> {
+        fs::create_dir_all(warm_dir)?;
+
+        // Version tag
+        let mut vbuf = [0u8; 6];
+        vbuf[..4].copy_from_slice(WARM_MAGIC);
+        vbuf[4..6].copy_from_slice(&WARM_VERSION.to_le_bytes());
+        fs::write(warm_dir.join("version"), vbuf)?;
+
+        // HNSW graph
+        self.index
+            .file_dump(warm_dir, "index")
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        // Sidecar
+        let encoded = bincode::serialize(&self.records)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        fs::write(warm_dir.join("records.bin"), encoded)?;
+
+        Ok(())
+    }
+
+    /// Try to reload from a previously dumped warm index.
+    ///
+    /// Returns `None` (falling back to cold-rebuild) if:
+    ///   - the version file is absent or version-mismatched
+    ///   - any of the three data files are absent
+    ///   - any file is corrupt
+    ///
+    /// Uses `Box::leak` on the `HnswIo` reader so the returned `Hnsw` is
+    /// `'static`. The allocation is fixed per process restart (~a few KB).
+    pub fn load_warm(warm_dir: &Path, episode_dim: usize) -> Option<Self> {
+        // Version check
+        let vbuf = fs::read(warm_dir.join("version")).ok()?;
+        if vbuf.len() < 6
+            || &vbuf[..4] != WARM_MAGIC
+            || u16::from_le_bytes([vbuf[4], vbuf[5]]) != WARM_VERSION
+        {
+            return None;
+        }
+
+        // Check all three data files exist before attempting to load
+        let data_path = warm_dir.join("index.hnsw.data");
+        let graph_path = warm_dir.join("index.hnsw.graph");
+        let sidecar_path = warm_dir.join("records.bin");
+        if !data_path.exists() || !graph_path.exists() || !sidecar_path.exists() {
+            return None;
+        }
+
+        // Sidecar records
+        let sidecar_bytes = fs::read(&sidecar_path).ok()?;
+        let records: HashMap<usize, EpisodeRecord> =
+            bincode::deserialize(&sidecar_bytes).ok()?;
+
+        // HNSW — leak HnswIo so the returned Hnsw<'static, ...> is valid
+        let io = Box::new(HnswIo::new(warm_dir, "index"));
+        let io_static: &'static mut HnswIo = Box::leak(io);
+        let index: Hnsw<'static, f32, DistL2> = io_static.load_hnsw().ok()?;
+
+        Some(Self { index, records, dim: episode_dim })
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +184,43 @@ mod tests {
             timestamp_secs: id as f64,
             values: vec![val; 8],
         }
+    }
+
+    #[test]
+    fn warm_dump_load_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let warm_dir = dir.path().join("warm");
+        let dim = 8;
+
+        let mut store = SemanticStore::new(dim);
+        for i in 0..10u64 {
+            store.insert(make_record(i, i as f32));
+        }
+        store.dump(&warm_dir).expect("dump failed");
+
+        let loaded = SemanticStore::load_warm(&warm_dir, dim).expect("load_warm returned None");
+        assert_eq!(loaded.len(), 10);
+
+        // Query should still work
+        let cue = vec![5.0f32; dim];
+        let results = loaded.query(&cue, 1);
+        assert_eq!(results[0].id, 5);
+    }
+
+    #[test]
+    fn warm_load_returns_none_on_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(SemanticStore::load_warm(dir.path(), 8).is_none());
+    }
+
+    #[test]
+    fn warm_load_returns_none_on_version_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let warm_dir = dir.path().join("warm");
+        std::fs::create_dir_all(&warm_dir).unwrap();
+        // Write a corrupt version file
+        std::fs::write(warm_dir.join("version"), b"SMNW\xff\xff").unwrap();
+        assert!(SemanticStore::load_warm(&warm_dir, 8).is_none());
     }
 
     #[test]

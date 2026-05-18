@@ -22,3 +22,5 @@ candle-core        = "0.10"
 candle-nn          = "0.10"
 hnsw_rs            = "0.3"
 memmap2            = "0.9"
+serde              = { version = "1", features = ["derive"] }
+bincode            = "1"

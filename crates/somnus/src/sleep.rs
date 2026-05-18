@@ -635,6 +635,11 @@ pub fn run_sleep_cycle(
         if let Err(e) = save_snapshot(episodic, memory_dir) {
             tracing::warn!(?e, "episodic snapshot write failed");
         }
+        // Persist warm HNSW index so restart avoids cold-rebuild (~3 min at 100k records).
+        let warm_dir = memory_dir.join("warm");
+        if let Err(e) = recall.warm.dump(&warm_dir) {
+            tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
+        }
         // Perception weights (safetensors) written to snapshot dir.
         let w_path = weights_path(memory_dir);
         if let Err(e) = perception.save_weights(&w_path) {

@@ -1,5 +1,5 @@
 /// A single perceived episode: the binding area's output at one moment in time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EpisodeRecord {
     /// Monotonic session-local id assigned by EpisodicBuffer::push.
     pub id: u64,
