@@ -125,15 +125,17 @@ The `promote()` stub in `RecollectionLayer` remains for future use but is not ne
 
 Improve the sleep cycle to match the architectural intent more closely.
 
-### 10a — Wake-performance degradation trigger
+### 10a — Wake-performance degradation trigger ✓
 
 Second sleep entry condition from the architecture. If prediction quality (prior_cosine mean across regions) drops below a calibrated floor during wake, enter sleep early without waiting for the buffer to fill or the schedule to fire.
 
-- Track a rolling EWMA of per-episode prior_cosine means during wake.
-- If EWMA drops below `--perf-sleep-threshold` (default: tune from calibration data), set a flag that triggers sleep at the next episode boundary.
-- Log trigger reason (`perf_degradation`).
+- Track a rolling EWMA (α=0.1) of per-episode prior_cosine means during wake.
+- Capture a baseline from the first 20 episodes of each wake cycle (arithmetic mean).
+- When EWMA drops > `--perf-sleep-threshold` below the baseline, set flag → `perf_degradation` trigger.
+- Default threshold 0.0 (disabled). Requires `--prior-beta > 0` for cosines to be non-None.
+- Validated: 5× talking_head clips establish baseline=0.566; novel noise clip tanks EWMA to 0.505; trigger fires at wake_secs=22 with buffer only 8% full.
 
-**Exit criterion:** sleep fires on a perf-degradation trigger in a controlled test (inject novel content to tank prior_cosine, observe early sleep entry).
+**Exit criterion:** ✓ sleep fires on a perf-degradation trigger in a controlled test (inject novel content to tank prior_cosine, observe early sleep entry).
 
 ### 10b — Adaptive sleep duration
 

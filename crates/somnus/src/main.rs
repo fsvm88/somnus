@@ -19,8 +19,7 @@ use somnus_memory::{
 };
 use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
 use somnus_sensory::{
-    AudioCapture, AudioFrame, MediaFile, SensorMetrics, Timestamp, VideoCapture,
-    VideoFrame,
+    AudioCapture, AudioFrame, MediaFile, SensorMetrics, Timestamp, VideoCapture, VideoFrame,
 };
 use std::{
     io::{BufWriter, Write},
@@ -150,6 +149,13 @@ struct Args {
     /// Requires --action. Useful for non-interactive evaluation runs.
     #[arg(long)]
     query: Option<String>,
+
+    /// If > 0.0, trigger sleep early when the per-episode prior_cosine EWMA drops
+    /// more than this amount below the healthy baseline captured at wake start.
+    /// Set to 0.0 (default) to disable; calibrate from observed prior_cosine ranges
+    /// before enabling. Trigger is logged as "perf_degradation".
+    #[arg(long, default_value = "0.0")]
+    perf_sleep_threshold: f64,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -597,6 +603,15 @@ async fn main() -> Result<()> {
     let mut prior_cosine_sums: [f64; 5] = [0.0; 5];
     let mut prior_cosine_counts: [usize; 5] = [0; 5];
     let mut lang_ingest_count: usize = 0;
+    // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
+    // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
+    // cosine_ewma: exponentially weighted moving average (α = COSINE_EWMA_ALPHA).
+    // perf_sleep_flag: set when EWMA drops > perf_sleep_threshold below baseline.
+    let mut cosine_ewma: Option<f64> = None;
+    let mut cosine_baseline: Option<f64> = None;
+    let mut cosine_baseline_accum: f64 = 0.0;
+    let mut cosine_baseline_n: usize = 0;
+    let mut perf_sleep_flag = false;
     // ASR count shared with the audio encoder task.
     let asr_count = Arc::new(AtomicUsize::new(0));
 
@@ -793,7 +808,11 @@ async fn main() -> Result<()> {
                 });
             }
             Err(e) => {
-                tracing::warn!(?e, webcam = args.webcam, "webcam unavailable — running audio-only");
+                tracing::warn!(
+                    ?e,
+                    webcam = args.webcam,
+                    "webcam unavailable — running audio-only"
+                );
             }
         }
     }
@@ -997,6 +1016,17 @@ async fn main() -> Result<()> {
                         lang_ingest_count += 1;
                         if ep {
                             wake_episodes += 1;
+                            if let Some(m) = episode_cosine_mean(&cosines) {
+                                update_perf_ewma(
+                                    m,
+                                    &mut cosine_ewma,
+                                    &mut cosine_baseline,
+                                    &mut cosine_baseline_accum,
+                                    &mut cosine_baseline_n,
+                                    &mut perf_sleep_flag,
+                                    args.perf_sleep_threshold,
+                                );
+                            }
                         }
                         if let Some(m) = mse {
                             wake_output_mse_sum += m as f64;
@@ -1019,15 +1049,22 @@ async fn main() -> Result<()> {
         // ── sleep trigger check ───────────────────────────────────────────────
         let high_water_hit = episodic.len() >= high_water;
         let schedule_hit = wake_start.elapsed() >= max_wake;
-        let should_sleep = high_water_hit || schedule_hit;
-        let sleep_trigger = if high_water_hit { "high_water" } else { "schedule" };
+        let perf_degradation_hit = perf_sleep_flag && args.perf_sleep_threshold > 0.0;
+        let should_sleep = high_water_hit || schedule_hit || perf_degradation_hit;
+        let sleep_trigger = if high_water_hit {
+            "high_water"
+        } else if perf_degradation_hit {
+            "perf_degradation"
+        } else {
+            "schedule"
+        };
 
         if should_sleep && !episodic.is_empty() {
             info!(
-                trigger       = sleep_trigger,
-                buffer_len    = episodic.len(),
-                buffer_cap    = args.episodic_capacity,
-                wake_secs     = wake_start.elapsed().as_secs(),
+                trigger = sleep_trigger,
+                buffer_len = episodic.len(),
+                buffer_cap = args.episodic_capacity,
+                wake_secs = wake_start.elapsed().as_secs(),
                 "entering sleep"
             );
             interrupt.store(false, Ordering::Relaxed);
@@ -1126,6 +1163,11 @@ async fn main() -> Result<()> {
                     prior_cosine_sums = [0.0; 5];
                     prior_cosine_counts = [0; 5];
                     lang_ingest_count = 0;
+                    cosine_ewma = None;
+                    cosine_baseline = None;
+                    cosine_baseline_accum = 0.0;
+                    cosine_baseline_n = 0;
+                    perf_sleep_flag = false;
                 }
                 Err(e) => tracing::warn!(?e, "sleep cycle error"),
             }
@@ -1165,6 +1207,9 @@ async fn main() -> Result<()> {
                                         Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                     }
                                     wake_episodes += 1;
+                                    if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
+                                        update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
+                                    }
                                 }
                                 record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if !startup_query_fired && out.episode.is_some() {
@@ -1205,6 +1250,9 @@ async fn main() -> Result<()> {
                                         Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                     }
                                     wake_episodes += 1;
+                                    if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
+                                        update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
+                                    }
                                 }
                                 record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if !startup_query_fired && out.episode.is_some() {
@@ -1242,7 +1290,12 @@ async fn main() -> Result<()> {
                             &mut decoder,
                         ) {
                             lang_ingest_count += 1;
-                            if ep { wake_episodes += 1; }
+                            if ep {
+                                wake_episodes += 1;
+                                if let Some(m) = episode_cosine_mean(&cosines) {
+                                    update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
+                                }
+                            }
                             if let Some(m) = mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
                             accumulate_cosines(&cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                         }
@@ -1544,6 +1597,82 @@ fn accumulate_cosines(cosines: &[Option<f32>; 5], sums: &mut [f64; 5], counts: &
         if let Some(v) = c {
             sums[i] += *v as f64;
             counts[i] += 1;
+        }
+    }
+}
+
+/// Compute the mean of active (non-None) prior_cosines for a single episode.
+fn episode_cosine_mean(cosines: &[Option<f32>; 5]) -> Option<f64> {
+    let (sum, n) = cosines
+        .iter()
+        .filter_map(|c| c.map(|v| v as f64))
+        .fold((0.0f64, 0usize), |(s, n), v| (s + v, n + 1));
+    if n > 0 {
+        Some(sum / n as f64)
+    } else {
+        None
+    }
+}
+
+const COSINE_EWMA_ALPHA: f64 = 0.1;
+const COSINE_BASELINE_N: usize = 20;
+
+/// Update per-episode prior_cosine EWMA and perf-degradation flag.
+///
+/// Captures a baseline from the first `COSINE_BASELINE_N` episodes; afterwards
+/// updates the EWMA and sets `perf_sleep_flag` when the EWMA drops more than
+/// `threshold` below the baseline. At threshold == 0.0 the flag is never set.
+fn update_perf_ewma(
+    episode_mean: f64,
+    ewma: &mut Option<f64>,
+    baseline: &mut Option<f64>,
+    baseline_accum: &mut f64,
+    baseline_n: &mut usize,
+    perf_sleep_flag: &mut bool,
+    threshold: f64,
+) {
+    // Accumulate baseline from first N episodes.
+    if baseline.is_none() {
+        *baseline_accum += episode_mean;
+        *baseline_n += 1;
+        if *baseline_n >= COSINE_BASELINE_N {
+            *baseline = Some(*baseline_accum / *baseline_n as f64);
+            tracing::debug!(
+                cosine_baseline = baseline.unwrap(),
+                "perf-ewma baseline captured"
+            );
+        }
+        // Also seed the EWMA from the very first episode.
+        *ewma = Some(match *ewma {
+            None => episode_mean,
+            Some(prev) => COSINE_EWMA_ALPHA * episode_mean + (1.0 - COSINE_EWMA_ALPHA) * prev,
+        });
+        return;
+    }
+
+    // Update EWMA.
+    let prev = ewma.unwrap_or(episode_mean);
+    let next = COSINE_EWMA_ALPHA * episode_mean + (1.0 - COSINE_EWMA_ALPHA) * prev;
+    *ewma = Some(next);
+
+    tracing::debug!(
+        cosine_ewma = next,
+        cosine_baseline = baseline.unwrap(),
+        "perf-ewma update"
+    );
+
+    // Set flag if EWMA has dropped below baseline by more than threshold.
+    if threshold > 0.0 && !*perf_sleep_flag {
+        let drop = baseline.unwrap() - next;
+        if drop > threshold {
+            tracing::info!(
+                cosine_ewma = next,
+                cosine_baseline = baseline.unwrap(),
+                drop,
+                threshold,
+                "perf-degradation threshold exceeded — flagging early sleep"
+            );
+            *perf_sleep_flag = true;
         }
     }
 }
