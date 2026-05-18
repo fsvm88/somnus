@@ -56,19 +56,49 @@ def get_list(rec, key, idx, default=None):
 
 
 def make_x_labels(records):
-    """Build x-axis tick labels: 'C<n>' or '<file>C<n>' when multiple files."""
+    """Build x-axis tick labels.
+
+    When any record has a `session` field: "S{n}C{m}".
+    Otherwise fall back to plain "C{n}" (single-session or pre-campaign data).
+    """
+    has_session = any(get(r, "session") is not None for r in records)
     labels = []
     for i, r in enumerate(records):
         cycle = get(r, "cycle")
-        label = f"C{cycle}" if cycle is not None else str(i + 1)
-        labels.append(label)
+        session = get(r, "session")
+        if has_session:
+            s = session if session is not None else "?"
+            c = cycle if cycle is not None else i + 1
+            labels.append(f"S{s}C{c}")
+        else:
+            labels.append(f"C{cycle}" if cycle is not None else str(i + 1))
     return labels
+
+
+def session_boundaries(records):
+    """Return x-indices where a new session starts (i > 0 and session changes)."""
+    boundaries = []
+    prev_session = None
+    for i, r in enumerate(records):
+        s = get(r, "session")
+        if s is not None and s != prev_session and i > 0:
+            boundaries.append(i)
+        if s is not None:
+            prev_session = s
+    return boundaries
+
+
+def draw_session_lines(ax, records):
+    """Draw vertical dashed lines at session boundaries."""
+    for xi in session_boundaries(records):
+        ax.axvline(xi - 0.5, color="#888888", linewidth=0.8, linestyle="--", alpha=0.6)
 
 
 def plot_language_trajectory(records, out_path, x_labels):
     fig, ax = plt.subplots(figsize=(max(8, len(records) * 0.5), 5))
     x = np.arange(len(records))
 
+    draw_session_lines(ax, records)
     for i, (name, color) in enumerate(zip(REGION_NAMES, REGION_COLORS)):
         ys = [get_list(r, "prior_cosine_mean", i) for r in records]
         valid = [(xi, y) for xi, y in zip(x, ys) if y is not None]
@@ -98,6 +128,9 @@ def plot_growth_timeline(records, out_path, x_labels):
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, len(records) * 0.5), 6),
                                           gridspec_kw={"height_ratios": [1, 3]})
     x = np.arange(len(records))
+
+    draw_session_lines(ax_top, records)
+    draw_session_lines(ax_bot, records)
 
     # Top: grew flag
     grew = [1 if get(r, "grew") else 0 for r in records]
@@ -147,6 +180,7 @@ def plot_per_region_mse(records, out_path, x_labels):
     fig, ax = plt.subplots(figsize=(max(8, len(records) * 0.5), 5))
     x = np.arange(len(records))
 
+    draw_session_lines(ax, records)
     for i, (name, color) in enumerate(zip(REGION_NAMES, REGION_COLORS)):
         ys = [get_list(r, "per_region_mse", i) for r in records]
         valid = [(xi, y) for xi, y in zip(x, ys) if y is not None]

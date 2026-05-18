@@ -140,6 +140,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     max_sleep_cycles: usize,
 
+    /// Session index written to every NDJSON metrics line.
+    /// Used by train_campaign.sh to number consecutive runs in a multi-session
+    /// campaign; 0 means "not part of a campaign" and is omitted from the line.
+    #[arg(long, default_value = "0")]
+    session: usize,
+
     /// Append one NDJSON metrics line per sleep cycle to this file.
     /// Contains: cycle, ts, traces_replayed, mean_loss, mean_output_mse,
     /// warm_recall_l2, was_interrupted, region_sizes, grew, wake_episodes,
@@ -1167,6 +1173,7 @@ async fn main() -> Result<()> {
                             .unwrap_or(0.0);
                         let line = serde_json::json!({
                             "cycle":             sleep_cycle_count,
+                            "session":           if args.session > 0 { Some(args.session) } else { None },
                             "ts":                ts,
                             "sleep_trigger":     sleep_trigger,
                             "traces_replayed":   stats.traces_replayed,
