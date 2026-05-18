@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-17 (Phase 8 generation evaluation + diagnostics)
-> **Last commit on main:** 1ce11a8 — *Phase 8: generation evaluation, diagnostics, repetition penalty (ADR 0015)*
+> **Last updated:** 2026-05-18 (Phase 8 cosine loss fix + spike investigation)
+> **Last commit on main:** 42c177c — *Fix projection loss explosion: cosine alignment loss + default log level*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -285,12 +285,31 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
   - "hello" → "John Doe" book-author narrative (consistent across runs → region prefix IS doing something)
 - Projection convergence expected to take 30+ sessions on one clip. On live mic: much faster.
 
+**Also done (2026-05-18) — projection spike investigation + cosine loss fix:**
+- P8S1 (old MSE loss): C3 diverged catastrophically (proj_mean=1.77e12, ratio max/mean=58.85×).
+  Root cause: C2 trained projection to high precision (proj_mean=0.004); C3's new episode
+  distribution caused large gradients; AdamW's stale v_t (≈ g_C2²) amplified C3 gradient →
+  explosion. Same mechanism as S2C1 spike in Phase 7.
+- Fix: switched `projection_step` loss from raw MSE to **cosine alignment loss** — normalise
+  both `proj_mean` and `text_mean` to unit vectors before computing MSE. Loss bounded [0,4];
+  magnitude-invariant; prevents gradient explosion regardless of AdamW moment state.
+- Implementation: `proj_mean / ||proj_mean||` kept in graph (via `broadcast_div` on scalar norm
+  tensor) for correct gradient flow. `text_mean` normalised as scalar (frozen, no grad needed).
+- P8S2 (cosine loss): C1 proj_mean=0.0011, C3 proj_mean=0.0007, max/mean ≤ 3.3× throughout.
+  No divergence. Fix confirmed.
+- Also fixed: tracing default log level → INFO when RUST_LOG unset (so --log-file captures logs).
+- Cosine loss scale: ~0.001–0.002 at current training level (vs 0.004–0.016 with MSE).
+  Comparable to 2*(1-cosine_sim); lower is better alignment.
+
+**P8S2 language prior_cosine trajectory:**
+- C1=0.023 → C2=0.011 (interrupted, 28 traces) → C3=0.040
+- Slow upward trend confirmed. Target 0.1–0.2 expected within ~10 more sessions.
+
 **Next (queued):**
-- Run more training sessions with the new diagnostics (`proj_loss_max`, weight norm) to characterize
-  the S2C1 spike pattern.
-- Decide on spike fix from data: if max ≈ mean (sustained shift), no fix needed; if max >> mean
-  (catastrophic steps), consider true gradient clipping via backward()+step() split.
-- Language prior_cosine tracking: target 0.1–0.2 within 10 sessions.
+- Continue training sessions to accumulate language prior_cosine (track toward 0.1–0.2 milestone).
+- Generation re-evaluation: run `--query` after ~10 more sessions to check if output becomes
+  more clip-grounded (ASR transcriptions should start biasing generation topic).
+- Consider multi-clip training for faster language coverage vs. single-clip repetition.
 
 ## Open architectural questions
 
