@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (multi-clip calibration session 1)
-> **Last commit on main:** 99f3389 — *Multi-clip training: --file accepts multiple paths*
+> **Last updated:** 2026-05-18 (Phase 9 complete)
+> **Last commit on main:** b0a05ed — *Phase 9: schedule trigger logging, graceful mic/webcam, 9c closed as non-issue*
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -328,11 +328,22 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
   - env: 0.502→0.516→0.657 (steadily adapting to diverse audio)
   - language: 0.021→0.019→0.043 (slow upward from baseline 0.011; 3.9× above baseline after session)
 
-**Next (queued):**
-- Continue multi-clip training sessions (same 4-clip rotation) to push language prior_cosine
-  toward 0.1–0.2 milestone. Each session of 3 cycles adds ~0.01–0.02 to language cosine.
-- Generation re-evaluation: run `--query` after language cosine reaches ~0.1 to check
-  clip-grounded output.
+**Also done (2026-05-18) — Phase 9 (continuous operation):**
+- **9a (schedule trigger):** sleep entry now logs trigger reason (`high_water` vs `schedule`),
+  buffer occupancy, and elapsed wake_secs. `sleep_trigger` field added to NDJSON metrics.
+  Validated: fired at 30s with buffer_len=803/4096 (19.6%), well below high_water mark.
+- **9b (mic/webcam graceful failure):** `AudioCapture::start` and `VideoCapture::open` failures
+  now warn+continue instead of hard-failing. Validated: mic warns gracefully
+  (`AudioConfig(DeviceNotAvailable)`), system continues on file input; full sleep cycle completes.
+- **9c (cold→warm promotion):** investigated and closed as non-issue. Warm is already kept in
+  sync with cold at all times (startup rebuild + spill+insert during sleep). Roadmap updated.
+  Real scaling concern (HNSW rebuild time at 164k records → ~3min) deferred to Phase 11.
+
+**Next (queued): Phase 10 — Sleep fidelity (medium priority)**
+- 10a: Wake-performance degradation trigger (EWMA prior_cosine → early sleep entry)
+- 10b: Adaptive sleep duration (loss-target exit condition)
+- 10c: Gist-level self-probe in REM
+- 10d: Working memory (recent episode ring → binding context prefix)
 
 ## Open architectural questions
 
