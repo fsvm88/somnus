@@ -401,8 +401,15 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - `scripts/train_campaign.sh`: N sessions × CYCLES cycles, shared memory/, single metrics JSONL, auto-runs eval_metrics.py at the end. Configurable via SESSIONS/CYCLES/CLIPS/MEMORY_DIR/EXTRA_ARGS env vars.
 - `eval_metrics.py` updated: S{n}C{m} x-axis labels; vertical dashed session-boundary lines on all four charts.
 
-**Next (queued): Run `SESSIONS=20 CYCLES=3 scripts/train_campaign.sh`**
-Observe language prior_cosine trajectory. Expect ~30 sessions to reach 0.1–0.2 (Phase 8 estimate). Eval harness output will confirm or revise that estimate.
+**Campaign started (2026-05-18), interrupted after 2 sessions:**
+- Campaign dir: `memory/campaign_20260518_224726/`
+- 6 cycles recorded in `metrics.jsonl`; snapshot is current (S2C3 complete)
+- Language prior_cosine: S1C3=0.0023 → S2C2=0.0327 → S2C3=0.0265 (slow upward trend)
+- S2C1 was interrupted (salience trigger); S2C2-3 ran fully
+
+**Next (queued): Resume campaign**
+Run `SESSIONS=18 CYCLES=3 scripts/train_campaign.sh` (18 remaining sessions).
+Or restart from scratch: `SESSIONS=20 CYCLES=3 scripts/train_campaign.sh` with a fresh campaign dir (memory/ snapshot carries over either way).
 
 ## Open architectural questions
 
