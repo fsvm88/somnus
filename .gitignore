@@ -23,3 +23,15 @@ experiments/**/.claude/
 # generated test artifacts
 test.mp4
 *.ndjson
+
+# Large regenerable runtime artifacts
+memory/snapshot/
+memory/warm/
+memory/episodes.cold
+memory_baseline_backup/
+clips/
+models/*.safetensors
+models/qwen25_tokenizer.json
+models/whisper_tokenizer.json
+memory/somnus.pid
+scripts/__pycache__/
