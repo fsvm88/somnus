@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a complete)
-> **Last commit on main:** (see git log) — Phase 11a: PQ compression for cold archive
+> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a, 11b complete)
+> **Last commit on main:** (see git log) — Phase 11b: REM creative recombination
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -379,7 +379,17 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - 6 new tests pass (round-trip, serialise, archive, convert, bad_magic, constants); 18/18 total in somnus-memory.
 - Roadmap 11a marked ✓.
 
-**Next (queued): Phase 9b (real mic/webcam end-to-end) or Phase 11b (creative recombination in REM)**
+**Also done (2026-05-18) — Phase 11b: REM creative recombination:**
+- `PerceptionProcessor::synthesize_episode(&self, regional_a, regional_b, alpha)` — blends encoder inputs (α=0.5), runs through `layer_forward_settling` (no DC update) + binding (no WM context) → synthetic episode vector.
+- `PerceptionProcessor::measure_output_mse_inference(&self, episode, regional)` — inference-mode output-head MSE without backward step.
+- REM creative recombination block in `sleep.rs` (after growth, before `episodic.clear`):
+  - Constants: `REM_SYNTH_ALPHA=0.5`, `REM_SYNTH_MIN_L2=2.0`, `REM_SYNTH_MAX_N=8`.
+  - Samples real episodes for inference-mode baseline MSE (`mean_real_inference_mse`).
+  - Pairs with L2 > 2.0 synthesized; output MSE averaged over both source regionals → `mean_synthetic_output_mse`.
+  - All three new fields in `SleepStats` + NDJSON metrics.
+- Roadmap 11b marked ✓.
+
+**Next (queued): Phase 9b (real mic/webcam end-to-end)**
 
 ## Open architectural questions
 

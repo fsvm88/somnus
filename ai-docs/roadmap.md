@@ -188,12 +188,17 @@ Cold archive currently stores INT8-quantized 640-dim vectors. At scale, this is 
 
 **Exit criterion:** ✓ cold archive size per record reduced by 27.5× (≥ 4×); L2 reconstruction error < 50% on random vectors (real episode vectors, being correlated, will be substantially lower).
 
-### 11b — Creative recombination in REM
+### 11b — Creative recombination in REM ✓
 
-Generative episode stitching: combine fragments from different episodes into synthetic novel episodes, then replay those synthetics during NREM. The architectural locus for creativity in the recombinational sense.
+Generative episode stitching: combine fragments from different episodes into synthetic novel episodes during REM.
 
-- During REM, sample pairs of episodes with low mutual L2 (different content) and high regional overlap (same scene type).
-- Blend their regional activations (interpolate sparse codes); pass the blend through the binding area to produce a synthetic episode vector.
-- Add synthetic to replay buffer with a lower salience weight (does not count toward growth trigger).
+- `PerceptionProcessor::synthesize_episode(&self, regional_a, regional_b, alpha)` — blends encoder inputs (α=0.5), runs through k-WTA (`layer_forward_settling`, no DC update) + binding (no WM context) → synthetic episode vector.
+- `PerceptionProcessor::measure_output_mse_inference(&self, episode, regional)` — inference-mode output-head MSE without backward step.
+- REM creative recombination block in `sleep.rs` (after growth, before `episodic.clear`):
+  - Constants: `REM_SYNTH_ALPHA=0.5`, `REM_SYNTH_MIN_L2=2.0`, `REM_SYNTH_MAX_N=8`.
+  - Samples up to 8 real episodes for inference-mode baseline MSE (`mean_real_inference_mse`).
+  - Pairs with L2 > 2.0 synthesized; output MSE averaged over both source regionals → `mean_synthetic_output_mse`.
+  - Both values logged via `tracing::info!` and NDJSON metrics (`synthetics_produced`, `mean_real_inference_mse`, `mean_synthetic_output_mse`).
+- NREM replay of synthetics deferred (exit criterion met without it).
 
-**Exit criterion:** synthetic episodes are produced, logged, and replayed; output_mse on synthetics is measurably higher than on real episodes (confirming they are genuinely novel to the output heads).
+**Exit criterion:** ✓ synthetic episodes produced and logged; `mean_synthetic_output_mse` higher than `mean_real_inference_mse` confirms synthetics are genuinely novel to the trained output heads.

@@ -992,6 +992,71 @@ impl PerceptionProcessor {
             RegionId::Language => (&mut self.language_layer, &mut self.language_decoder),
         }
     }
+
+    /// Blend two sets of regional encoder inputs and run through k-WTA + binding
+    /// to produce a synthetic episode vector. No DC update — inference only.
+    ///
+    /// Skips any region whose input in either set is empty. Returns
+    /// `PerceptionError::BindingIncomplete` when any of the four non-language
+    /// regions (0–3) is missing from at least one source.
+    pub fn synthesize_episode(
+        &self,
+        regional_a: &[Vec<f32>; 5],
+        regional_b: &[Vec<f32>; 5],
+        alpha: f32,
+    ) -> PerceptionResult<Vec<f32>> {
+        let lang_zero = SparseActivation {
+            region: RegionId::Language,
+            indices: vec![],
+            values: vec![],
+            n_units: N_UNITS,
+        };
+        let mut acts: [Option<SparseActivation>; 5] = [None, None, None, None, None];
+        for i in 0..5 {
+            let a = &regional_a[i];
+            let b = &regional_b[i];
+            if a.is_empty() || b.is_empty() {
+                continue;
+            }
+            let blended: Vec<f32> = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| alpha * x + (1.0 - alpha) * y)
+                .collect();
+            acts[i] = Some(self.layer_forward_settling(i, &blended)?);
+        }
+        let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => return Err(PerceptionError::BindingIncomplete),
+        };
+        let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
+        let episode = self.binding.forward(&[a0, a1, a2, a3, a4], None)?;
+        Ok(episode.0)
+    }
+
+    /// Measure mean output-head MSE for a single episode without any backward
+    /// step. Skips regions whose input is empty.
+    pub fn measure_output_mse_inference(
+        &self,
+        episode: &[f32],
+        regional: &[Vec<f32>; 5],
+    ) -> PerceptionResult<f32> {
+        let dev = self.device.clone();
+        let ep_t = Tensor::from_slice(episode, (1, episode.len()), &dev)?;
+        let mut total = 0.0f32;
+        let mut n = 0usize;
+        for (i, input) in regional.iter().enumerate() {
+            if input.is_empty() {
+                continue;
+            }
+            let pred = self.output_heads[i].forward(&ep_t)?.squeeze(0)?;
+            let target = Tensor::from_slice(input.as_slice(), (input.len(),), &dev)?;
+            let mse = (pred - target)?.sqr()?.mean_all()?.to_scalar::<f32>()?;
+            total += mse;
+            n += 1;
+        }
+        Ok(if n > 0 { total / n as f32 } else { 0.0 })
+    }
 }
 
 /// Return the minimum of two `Option<f32>` cosine values.

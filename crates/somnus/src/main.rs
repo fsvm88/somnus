@@ -1175,6 +1175,9 @@ async fn main() -> Result<()> {
                             "mean_proj_loss":    stats.mean_proj_loss,
                             "proj_loss_max":     stats.proj_loss_max,
                             "decoder_trainable": stats.decoder_trainable_records,
+                            "synthetics_produced":        stats.synthetics_produced,
+                            "mean_real_inference_mse":    stats.mean_real_inference_mse,
+                            "mean_synthetic_output_mse":  stats.mean_synthetic_output_mse,
                         })
                         .to_string();
                         use std::io::Write as _;
