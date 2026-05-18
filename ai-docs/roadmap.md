@@ -203,7 +203,7 @@ Generative episode stitching: combine fragments from different episodes into syn
 
 **Exit criterion:** ✓ synthetic episodes produced and logged; `mean_synthetic_output_mse` higher than `mean_real_inference_mse` confirms synthetics are genuinely novel to the trained output heads.
 
-## Phase 12 — Observability and scaling (medium priority)
+## Phase 12 — Observability and scaling ✓
 
 Three independent improvements that pay dividends across all future work. Ordered by
 dependency: 12a (eval harness) should land first because 12c (distillation) requires its
