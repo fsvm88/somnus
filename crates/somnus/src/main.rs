@@ -156,6 +156,18 @@ struct Args {
     /// before enabling. Trigger is logged as "perf_degradation".
     #[arg(long, default_value = "0.0")]
     perf_sleep_threshold: f64,
+
+    /// NREM exits early when loss EWMA drops below this value (0.0 = run all traces).
+    /// Useful when consolidation converges quickly on small or familiar buffers.
+    /// Exit is logged as "loss_target_met" in the sleep summary.
+    #[arg(long, default_value = "0.0")]
+    sleep_loss_target: f32,
+
+    /// Hard cap on total sleep-cycle wall time in seconds (0 = no cap).
+    /// When exceeded the cycle is treated as interrupted (no spill, no snapshot).
+    /// Exit is logged as "time_budget" in the sleep summary.
+    #[arg(long, default_value = "0")]
+    sleep_max_secs: u64,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -1078,6 +1090,8 @@ async fn main() -> Result<()> {
                 Arc::clone(&interrupt_sleep),
                 Arc::clone(&pending_embs),
                 &mut decoder,
+                args.sleep_loss_target,
+                args.sleep_max_secs,
             ) {
                 Ok(stats) => {
                     sleep_cycle_count += 1;
@@ -1091,6 +1105,7 @@ async fn main() -> Result<()> {
                         mean_proj_loss = ?stats.mean_proj_loss,
                         decoder_trainable = stats.decoder_trainable_records,
                         interrupted   = stats.was_interrupted,
+                        nrem_exit     = stats.nrem_exit_reason,
                         wake_episodes,
                         asr_count     = cycle_asr,
                         lang_ingest   = lang_ingest_count,
@@ -1138,6 +1153,7 @@ async fn main() -> Result<()> {
                             "per_region_mse":    stats.per_region_mse,
                             "warm_recall_l2":    stats.warm_recall_l2,
                             "was_interrupted":   stats.was_interrupted,
+                            "nrem_exit_reason":  stats.nrem_exit_reason,
                             "region_sizes":      region_sizes,
                             "grew":              grew,
                             "regions_grown":     stats.regions_grown.iter().map(|r| r.as_index()).collect::<Vec<_>>(),

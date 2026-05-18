@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -80,6 +81,8 @@ pub struct SleepStats {
     pub per_region_mse: [f32; 5],
     pub regions_grown: Vec<RegionId>,
     pub was_interrupted: bool,
+    /// Why the NREM loop exited: "traces_exhausted", "loss_target_met", "time_budget", "salience".
+    pub nrem_exit_reason: &'static str,
     /// Mean L2 distance to nearest warm-memory neighbor during REM probe.
     /// Some only when warm had pre-spill entries (cross-cycle/cross-session signal).
     pub warm_recall_l2: Option<f32>,
@@ -95,6 +98,7 @@ pub struct SleepStats {
 /// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
 /// by the main loop. A high count means the world is active while the system sleeps;
 /// once it exceeds `SALIENCE_THRESHOLD` the current replay step is the last one.
+#[allow(clippy::too_many_arguments)]
 pub fn run_sleep_cycle(
     perception: &mut PerceptionProcessor,
     episodic: &mut EpisodicBuffer,
@@ -103,7 +107,10 @@ pub fn run_sleep_cycle(
     interrupt: Arc<AtomicBool>,
     pending_embs: Arc<AtomicUsize>,
     decoder: &mut Option<ActionDecoder>,
+    sleep_loss_target: f32,
+    sleep_max_secs: u64,
 ) -> Result<SleepStats> {
+    let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
 
     let mut traces_replayed = 0usize;
@@ -111,6 +118,7 @@ pub fn run_sleep_cycle(
     let mut total_output_mse = 0.0f32;
     let mut output_mse_n = 0usize;
     let mut was_interrupted = false;
+    let mut nrem_exit_reason: &'static str = "traces_exhausted";
     let mut total_proj_loss = 0.0f32;
     let mut proj_loss_n = 0usize;
     let mut proj_loss_max = 0.0f32;
@@ -150,6 +158,7 @@ pub fn run_sleep_cycle(
                 );
             }
             was_interrupted = true;
+            nrem_exit_reason = "salience";
             break;
         }
 
@@ -182,6 +191,31 @@ pub fn run_sleep_cycle(
                 output_mse_n += 1;
             }
             Err(e) => tracing::warn!(?e, "output head replay error"),
+        }
+
+        // ── Adaptive exit checks (10b) ────────────────────────────────────────
+        // Loss-target: NREM exits cleanly; REM + spill + snapshot still run.
+        if sleep_loss_target > 0.0 && step > 0 && loss_ewma < sleep_loss_target {
+            tracing::info!(
+                loss_ewma,
+                sleep_loss_target,
+                "NREM: loss target met — early exit"
+            );
+            nrem_exit_reason = "loss_target_met";
+            // Advance checkpoint so the remaining traces are skipped on restore.
+            episodic.replay_checkpoint = episodic.len();
+            break;
+        }
+        // Time budget: treat as interrupted (no REM/spill/snapshot).
+        if sleep_max_secs > 0 && sleep_start.elapsed().as_secs() >= sleep_max_secs {
+            tracing::info!(
+                elapsed_secs = sleep_start.elapsed().as_secs(),
+                sleep_max_secs,
+                "sleep: max time exceeded — interrupting"
+            );
+            was_interrupted = true;
+            nrem_exit_reason = "time_budget";
+            break;
         }
 
         // Projection training: surrogate MSE loss for traces that carry a text target (ADR 0012).
@@ -395,6 +429,7 @@ pub fn run_sleep_cycle(
         per_region_mse,
         regions_grown,
         was_interrupted,
+        nrem_exit_reason,
         warm_recall_l2,
         mean_proj_loss,
         proj_loss_max: proj_loss_max_opt,

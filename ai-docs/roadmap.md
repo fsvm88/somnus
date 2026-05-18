@@ -137,16 +137,16 @@ Second sleep entry condition from the architecture. If prediction quality (prior
 
 **Exit criterion:** ✓ sleep fires on a perf-degradation trigger in a controlled test (inject novel content to tank prior_cosine, observe early sleep entry).
 
-### 10b — Adaptive sleep duration
+### 10b — Adaptive sleep duration ✓
 
 Sleep currently runs for a fixed episode count (all traces in the buffer). The architecture specifies: run until consolidation goals are met, or a max-sleep-time cap. "Consolidation goals" = mean NREM loss below a threshold AND warm recall L2 below threshold after REM probe.
 
-- Add `--sleep-loss-target` (e.g., 0.01) and `--sleep-max-secs` (e.g., 7200).
-- NREM loop exits early when mean loss < target (current: always runs all traces).
-- Overall sleep exits when both targets are met or max time is reached.
-- Log which exit condition fired.
+- `--sleep-loss-target f32` (default 0.0 = run all traces): NREM exits early when loss EWMA < target; REM + spill + snapshot still run (`interrupted=false`).
+- `--sleep-max-secs u64` (default 0 = no cap): sleep exits when wall time exceeds cap; treated as interrupted (no REM/spill/snapshot).
+- `nrem_exit_reason` field in SleepStats and NDJSON: `"traces_exhausted"`, `"loss_target_met"`, `"time_budget"`, `"salience"`.
+- Validated: target=2.0 on 29-trace buffer → exits after 2 traces (`nrem_exit="loss_target_met"`, `interrupted=false`). max-secs=5 on 55-trace buffer → exits after 4 traces (`nrem_exit="time_budget"`, `interrupted=true`).
 
-**Exit criterion:** sleep exits early on a session where the buffer is small and loss converges quickly; full budget is spent when content is novel.
+**Exit criterion:** ✓ sleep exits early on a session where loss converges quickly; time-budget exits as interrupted.
 
 ### 10c — Gist-level self-probe in REM
 
