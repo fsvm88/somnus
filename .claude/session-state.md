@@ -1,7 +1,7 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-18 (Phases 10b, 10c, 10d, 11a, 11b, 12a, 12b, 12c complete)
-> **Last commit on main:** (see git log) — Phase 12c: regional unit pruning
+> **Last updated:** 2026-05-23
+> **Last commit on main:** 848ecde — Fix settle loop / prior-blend amplitude explosion
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -407,9 +407,24 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - Language prior_cosine: S1C3=0.0023 → S2C2=0.0327 → S2C3=0.0265 (slow upward trend)
 - S2C1 was interrupted (salience trigger); S2C2-3 ran fully
 
-**Next (queued): Resume campaign**
-Run `SESSIONS=18 CYCLES=3 scripts/train_campaign.sh` (18 remaining sessions).
-Or restart from scratch: `SESSIONS=20 CYCLES=3 scripts/train_campaign.sh` with a fresh campaign dir (memory/ snapshot carries over either way).
+**2026-05-23: NaN crash diagnosed and fixed:**
+- Campaign `campaign_20260523_fixed` crashed after ~4 min with settle delta → inf → NaN
+- Root cause: output heads overfit on 4 clips (max weight 2.618) → settle predictions 10-100× raw input scale → settle loop at beta=0.5 amplifies → episode explodes → `update_prior_predictions` contaminates next episode → positive feedback → permanent explosion
+- Trigger: `action gain[visual]=2.0` (unfamiliar visual content) combined with inflated output-head weights; spikes recovered until ~episode 255340 when contamination made them self-sustaining
+- Fix (commit 848ecde): normalize output-head predictions to raw input L2 norm before blending in both `settle_episode()` and `blend_with_prior()` — settle refines direction not magnitude
+- Validated: `campaign_20260523_fixed2` running; max settle delta 26.6 (was 3e15), max mse 5.6 (was 2e35)
+
+**GPU backend (Task #2):** NREM sleep = 1.4% of cycle time (9.1s / 650s). Burn migration deferred — max improvement is 1.2% of total wall time.
+
+**Campaign running (2026-05-23):**
+- `SESSIONS=18 CYCLES=3 CAMPAIGN_DIR=memory/campaign_20260523_fixed2 scripts/train_campaign.sh` started in background
+- Monitor: `tail -f memory/campaign_20260523_fixed2/logs/session_1.log`
+- Metrics: `memory/campaign_20260523_fixed2/metrics.jsonl`
+
+**Next (queued):**
+1. Let `campaign_20260523_fixed2` complete (18 sessions × 3 cycles)
+2. Check language prior_cosine trajectory and mse_sleep evolution
+3. Evaluate whether the settle loop fix changed settling quality (prior_cosine at convergence vs. before)
 
 ## Open architectural questions
 
