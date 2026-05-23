@@ -1322,3 +1322,45 @@ fn apply_gain(values: &[f32], gain: f32) -> Vec<f32> {
     }
     values.iter().map(|&x| x * gain).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_regional(dims: &[usize; 5]) -> [Vec<f32>; 5] {
+        std::array::from_fn(|i| {
+            (0..dims[i]).map(|j| (i as f32 + j as f32 * 0.01).sin()).collect()
+        })
+    }
+
+    /// B=1 batched replay should return the same loss as sequential replay.
+    /// Both processors are seeded from the same saved weights so initial
+    /// parameters are identical.
+    #[test]
+    fn replay_batch_b1_matches_sequential() {
+        let dev = Device::Cpu;
+        let regional = make_regional(&REGION_DIMS);
+
+        // Initialise one processor and persist its weights.
+        let tmp = std::env::temp_dir().join(format!(
+            "somnus_test_weights_{}.safetensors",
+            std::process::id()
+        ));
+        let mut seq = PerceptionProcessor::new(dev.clone()).unwrap();
+        seq.save_weights(&tmp).unwrap();
+
+        // Load those exact weights into a second processor.
+        let mut bat = PerceptionProcessor::new(dev.clone()).unwrap();
+        bat.load_weights(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        let seq_loss = seq.replay_step(&regional).unwrap();
+        let bat_loss = bat.replay_step_batch(&[&regional]).unwrap();
+
+        let diff = (seq_loss - bat_loss).abs();
+        assert!(
+            diff < 1e-4,
+            "B=1 batched loss {bat_loss} diverged from sequential {seq_loss} by {diff}"
+        );
+    }
+}

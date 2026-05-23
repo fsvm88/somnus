@@ -286,7 +286,7 @@ pub fn run_sleep_cycle(
                 } else {
                     EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
                 };
-                total_train_loss += loss;
+                total_train_loss += loss * batch.len() as f32;
                 traces_replayed += batch.len();
             }
             Err(e) => tracing::warn!(?e, "replay_step_batch error — skipping batch"),
