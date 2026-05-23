@@ -959,10 +959,16 @@ impl PerceptionProcessor {
             let mut acts: [Option<SparseActivation>; 5] = [None, None, None, None, None];
             for i in 0..5 {
                 if let Some(raw) = &self.latest_inputs[i] {
+                    // Scale prediction to raw input's L2 norm: settle refines direction, not
+                    // magnitude. Prevents amplitude explosion when output heads are overfit.
+                    let raw_norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                    let pred_norm =
+                        preds[i].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                    let amp_scale = raw_norm / pred_norm;
                     let blended: Vec<f32> = raw
                         .iter()
                         .zip(&preds[i])
-                        .map(|(&r, &p)| (1.0 - self.settle_beta) * r + self.settle_beta * p)
+                        .map(|(&r, &p)| (1.0 - self.settle_beta) * r + self.settle_beta * p * amp_scale)
                         .collect();
                     acts[i] = Some(self.layer_forward_settling(i, &blended)?);
                 }
@@ -1024,10 +1030,14 @@ impl PerceptionProcessor {
             Some(prior) => {
                 let cosine = Self::cosine_sim(values, prior);
                 let beta = self.prior_beta;
+                // Scale prior to raw input's L2 norm before blending (same guard as settle loop).
+                let raw_norm = values.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                let prior_norm = prior.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                let amp_scale = raw_norm / prior_norm;
                 let blended = values
                     .iter()
                     .zip(prior)
-                    .map(|(&r, &p)| (1.0 - beta) * r + beta * p)
+                    .map(|(&r, &p)| (1.0 - beta) * r + beta * p * amp_scale)
                     .collect();
                 (blended, Some(cosine))
             }
