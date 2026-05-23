@@ -248,6 +248,25 @@ def export_whisper_decoder() -> None:
 
 # ── Qwen2.5-0.5B wrappers (ADR 0012) ──────────────────────────────────────────
 
+class Qwen25GainWrapper(torch.nn.Module):
+    """Qwen2Model (base transformer only, no LM head).
+
+    Used exclusively for per-episode action gain computation.
+    Static input shape [1, N_REGIONS=5, hidden_size=896] — no dynamic axes,
+    so ORT can plan static memory allocation and skip the LM head entirely.
+
+    Input:  inputs_embeds    (1, 5, 896)
+    Output: last_hidden_state (1, 5, 896)
+    """
+    def __init__(self, model_instance):
+        super().__init__()
+        self.model = model_instance.model  # Qwen2Model, no lm_head
+
+    def forward(self, inputs_embeds):
+        out = self.model(inputs_embeds=inputs_embeds)
+        return out.last_hidden_state
+
+
 class Qwen25LMWrapper(torch.nn.Module):
     """Qwen2Model (base transformer) + LM head.
 
@@ -270,11 +289,12 @@ class Qwen25LMWrapper(torch.nn.Module):
 
 
 def export_qwen25() -> None:
+    gain_out = MODELS_DIR / "qwen25_gain.onnx"
     lm_out = MODELS_DIR / "qwen25_lm.onnx"
     embed_out = MODELS_DIR / "qwen25_embed_table.safetensors"
     tok_out = MODELS_DIR / "qwen25_tokenizer.json"
 
-    if lm_out.exists() and embed_out.exists() and tok_out.exists():
+    if gain_out.exists() and lm_out.exists() and embed_out.exists() and tok_out.exists():
         print(f"  skip: qwen25 artifacts already present")
         return
 
@@ -287,6 +307,23 @@ def export_qwen25() -> None:
     tokenizer = AutoTokenizer.from_pretrained(repo, revision=rev)
 
     hidden_size = model.config.hidden_size  # 896 for Qwen2.5-0.5B
+
+    n_regions = 5  # must match N_REGIONS in crates/somnus/src/action.rs
+    if not gain_out.exists():
+        gain_wrapper = Qwen25GainWrapper(model).eval()
+        dummy_gain = torch.zeros(1, n_regions, hidden_size)
+        print(f"  exporting qwen25_gain.onnx (static [1,{n_regions},{hidden_size}], no LM head)…")
+        with torch.no_grad():
+            torch.onnx.export(
+                gain_wrapper,
+                dummy_gain,
+                str(gain_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state"],
+                # No dynamic_axes: static shape lets ORT plan memory statically
+                opset_version=17,
+            )
+        report(gain_out)
 
     if not lm_out.exists():
         wrapper = Qwen25LMWrapper(model).eval()

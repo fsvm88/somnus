@@ -26,6 +26,9 @@ pub struct ActionDecoder {
     optimizer: AdamW,
     /// Frozen embedding table [vocab_size, LM_HIDDEN] for training surrogate loss + generation.
     embed_table: Tensor,
+    /// Transformer-only (no LM head), static [1,5,896] — used by update_gain().
+    gain_session: Session,
+    /// Full model with LM head, dynamic seq_len — used by generate().
     lm_session: Session,
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
@@ -37,15 +40,17 @@ impl ActionDecoder {
     /// Load all model artifacts from `models_dir`.
     /// Returns Err if any required file is absent.
     pub fn new(models_dir: &std::path::Path, device: Device) -> Result<Self> {
+        let gain_path = models_dir.join("qwen25_gain.onnx");
         let lm_path = models_dir.join("qwen25_lm.onnx");
         let embed_path = models_dir.join("qwen25_embed_table.safetensors");
         let tok_path = models_dir.join("qwen25_tokenizer.json");
-        for p in [&lm_path, &embed_path, &tok_path] {
+        for p in [&gain_path, &lm_path, &embed_path, &tok_path] {
             if !p.exists() {
                 bail!("action decoder model file not found: {}", p.display());
             }
         }
 
+        let gain_session = Session::builder()?.commit_from_file(&gain_path)?;
         let lm_session = Session::builder()?.commit_from_file(&lm_path)?;
 
         let mut embed_tensors = candle_core::safetensors::load(&embed_path, &device)?;
@@ -72,6 +77,7 @@ impl ActionDecoder {
             varmap,
             optimizer,
             embed_table,
+            gain_session,
             lm_session,
             tokenizer,
             gain: [1.0; 5],
@@ -88,7 +94,7 @@ impl ActionDecoder {
             .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
         let tensor = TensorRef::from_array_view(&inputs)?;
         let outputs = self
-            .lm_session
+            .gain_session
             .run(ort::inputs!["inputs_embeds" => tensor])?;
         let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
         if shape.len() < 3 || shape[1] != N_REGIONS as i64 {
