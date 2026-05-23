@@ -108,6 +108,11 @@ struct Args {
     #[arg(long, default_value = "true")]
     action_gain: bool,
 
+    /// Run the gain update every N episodes instead of every episode.
+    /// Gain changes slowly; N=10 cuts Qwen ORT cost by ~10× with negligible quality loss.
+    #[arg(long, default_value = "10")]
+    gain_interval: usize,
+
     /// Maximum tokens to generate per query (ADR 0012).
     #[arg(long, default_value = "128")]
     action_max_tokens: usize,
@@ -646,6 +651,7 @@ async fn main() -> Result<()> {
     let mut prior_cosine_sums: [f64; 5] = [0.0; 5];
     let mut prior_cosine_counts: [usize; 5] = [0; 5];
     let mut lang_ingest_count: usize = 0;
+    let mut gain_episode_counter: usize = 0;
     // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
     // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
     // cosine_ewma: exponentially weighted moving average (α = COSINE_EWMA_ALPHA).
@@ -1221,6 +1227,7 @@ async fn main() -> Result<()> {
                     prior_cosine_sums = [0.0; 5];
                     prior_cosine_counts = [0; 5];
                     lang_ingest_count = 0;
+                    gain_episode_counter = 0;
                     cosine_ewma = None;
                     cosine_baseline = None;
                     cosine_baseline_accum = 0.0;
@@ -1273,12 +1280,15 @@ async fn main() -> Result<()> {
                                 if !startup_query_fired && out.episode.is_some() {
                                     startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
-                                if args.action_gain {
-                                    if let Some(ep) = &out.episode {
-                                        if let Some(ref mut dec) = decoder {
-                                            match dec.update_gain(&ep.0) {
-                                                Ok(()) => perception.set_region_gain(dec.gain),
-                                                Err(e) => tracing::warn!(?e, "gain update failed"),
+                                if args.action_gain && out.episode.is_some() {
+                                    gain_episode_counter += 1;
+                                    if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                        if let Some(ep) = &out.episode {
+                                            if let Some(ref mut dec) = decoder {
+                                                match dec.update_gain(&ep.0) {
+                                                    Ok(()) => perception.set_region_gain(dec.gain),
+                                                    Err(e) => tracing::warn!(?e, "gain update failed"),
+                                                }
                                             }
                                         }
                                     }
@@ -1316,12 +1326,15 @@ async fn main() -> Result<()> {
                                 if !startup_query_fired && out.episode.is_some() {
                                     startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
-                                if args.action_gain {
-                                    if let Some(ep) = &out.episode {
-                                        if let Some(ref mut dec) = decoder {
-                                            match dec.update_gain(&ep.0) {
-                                                Ok(()) => perception.set_region_gain(dec.gain),
-                                                Err(e) => tracing::warn!(?e, "gain update failed"),
+                                if args.action_gain && out.episode.is_some() {
+                                    gain_episode_counter += 1;
+                                    if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                        if let Some(ep) = &out.episode {
+                                            if let Some(ref mut dec) = decoder {
+                                                match dec.update_gain(&ep.0) {
+                                                    Ok(()) => perception.set_region_gain(dec.gain),
+                                                    Err(e) => tracing::warn!(?e, "gain update failed"),
+                                                }
                                             }
                                         }
                                     }

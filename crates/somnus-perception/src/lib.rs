@@ -100,6 +100,11 @@ pub struct PerceptionProcessor {
     /// Reset to 1.0 at sleep entry. Default: [1.0; 5] (no-op).
     region_gain: [f32; 5],
 
+    /// Last raw language embedding received from ASR or stdin (ADR 0013).
+    /// Persists across episodes and is re-applied each ingest call (no duty-cycle
+    /// update) so every episode includes the current language context.
+    last_language_input: Option<Vec<f32>>,
+
     /// Fixed-capacity ring of recent episode vectors for cross-episode context.
     /// Cleared at sleep entry. Disabled when wm_size == 0.
     working_memory: VecDeque<Vec<f32>>,
@@ -204,6 +209,7 @@ impl PerceptionProcessor {
             settle_steps: 0,
             settle_beta: 0.5,
             region_gain: [1.0; 5],
+            last_language_input: None,
             working_memory: VecDeque::new(),
             wm_size: 0,
             varmap,
@@ -241,6 +247,7 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
         self.latest_inputs[RegionId::Symbolic.as_index()] = Some(values.to_vec());
 
+        self.refresh_language_cache()?;
         let wm = self.wm_mean_vec();
         let (episode, regional_inputs) = self.try_bind(wm.as_deref())?;
         let min_cos = min_cosine_2(speech_cos, symbolic_cos);
@@ -272,6 +279,7 @@ impl PerceptionProcessor {
         self.latest[RegionId::AudioEnv.as_index()] = Some(act);
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
+        self.refresh_language_cache()?;
         let wm = self.wm_mean_vec();
         let (episode, regional_inputs) = self.try_bind(wm.as_deref())?;
         let episode = self.maybe_settle_and_update(episode, cosine)?;
@@ -298,6 +306,7 @@ impl PerceptionProcessor {
         self.latest[RegionId::Visual.as_index()] = Some(act);
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
+        self.refresh_language_cache()?;
         let wm = self.wm_mean_vec();
         let (episode, regional_inputs) = self.try_bind(wm.as_deref())?;
         let episode = self.maybe_settle_and_update(episode, cosine)?;
@@ -317,6 +326,7 @@ impl PerceptionProcessor {
     /// Language is optional: episodes are produced from regions 0–3; this region
     /// zero-pads the binding area's language slot when absent (ADR 0013).
     pub fn ingest_language(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
+        self.last_language_input = Some(values.to_vec());
         let gained = apply_gain(values, self.region_gain[4]);
         let (input, cosine) = self.blend_with_prior(&gained, 4);
         if let Some(c) = cosine {
@@ -362,6 +372,20 @@ impl PerceptionProcessor {
         } else {
             Ok(None)
         }
+    }
+
+    /// Refresh latest[4] from last_language_input without updating duty cycles.
+    ///
+    /// Called at the start of every non-language ingest so every episode carries
+    /// the current language context even between ASR events. Uses forward_no_dc
+    /// to avoid skewing duty cycles with repeated identical inputs.
+    fn refresh_language_cache(&mut self) -> PerceptionResult<()> {
+        if let Some(ref emb) = self.last_language_input.clone() {
+            let act = self.language_layer.forward_no_dc(emb)?;
+            self.latest[RegionId::Language.as_index()] = Some(act);
+            self.latest_inputs[RegionId::Language.as_index()] = Some(emb.clone());
+        }
+        Ok(())
     }
 
     /// Attempt to produce an episode vector.
