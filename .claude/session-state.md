@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-23
-> **Last commit on main:** 848ecde — Fix settle loop / prior-blend amplitude explosion
+> **Last commit on main:** 4024106 — Phase 14: Qwen gain-only ONNX export (transformer, no LM head)
 > **Branch:** `main` (tracking `origin/main` on Codeberg, SHA-256 repo)
 
 Canonical record of where the conversation arc on somnus stands. Read end-to-end when resuming a session.
@@ -421,10 +421,24 @@ effective gradient clip — advised against it. `proj_loss_max` added to diagnos
 - Monitor: `tail -f memory/campaign_20260523_fixed2/logs/session_1.log`
 - Metrics: `memory/campaign_20260523_fixed2/metrics.jsonl`
 
+**Also done (2026-05-23) — Phase 14: Qwen gain-only ONNX export:**
+- `scripts/export_models.py`: `Qwen25GainWrapper` (transformer only, no lm_head); exports `qwen25_gain.onnx` with static shape [1,5,896], no dynamic axes. Validated: single output `last_hidden_state`, 1435 MB (vs 1979 MB for qwen25_lm.onnx — 27% smaller).
+- `crates/somnus/src/action.rs`: `gain_session: Session` field added; loaded from `qwen25_gain.onnx`; `update_gain()` uses `gain_session` (no LM head); `generate()` unchanged on `lm_session`.
+- Expected savings: ~15-18ms/episode (~18% speedup from eliminating logit projection on every episode).
+- Will take effect starting S11 (running process loaded the old model at startup).
+
+**Also done (2026-05-23) — design clarification on sessions:**
+- The session/campaign abstraction is a test harness, not the primary runtime model.
+- The system is designed to run 24/7/365 via `scripts/run.sh` without `--max-sleep-cycles`.
+- Session restarts are useful only for benchmarking/debugging/validation.
+- `scripts/train_campaign.sh` updated: `CAPACITY` env var controls `--episodic-capacity` (default 4096).
+  - For fast validation: `CAPACITY=64 SESSIONS=5 CYCLES=1 scripts/train_campaign.sh` → ~5s/session.
+
 **Next (queued):**
-1. Let `campaign_20260523_fixed2` complete (18 sessions × 3 cycles)
+1. Let `campaign_20260523_fixed2` complete (S10 currently running, 8 sessions remain)
 2. Check language prior_cosine trajectory and mse_sleep evolution
-3. Evaluate whether the settle loop fix changed settling quality (prior_cosine at convergence vs. before)
+3. Evaluate timing improvement from gain-only model (compare session logs before/after S11)
+4. Consider: continuous run mode (no --max-sleep-cycles) rather than campaign for the next long-running test
 
 ## Open architectural questions
 

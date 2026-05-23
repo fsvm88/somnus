@@ -10,6 +10,8 @@
 # Options (environment variables):
 #   SESSIONS      Number of sessions to run  (default: 10)
 #   CYCLES        Sleep cycles per session   (default: 3)
+#   CAPACITY      Episodic buffer size; sleep triggers at 80% (default: 4096)
+#                 Set small for fast validation, e.g. CAPACITY=64 → ~51 episodes/cycle
 #   CLIPS         Space-separated clip paths (default: all four in clips/)
 #   CAMPAIGN_DIR  Directory for metrics/logs (default: memory/campaign_<timestamp>)
 #   MEMORY_DIR    Shared memory directory    (default: memory)
@@ -27,6 +29,7 @@ cd "$REPO_ROOT"
 # ── Parameters ────────────────────────────────────────────────────────────────
 SESSIONS="${SESSIONS:-10}"
 CYCLES="${CYCLES:-3}"
+CAPACITY="${CAPACITY:-4096}"
 MEMORY_DIR="${MEMORY_DIR:-memory}"
 CAMPAIGN_DIR="${CAMPAIGN_DIR:-${MEMORY_DIR}/campaign_$(date +%Y%m%d_%H%M%S)}"
 CLIPS="${CLIPS:-clips/talking_head.mp4 clips/urban.mp4 clips/animation.mp4 clips/nature.mp4}"
@@ -46,13 +49,14 @@ SOMNUS="$REPO_ROOT/target/release/somnus"
 cat > "${CAMPAIGN_DIR}/params.txt" <<EOF
 SESSIONS=${SESSIONS}
 CYCLES=${CYCLES}
+CAPACITY=${CAPACITY}
 CLIPS=${CLIPS}
 MEMORY_DIR=${MEMORY_DIR}
 EXTRA_ARGS=${EXTRA_ARGS}
 started=$(date -Iseconds)
 EOF
 
-echo "[campaign] starting: ${SESSIONS} sessions × ${CYCLES} cycles"
+echo "[campaign] starting: ${SESSIONS} sessions × ${CYCLES} cycles  (capacity=${CAPACITY})"
 echo "[campaign] metrics → ${METRICS_FILE}"
 echo "[campaign] logs    → ${LOG_DIR}/"
 echo ""
@@ -78,6 +82,7 @@ for i in $(seq 1 "$SESSIONS"); do
         --prior-beta 0.1 \
         --settle-steps 3 \
         --working-memory-size 8 \
+        --episodic-capacity "$CAPACITY" \
         --max-sleep-cycles "$CYCLES" \
         --replay-batch-size 64 \
         --metrics-file "$METRICS_FILE" \
