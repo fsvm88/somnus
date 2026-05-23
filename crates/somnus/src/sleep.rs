@@ -211,6 +211,7 @@ pub fn run_sleep_cycle(
     sleep_max_secs: u64,
     prune_fraction: f32,
     prune_min_grown: usize,
+    replay_batch_size: usize,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -250,7 +251,11 @@ pub fn run_sleep_cycle(
     let decoder_trainable_records = traces.iter().filter(|(_, _, t)| t.is_some()).count();
     tracing::info!(decoder_trainable_records, "NREM: decoder-trainable traces");
 
-    for (step, (episode_vec, regional, text_target)) in traces.iter().enumerate() {
+    // Effective batch size: fall back to 1 (sequential) when 0 is passed.
+    let batch_size = replay_batch_size.max(1);
+
+    let mut batch_start = 0usize; // index into `traces` of the current batch start
+    while batch_start < n_traces {
         let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD;
         if interrupt.load(Ordering::Relaxed) || salient {
             if salient {
@@ -264,51 +269,51 @@ pub fn run_sleep_cycle(
             break;
         }
 
-        // Neuromodulated lr: cosine schedule × loss-trend gate
+        let batch_end = (batch_start + batch_size).min(n_traces);
+        let batch = &traces[batch_start..batch_end];
+
+        // Neuromodulated lr: use step index at batch start (cosine schedule is slow).
         let prev_ewma = loss_ewma;
-        let lr = nrem_lr(step, n_traces, loss_ewma, prev_ewma);
+        let lr = nrem_lr(batch_start, n_traces, loss_ewma, prev_ewma);
         perception.set_learning_rate(lr);
 
-        match perception.replay_step(regional) {
+        // ── k-WTA + SAE replay (batched) ─────────────────────────────────────
+        let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _)| r).collect();
+        match perception.replay_step_batch(&regionals) {
             Ok(loss) => {
-                loss_ewma = if step == 0 {
+                loss_ewma = if batch_start == 0 {
                     loss
                 } else {
                     EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
                 };
                 total_train_loss += loss;
-                traces_replayed += 1;
+                traces_replayed += batch.len();
             }
-            Err(e) => tracing::warn!(?e, "replay_step error — skipping trace"),
+            Err(e) => tracing::warn!(?e, "replay_step_batch error — skipping batch"),
         }
-        // Always advance checkpoint, even on error, to avoid replaying a broken trace forever.
-        episodic.replay_checkpoint += 1;
+        episodic.replay_checkpoint += batch.len();
 
-        // Also train output heads during NREM using the stored episode vector (ADR 0010).
-        // The stored episode_vec is a constant (untracked) so gradients flow only through
-        // the output head weights, not the binding area or k-WTA layers.
-        match perception.wake_reconstruct_step(episode_vec, regional) {
+        // ── Output head replay (batched, ADR 0010) ───────────────────────────
+        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _)| ep.as_slice()).collect();
+        match perception.wake_reconstruct_step_batch(&ep_slices, &regionals) {
             Ok(mse) => {
                 total_output_mse += mse;
                 output_mse_n += 1;
             }
-            Err(e) => tracing::warn!(?e, "output head replay error"),
+            Err(e) => tracing::warn!(?e, "output head batch replay error"),
         }
 
         // ── Adaptive exit checks (10b) ────────────────────────────────────────
-        // Loss-target: NREM exits cleanly; REM + spill + snapshot still run.
-        if sleep_loss_target > 0.0 && step > 0 && loss_ewma < sleep_loss_target {
+        if sleep_loss_target > 0.0 && batch_start > 0 && loss_ewma < sleep_loss_target {
             tracing::info!(
                 loss_ewma,
                 sleep_loss_target,
                 "NREM: loss target met — early exit"
             );
             nrem_exit_reason = "loss_target_met";
-            // Advance checkpoint so the remaining traces are skipped on restore.
             episodic.replay_checkpoint = episodic.len();
             break;
         }
-        // Time budget: treat as interrupted (no REM/spill/snapshot).
         if sleep_max_secs > 0 && sleep_start.elapsed().as_secs() >= sleep_max_secs {
             tracing::info!(
                 elapsed_secs = sleep_start.elapsed().as_secs(),
@@ -320,21 +325,25 @@ pub fn run_sleep_cycle(
             break;
         }
 
-        // Projection training: surrogate MSE loss for traces that carry a text target (ADR 0012).
+        // ── Projection training: per-trace (separate optimizer, ADR 0012) ────
         if let Some(ref mut dec) = decoder {
-            if let Some(ids) = text_target {
-                match dec.projection_step(episode_vec, ids) {
-                    Ok(loss) => {
-                        total_proj_loss += loss;
-                        proj_loss_n += 1;
-                        if loss > proj_loss_max {
-                            proj_loss_max = loss;
+            for (episode_vec, _, text_target) in batch {
+                if let Some(ids) = text_target {
+                    match dec.projection_step(episode_vec, ids) {
+                        Ok(loss) => {
+                            total_proj_loss += loss;
+                            proj_loss_n += 1;
+                            if loss > proj_loss_max {
+                                proj_loss_max = loss;
+                            }
                         }
+                        Err(e) => tracing::warn!(?e, "projection_step error"),
                     }
-                    Err(e) => tracing::warn!(?e, "projection_step error"),
                 }
             }
         }
+
+        batch_start = batch_end;
     }
 
     // Log projection weight norm after NREM for cross-session spike diagnostics.

@@ -191,6 +191,12 @@ struct Args {
     /// Avoids thrashing on small growth steps.
     #[arg(long, default_value = "64")]
     prune_min_grown: usize,
+
+    /// Number of traces processed per forward+backward pass during NREM replay.
+    /// Higher values amortise optimizer overhead and improve BLAS utilisation.
+    /// 0 or 1 = sequential (original behaviour). Default: 64.
+    #[arg(long, default_value = "64")]
+    replay_batch_size: usize,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -1120,6 +1126,7 @@ async fn main() -> Result<()> {
                 args.sleep_max_secs,
                 args.prune_fraction,
                 args.prune_min_grown,
+                args.replay_batch_size,
             ) {
                 Ok(stats) => {
                     sleep_cycle_count += 1;

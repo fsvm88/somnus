@@ -123,6 +123,55 @@ impl KWtaLayer {
         Ok((act, z))
     }
 
+    /// Batched forward for NREM replay.
+    ///
+    /// `input_batch` has shape `[B, n_in]`. Returns `(z_batch, mask_batch)` both
+    /// shape `[B, n_units]`. `z_batch` is tracked; `mask_batch` is a detached
+    /// constant. Caller computes `sparse_z = z_batch * mask_batch` to preserve
+    /// gradient flow through the encoder weights.
+    ///
+    /// Duty cycles are updated per-sample in batch order (same semantics as
+    /// the sequential path).
+    pub fn forward_tracked_batch(
+        &mut self,
+        input_batch: &Tensor,
+        b: usize,
+    ) -> PerceptionResult<(Tensor, Tensor)> {
+        let z_batch = self.linear.forward(input_batch)?; // [B, n_units]
+        let z_vec2: Vec<Vec<f32>> = z_batch.to_vec2()?;
+
+        let n = self.n_units;
+        let mut flat_masks = vec![0.0f32; b * n];
+
+        for (si, z_vec) in z_vec2.iter().enumerate() {
+            let target_dc = K_ACTIVE as f32 / n as f32;
+            let mut boosted = z_vec.clone();
+            for (i, dc) in self.duty_cycle.iter().enumerate() {
+                boosted[i] += BOOST_STRENGTH * (target_dc - dc);
+            }
+            let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
+            let split = n - K_ACTIVE;
+            indexed.select_nth_unstable_by(split, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top_k = &indexed[split..];
+
+            let active: std::collections::HashSet<usize> =
+                top_k.iter().map(|&(i, _)| i).collect();
+            for i in 0..n {
+                let fired = if active.contains(&i) { 1.0 } else { 0.0 };
+                self.duty_cycle[i] =
+                    (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
+                if fired > 0.0 {
+                    flat_masks[si * n + i] = 1.0;
+                }
+            }
+        }
+
+        let mask_t = Tensor::from_vec(flat_masks, (b, n), &self.device)?;
+        Ok((z_batch, mask_t))
+    }
+
     fn select_top_k(&mut self, z_vec: Vec<f32>) -> PerceptionResult<SparseActivation> {
         let n = self.n_units;
 

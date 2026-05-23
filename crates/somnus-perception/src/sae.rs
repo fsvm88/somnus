@@ -74,6 +74,21 @@ impl SaeDecoder {
         Ok(loss)
     }
 
+    /// Batched MSE loss for NREM replay.
+    ///
+    /// `input_batch`: `[B, n_in]` (target, detached).
+    /// `sparse_z_batch`: `[B, n_units]` (tracked — gradients flow through this).
+    /// Returns a scalar mean MSE over the whole batch × all output dims.
+    pub fn mse_loss_batch_tensor(
+        &self,
+        input_batch: &Tensor,
+        sparse_z_batch: &Tensor,
+    ) -> PerceptionResult<Tensor> {
+        let recon = self.decoder.forward(sparse_z_batch)?; // [B, n_in]
+        let loss = (input_batch - recon)?.sqr()?.mean_all()?;
+        Ok(loss)
+    }
+
     /// Replace the internal decoder with a new Linear (used during growth).
     pub fn replace_linear(&mut self, new_decoder: Linear, new_n_units: usize) {
         self.decoder = new_decoder;

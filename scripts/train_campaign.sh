@@ -79,6 +79,7 @@ for i in $(seq 1 "$SESSIONS"); do
         --settle-steps 3 \
         --working-memory-size 8 \
         --max-sleep-cycles "$CYCLES" \
+        --replay-batch-size 64 \
         --metrics-file "$METRICS_FILE" \
         --log-file "$SESSION_LOG" \
         --session "$i" \

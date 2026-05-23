@@ -444,6 +444,75 @@ impl PerceptionProcessor {
         }
     }
 
+    /// Batched NREM replay step: process `batch.len()` traces in a single
+    /// forward+backward pass per region. One `optimizer.backward_step` for the
+    /// whole batch — amortises optimizer overhead and enables larger BLAS tiles.
+    ///
+    /// Loss is mean MSE across all (sample, region) pairs; semantically
+    /// equivalent to the mean of `batch.len()` sequential `replay_step` calls.
+    pub fn replay_step_batch(&mut self, batch: &[&[Vec<f32>; 5]]) -> PerceptionResult<f32> {
+        if batch.is_empty() {
+            return Ok(0.0);
+        }
+        let dev = self.device.clone();
+        let mut total_loss: Option<Tensor> = None;
+        let mut n_terms = 0usize;
+
+        for region_idx in 0..5usize {
+            // Collect non-empty inputs for this region; remember which batch slots contributed.
+            let valid: Vec<&Vec<f32>> = batch
+                .iter()
+                .filter_map(|r| {
+                    let v = &r[region_idx];
+                    if v.is_empty() { None } else { Some(v) }
+                })
+                .collect();
+            if valid.is_empty() {
+                continue;
+            }
+
+            let b = valid.len();
+            let n_in = valid[0].len();
+
+            let flat: Vec<f32> = valid.iter().flat_map(|v| v.iter().copied()).collect();
+            let input_batch = Tensor::from_vec(flat, (b, n_in), &dev)?;
+
+            let (z_batch, mask_t) = match region_idx {
+                0 => self.speech_layer.forward_tracked_batch(&input_batch, b)?,
+                1 => self.env_layer.forward_tracked_batch(&input_batch, b)?,
+                2 => self.visual_layer.forward_tracked_batch(&input_batch, b)?,
+                3 => self.symbolic_layer.forward_tracked_batch(&input_batch, b)?,
+                4 => self.language_layer.forward_tracked_batch(&input_batch, b)?,
+                _ => unreachable!(),
+            };
+
+            let sparse_z = z_batch.mul(&mask_t)?;
+
+            let region_loss = match region_idx {
+                0 => self.speech_decoder.mse_loss_batch_tensor(&input_batch, &sparse_z)?,
+                1 => self.env_decoder.mse_loss_batch_tensor(&input_batch, &sparse_z)?,
+                2 => self.visual_decoder.mse_loss_batch_tensor(&input_batch, &sparse_z)?,
+                3 => self.symbolic_decoder.mse_loss_batch_tensor(&input_batch, &sparse_z)?,
+                4 => self.language_decoder.mse_loss_batch_tensor(&input_batch, &sparse_z)?,
+                _ => unreachable!(),
+            };
+
+            total_loss = Some(match total_loss {
+                None => region_loss,
+                Some(acc) => acc.add(&region_loss)?,
+            });
+            n_terms += 1;
+        }
+
+        if let Some(loss) = total_loss {
+            let loss_val = loss.to_scalar::<f32>()?;
+            self.optimizer.backward_step(&loss)?;
+            Ok(loss_val / n_terms.max(1) as f32)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     fn layer_forward_tracked(
         &mut self,
         idx: usize,
@@ -699,6 +768,72 @@ impl PerceptionProcessor {
             "region pruned"
         );
         Ok(n_prune)
+    }
+
+    /// Batched output-head training for NREM replay (ADR 0010).
+    ///
+    /// `episodes` and `regionals` are parallel slices of length B.
+    /// For each output head, only samples with a non-empty regional input
+    /// contribute to the loss. Single backward_step for the whole batch.
+    pub fn wake_reconstruct_step_batch(
+        &mut self,
+        episodes: &[&[f32]],
+        regionals: &[&[Vec<f32>; 5]],
+    ) -> PerceptionResult<f32> {
+        if episodes.is_empty() {
+            return Ok(0.0);
+        }
+        let dev = self.device.clone();
+        let ep_dim = episodes[0].len();
+        let mut total_loss: Option<Tensor> = None;
+        let mut n = 0usize;
+
+        for head_idx in 0..5usize {
+            let valid_pairs: Vec<(&[f32], &Vec<f32>)> = episodes
+                .iter()
+                .zip(regionals.iter())
+                .filter_map(|(&ep, &r)| {
+                    let inp = &r[head_idx];
+                    if inp.is_empty() { None } else { Some((ep, inp)) }
+                })
+                .collect();
+
+            if valid_pairs.is_empty() {
+                continue;
+            }
+
+            let b = valid_pairs.len();
+            let n_in = valid_pairs[0].1.len();
+
+            let flat_eps: Vec<f32> = valid_pairs
+                .iter()
+                .flat_map(|(ep, _)| ep.iter().copied())
+                .collect();
+            let flat_targets: Vec<f32> = valid_pairs
+                .iter()
+                .flat_map(|(_, inp)| inp.iter().copied())
+                .collect();
+
+            let ep_batch = Tensor::from_vec(flat_eps, (b, ep_dim), &dev)?;
+            let target_batch = Tensor::from_vec(flat_targets, (b, n_in), &dev)?;
+
+            let pred = self.output_heads[head_idx].forward(&ep_batch)?; // [B, n_in]
+            let loss = (pred - target_batch)?.sqr()?.mean_all()?;
+
+            total_loss = Some(match total_loss {
+                None => loss,
+                Some(acc) => acc.add(&loss)?,
+            });
+            n += 1;
+        }
+
+        if let Some(loss) = total_loss {
+            let loss_val = loss.to_scalar::<f32>()?;
+            self.optimizer.backward_step(&loss)?;
+            Ok(loss_val / n.max(1) as f32)
+        } else {
+            Ok(0.0)
+        }
     }
 
     /// Run one wake-time reconstruction step on a just-produced episode.
