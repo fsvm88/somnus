@@ -212,6 +212,7 @@ pub fn run_sleep_cycle(
     prune_fraction: f32,
     prune_min_grown: usize,
     replay_batch_size: usize,
+    nrem_min_traces: usize,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -256,7 +257,8 @@ pub fn run_sleep_cycle(
 
     let mut batch_start = 0usize; // index into `traces` of the current batch start
     while batch_start < n_traces {
-        let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD;
+        let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD
+            && batch_start >= nrem_min_traces;
         if interrupt.load(Ordering::Relaxed) || salient {
             if salient {
                 tracing::info!(

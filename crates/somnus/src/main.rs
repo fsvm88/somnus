@@ -202,6 +202,13 @@ struct Args {
     /// 0 or 1 = sequential (original behaviour). Default: 64.
     #[arg(long, default_value = "64")]
     replay_batch_size: usize,
+
+    /// Minimum number of NREM traces replayed before the salience gate can
+    /// interrupt sleep. Prevents early-exit on the very first batch when
+    /// diverse/long clips produce many novel embeddings immediately.
+    /// 0 = no floor (original behaviour); try 500–1000 with long-clip training.
+    #[arg(long, default_value = "0")]
+    nrem_min_traces: usize,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -220,21 +227,15 @@ struct AudioProcessor {
     buf_48k: Vec<f32>,
     ts_16k: Option<Timestamp>,
     ts_48k: Option<Timestamp>,
-    /// Optional Whisper ASR decoder (Stage B, ADR 0013). Present when --language is set
-    /// and whisper_tiny_decoder.onnx / whisper_tokenizer.json exist in --models-dir.
-    whisper_dec: Option<WhisperDecoder>,
-    /// Channel to forward ASR transcriptions to the language ingest path.
-    lang_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    /// Count of successful ASR transcriptions; shared with main loop for metrics.
-    asr_count: Arc<AtomicUsize>,
+    /// Sends encoder hidden states to the dedicated ASR background thread (ADR 0013).
+    /// Non-blocking (try_send): drops the chunk if the decoder is still busy.
+    asr_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 }
 
 impl AudioProcessor {
     fn new(
         models_dir: &std::path::Path,
-        whisper_dec: Option<WhisperDecoder>,
-        lang_tx: Option<tokio::sync::mpsc::Sender<String>>,
-        asr_count: Arc<AtomicUsize>,
+        asr_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
     ) -> Result<Self> {
         Ok(Self {
             encoder: AudioEncoder::new(models_dir)?,
@@ -246,9 +247,7 @@ impl AudioProcessor {
             buf_48k: Vec::new(),
             ts_16k: None,
             ts_48k: None,
-            whisper_dec,
-            lang_tx,
-            asr_count,
+            asr_tx,
         })
     }
 
@@ -311,16 +310,11 @@ impl AudioProcessor {
                 encode_ms = start.elapsed().as_millis(),
                 "speech embedding"
             );
-            // ASR: greedy decode from encoder hidden state when Whisper decoder is available.
-            if let (Some(ref mut dec), Some(ref tx)) = (&mut self.whisper_dec, &self.lang_tx) {
-                match dec.decode_greedy(&hidden_flat, 200) {
-                    Ok(text) if !text.is_empty() => {
-                        tracing::info!(chars = text.len(), "whisper ASR");
-                        self.asr_count.fetch_add(1, Ordering::Relaxed);
-                        let _ = tx.blocking_send(text);
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(?e, "whisper ASR failed"),
+            // ASR: send hidden states to the dedicated ASR thread (non-blocking).
+            // If the decoder is still busy the chunk is dropped; audio processing continues.
+            if let Some(ref tx) = self.asr_tx {
+                if tx.try_send(hidden_flat).is_err() {
+                    tracing::debug!("ASR thread busy — hidden state dropped");
                 }
             }
             embs.push(emb);
@@ -891,19 +885,41 @@ async fn main() -> Result<()> {
         }
     });
 
+    // ── ASR background thread (Stage B, ADR 0013) ────────────────────────────
+    // Decouples Whisper decoding from audio accumulation: the audio thread sends
+    // encoder hidden states via a bounded channel and returns immediately; decoding
+    // happens concurrently.  Channel capacity 2: one being decoded + one buffered.
+    let asr_hidden_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = if let Some(dec) = whisper_dec {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        let lang_tx_asr = lang_tx.clone();
+        let asr_cnt = Arc::clone(&asr_count);
+        std::thread::spawn(move || {
+            let mut dec = dec;
+            while let Ok(hidden) = rx.recv() {
+                match dec.decode_greedy(&hidden, 200) {
+                    Ok(text) if !text.is_empty() => {
+                        tracing::info!(chars = text.len(), "whisper ASR");
+                        asr_cnt.fetch_add(1, Ordering::Relaxed);
+                        let _ = lang_tx_asr.blocking_send(text);
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(?e, "whisper ASR failed"),
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     // ── audio encoder task ────────────────────────────────────────────────────
     let (audio_emb_tx, mut audio_emb_rx) = mpsc::channel::<AudioEmbedding>(32);
     {
         let models_dir = args.models_dir.clone();
         let mut audio_rx = audio_rx;
         let pending = Arc::clone(&pending_embs);
-        // ASR: pass whisper_dec and a lang_tx clone so the audio task can send
-        // transcriptions to the language ingest path without blocking the main loop.
-        let lang_asr_tx = whisper_dec.as_ref().map(|_| lang_tx.clone());
-        let asr_cnt = Arc::clone(&asr_count);
         tokio::task::spawn_blocking(move || {
-            let mut proc = match AudioProcessor::new(&models_dir, whisper_dec, lang_asr_tx, asr_cnt)
-            {
+            let mut proc = match AudioProcessor::new(&models_dir, asr_hidden_tx) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(?e, "audio encoder init failed");
@@ -927,7 +943,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Original lang_tx is no longer needed; clones are held by stdin reader and audio task.
+    // Original lang_tx is no longer needed; clones are held by stdin reader and ASR thread.
     // Dropping it here ensures lang_rx closes once both senders finish.
     drop(lang_tx);
 
@@ -1133,6 +1149,7 @@ async fn main() -> Result<()> {
                 args.prune_fraction,
                 args.prune_min_grown,
                 args.replay_batch_size,
+                args.nrem_min_traces,
             ) {
                 Ok(stats) => {
                     sleep_cycle_count += 1;
