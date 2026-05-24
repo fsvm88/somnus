@@ -1,7 +1,8 @@
 /// Sleep cycle: NREM-like consolidation + REM-like self-probe + growth.
 ///
 /// Blocks the main loop. Checks `interrupt` flag after every replay step;
-/// exits early if set (progress is preserved via `episodic.replay_checkpoint`).
+/// exits early if set. Language-tagged traces are replayed first each cycle
+/// so they are never skipped even when the salience gate fires early.
 use std::{
     path::Path,
     sync::{
@@ -232,10 +233,12 @@ pub fn run_sleep_cycle(
 
     // ── NREM-like: replay + train ─────────────────────────────────────────────
     // Collect snapshots; avoids borrowing episodic during training.
+    // Always start from 0 each cycle: language-priority ordering makes the
+    // cross-cycle checkpoint unnecessary and would misplace prioritized traces.
+    episodic.replay_checkpoint = 0;
     type TraceSnapshot = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>);
-    let traces: Vec<TraceSnapshot> = episodic
+    let mut traces: Vec<TraceSnapshot> = episodic
         .iter_traces()
-        .skip(episodic.replay_checkpoint)
         .map(|t| {
             (
                 t.record.values.clone(),
@@ -244,6 +247,9 @@ pub fn run_sleep_cycle(
             )
         })
         .collect();
+    // Language-priority ordering: stable sort puts language-tagged traces first.
+    // Every cycle — even one interrupted at the floor — replays all language traces.
+    traces.sort_by_key(|(_, _, txt)| if txt.is_some() { 0usize } else { 1 });
 
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;
@@ -293,7 +299,6 @@ pub fn run_sleep_cycle(
             }
             Err(e) => tracing::warn!(?e, "replay_step_batch error — skipping batch"),
         }
-        episodic.replay_checkpoint += batch.len();
 
         // ── Output head replay (batched, ADR 0010) ───────────────────────────
         let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _)| ep.as_slice()).collect();
@@ -313,7 +318,6 @@ pub fn run_sleep_cycle(
                 "NREM: loss target met — early exit"
             );
             nrem_exit_reason = "loss_target_met";
-            episodic.replay_checkpoint = episodic.len();
             break;
         }
         if sleep_max_secs > 0 && sleep_start.elapsed().as_secs() >= sleep_max_secs {
