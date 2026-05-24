@@ -209,6 +209,13 @@ struct Args {
     /// 0 = no floor (original behaviour); try 500–1000 with long-clip training.
     #[arg(long, default_value = "0")]
     nrem_min_traces: usize,
+
+    /// Minimum character count for an ASR transcription to be forwarded to the
+    /// language ingest path. Filters noise/silence artifacts from non-speech
+    /// clips (Whisper often outputs 1–7 char strings on urban/nature audio).
+    /// 0 = accept all non-empty strings. Default: 20.
+    #[arg(long, default_value = "20")]
+    asr_min_chars: usize,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -893,14 +900,18 @@ async fn main() -> Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
         let lang_tx_asr = lang_tx.clone();
         let asr_cnt = Arc::clone(&asr_count);
+        let asr_min_chars = args.asr_min_chars;
         std::thread::spawn(move || {
             let mut dec = dec;
             while let Ok(hidden) = rx.recv() {
                 match dec.decode_greedy(&hidden, 200) {
-                    Ok(text) if !text.is_empty() => {
+                    Ok(text) if text.len() >= asr_min_chars.max(1) => {
                         tracing::info!(chars = text.len(), "whisper ASR");
                         asr_cnt.fetch_add(1, Ordering::Relaxed);
                         let _ = lang_tx_asr.blocking_send(text);
+                    }
+                    Ok(text) if !text.is_empty() => {
+                        tracing::debug!(chars = text.len(), "whisper ASR filtered (below min_chars)");
                     }
                     Ok(_) => {}
                     Err(e) => tracing::warn!(?e, "whisper ASR failed"),
