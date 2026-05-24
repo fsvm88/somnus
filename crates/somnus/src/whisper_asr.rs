@@ -33,7 +33,7 @@ impl WhisperDecoder {
                 "whisper decoder files not found (need whisper_tiny_decoder.onnx + whisper_tokenizer.json)"
             );
         }
-        let session = Session::builder()?.commit_from_file(&dec_path)?;
+        let session = crate::migraphx_session(&dec_path)?;
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("whisper tokenizer load failed: {e}"))?;
         Ok(Self { session, tokenizer })

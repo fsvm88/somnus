@@ -8,6 +8,34 @@ pub mod audio;
 pub mod preprocess;
 pub mod video;
 
+/// Register MIGraphX EP on a session builder using the generic key-value ORT API.
+///
+/// The struct-based `SessionOptionsAppendExecutionProvider_MIGraphX` triggers MIGraphX's
+/// internal problem-cache auto-save with an empty path, causing GPU kernel failure.
+/// The generic API (identical to Python's `providers=["MIGraphXExecutionProvider"]`)
+/// bypasses this bug.
+pub(crate) fn session_with_migraphx(
+    path: &std::path::Path,
+) -> EncodingResult<ort::session::Session> {
+    use ort::AsPointer;
+    use std::ffi::CString;
+    let mut builder = ort::session::Session::builder()?;
+    let name = CString::new("MIGraphXExecutionProvider").unwrap();
+    let status = unsafe {
+        (ort::api().SessionOptionsAppendExecutionProvider)(
+            builder.ptr_mut(),
+            name.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if !status.0.is_null() {
+        unsafe { (ort::api().ReleaseStatus)(status.0) };
+    }
+    Ok(builder.commit_from_file(path)?)
+}
+
 pub use audio::{AudioEmbedding, AudioEncoder, AudioEncoderSource};
 pub use video::{VideoEmbedding, VideoEncoder};
 

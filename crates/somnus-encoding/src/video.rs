@@ -5,7 +5,8 @@ use ndarray::Array4;
 use ort::{session::Session, value::TensorRef};
 
 use crate::{
-    audio::mean_pool_2d, preprocess::image::frame_to_tensor, EncodingError, EncodingResult,
+    audio::mean_pool_2d, preprocess::image::frame_to_tensor, session_with_migraphx,
+    EncodingError, EncodingResult,
 };
 
 pub struct VideoEmbedding {
@@ -19,7 +20,7 @@ pub struct VideoEncoder {
 
 impl VideoEncoder {
     pub fn new(models_dir: &Path) -> EncodingResult<Self> {
-        let session = Session::builder()?.commit_from_file(models_dir.join("dinov2_small.onnx"))?;
+        let session = session_with_migraphx(&models_dir.join("dinov2_small.onnx"))?;
         Ok(Self { session })
     }
 

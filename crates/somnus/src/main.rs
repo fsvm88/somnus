@@ -2,6 +2,28 @@ mod action;
 mod sleep;
 mod whisper_asr;
 
+/// Register MIGraphX EP using the generic key-value ORT API, then build the session.
+/// Avoids the struct-based API which triggers MIGraphX's internal problem-cache auto-save
+/// with an empty path (causing GPU kernel failure on gfx1201 RDNA4).
+pub(crate) fn migraphx_session(path: &std::path::Path) -> anyhow::Result<ort::session::Session> {
+    use ort::AsPointer;
+    let mut builder = ort::session::Session::builder()?;
+    let name = std::ffi::CString::new("MIGraphXExecutionProvider").unwrap();
+    let status = unsafe {
+        (ort::api().SessionOptionsAppendExecutionProvider)(
+            builder.ptr_mut(),
+            name.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if !status.0.is_null() {
+        unsafe { (ort::api().ReleaseStatus)(status.0) };
+    }
+    Ok(builder.commit_from_file(path)?)
+}
+
 use action::ActionDecoder;
 use whisper_asr::WhisperDecoder;
 

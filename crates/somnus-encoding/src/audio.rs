@@ -6,7 +6,7 @@ use ort::{session::Session, value::TensorRef};
 
 use crate::{
     preprocess::mel::{ClapMel, WhisperMel},
-    EncodingError, EncodingResult,
+    session_with_migraphx, EncodingError, EncodingResult,
 };
 
 pub struct AudioEmbedding {
@@ -35,10 +35,8 @@ const CLAP_SAMPLES: usize = 480_000; // 10 s @ 48 kHz
 
 impl AudioEncoder {
     pub fn new(models_dir: &Path) -> EncodingResult<Self> {
-        let speech_session =
-            Session::builder()?.commit_from_file(models_dir.join("whisper_tiny_encoder.onnx"))?;
-        let env_session =
-            Session::builder()?.commit_from_file(models_dir.join("clap_audio_encoder.onnx"))?;
+        let speech_session = session_with_migraphx(&models_dir.join("whisper_tiny_encoder.onnx"))?;
+        let env_session = session_with_migraphx(&models_dir.join("clap_audio_encoder.onnx"))?;
         Ok(Self {
             speech_session,
             env_session,

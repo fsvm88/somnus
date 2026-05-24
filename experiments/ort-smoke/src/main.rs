@@ -1,7 +1,34 @@
+use std::ffi::CString;
 use std::path::PathBuf;
 
 use ndarray::{Array3, Array4};
-use ort::{session::Session, value::TensorRef};
+use ort::{AsPointer, session::Session, value::TensorRef};
+
+/// Register MIGraphX EP using the generic key-value API (same path as Python ORT).
+/// The struct-based SessionOptionsAppendExecutionProvider_MIGraphX triggers MIGraphX's
+/// internal problem-cache save with an empty path, which causes kernel execution to fail.
+fn migraphx_session(model: impl AsRef<std::path::Path>) -> anyhow::Result<Session> {
+    let mut builder = Session::builder()?;
+    // Call the generic EP registration — identical to Python's providers=["MIGraphXExecutionProvider"]
+    let provider_name = CString::new("MIGraphXExecutionProvider").unwrap();
+    let keys: Vec<*const std::ffi::c_char> = vec![];
+    let vals: Vec<*const std::ffi::c_char> = vec![];
+    let status = unsafe {
+        (ort::api().SessionOptionsAppendExecutionProvider)(
+            builder.ptr_mut(),
+            provider_name.as_ptr(),
+            keys.as_ptr(),
+            vals.as_ptr(),
+            0,
+        )
+    };
+    if !status.0.is_null() {
+        // ORT returns a non-null OrtStatus* on error; log and fall through to CPU-only
+        eprintln!("MIGraphX EP registration returned non-null status (may fall back to CPU)");
+        unsafe { (ort::api().ReleaseStatus)(status.0) };
+    }
+    Ok(builder.commit_from_file(model)?)
+}
 
 fn main() -> anyhow::Result<()> {
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
@@ -18,7 +45,7 @@ fn main() -> anyhow::Result<()> {
     // ── Whisper-tiny encoder ──────────────────────────────────────────────────
     println!("=== whisper_tiny_encoder ===");
     {
-        let mut session = Session::builder()?.commit_from_file(models.join("whisper_tiny_encoder.onnx"))?;
+        let mut session = migraphx_session(models.join("whisper_tiny_encoder.onnx"))?;
         for i in session.inputs()  { println!("  in  {:?} {:?}", i.name(), i.dtype()); }
         for o in session.outputs() { println!("  out {:?} {:?}", o.name(), o.dtype()); }
 
@@ -34,11 +61,10 @@ fn main() -> anyhow::Result<()> {
     // ── CLAP audio encoder ────────────────────────────────────────────────────
     println!("=== clap_audio_encoder ===");
     {
-        let mut session = Session::builder()?.commit_from_file(models.join("clap_audio_encoder.onnx"))?;
+        let mut session = migraphx_session(models.join("clap_audio_encoder.onnx"))?;
         for i in session.inputs()  { println!("  in  {:?} {:?}", i.name(), i.dtype()); }
         for o in session.outputs() { println!("  out {:?} {:?}", o.name(), o.dtype()); }
 
-        // (batch=1, channels=1, time=1001, mels=64)
         let input: Array4<f32> = Array4::zeros((1, 1, 1001, 64));
         let input_ref = TensorRef::from_array_view(&input)?;
         let outputs = session.run(ort::inputs!["input_features" => input_ref])?;
@@ -51,11 +77,10 @@ fn main() -> anyhow::Result<()> {
     // ── DINOv2-S/14 ──────────────────────────────────────────────────────────
     println!("=== dinov2_small ===");
     {
-        let mut session = Session::builder()?.commit_from_file(models.join("dinov2_small.onnx"))?;
+        let mut session = migraphx_session(models.join("dinov2_small.onnx"))?;
         for i in session.inputs()  { println!("  in  {:?} {:?}", i.name(), i.dtype()); }
         for o in session.outputs() { println!("  out {:?} {:?}", o.name(), o.dtype()); }
 
-        // (batch=1, channels=3, H=224, W=224)
         let input: Array4<f32> = Array4::zeros((1, 3, 224, 224));
         let input_ref = TensorRef::from_array_view(&input)?;
         let outputs = session.run(ort::inputs!["pixel_values" => input_ref])?;
