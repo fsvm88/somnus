@@ -51,7 +51,7 @@ impl ActionDecoder {
         }
 
         let gain_session = crate::migraphx_session(&gain_path)?;
-        let lm_session = crate::migraphx_session(&lm_path)?;
+        let lm_session = crate::cpu_session(&lm_path)?;
 
         let mut embed_tensors = candle_core::safetensors::load(&embed_path, &device)?;
         let embed_table = embed_tensors.remove("embed_tokens.weight").ok_or_else(|| {

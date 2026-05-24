@@ -24,6 +24,12 @@ pub(crate) fn migraphx_session(path: &std::path::Path) -> anyhow::Result<ort::se
     Ok(builder.commit_from_file(path)?)
 }
 
+/// CPU-only session for models with dynamic shapes (Whisper decoder, Qwen LM).
+/// MIGraphX requires static shapes; these models grow their sequence dimension at runtime.
+pub(crate) fn cpu_session(path: &std::path::Path) -> anyhow::Result<ort::session::Session> {
+    Ok(ort::session::Session::builder()?.commit_from_file(path)?)
+}
+
 use action::ActionDecoder;
 use whisper_asr::WhisperDecoder;
 
@@ -1507,7 +1513,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    Ok(())
+    // MIGraphX EP segfaults during ORT session drop on exit (gfx1201/RDNA4 cleanup bug).
+    // All data is written to disk at this point; skip destructors.
+    std::process::exit(0)
 }
 
 // ── recollection constants ────────────────────────────────────────────────────
