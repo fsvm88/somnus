@@ -12,6 +12,10 @@ use tokenizers::Tokenizer;
 pub const WHISPER_ENC_SEQ: usize = 1500;
 pub const WHISPER_ENC_DIM: usize = 384;
 
+// Must match WHISPER_DECODER_MAX_SEQ in scripts/export_models.py.
+// decoder_input_ids is always padded to this length; logits read from position (real_len-1).
+const DECODER_MAX_SEQ: usize = 204; // 4-token prefix + 200 max generated tokens
+
 // Whisper special token IDs (multilingual model, whisper-tiny)
 const SOT: i64 = 50258;
 const EOT: i64 = 50257;
@@ -33,7 +37,7 @@ impl WhisperDecoder {
                 "whisper decoder files not found (need whisper_tiny_decoder.onnx + whisper_tokenizer.json)"
             );
         }
-        let session = crate::cpu_session(&dec_path)?;
+        let session = crate::migraphx_session(&dec_path)?;
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("whisper tokenizer load failed: {e}"))?;
         Ok(Self { session, tokenizer })
@@ -43,23 +47,32 @@ impl WhisperDecoder {
     ///
     /// `encoder_hidden`: flat slice of length 1500 * 384 = 576 000.
     /// Returns decoded text (trimmed), or empty string for silence/noise.
+    ///
+    /// The decoder ONNX expects static shape (1, DECODER_MAX_SEQ) for decoder_input_ids.
+    /// We maintain a padded buffer; at each step we read logits from position (real_len-1).
+    /// Causal attention means padding zeros after real_len have no effect on earlier positions.
     pub fn decode_greedy(&mut self, encoder_hidden: &[f32], max_tokens: usize) -> Result<String> {
+        let max_tokens = max_tokens.min(DECODER_MAX_SEQ - 4); // 4 = prefix length
+
         let enc_arr = Array3::from_shape_vec(
             (1, WHISPER_ENC_SEQ, WHISPER_ENC_DIM),
             encoder_hidden.to_vec(),
         )
         .map_err(|e| anyhow::anyhow!("encoder hidden shape error: {e}"))?;
 
-        // Fixed English-transcription prefix: SOT, EN, TRANSCRIBE, NO_TIMESTAMPS
-        let mut tokens: Vec<i64> = vec![SOT, EN, TRANSCRIBE, NO_TIMESTAMPS];
-        let mut text_ids: Vec<u32> = Vec::new();
+        // Padded token buffer: prefix tokens + zeros for the rest.
+        let mut padded = vec![0i64; DECODER_MAX_SEQ];
+        padded[0] = SOT; padded[1] = EN; padded[2] = TRANSCRIBE; padded[3] = NO_TIMESTAMPS;
+        let mut real_len: usize = 4; // number of real (non-padding) tokens placed so far
+        let mut generated: Vec<u32> = Vec::new();
+
+        let enc_tensor_base = enc_arr.clone();
 
         for _ in 0..max_tokens {
-            let seq_len = tokens.len();
-            let dec_arr = Array2::from_shape_vec((1, seq_len), tokens.clone())
+            let dec_arr = Array2::from_shape_vec((1, DECODER_MAX_SEQ), padded.clone())
                 .map_err(|e| anyhow::anyhow!("decoder ids shape error: {e}"))?;
 
-            let enc_tensor = TensorRef::from_array_view(&enc_arr)?;
+            let enc_tensor = TensorRef::from_array_view(&enc_tensor_base)?;
             let dec_tensor = TensorRef::from_array_view(&dec_arr)?;
 
             let outputs = self.session.run(ort::inputs![
@@ -67,24 +80,32 @@ impl WhisperDecoder {
                 "decoder_input_ids"    => dec_tensor,
             ])?;
 
-            // logits shape: (1, 1, vocab_size) — last position only
+            // logits shape: (1, DECODER_MAX_SEQ, vocab_size) — read position (real_len - 1)
             let (_shape, logits_data) = outputs["logits"].try_extract_tensor::<f32>()?;
-            let logits: Vec<f32> = logits_data.to_vec();
-            let next_id = argmax(&logits) as i64;
+            let logits_flat: Vec<f32> = logits_data.to_vec();
+            let vocab_size = logits_flat.len() / DECODER_MAX_SEQ;
+            let step_logits = &logits_flat[(real_len - 1) * vocab_size..real_len * vocab_size];
+
+            // Repetition penalty: divide logit by 1.3 for each previously generated token.
+            let mut penalized: Vec<f32> = step_logits.to_vec();
+            for &id in &generated {
+                penalized[id as usize] /= 1.3;
+            }
+            let next_id = argmax(&penalized) as i64;
 
             if next_id == EOT {
                 break;
             }
-            tokens.push(next_id);
-            // Only accumulate regular text tokens (id < EOT = 50257)
+            padded[real_len] = next_id;
+            real_len += 1;
             if next_id < EOT {
-                text_ids.push(next_id as u32);
+                generated.push(next_id as u32);
             }
         }
 
         let text = self
             .tokenizer
-            .decode(&text_ids, true)
+            .decode(&generated, true)
             .map_err(|e| anyhow::anyhow!("whisper decode failed: {e}"))?;
         Ok(text.trim().to_string())
     }

@@ -179,27 +179,34 @@ def export_dinov2() -> None:
 
 # ── Whisper-tiny decoder wrapper (ADR 0013) ────────────────────────────────────
 
+# Static sequence length for the decoder: 4-token prefix + 200 max generated tokens.
+# MIGraphX requires static shapes; dynamic seq_len causes "invalid input for conversion
+# to integer" at runtime. The Rust decode loop pads decoder_input_ids to this length and
+# reads logits from position (real_len - 1). Causal attention ensures padding zeros after
+# the current position have no effect on earlier positions' outputs.
+WHISPER_DECODER_MAX_SEQ = 204  # PREFIX_LEN(4) + max_tokens(200)
+
+
 class WhisperDecoderWrapper(torch.nn.Module):
-    """Whisper-tiny decoder + LM head; only projects the last token position.
+    """Whisper-tiny decoder + full LM head with static input shape.
 
     Input:
-      encoder_hidden_states  (1, 1500, 384) f32  — from whisper_tiny_encoder.onnx
-      decoder_input_ids      (1, seq_len)   int64 — prefix + generated so far
+      encoder_hidden_states  (1, 1500, 384)              f32   — static
+      decoder_input_ids      (1, WHISPER_DECODER_MAX_SEQ) int64 — padded with 0s past real_len
     Output:
-      logits                 (1, 1, 51865) f32   — logits for position [-1] only
+      logits  (1, WHISPER_DECODER_MAX_SEQ, 51865) f32 — Rust slices position (real_len-1)
     """
     def __init__(self, model_instance):
         super().__init__()
         self.decoder = model_instance.model.decoder
-        self.proj_out = model_instance.proj_out   # Whisper uses proj_out, not lm_head
+        self.proj_out = model_instance.proj_out
 
     def forward(self, encoder_hidden_states, decoder_input_ids):
         out = self.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=encoder_hidden_states,
         )
-        last = out.last_hidden_state[:, -1:, :]   # (1, 1, 384)
-        return self.proj_out(last)                 # (1, 1, 51865)
+        return self.proj_out(out.last_hidden_state)  # (1, MAX_SEQ, 51865)
 
 
 def export_whisper_decoder() -> None:
@@ -221,8 +228,8 @@ def export_whisper_decoder() -> None:
     if not lm_out.exists():
         wrapper = WhisperDecoderWrapper(model).eval()
         dummy_enc = torch.zeros(1, 1500, 384)
-        dummy_dec = torch.zeros(1, 4, dtype=torch.long)   # 4-token prefix
-        print("  exporting whisper_tiny_decoder.onnx…")
+        dummy_dec = torch.zeros(1, WHISPER_DECODER_MAX_SEQ, dtype=torch.long)
+        print(f"  exporting whisper_tiny_decoder.onnx (static seq={WHISPER_DECODER_MAX_SEQ})…")
         with torch.no_grad():
             torch.onnx.export(
                 wrapper,
@@ -230,11 +237,7 @@ def export_whisper_decoder() -> None:
                 str(lm_out),
                 input_names=["encoder_hidden_states", "decoder_input_ids"],
                 output_names=["logits"],
-                dynamic_axes={
-                    "encoder_hidden_states": {0: "batch"},
-                    "decoder_input_ids":     {0: "batch", 1: "seq_len"},
-                    "logits":                {0: "batch"},
-                },
+                # No dynamic_axes: both inputs are fully static for MIGraphX.
                 opset_version=17,
             )
         report(lm_out)
