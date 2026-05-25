@@ -76,6 +76,9 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
     echo "[campaign] ── session ${i}/${SESSION_END} ──────────────────────────────"
 
     # shellcheck disable=SC2086
+    # Capture exit code via || to prevent set -e from triggering on expected
+    # non-zero exits (e.g. exit 139 = known MIGraphX destructor race on gfx1201).
+    EXIT=0
     "$SOMNUS" \
         $FILE_FLAGS \
         --file-loop \
@@ -92,9 +95,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
         --log-file "$SESSION_LOG" \
         --session "$i" \
         $EXTRA_ARGS \
-        2>>"$SESSION_LOG"
-
-    EXIT=$?
+        2>>"$SESSION_LOG" || EXIT=$?
     # Exit code 139 (SIGSEGV) is a known MIGraphX destructor race on gfx1201/RDNA4:
     # GPU encoder threads may be mid-kernel when process::exit(0) tears down the process.
     # All work is written to disk before this crash; treat it as success.
