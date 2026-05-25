@@ -244,6 +244,13 @@ struct Args {
     /// 0 = accept all non-empty strings. Default: 20.
     #[arg(long, default_value = "20")]
     asr_min_chars: usize,
+
+    /// How many extra times language-tagged traces are repeated at the front of
+    /// the NREM replay queue (in addition to the one baseline pass).
+    /// 0 = no oversampling (default). 9 = replay language traces 10× total.
+    /// Increases the projection training budget without adding new data.
+    #[arg(long, default_value = "0")]
+    lang_oversample: usize,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -1189,6 +1196,7 @@ async fn main() -> Result<()> {
                 args.prune_min_grown,
                 args.replay_batch_size,
                 args.nrem_min_traces,
+                args.lang_oversample,
             ) {
                 Ok(stats) => {
                     sleep_cycle_count += 1;

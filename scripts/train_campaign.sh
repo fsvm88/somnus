@@ -34,6 +34,10 @@ CAPACITY="${CAPACITY:-4096}"
 MEMORY_DIR="${MEMORY_DIR:-memory}"
 CAMPAIGN_DIR="${CAMPAIGN_DIR:-${MEMORY_DIR}/campaign_$(date +%Y%m%d_%H%M%S)}"
 CLIPS="${CLIPS:-clips/talking_head.mp4 clips/urban.mp4 clips/animation.mp4 clips/nature.mp4}"
+# Optional text corpus for language injection via inject_text.py.
+# Space-separated glob of .txt files. Leave empty to disable.
+TEXT_CORPUS="${TEXT_CORPUS:-}"
+TEXT_RATE="${TEXT_RATE:-5}"      # chunks per second fed to --language stdin
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 METRICS_FILE="${CAMPAIGN_DIR}/metrics.jsonl"
@@ -79,23 +83,49 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
     # Capture exit code via || to prevent set -e from triggering on expected
     # non-zero exits (e.g. exit 139 = known MIGraphX destructor race on gfx1201).
     EXIT=0
-    "$SOMNUS" \
-        $FILE_FLAGS \
-        --file-loop \
-        --memory-dir "$MEMORY_DIR" \
-        --language \
-        --action \
-        --prior-beta 0.1 \
-        --settle-steps 3 \
-        --working-memory-size 8 \
-        --episodic-capacity "$CAPACITY" \
-        --max-sleep-cycles "$CYCLES" \
-        --replay-batch-size 64 \
-        --metrics-file "$METRICS_FILE" \
-        --log-file "$SESSION_LOG" \
-        --session "$i" \
-        $EXTRA_ARGS \
-        2>>"$SESSION_LOG" || EXIT=$?
+    if [ -n "$TEXT_CORPUS" ]; then
+        # Pipe text corpus into somnus's stdin as language ingest events.
+        # inject_text.py loops the corpus indefinitely; killed when somnus exits.
+        # shellcheck disable=SC2086
+        python3 "$REPO_ROOT/scripts/inject_text.py" $TEXT_CORPUS \
+            --rate "$TEXT_RATE" --shuffle \
+            2>>"$SESSION_LOG" \
+        | "$SOMNUS" \
+            $FILE_FLAGS \
+            --file-loop \
+            --memory-dir "$MEMORY_DIR" \
+            --language \
+            --action \
+            --prior-beta 0.1 \
+            --settle-steps 3 \
+            --working-memory-size 8 \
+            --episodic-capacity "$CAPACITY" \
+            --max-sleep-cycles "$CYCLES" \
+            --replay-batch-size 64 \
+            --metrics-file "$METRICS_FILE" \
+            --log-file "$SESSION_LOG" \
+            --session "$i" \
+            $EXTRA_ARGS \
+            2>>"$SESSION_LOG" || EXIT=$?
+    else
+        "$SOMNUS" \
+            $FILE_FLAGS \
+            --file-loop \
+            --memory-dir "$MEMORY_DIR" \
+            --language \
+            --action \
+            --prior-beta 0.1 \
+            --settle-steps 3 \
+            --working-memory-size 8 \
+            --episodic-capacity "$CAPACITY" \
+            --max-sleep-cycles "$CYCLES" \
+            --replay-batch-size 64 \
+            --metrics-file "$METRICS_FILE" \
+            --log-file "$SESSION_LOG" \
+            --session "$i" \
+            $EXTRA_ARGS \
+            2>>"$SESSION_LOG" || EXIT=$?
+    fi
     # Exit code 139 (SIGSEGV) is a known MIGraphX destructor race on gfx1201/RDNA4:
     # GPU encoder threads may be mid-kernel when process::exit(0) tears down the process.
     # All work is written to disk before this crash; treat it as success.

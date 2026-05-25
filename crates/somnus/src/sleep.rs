@@ -214,6 +214,7 @@ pub fn run_sleep_cycle(
     prune_min_grown: usize,
     replay_batch_size: usize,
     nrem_min_traces: usize,
+    lang_oversample: usize,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -250,6 +251,28 @@ pub fn run_sleep_cycle(
     // Language-priority ordering: stable sort puts language-tagged traces first.
     // Every cycle — even one interrupted at the floor — replays all language traces.
     traces.sort_by_key(|(_, _, txt)| if txt.is_some() { 0usize } else { 1 });
+
+    // Language oversampling: prepend lang_oversample extra copies of language-tagged
+    // traces before the full sorted list. With lang_oversample=9 the projection sees
+    // each language trace 10× per NREM cycle without changing non-language replay.
+    if lang_oversample > 0 {
+        let lang_traces: Vec<_> = traces
+            .iter()
+            .filter(|(_, _, txt)| txt.is_some())
+            .cloned()
+            .collect();
+        if !lang_traces.is_empty() {
+            let extra: Vec<_> = lang_traces
+                .iter()
+                .cloned()
+                .cycle()
+                .take(lang_traces.len() * lang_oversample)
+                .collect();
+            let mut extended = extra;
+            extended.extend(traces);
+            traces = extended;
+        }
+    }
 
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;

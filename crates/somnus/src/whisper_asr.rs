@@ -64,12 +64,11 @@ impl WhisperDecoder {
         // Padded token buffer: prefix tokens + zeros for the rest.
         let mut padded = vec![0i64; DECODER_MAX_SEQ];
         padded[0] = SOT; padded[1] = EN; padded[2] = TRANSCRIBE; padded[3] = NO_TIMESTAMPS;
-        let mut real_len: usize = 4; // number of real (non-padding) tokens placed so far
         let mut generated: Vec<u32> = Vec::new();
 
         let enc_tensor_base = enc_arr.clone();
 
-        for _ in 0..max_tokens {
+        for real_len in 4..4 + max_tokens {
             let dec_arr = Array2::from_shape_vec((1, DECODER_MAX_SEQ), padded.clone())
                 .map_err(|e| anyhow::anyhow!("decoder ids shape error: {e}"))?;
 
@@ -98,7 +97,6 @@ impl WhisperDecoder {
                 break;
             }
             padded[real_len] = next_id;
-            real_len += 1;
             if next_id < EOT {
                 generated.push(next_id as u32);
             }
