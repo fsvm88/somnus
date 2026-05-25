@@ -28,6 +28,7 @@ cd "$REPO_ROOT"
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 SESSIONS="${SESSIONS:-10}"
+SESSION_START="${SESSION_START:-1}"    # first session number (for continuations)
 CYCLES="${CYCLES:-3}"
 CAPACITY="${CAPACITY:-4096}"
 MEMORY_DIR="${MEMORY_DIR:-memory}"
@@ -46,8 +47,9 @@ cargo build --release -p somnus 2>&1
 SOMNUS="$REPO_ROOT/target/release/somnus"
 
 # ── Record campaign parameters ────────────────────────────────────────────────
-cat > "${CAMPAIGN_DIR}/params.txt" <<EOF
+cat >> "${CAMPAIGN_DIR}/params.txt" <<EOF
 SESSIONS=${SESSIONS}
+SESSION_START=${SESSION_START}
 CYCLES=${CYCLES}
 CAPACITY=${CAPACITY}
 CLIPS=${CLIPS}
@@ -56,7 +58,8 @@ EXTRA_ARGS=${EXTRA_ARGS}
 started=$(date -Iseconds)
 EOF
 
-echo "[campaign] starting: ${SESSIONS} sessions × ${CYCLES} cycles  (capacity=${CAPACITY})"
+SESSION_END=$((SESSION_START + SESSIONS - 1))
+echo "[campaign] starting: sessions ${SESSION_START}–${SESSION_END} × ${CYCLES} cycles  (capacity=${CAPACITY})"
 echo "[campaign] metrics → ${METRICS_FILE}"
 echo "[campaign] logs    → ${LOG_DIR}/"
 echo ""
@@ -68,9 +71,9 @@ for clip in $CLIPS; do
 done
 
 # ── Session loop ──────────────────────────────────────────────────────────────
-for i in $(seq 1 "$SESSIONS"); do
+for i in $(seq "$SESSION_START" "$SESSION_END"); do
     SESSION_LOG="${LOG_DIR}/session_${i}.log"
-    echo "[campaign] ── session ${i}/${SESSIONS} ──────────────────────────────"
+    echo "[campaign] ── session ${i}/${SESSION_END} ──────────────────────────────"
 
     # shellcheck disable=SC2086
     "$SOMNUS" \
@@ -92,7 +95,10 @@ for i in $(seq 1 "$SESSIONS"); do
         2>>"$SESSION_LOG"
 
     EXIT=$?
-    if [ $EXIT -ne 0 ]; then
+    # Exit code 139 (SIGSEGV) is a known MIGraphX destructor race on gfx1201/RDNA4:
+    # GPU encoder threads may be mid-kernel when process::exit(0) tears down the process.
+    # All work is written to disk before this crash; treat it as success.
+    if [ $EXIT -ne 0 ] && [ $EXIT -ne 139 ]; then
         echo "[campaign] session ${i} exited with code ${EXIT} — check ${SESSION_LOG}"
         echo "[campaign] stopping campaign."
         exit $EXIT
@@ -103,7 +109,7 @@ done
 
 # ── Post-campaign eval ────────────────────────────────────────────────────────
 echo ""
-echo "[campaign] all ${SESSIONS} sessions complete."
+echo "[campaign] sessions ${SESSION_START}–${SESSION_END} complete."
 echo "[campaign] running eval harness…"
 
 python3 scripts/eval_metrics.py \
