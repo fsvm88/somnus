@@ -861,11 +861,12 @@ impl PerceptionProcessor {
             let old_n = layer.n_units;
             let new_n = old_n + n_new;
 
+            // Encoder weight shape: [n_in, n_units] — grow by appending new columns (dim 1).
             let old_w: Tensor<Wgpu, 2> = layer.linear.weight.val().inner();
-            let new_rows: Tensor<Wgpu, 2> =
-                Tensor::random([n_new, n_in], Distribution::Normal(0.0, 0.01), &device);
+            let new_cols: Tensor<Wgpu, 2> =
+                Tensor::random([n_in, n_new], Distribution::Normal(0.0, 0.01), &device);
             let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+                Tensor::from_inner(Tensor::cat(vec![old_w, new_cols], 1));
             layer.linear.weight = Param::initialized(ParamId::new(), new_w);
             layer.n_units = new_n;
             layer.duty_cycle.extend(vec![0.0f32; n_new]);
@@ -873,11 +874,12 @@ impl PerceptionProcessor {
         };
 
         {
+            // Decoder weight shape: [n_units, n_in] — grow by appending new rows (dim 0).
             let decoder = Self::decoder_mut(model, region);
             let old_w: Tensor<Wgpu, 2> = decoder.decoder.weight.val().inner();
-            let new_cols: Tensor<Wgpu, 2> = Tensor::zeros([n_in, n_new], &device);
+            let new_rows: Tensor<Wgpu, 2> = Tensor::zeros([n_new, n_in], &device);
             let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_cols], 1));
+                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_w);
             decoder.n_units = new_n;
         }
@@ -903,7 +905,7 @@ impl PerceptionProcessor {
             return 0;
         }
 
-        // Extract encoder weights to CPU: [current_n, n_in] row-major.
+        // Encoder weight shape: [n_in, current_n] — units are columns.
         let enc_flat: Vec<f32> = Self::layer_mut(model, region)
             .linear
             .weight
@@ -913,11 +915,11 @@ impl PerceptionProcessor {
             .to_vec()
             .unwrap();
 
+        // L1 norm of unit i = sum over rows j of abs(enc_flat[j * current_n + i]).
         let mut grown_norms: Vec<(usize, f32)> = (N_UNITS..current_n)
             .map(|i| {
-                let norm: f32 = enc_flat[i * n_in..(i + 1) * n_in]
-                    .iter()
-                    .map(|x| x.abs())
+                let norm: f32 = (0..n_in)
+                    .map(|j| enc_flat[j * current_n + i].abs())
                     .sum();
                 (i, norm)
             })
@@ -929,12 +931,15 @@ impl PerceptionProcessor {
         let keep: Vec<usize> = (0..current_n).filter(|i| !remove.contains(i)).collect();
         let new_n = keep.len();
 
-        let new_enc_flat: Vec<f32> = keep
-            .iter()
-            .flat_map(|&i| enc_flat[i * n_in..(i + 1) * n_in].iter().copied())
+        // Keep columns `keep` from [n_in, current_n] → [n_in, new_n].
+        let new_enc_flat: Vec<f32> = (0..n_in)
+            .flat_map(|j| {
+                let enc = &enc_flat;
+                keep.iter().map(move |&i| enc[j * current_n + i]).collect::<Vec<_>>()
+            })
             .collect();
 
-        // Extract decoder weights: [n_in, current_n] row-major.
+        // Decoder weight shape: [current_n, n_in] — units are rows.
         let dec_flat: Vec<f32> = Self::decoder_mut(model, region)
             .decoder
             .weight
@@ -943,19 +948,16 @@ impl PerceptionProcessor {
             .convert::<f32>()
             .to_vec()
             .unwrap();
-        let new_dec_flat: Vec<f32> = (0..n_in)
-            .flat_map(|r| {
-                let dec = &dec_flat;
-                keep.iter()
-                    .map(move |&c| dec[r * current_n + c])
-                    .collect::<Vec<_>>()
-            })
+        // Keep rows `keep` from [current_n, n_in] → [new_n, n_in].
+        let new_dec_flat: Vec<f32> = keep
+            .iter()
+            .flat_map(|&i| dec_flat[i * n_in..(i + 1) * n_in].iter().copied())
             .collect();
 
         {
             let layer = Self::layer_mut(model, region);
             let new_enc: Tensor<TrainB, 2> =
-                Tensor::from_data(TensorData::new(new_enc_flat, [new_n, n_in]), &device);
+                Tensor::from_data(TensorData::new(new_enc_flat, [n_in, new_n]), &device);
             layer.linear.weight = Param::initialized(ParamId::new(), new_enc);
             let old_dc = layer.duty_cycle.clone();
             layer.duty_cycle = keep.iter().map(|&i| old_dc[i]).collect();
@@ -965,7 +967,7 @@ impl PerceptionProcessor {
         {
             let decoder = Self::decoder_mut(model, region);
             let new_dec: Tensor<TrainB, 2> =
-                Tensor::from_data(TensorData::new(new_dec_flat, [n_in, new_n]), &device);
+                Tensor::from_data(TensorData::new(new_dec_flat, [new_n, n_in]), &device);
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_dec);
             decoder.n_units = new_n;
         }

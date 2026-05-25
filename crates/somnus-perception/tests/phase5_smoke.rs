@@ -97,4 +97,18 @@ mod tests {
         let sizes = proc.region_sizes();
         assert!(sizes.iter().all(|&n| n == N_UNITS));
     }
+
+    /// grow_region and replay_step still produce finite loss after growth.
+    #[test]
+    fn grow_then_replay_finite() {
+        use somnus_perception::{N_UNITS, RegionId};
+        let mut proc = make_proc();
+        proc.grow_region(RegionId::AudioSpeech, 32);
+        assert_eq!(proc.region_sizes()[0], N_UNITS + 32);
+        let regional: [Vec<f32>; 5] = std::array::from_fn(|i| {
+            (0..REGION_DIMS[i]).map(|j| (j as f32 * 0.001).sin()).collect()
+        });
+        let loss = proc.replay_step(&regional).unwrap();
+        assert!(loss.is_finite(), "loss after grow not finite: {loss}");
+    }
 }
