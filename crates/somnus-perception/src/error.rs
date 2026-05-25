@@ -2,8 +2,8 @@ use crate::region::RegionId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PerceptionError {
-    #[error("candle error: {0}")]
-    Candle(#[from] candle_core::Error),
+    #[error("burn error: {0}")]
+    Burn(String),
 
     #[error("region mismatch: expected {expected:?}, got {got:?}")]
     RegionMismatch { expected: RegionId, got: RegionId },

@@ -8,10 +8,18 @@
 /// Training (NREM): surrogate MSE loss between mean(proj_tokens) and
 /// mean(text_target_embeddings) from text-bypass queries.
 use anyhow::{bail, Result};
-use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{linear_no_bias, AdamW, Linear, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use burn::{
+    backend::{wgpu::WgpuDevice, Autodiff, Wgpu},
+    module::Module,
+    nn::{Linear, LinearConfig},
+    optim::adaptor::OptimizerAdaptor,
+    optim::{AdamW, AdamWConfig, GradientsParams, Optimizer},
+    record::{BinFileRecorder, FullPrecisionSettings},
+    tensor::{Tensor, TensorData},
+};
 use ndarray::Array3;
 use ort::{session::Session, value::TensorRef};
+use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 
 pub const LM_HIDDEN: usize = 896; // Qwen2.5-0.5B hidden dimension
@@ -20,12 +28,19 @@ const EPISODE_DIM: usize = 640;
 const PROJ_LR: f64 = 1e-4;
 const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
 
+type TrainB = Autodiff<Wgpu>;
+type ProjOptim = OptimizerAdaptor<AdamW, ProjModel<TrainB>, TrainB>;
+
+#[derive(Module, Debug)]
+struct ProjModel<B: burn::tensor::backend::Backend> {
+    projection: Linear<B>,
+}
+
 pub struct ActionDecoder {
-    projection: Linear,
-    varmap: VarMap,
-    optimizer: AdamW,
-    /// Frozen embedding table [vocab_size, LM_HIDDEN] for training surrogate loss + generation.
-    embed_table: Tensor,
+    model: Option<ProjModel<TrainB>>,
+    optimizer: ProjOptim,
+    /// Frozen embedding table: flat [vocab_size * LM_HIDDEN], row-major f32.
+    embed_table: Vec<f32>,
     /// Transformer-only (no LM head), static [1,5,896] — used by update_gain().
     gain_session: Session,
     /// Full model with LM head, dynamic seq_len — used by generate().
@@ -33,13 +48,13 @@ pub struct ActionDecoder {
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
     pub gain: [f32; 5],
-    device: Device,
+    device: WgpuDevice,
 }
 
 impl ActionDecoder {
     /// Load all model artifacts from `models_dir`.
     /// Returns Err if any required file is absent.
-    pub fn new(models_dir: &std::path::Path, device: Device) -> Result<Self> {
+    pub fn new(models_dir: &std::path::Path, device: WgpuDevice) -> Result<Self> {
         let gain_path = models_dir.join("qwen25_gain.onnx");
         let lm_path = models_dir.join("qwen25_lm.onnx");
         let embed_path = models_dir.join("qwen25_embed_table.safetensors");
@@ -53,28 +68,32 @@ impl ActionDecoder {
         let gain_session = crate::migraphx_session(&gain_path)?;
         let lm_session = crate::cpu_session(&lm_path)?;
 
-        let mut embed_tensors = candle_core::safetensors::load(&embed_path, &device)?;
-        let embed_table = embed_tensors.remove("embed_tokens.weight").ok_or_else(|| {
-            anyhow::anyhow!("embed_tokens.weight missing in {}", embed_path.display())
+        let bytes = std::fs::read(&embed_path)?;
+        let st = SafeTensors::deserialize(&bytes)
+            .map_err(|e| anyhow::anyhow!("safetensors load failed: {e}"))?;
+        let tv = st.tensor("embed_tokens.weight").map_err(|e| {
+            anyhow::anyhow!(
+                "embed_tokens.weight missing in {}: {e}",
+                embed_path.display()
+            )
         })?;
+        let embed_table: Vec<f32> = tv
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
 
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
 
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let projection = linear_no_bias(EPISODE_DIM, N_REGIONS * LM_HIDDEN, vb.pp("projection"))?;
-        let optimizer = AdamW::new(
-            varmap.all_vars(),
-            ParamsAdamW {
-                lr: PROJ_LR,
-                ..Default::default()
-            },
-        )?;
+        let projection = LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
+            .with_bias(false)
+            .init::<TrainB>(&device);
+        let model = ProjModel { projection };
+        let optimizer: ProjOptim = AdamWConfig::new().init::<TrainB, ProjModel<TrainB>>();
 
         Ok(Self {
-            projection,
-            varmap,
+            model: Some(model),
             optimizer,
             embed_table,
             gain_session,
@@ -88,7 +107,7 @@ impl ActionDecoder {
     /// Project episode vector → 4 region tokens → LM forward →
     /// update `self.gain` from hidden-state L2 norms (ADR 0012).
     pub fn update_gain(&mut self, episode: &[f32]) -> Result<()> {
-        let proj_flat = self.project_flat(episode)?; // [4 * LM_HIDDEN]
+        let proj_flat = self.project_flat(episode)?; // [N_REGIONS * LM_HIDDEN]
 
         let inputs = Array3::from_shape_vec((1, N_REGIONS, LM_HIDDEN), proj_flat)
             .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
@@ -118,15 +137,15 @@ impl ActionDecoder {
 
     /// Autoregressive greedy generation given a current episode vector and a text query.
     ///
-    /// Prepends the 4 projected region tokens as a soft prefix before the query tokens.
+    /// Prepends the N_REGIONS projected region tokens as a soft prefix before the query tokens.
     /// Returns the generated text (decoded, EOS stripped).
     pub fn generate(&mut self, episode: &[f32], query: &str, max_tokens: usize) -> Result<String> {
-        let proj_flat = self.project_flat(episode)?; // [4 * LM_HIDDEN]
+        let proj_flat = self.project_flat(episode)?; // [N_REGIONS * LM_HIDDEN]
 
         let query_ids = self.tokenize(query)?;
         let query_embeds = self.embed_flat(&query_ids)?; // [n_query * LM_HIDDEN]
 
-        // Concatenate region tokens + query embeds → [4 + n_query, LM_HIDDEN]
+        // Concatenate region tokens + query embeds → [N_REGIONS + n_query, LM_HIDDEN]
         let mut all_embeds: Vec<f32> = proj_flat;
         all_embeds.extend_from_slice(&query_embeds);
         let mut seq_len = N_REGIONS + query_ids.len();
@@ -178,39 +197,54 @@ impl ActionDecoder {
     ///
     /// Loss: cosine MSE — MSE between L2-normalised mean(projected region tokens) and
     /// normalised mean(text token embeddings). Bounded in [0, 4]; magnitude-invariant.
-    /// Prevents loss explosion when the episode-vector distribution shifts between cycles
-    /// (observed: C3 MSE spike to 1.77e12 with unnormalised loss). Gradients flow through
-    /// the projection only; embed_table is frozen (no Var).
     pub fn projection_step(&mut self, episode: &[f32], target_ids: &[u32]) -> Result<f32> {
         if target_ids.is_empty() {
             return Ok(0.0);
         }
-        let dev = self.device.clone();
-        let ep_t = Tensor::from_slice(episode, (1, EPISODE_DIM), &dev)?;
-        let proj_out = self
-            .projection
-            .forward(&ep_t)?
-            .reshape((N_REGIONS, LM_HIDDEN))?; // [N_REGIONS, LM_HIDDEN]
-        let proj_mean = proj_out.mean(0)?; // [LM_HIDDEN]
 
-        // Frozen text embeddings; no gradient
-        let idx = Tensor::from_vec(target_ids.to_vec(), (target_ids.len(),), &dev)?;
-        let text_embeds = self.embed_table.index_select(&idx, 0)?.detach(); // [n, LM_HIDDEN]
-        let text_mean = text_embeds.mean(0)?; // [LM_HIDDEN]
+        // Pure-Rust: mean-pool + L2-normalize text embeddings (frozen, no grad).
+        let mut text_mean = vec![0.0f32; LM_HIDDEN];
+        for &id in target_ids {
+            let row = &self.embed_table[id as usize * LM_HIDDEN..(id as usize + 1) * LM_HIDDEN];
+            for (a, b) in text_mean.iter_mut().zip(row) {
+                *a += b;
+            }
+        }
+        let n = target_ids.len() as f32;
+        for v in &mut text_mean {
+            *v /= n;
+        }
+        let text_norm: f32 = (text_mean.iter().map(|x| x * x).sum::<f32>() + 1e-8).sqrt();
+        for v in &mut text_mean {
+            *v /= text_norm;
+        }
 
-        // Normalise proj_mean inside the graph so gradients flow through the normalisation.
-        // affine(1.0, eps) adds a small constant to prevent division by zero.
-        let proj_norm = proj_mean.sqr()?.sum_all()?.affine(1.0, 1e-8)?.sqrt()?;
-        let proj_unit = proj_mean.broadcast_div(&proj_norm)?;
+        // Burn forward pass (with grad tracking).
+        let ep_data = TensorData::new(episode.to_vec(), [1, EPISODE_DIM]);
+        let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
 
-        // text_mean is frozen; scalar normalisation is fine (no need to keep in graph).
-        let text_norm = (text_mean.sqr()?.sum_all()?.to_scalar::<f32>()? as f64 + 1e-8).sqrt();
-        let text_unit = text_mean.affine(text_norm.recip(), 0.0)?;
+        let model = self.model.as_ref().unwrap();
+        let proj_out = model.projection.forward(ep_t); // [1, N_REGIONS * LM_HIDDEN]
+        let proj_out = proj_out.reshape([N_REGIONS, LM_HIDDEN]); // [N_REGIONS, LM_HIDDEN]
+        let proj_sum = proj_out.sum_dim(0); // [1, LM_HIDDEN]
+        let sq_sum = proj_sum.clone().powf_scalar(2.0).sum_dim(1); // [1, 1]
+        let norm = (sq_sum + 1e-8f32).sqrt(); // [1, 1]
+        let proj_unit = proj_sum / norm; // [1, LM_HIDDEN]
 
-        // Cosine MSE = 2*(1 − cosine_similarity); bounded [0, 4].
-        let loss = (proj_unit - text_unit)?.sqr()?.mean_all()?;
-        let loss_val = loss.to_scalar::<f32>()?;
-        self.optimizer.backward_step(&loss)?;
+        // Detached text target tensor.
+        let text_data = TensorData::new(text_mean, [1, LM_HIDDEN]);
+        let text_unit: Tensor<TrainB, 2> = Tensor::from_data(text_data, &self.device);
+
+        let loss = (proj_unit - text_unit).powf_scalar(2.0).mean();
+        let loss_val: f32 = loss.clone().into_scalar();
+
+        // Take/replace pattern for the optimizer step.
+        let model = self.model.take().unwrap();
+        let grads = loss.backward();
+        let grads_p = GradientsParams::from_grads(grads, &model);
+        let model = self.optimizer.step(PROJ_LR, model, grads_p);
+        self.model = Some(model);
+
         Ok(loss_val)
     }
 
@@ -225,34 +259,48 @@ impl ActionDecoder {
     /// Frobenius norm of the projection weight matrix (monitoring, Phase 8).
     #[allow(dead_code)]
     pub fn proj_weight_norm(&self) -> Result<f32> {
-        let data = self.varmap.data().lock().unwrap();
-        let w = data["projection.weight"].as_tensor();
-        Ok(w.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt())
+        let model = self.model.as_ref().unwrap();
+        let w_data = model.projection.weight.val().into_data();
+        let flat = w_data.convert::<f32>().to_vec::<f32>().unwrap();
+        Ok(flat.iter().map(|x| x * x).sum::<f32>().sqrt())
     }
 
-    /// Save projection weights to a safetensors file.
+    /// Save projection weights to a burn binary file.
     pub fn save_weights(&self, path: &std::path::Path) -> Result<()> {
-        self.varmap.save(path)?;
-        Ok(())
+        let model_clone = self.model.as_ref().unwrap().clone();
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF8 path"))?;
+        model_clone
+            .save_file(path_str, &recorder)
+            .map_err(|e| anyhow::anyhow!("save_weights failed: {e}"))
     }
 
-    /// Load projection weights from a safetensors file and rebuild the Linear.
+    /// Load projection weights from a burn binary file.
     pub fn load_weights(&mut self, path: &std::path::Path) -> Result<()> {
-        self.varmap.load(path)?;
-        let w = {
-            let data = self.varmap.data().lock().unwrap();
-            data["projection.weight"].as_tensor().clone()
-        };
-        self.projection = Linear::new(w, None);
+        let model = self.model.take().unwrap();
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF8 path"))?;
+        let model = model
+            .load_file(path_str, &recorder, &self.device)
+            .map_err(|e| anyhow::anyhow!("load_weights failed: {e}"))?;
+        self.model = Some(model);
         Ok(())
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
 
-    /// Project episode → flat Vec<f32> of length [4 * LM_HIDDEN].
+    /// Project episode → flat Vec<f32> of length [N_REGIONS * LM_HIDDEN].
     fn project_flat(&self, episode: &[f32]) -> Result<Vec<f32>> {
-        let ep_t = Tensor::from_slice(episode, (1, EPISODE_DIM), &self.device)?;
-        Ok(self.projection.forward(&ep_t)?.squeeze(0)?.to_vec1()?)
+        let model = self.model.as_ref().unwrap();
+        let ep_data = TensorData::new(episode.to_vec(), [1, EPISODE_DIM]);
+        let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
+        let proj = model.projection.forward(ep_t); // [1, N_REGIONS * LM_HIDDEN]
+        let flat = proj.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        Ok(flat)
     }
 
     /// Embed token IDs → flat Vec<f32> of length [n * LM_HIDDEN].
@@ -260,9 +308,12 @@ impl ActionDecoder {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let idx = Tensor::from_vec(ids.to_vec(), (ids.len(),), &self.device)?;
-        let embeds = self.embed_table.index_select(&idx, 0)?; // [n, LM_HIDDEN]
-        Ok(embeds.flatten_all()?.to_vec1()?)
+        let mut out = Vec::with_capacity(ids.len() * LM_HIDDEN);
+        for &id in ids {
+            let start = id as usize * LM_HIDDEN;
+            out.extend_from_slice(&self.embed_table[start..start + LM_HIDDEN]);
+        }
+        Ok(out)
     }
 }
 

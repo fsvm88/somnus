@@ -1,39 +1,37 @@
-use candle_core::{Device, Module, Tensor};
-use candle_nn::{linear_no_bias, Linear, VarBuilder};
-
-use crate::{
-    error::PerceptionResult,
-    region::{RegionId, SparseActivation, N_UNITS},
+use burn::{
+    module::Module,
+    nn::{Linear, LinearConfig},
+    tensor::{backend::Backend, Tensor, TensorData},
 };
+
+use crate::region::{RegionId, SparseActivation, N_UNITS};
 
 /// Thin linear decoder: n_units → n_in.
 ///
-/// In Phase 3 the weights are randomly initialised; reconstruction error is
-/// observable as a metric but not meaningful until Phase 5 trains the decoder
-/// via experience replay.
-pub struct SaeDecoder {
+/// Weights are randomly initialised; reconstruction error is observable as a metric
+/// but not meaningful until Phase 5 trains the decoder via experience replay.
+#[derive(Module, Debug)]
+pub struct SaeDecoder<B: Backend> {
+    pub(crate) decoder: Linear<B>,
+    #[module(skip)]
     pub region: RegionId,
+    #[module(skip)]
     pub n_in: usize,
+    #[module(skip)]
     pub n_units: usize,
-    decoder: Linear,
-    device: Device,
 }
 
-impl SaeDecoder {
-    pub fn new(
-        region: RegionId,
-        n_in: usize,
-        vb: VarBuilder,
-        device: Device,
-    ) -> PerceptionResult<Self> {
-        let decoder = linear_no_bias(N_UNITS, n_in, vb)?;
-        Ok(Self {
+impl<B: Backend> SaeDecoder<B> {
+    pub fn new(region: RegionId, n_in: usize, device: &B::Device) -> Self {
+        let decoder = LinearConfig::new(N_UNITS, n_in)
+            .with_bias(false)
+            .init(device);
+        Self {
+            decoder,
             region,
             n_in,
             n_units: N_UNITS,
-            decoder,
-            device,
-        })
+        }
     }
 
     /// MSE between the original encoder input and the decoder's reconstruction
@@ -42,75 +40,50 @@ impl SaeDecoder {
         &self,
         input: &[f32],
         act: &SparseActivation,
-    ) -> PerceptionResult<f32> {
+        device: &B::Device,
+    ) -> f32 {
         debug_assert_eq!(input.len(), self.n_in);
-        let dense = act.to_dense();
-        let dense_t = Tensor::from_vec(dense, (1, act.n_units), &self.device)?;
-        let recon = self.decoder.forward(&dense_t)?.squeeze(0)?;
-        let recon_vec: Vec<f32> = recon.to_vec1()?;
-        let mse = input
+        let dense = act.to_dense_n(self.n_units);
+        let dense_t = Tensor::<B, 2>::from_data(TensorData::new(dense, [1, self.n_units]), device);
+        let recon_t: Tensor<B, 2> = self.decoder.forward(dense_t); // [1, n_in]
+        let recon_vec: Vec<f32> = recon_t.into_data().convert::<f32>().to_vec().unwrap();
+        input
             .iter()
             .zip(recon_vec.iter())
             .map(|(a, b)| (a - b).powi(2))
             .sum::<f32>()
-            / self.n_in as f32;
-        Ok(mse)
+            / self.n_in as f32
     }
 
-    /// MSE loss as a tracked Tensor — used during sleep training.
-    ///
-    /// `input_vec` is the original encoder embedding.
-    /// `sparse_z` is the masked linear output from the k-WTA layer (tracked tensor, shape [n_units]).
-    /// Gradient flows: loss → decoder weights → sparse_z → encoder Linear weights.
-    pub fn mse_loss_tensor(
-        &self,
-        input_vec: &[f32],
-        sparse_z: &Tensor,
-    ) -> PerceptionResult<Tensor> {
-        debug_assert_eq!(input_vec.len(), self.n_in);
-        let input_t = Tensor::from_vec(input_vec.to_vec(), (self.n_in,), &self.device)?;
-        let recon = self.decoder.forward(&sparse_z.unsqueeze(0)?)?.squeeze(0)?;
-        let loss = (input_t - recon)?.sqr()?.mean_all()?;
-        Ok(loss)
-    }
-
-    /// Batched MSE loss for NREM replay.
+    /// Batched MSE loss for NREM replay (B=1 for sequential, B>1 for batched).
     ///
     /// `input_batch`: `[B, n_in]` (target, detached).
     /// `sparse_z_batch`: `[B, n_units]` (tracked — gradients flow through this).
     /// Returns a scalar mean MSE over the whole batch × all output dims.
-    pub fn mse_loss_batch_tensor(
+    pub fn mse_loss_batch(
         &self,
-        input_batch: &Tensor,
-        sparse_z_batch: &Tensor,
-    ) -> PerceptionResult<Tensor> {
-        let recon = self.decoder.forward(sparse_z_batch)?; // [B, n_in]
-        let loss = (input_batch - recon)?.sqr()?.mean_all()?;
-        Ok(loss)
-    }
-
-    /// Replace the internal decoder with a new Linear (used during growth).
-    pub fn replace_linear(&mut self, new_decoder: Linear, new_n_units: usize) {
-        self.decoder = new_decoder;
-        self.n_units = new_n_units;
+        input_batch: Tensor<B, 2>,
+        sparse_z_batch: Tensor<B, 2>,
+    ) -> Tensor<B, 1> {
+        let recon: Tensor<B, 2> = self.decoder.forward(sparse_z_batch); // [B, n_in]
+        (input_batch - recon).powi_scalar(2).mean()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
-    use candle_nn::VarMap;
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::NdArray;
 
-    fn make_decoder(region: RegionId, n_in: usize) -> SaeDecoder {
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        SaeDecoder::new(region, n_in, vb, device).unwrap()
+    fn make_decoder(region: RegionId, n_in: usize) -> SaeDecoder<NdArray> {
+        let device = NdArrayDevice::Cpu;
+        SaeDecoder::new(region, n_in, &device)
     }
 
     #[test]
     fn reconstruction_error_is_finite_and_nonneg() {
+        let device = NdArrayDevice::Cpu;
         let dec = make_decoder(RegionId::Visual, 384);
         let input = vec![0.1f32; 384];
         let act = SparseActivation {
@@ -119,7 +92,7 @@ mod tests {
             values: vec![0.5f32; 20],
             n_units: N_UNITS,
         };
-        let err = dec.reconstruction_error(&input, &act).unwrap();
+        let err = dec.reconstruction_error(&input, &act, &device);
         assert!(err.is_finite());
         assert!(err >= 0.0);
     }

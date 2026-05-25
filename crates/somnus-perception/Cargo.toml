@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-candle-core  = { workspace = true }
-candle-nn    = { workspace = true }
+burn         = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
 

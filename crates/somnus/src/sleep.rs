@@ -424,9 +424,7 @@ pub fn run_sleep_cycle(
 
     // ── Homeostatic downscaling ───────────────────────────────────────────────
     if !was_interrupted {
-        if let Err(e) = perception.homeostatic_decay(DECAY_RATE) {
-            tracing::warn!(?e, "homeostatic decay error");
-        }
+        perception.homeostatic_decay(DECAY_RATE);
     }
 
     // ── REM pre-spill: warm recall probe ─────────────────────────────────────
@@ -571,10 +569,8 @@ pub fn run_sleep_cycle(
                     gist_recall_rate = ?gist_recall_rate,
                     "growing region"
                 );
-                match perception.grow_region(region, GROWTH_BATCH) {
-                    Ok(()) => regions_grown.push(region),
-                    Err(e) => tracing::warn!(?e, region = ?region, "grow_region error"),
-                }
+                perception.grow_region(region, GROWTH_BATCH);
+                regions_grown.push(region);
             }
         }
 
@@ -605,13 +601,10 @@ pub fn run_sleep_cycle(
             for (i, &region) in region_ids.iter().enumerate() {
                 let n_grown = perception.region_sizes()[i].saturating_sub(N_UNITS);
                 if n_grown >= prune_min_grown {
-                    match perception.prune_region(region, prune_fraction) {
-                        Ok(n) if n > 0 => {
-                            regions_pruned.push(region);
-                            total_units_pruned += n;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(?e, region = ?region, "prune_region error"),
+                    let n = perception.prune_region(region, prune_fraction);
+                    if n > 0 {
+                        regions_pruned.push(region);
+                        total_units_pruned += n;
                     }
                 }
             }
@@ -675,10 +668,8 @@ pub fn run_sleep_cycle(
                     Ok(synth_ep) => {
                         synthetics_produced += 1;
                         // Measure novelty: MSE of both source regionals against the synthetic.
-                        let mse_a =
-                            perception.measure_output_mse_inference(&synth_ep, reg_a);
-                        let mse_b =
-                            perception.measure_output_mse_inference(&synth_ep, reg_b);
+                        let mse_a = perception.measure_output_mse_inference(&synth_ep, reg_a);
+                        let mse_b = perception.measure_output_mse_inference(&synth_ep, reg_b);
                         match (mse_a, mse_b) {
                             (Ok(a), Ok(b)) => {
                                 synth_mse_total += (a + b) / 2.0;

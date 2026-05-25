@@ -1,7 +1,11 @@
-use candle_core::{Device, Module, Tensor};
-use candle_nn::{linear, Linear, VarBuilder};
-
-use crate::error::PerceptionResult;
+use burn::{
+    module::Module,
+    nn::{Linear, LinearConfig},
+    tensor::{
+        backend::{AutodiffBackend, Backend},
+        Tensor, TensorData,
+    },
+};
 
 pub const N_UNITS: usize = 1024;
 pub const K_ACTIVE: usize = 20;
@@ -66,115 +70,55 @@ impl SparseActivation {
 }
 
 /// k-WTA linear layer with per-unit duty-cycle boosting.
-pub struct KWtaLayer {
+///
+/// Generic over backend B. The training-path methods (forward_tracked,
+/// forward_tracked_batch) are in a separate impl block requiring AutodiffBackend.
+#[derive(Module, Debug)]
+pub struct KWtaLayer<B: Backend> {
+    pub linear: Linear<B>,
+    #[module(skip)]
     pub region: RegionId,
-    pub linear: Linear,
+    #[module(skip)]
     pub n_units: usize,
-    device: Device,
+    #[module(skip)]
     pub duty_cycle: Vec<f32>,
 }
 
-impl KWtaLayer {
-    pub fn new(
-        region: RegionId,
-        n_in: usize,
-        vb: VarBuilder,
-        device: Device,
-    ) -> PerceptionResult<Self> {
-        let linear = linear(n_in, N_UNITS, vb)?;
-        Ok(Self {
-            region,
+impl<B: Backend> KWtaLayer<B> {
+    pub fn new(region: RegionId, n_in: usize, device: &B::Device) -> Self {
+        let linear = LinearConfig::new(n_in, N_UNITS)
+            .with_bias(false)
+            .init(device);
+        Self {
             linear,
+            region,
             n_units: N_UNITS,
-            device,
             duty_cycle: vec![0.0f32; N_UNITS],
-        })
+        }
     }
 
-    pub fn forward(&mut self, input: &[f32]) -> PerceptionResult<SparseActivation> {
-        let t = Tensor::from_vec(input.to_vec(), (1, input.len()), &self.device)?;
-        let z = self.linear.forward(&t)?.squeeze(0)?;
-        let z_vec: Vec<f32> = z.to_vec1()?;
+    pub fn forward(&mut self, input: &[f32], device: &B::Device) -> SparseActivation {
+        let data = TensorData::new(input.to_vec(), [1, input.len()]);
+        let t = Tensor::<B, 2>::from_data(data, device);
+        let z: Tensor<B, 2> = self.linear.forward(t);
+        let z_vec: Vec<f32> = z.into_data().convert::<f32>().to_vec().unwrap();
         self.select_top_k(z_vec)
     }
 
     /// Forward pass without updating the duty-cycle moving average.
     ///
-    /// Use during settling iterations so that multiple passes per encoder input
+    /// Use during settling iterations so multiple passes per encoder input
     /// do not inflate the effective duty-cycle learning rate (ADR 0011).
-    pub fn forward_no_dc(&self, input: &[f32]) -> PerceptionResult<SparseActivation> {
-        let t = Tensor::from_vec(input.to_vec(), (1, input.len()), &self.device)?;
-        let z = self.linear.forward(&t)?.squeeze(0)?;
-        let z_vec: Vec<f32> = z.to_vec1()?;
+    pub fn forward_no_dc(&self, input: &[f32], device: &B::Device) -> SparseActivation {
+        let data = TensorData::new(input.to_vec(), [1, input.len()]);
+        let t = Tensor::<B, 2>::from_data(data, device);
+        let z: Tensor<B, 2> = self.linear.forward(t);
+        let z_vec: Vec<f32> = z.into_data().convert::<f32>().to_vec().unwrap();
         self.select_top_k_no_dc(z_vec)
     }
 
-    /// Forward pass that also returns the intermediate tracked tensor `z` for backprop.
-    /// Returns `(activation, z_tensor)` where z_tensor has shape `[n_units]`.
-    pub fn forward_tracked(
-        &mut self,
-        input: &[f32],
-    ) -> PerceptionResult<(SparseActivation, Tensor)> {
-        let t = Tensor::from_vec(input.to_vec(), (1, input.len()), &self.device)?;
-        let z = self.linear.forward(&t)?.squeeze(0)?; // tracked [n_units]
-        let z_vec: Vec<f32> = z.to_vec1()?; // read values — does NOT detach z
-
-        let act = self.select_top_k(z_vec)?;
-        Ok((act, z))
-    }
-
-    /// Batched forward for NREM replay.
-    ///
-    /// `input_batch` has shape `[B, n_in]`. Returns `(z_batch, mask_batch)` both
-    /// shape `[B, n_units]`. `z_batch` is tracked; `mask_batch` is a detached
-    /// constant. Caller computes `sparse_z = z_batch * mask_batch` to preserve
-    /// gradient flow through the encoder weights.
-    ///
-    /// Duty cycles are updated per-sample in batch order (same semantics as
-    /// the sequential path).
-    pub fn forward_tracked_batch(
-        &mut self,
-        input_batch: &Tensor,
-        b: usize,
-    ) -> PerceptionResult<(Tensor, Tensor)> {
-        let z_batch = self.linear.forward(input_batch)?; // [B, n_units]
-        let z_vec2: Vec<Vec<f32>> = z_batch.to_vec2()?;
-
+    fn select_top_k(&mut self, z_vec: Vec<f32>) -> SparseActivation {
         let n = self.n_units;
-        let mut flat_masks = vec![0.0f32; b * n];
-
-        for (si, z_vec) in z_vec2.iter().enumerate() {
-            let target_dc = K_ACTIVE as f32 / n as f32;
-            let mut boosted = z_vec.clone();
-            for (i, dc) in self.duty_cycle.iter().enumerate() {
-                boosted[i] += BOOST_STRENGTH * (target_dc - dc);
-            }
-            let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
-            let split = n - K_ACTIVE;
-            indexed.select_nth_unstable_by(split, |a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let top_k = &indexed[split..];
-
-            let active: std::collections::HashSet<usize> =
-                top_k.iter().map(|&(i, _)| i).collect();
-            for i in 0..n {
-                let fired = if active.contains(&i) { 1.0 } else { 0.0 };
-                self.duty_cycle[i] =
-                    (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
-                if fired > 0.0 {
-                    flat_masks[si * n + i] = 1.0;
-                }
-            }
-        }
-
-        let mask_t = Tensor::from_vec(flat_masks, (b, n), &self.device)?;
-        Ok((z_batch, mask_t))
-    }
-
-    fn select_top_k(&mut self, z_vec: Vec<f32>) -> PerceptionResult<SparseActivation> {
-        let n = self.n_units;
-
         let target_dc = K_ACTIVE as f32 / n as f32;
         let mut boosted = z_vec.clone();
         for (i, dc) in self.duty_cycle.iter().enumerate() {
@@ -198,16 +142,15 @@ impl KWtaLayer {
                 (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
         }
 
-        Ok(SparseActivation {
+        SparseActivation {
             region: self.region,
             indices: pairs.iter().map(|(i, _)| *i).collect(),
             values: pairs.iter().map(|(_, v)| *v).collect(),
             n_units: n,
-        })
+        }
     }
 
-    /// Same selection logic as `select_top_k` but does not update duty cycles.
-    fn select_top_k_no_dc(&self, z_vec: Vec<f32>) -> PerceptionResult<SparseActivation> {
+    fn select_top_k_no_dc(&self, z_vec: Vec<f32>) -> SparseActivation {
         let n = self.n_units;
         let target_dc = K_ACTIVE as f32 / n as f32;
         let mut boosted = z_vec.clone();
@@ -222,42 +165,123 @@ impl KWtaLayer {
         let top_k = &indexed[split..];
         let mut pairs: Vec<(u16, f32)> = top_k.iter().map(|&(i, _)| (i as u16, z_vec[i])).collect();
         pairs.sort_unstable_by_key(|(i, _)| *i);
-        Ok(SparseActivation {
+        SparseActivation {
             region: self.region,
             indices: pairs.iter().map(|(i, _)| *i).collect(),
             values: pairs.iter().map(|(_, v)| *v).collect(),
             n_units: n,
-        })
+        }
+    }
+}
+
+/// Training-path methods: require AutodiffBackend so `.detach()` is available.
+impl<B: AutodiffBackend> KWtaLayer<B> {
+    /// Forward pass that returns the tracked z tensor for backprop.
+    ///
+    /// Returns `(activation, z_tensor)` where z_tensor has shape `[1, n_units]`.
+    /// `.detach()` is called on a clone for the readback; the original `z` participates
+    /// in the gradient graph.
+    pub fn forward_tracked(
+        &mut self,
+        input: &[f32],
+        device: &B::Device,
+    ) -> (SparseActivation, Tensor<B, 2>) {
+        let data = TensorData::new(input.to_vec(), [1, input.len()]);
+        let t = Tensor::<B, 2>::from_data(data, device);
+        let z: Tensor<B, 2> = self.linear.forward(t); // [1, n_units], tracked
+
+        let z_vec: Vec<f32> = z
+            .clone()
+            .detach()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+
+        let act = self.select_top_k(z_vec);
+        (act, z)
+    }
+
+    /// Batched forward for NREM replay.
+    ///
+    /// `input_batch` has shape `[B, n_in]`. Returns `(z_batch, flat_masks)` where
+    /// `z_batch` is `[B, n_units]` tracked and `flat_masks` is a flat `Vec<f32>` of
+    /// shape `[B * n_units]` for the caller to upload as an untracked mask tensor.
+    ///
+    /// Duty cycles are updated per-sample in batch order.
+    pub fn forward_tracked_batch(
+        &mut self,
+        input_batch: Tensor<B, 2>,
+        b: usize,
+    ) -> (Tensor<B, 2>, Vec<f32>) {
+        let z_batch: Tensor<B, 2> = self.linear.forward(input_batch); // [B, n_units]
+
+        let z_vals: Vec<f32> = z_batch
+            .clone()
+            .detach()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+
+        let n = self.n_units;
+        let mut flat_masks = vec![0.0f32; b * n];
+
+        for (si, z_row) in z_vals.chunks(n).enumerate() {
+            let target_dc = K_ACTIVE as f32 / n as f32;
+            let mut boosted: Vec<f32> = z_row.to_vec();
+            for (i, dc) in self.duty_cycle.iter().enumerate() {
+                boosted[i] += BOOST_STRENGTH * (target_dc - dc);
+            }
+            let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
+            let split = n - K_ACTIVE;
+            indexed.select_nth_unstable_by(split, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top_k = &indexed[split..];
+
+            let active: std::collections::HashSet<usize> = top_k.iter().map(|&(i, _)| i).collect();
+            for i in 0..n {
+                let fired = if active.contains(&i) { 1.0 } else { 0.0 };
+                self.duty_cycle[i] =
+                    (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
+                if fired > 0.0 {
+                    flat_masks[si * n + i] = 1.0;
+                }
+            }
+        }
+
+        (z_batch, flat_masks)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
-    use candle_nn::VarMap;
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::NdArray;
 
-    fn make_layer(region: RegionId, n_in: usize) -> KWtaLayer {
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        KWtaLayer::new(region, n_in, vb, device).unwrap()
+    fn make_layer(region: RegionId, n_in: usize) -> KWtaLayer<NdArray> {
+        let device = NdArrayDevice::Cpu;
+        KWtaLayer::new(region, n_in, &device)
     }
 
     #[test]
     fn kwta_produces_exactly_k_active() {
+        let device = NdArrayDevice::Cpu;
         let mut layer = make_layer(RegionId::Visual, 384);
         let input = vec![0.5f32; 384];
-        let act = layer.forward(&input).unwrap();
+        let act = layer.forward(&input, &device);
         assert_eq!(act.indices.len(), K_ACTIVE);
         assert_eq!(act.values.len(), K_ACTIVE);
     }
 
     #[test]
     fn kwta_indices_sorted_and_in_range() {
+        let device = NdArrayDevice::Cpu;
         let mut layer = make_layer(RegionId::AudioEnv, 512);
         let input: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
-        let act = layer.forward(&input).unwrap();
+        let act = layer.forward(&input, &device);
         for &idx in &act.indices {
             assert!((idx as usize) < N_UNITS);
         }
@@ -268,9 +292,10 @@ mod tests {
 
     #[test]
     fn to_dense_has_correct_nonzero_count() {
+        let device = NdArrayDevice::Cpu;
         let mut layer = make_layer(RegionId::AudioSpeech, 384);
         let input = vec![1.0f32; 384];
-        let act = layer.forward(&input).unwrap();
+        let act = layer.forward(&input, &device);
         let dense = act.to_dense();
         assert_eq!(dense.len(), N_UNITS);
         let nonzero = dense.iter().filter(|&&v| v != 0.0).count();
@@ -288,7 +313,6 @@ mod tests {
         let dense = act.to_dense_n(512);
         assert_eq!(dense.len(), 512);
         assert_eq!(dense[0], 1.0);
-        // index 512 is out of range for n=512, should be dropped
         assert!(dense.iter().skip(1).all(|&v| v == 0.0));
     }
 }

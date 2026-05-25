@@ -5,7 +5,7 @@
 /// B=64. Prints throughput in traces/s and relative speedup.
 ///
 /// Run: cargo run --release -p somnus-perception --bin bench_nrem_batch
-use candle_core::Device;
+use burn::backend::wgpu::WgpuDevice;
 use somnus_perception::PerceptionProcessor;
 use std::time::Instant;
 
@@ -17,7 +17,9 @@ fn random_regional(seed_base: usize) -> [Vec<f32>; 5] {
     // Deterministic LCG so results are reproducible.
     let mut state = (seed_base as u64).wrapping_add(0xdeadbeef);
     let next = |s: &mut u64| -> f32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*s >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
     };
     std::array::from_fn(|i| (0..REGION_DIMS[i]).map(|_| next(&mut state)).collect())
@@ -43,24 +45,27 @@ fn run_batched(proc: &mut PerceptionProcessor, traces: &[[Vec<f32>; 5]], batch_s
 }
 
 fn main() {
-    let device = Device::Cpu;
+    let device = WgpuDevice::DefaultDevice;
     println!("Generating {N_TRACES} synthetic traces…");
     let traces: Vec<[Vec<f32>; 5]> = (0..N_TRACES).map(random_regional).collect();
 
     println!("Warming up JIT / allocators (1 sequential pass, not timed)…");
     {
-        let mut proc = PerceptionProcessor::new(device.clone()).unwrap();
+        let mut proc = PerceptionProcessor::new(device.clone());
         let _ = run_sequential(&mut proc, &traces[..32]);
     }
 
-    println!("\n{:<10} {:>14} {:>14} {:>10}", "batch_size", "wall_ms", "traces/s", "speedup_vs_1");
+    println!(
+        "\n{:<10} {:>14} {:>14} {:>10}",
+        "batch_size", "wall_ms", "traces/s", "speedup_vs_1"
+    );
     println!("{}", "-".repeat(52));
 
     let mut baseline_tps = 0.0f64;
 
     for &bs in BATCH_SIZES {
         // Fresh processor each run so optimizer state + duty cycles start equal.
-        let mut proc = PerceptionProcessor::new(device.clone()).unwrap();
+        let mut proc = PerceptionProcessor::new(device.clone());
 
         let t0 = Instant::now();
         if bs == 1 {
@@ -76,6 +81,9 @@ fn main() {
         }
         let speedup = tps / baseline_tps.max(1.0);
 
-        println!("{:<10} {:>14.1} {:>14.0} {:>10.2}×", bs, elapsed_ms, tps, speedup);
+        println!(
+            "{:<10} {:>14.1} {:>14.0} {:>10.2}×",
+            bs, elapsed_ms, tps, speedup
+        );
     }
 }

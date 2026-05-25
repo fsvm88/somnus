@@ -1,10 +1,10 @@
-use candle_core::{Device, Module, Tensor};
-use candle_nn::{linear_no_bias, ops::softmax, Linear, VarBuilder};
-
-use crate::{
-    error::PerceptionResult,
-    region::{SparseActivation, N_UNITS},
+use burn::{
+    module::Module,
+    nn::{Linear, LinearConfig},
+    tensor::{activation, backend::Backend, Tensor, TensorData},
 };
+
+use crate::region::{SparseActivation, N_UNITS};
 
 pub const EPISODE_DIM: usize = 640;
 
@@ -29,34 +29,41 @@ pub struct EpisodeVector(pub Vec<f32>);
 /// remains fixed-size regardless of how much the regional k-WTA layers have grown.
 /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
 /// The Language slot is zero-padded when no text embedding is available.
-pub struct BindingArea {
-    /// Per-region input projection: N_UNITS → D_PROJ.
-    pub(crate) region_projs: [Linear; 5],
-    pub(crate) w_q: Linear,
-    pub(crate) w_k: Linear,
-    pub(crate) w_v: Linear,
-    device: Device,
+#[derive(Module, Debug)]
+pub struct BindingArea<B: Backend> {
+    /// Per-region input projections: N_UNITS → D_PROJ (5 separate fields for derive compat).
+    pub(crate) region_0: Linear<B>,
+    pub(crate) region_1: Linear<B>,
+    pub(crate) region_2: Linear<B>,
+    pub(crate) region_3: Linear<B>,
+    pub(crate) region_4: Linear<B>,
+    pub(crate) w_q: Linear<B>,
+    pub(crate) w_k: Linear<B>,
+    pub(crate) w_v: Linear<B>,
 }
 
-impl BindingArea {
-    pub fn new(vb: VarBuilder, device: Device) -> PerceptionResult<Self> {
-        let region_projs = [
-            linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_0"))?,
-            linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_1"))?,
-            linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_2"))?,
-            linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_3"))?,
-            linear_no_bias(N_UNITS, D_PROJ, vb.pp("region_4"))?,
-        ];
-        let w_q = linear_no_bias(D_PROJ, D_PROJ, vb.pp("attn_q"))?;
-        let w_k = linear_no_bias(D_PROJ, D_PROJ, vb.pp("attn_k"))?;
-        let w_v = linear_no_bias(D_PROJ, D_PROJ, vb.pp("attn_v"))?;
-        Ok(Self {
-            region_projs,
-            w_q,
-            w_k,
-            w_v,
-            device,
-        })
+impl<B: Backend> BindingArea<B> {
+    pub fn new(device: &B::Device) -> Self {
+        let proj = || {
+            LinearConfig::new(N_UNITS, D_PROJ)
+                .with_bias(false)
+                .init(device)
+        };
+        let attn = || {
+            LinearConfig::new(D_PROJ, D_PROJ)
+                .with_bias(false)
+                .init(device)
+        };
+        Self {
+            region_0: proj(),
+            region_1: proj(),
+            region_2: proj(),
+            region_3: proj(),
+            region_4: proj(),
+            w_q: attn(),
+            w_k: attn(),
+            w_v: attn(),
+        }
     }
 
     /// Produce an episode vector from five sparse activations (one per region).
@@ -70,44 +77,58 @@ impl BindingArea {
         &self,
         acts: &[&SparseActivation; 5],
         wm_context: Option<&[f32]>,
-    ) -> PerceptionResult<EpisodeVector> {
+        device: &B::Device,
+    ) -> EpisodeVector {
+        let region_projs = [
+            &self.region_0,
+            &self.region_1,
+            &self.region_2,
+            &self.region_3,
+            &self.region_4,
+        ];
+
         // Project each region: N_UNITS → D_PROJ
-        let projected: Vec<Tensor> = acts
+        let projected: Vec<Tensor<B, 2>> = acts
             .iter()
-            .zip(self.region_projs.iter())
-            .map(|(act, proj)| -> PerceptionResult<Tensor> {
+            .zip(region_projs.iter())
+            .map(|(act, proj)| {
                 let dense = act.to_dense_n(N_UNITS);
-                let t = Tensor::from_vec(dense, (1, N_UNITS), &self.device)?;
-                Ok(proj.forward(&t)?.squeeze(0)?) // [D_PROJ]
+                let t = Tensor::<B, 2>::from_data(TensorData::new(dense, [1, N_UNITS]), device);
+                let out: Tensor<B, 2> = proj.forward(t); // [1, D_PROJ]
+                out
             })
-            .collect::<PerceptionResult<_>>()?;
+            .collect();
 
         // Stack current region tokens: [5, D_PROJ]
-        let x = Tensor::stack(&projected, 0)?;
+        let x: Tensor<B, 2> = Tensor::cat(projected, 0);
 
         // Q from current regions only: [5, D_PROJ]
-        let q = self.w_q.forward(&x)?;
+        let q: Tensor<B, 2> = self.w_q.forward(x.clone());
 
         // K and V from current regions + optional working-memory context.
-        // When context is present the wm vector [EPISODE_DIM] is reshaped to
-        // [5, D_PROJ] and concatenated, extending K/V to [10, D_PROJ].
         let (k, v) = if let Some(wm) = wm_context {
             debug_assert_eq!(wm.len(), EPISODE_DIM);
-            let wm_t = Tensor::from_slice(wm, (5, D_PROJ), &self.device)?;
-            let x_ext = Tensor::cat(&[&x, &wm_t], 0)?; // [10, D_PROJ]
-            (self.w_k.forward(&x_ext)?, self.w_v.forward(&x_ext)?)
+            let wm_t = Tensor::<B, 2>::from_data(TensorData::new(wm.to_vec(), [5, D_PROJ]), device);
+            let x_ext: Tensor<B, 2> = Tensor::cat(vec![x, wm_t], 0); // [10, D_PROJ]
+            (self.w_k.forward(x_ext.clone()), self.w_v.forward(x_ext))
         } else {
-            (self.w_k.forward(&x)?, self.w_v.forward(&x)?)
+            (self.w_k.forward(x.clone()), self.w_v.forward(x))
         };
 
-        // Scaled dot-product attention: Q [5,D] × K^T [D,5or10] → scores [5,5or10]
-        let scale = 1.0 / (D_PROJ as f64).sqrt();
-        let scores = q.matmul(&k.t()?)?.affine(scale, 0.0)?;
-        let attn = softmax(&scores, 1)?;
-        let out = attn.matmul(&v)?; // [5, D_PROJ]
+        // Scaled dot-product: Q [5,D] × K^T → scores [5, 5 or 10]
+        let scale = (D_PROJ as f32).sqrt().recip();
+        let scores: Tensor<B, 2> = q.matmul(k.transpose()).mul_scalar(scale);
+        let attn: Tensor<B, 2> = activation::softmax(scores, 1);
+        let out: Tensor<B, 2> = attn.matmul(v); // [5, D_PROJ]
 
         // Flatten [5, D_PROJ] → [EPISODE_DIM]
-        Ok(EpisodeVector(out.flatten_all()?.to_vec1()?))
+        let flat: Vec<f32> = out
+            .flatten::<1>(0, 1)
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        EpisodeVector(flat)
     }
 }
 
@@ -115,14 +136,12 @@ impl BindingArea {
 mod tests {
     use super::*;
     use crate::region::RegionId;
-    use candle_core::DType;
-    use candle_nn::VarMap;
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::NdArray;
 
-    fn make_area() -> BindingArea {
-        let device = Device::Cpu;
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        BindingArea::new(vb, device).unwrap()
+    fn make_area() -> BindingArea<NdArray> {
+        let device = NdArrayDevice::Cpu;
+        BindingArea::new(&device)
     }
 
     fn dummy_act(region: RegionId) -> SparseActivation {
@@ -145,6 +164,7 @@ mod tests {
 
     #[test]
     fn output_is_episode_dim() {
+        let device = NdArrayDevice::Cpu;
         let area = make_area();
         let acts = [
             &dummy_act(RegionId::AudioSpeech),
@@ -153,51 +173,59 @@ mod tests {
             &dummy_act(RegionId::Symbolic),
             &dummy_act(RegionId::Language),
         ];
-        let ep = area.forward(&acts, None).unwrap();
+        let ep = area.forward(&acts, None, &device);
         assert_eq!(ep.0.len(), EPISODE_DIM);
         assert!(ep.0.iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn zero_language_slot_is_finite() {
+        let device = NdArrayDevice::Cpu;
         let area = make_area();
-        let ep = area
-            .forward(&[
+        let ep = area.forward(
+            &[
                 &dummy_act(RegionId::AudioSpeech),
                 &dummy_act(RegionId::AudioEnv),
                 &dummy_act(RegionId::Visual),
                 &dummy_act(RegionId::Symbolic),
                 &zero_act(RegionId::Language),
-            ], None)
-            .unwrap();
+            ],
+            None,
+            &device,
+        );
         assert_eq!(ep.0.len(), EPISODE_DIM);
         assert!(ep.0.iter().all(|v| v.is_finite()));
     }
 
     #[test]
     fn output_differs_with_different_inputs() {
+        let device = NdArrayDevice::Cpu;
         let area = make_area();
         let zero = zero_act(RegionId::Visual);
         let active = dummy_act(RegionId::Visual);
 
-        let ep_zero = area
-            .forward(&[
+        let ep_zero = area.forward(
+            &[
                 &dummy_act(RegionId::AudioSpeech),
                 &dummy_act(RegionId::AudioEnv),
                 &zero,
                 &dummy_act(RegionId::Symbolic),
                 &zero_act(RegionId::Language),
-            ], None)
-            .unwrap();
-        let ep_active = area
-            .forward(&[
+            ],
+            None,
+            &device,
+        );
+        let ep_active = area.forward(
+            &[
                 &dummy_act(RegionId::AudioSpeech),
                 &dummy_act(RegionId::AudioEnv),
                 &active,
                 &dummy_act(RegionId::Symbolic),
                 &zero_act(RegionId::Language),
-            ], None)
-            .unwrap();
+            ],
+            None,
+            &device,
+        );
         assert_ne!(
             ep_zero.0, ep_active.0,
             "attention should produce different outputs"

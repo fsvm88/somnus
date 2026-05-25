@@ -34,7 +34,7 @@ use action::ActionDecoder;
 use whisper_asr::WhisperDecoder;
 
 use anyhow::Result;
-use candle_core::{Device as CandleDevice, Tensor};
+use burn::backend::wgpu::WgpuDevice;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use somnus_encoding::{
@@ -49,6 +49,7 @@ use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, SensorMetrics, Timestamp, VideoCapture, VideoFrame,
 };
+use safetensors::SafeTensors;
 use std::{
     io::{BufWriter, Write},
     path::PathBuf,
@@ -385,25 +386,32 @@ const LANG_DIM: usize = 896; // Qwen2.5 hidden / embedding dimension
 
 struct LangEmbedder {
     tokenizer: Tokenizer,
-    embed_table: Tensor, // [vocab_size, LANG_DIM], frozen
-    device: CandleDevice,
+    /// Flat row-major [vocab_size * LANG_DIM] f32 embed table.
+    embed_table: Vec<f32>,
 }
 
 impl LangEmbedder {
-    fn new(models_dir: &std::path::Path, device: CandleDevice) -> Result<Self> {
+    fn new(models_dir: &std::path::Path) -> Result<Self> {
         let embed_path = models_dir.join("qwen25_embed_table.safetensors");
         let tok_path = models_dir.join("qwen25_tokenizer.json");
-        let mut embed_tensors = candle_core::safetensors::load(&embed_path, &device)?;
-        let embed_table = embed_tensors
-            .remove("embed_tokens.weight")
-            .ok_or_else(|| anyhow::anyhow!("embed_tokens.weight missing in embed table"))?;
+        let bytes = std::fs::read(&embed_path)?;
+        let st = SafeTensors::deserialize(&bytes)
+            .map_err(|e| anyhow::anyhow!("safetensors load failed: {e}"))?;
+        let tv = st
+            .tensor("embed_tokens.weight")
+            .map_err(|e| anyhow::anyhow!("embed_tokens.weight missing: {e}"))?;
+        let embed_table: Vec<f32> = tv
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
-        info!(vocab = embed_table.dim(0)?, "language embedder ready");
+        let vocab = embed_table.len() / LANG_DIM;
+        info!(vocab, "language embedder ready");
         Ok(Self {
             tokenizer,
             embed_table,
-            device,
         })
     }
 
@@ -418,9 +426,21 @@ impl LangEmbedder {
         if ids.is_empty() {
             return Ok(vec![0.0f32; LANG_DIM]);
         }
-        let idx = Tensor::from_vec(ids.to_vec(), (ids.len(),), &self.device)?;
-        let embeds = self.embed_table.index_select(&idx, 0)?; // [n, 896]
-        Ok(embeds.mean(0)?.to_vec1()?)
+        let mut mean = vec![0.0f32; LANG_DIM];
+        for &id in ids {
+            let start = id as usize * LANG_DIM;
+            for (a, b) in mean
+                .iter_mut()
+                .zip(&self.embed_table[start..start + LANG_DIM])
+            {
+                *a += b;
+            }
+        }
+        let n = ids.len() as f32;
+        for v in &mut mean {
+            *v /= n;
+        }
+        Ok(mean)
     }
 }
 
@@ -535,10 +555,7 @@ async fn main() -> Result<()> {
     };
 
     // ── perception processor ──────────────────────────────────────────────────
-    let mut perception = match PerceptionProcessor::new(CandleDevice::Cpu) {
-        Ok(p) => p,
-        Err(e) => anyhow::bail!("perception processor init failed: {e}"),
-    };
+    let mut perception = PerceptionProcessor::new(WgpuDevice::DefaultDevice);
     perception.set_prior_beta(args.prior_beta);
     perception.set_settle_steps(args.settle_steps);
     perception.set_settle_beta(args.settle_beta);
@@ -608,7 +625,7 @@ async fn main() -> Result<()> {
 
     // ── action decoder ────────────────────────────────────────────────────────
     let mut decoder: Option<ActionDecoder> = if args.action {
-        match ActionDecoder::new(&args.models_dir, CandleDevice::Cpu) {
+        match ActionDecoder::new(&args.models_dir, WgpuDevice::DefaultDevice) {
             Ok(mut d) => {
                 let dec_w = args
                     .memory_dir
@@ -640,7 +657,7 @@ async fn main() -> Result<()> {
 
     // ── language embedder ─────────────────────────────────────────────────────
     let lang_embedder: Option<LangEmbedder> = if args.language {
-        match LangEmbedder::new(&args.models_dir, CandleDevice::Cpu) {
+        match LangEmbedder::new(&args.models_dir) {
             Ok(le) => Some(le),
             Err(e) => anyhow::bail!("language embedder init failed: {e}"),
         }
@@ -931,32 +948,36 @@ async fn main() -> Result<()> {
     // Decouples Whisper decoding from audio accumulation: the audio thread sends
     // encoder hidden states via a bounded channel and returns immediately; decoding
     // happens concurrently.  Channel capacity 2: one being decoded + one buffered.
-    let asr_hidden_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = if let Some(dec) = whisper_dec {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
-        let lang_tx_asr = lang_tx.clone();
-        let asr_cnt = Arc::clone(&asr_count);
-        let asr_min_chars = args.asr_min_chars;
-        std::thread::spawn(move || {
-            let mut dec = dec;
-            while let Ok(hidden) = rx.recv() {
-                match dec.decode_greedy(&hidden, 200) {
-                    Ok(text) if text.len() >= asr_min_chars.max(1) => {
-                        tracing::info!(chars = text.len(), "whisper ASR");
-                        asr_cnt.fetch_add(1, Ordering::Relaxed);
-                        let _ = lang_tx_asr.blocking_send(text);
+    let asr_hidden_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> =
+        if let Some(dec) = whisper_dec {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+            let lang_tx_asr = lang_tx.clone();
+            let asr_cnt = Arc::clone(&asr_count);
+            let asr_min_chars = args.asr_min_chars;
+            std::thread::spawn(move || {
+                let mut dec = dec;
+                while let Ok(hidden) = rx.recv() {
+                    match dec.decode_greedy(&hidden, 200) {
+                        Ok(text) if text.len() >= asr_min_chars.max(1) => {
+                            tracing::info!(chars = text.len(), "whisper ASR");
+                            asr_cnt.fetch_add(1, Ordering::Relaxed);
+                            let _ = lang_tx_asr.blocking_send(text);
+                        }
+                        Ok(text) if !text.is_empty() => {
+                            tracing::debug!(
+                                chars = text.len(),
+                                "whisper ASR filtered (below min_chars)"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(?e, "whisper ASR failed"),
                     }
-                    Ok(text) if !text.is_empty() => {
-                        tracing::debug!(chars = text.len(), "whisper ASR filtered (below min_chars)");
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(?e, "whisper ASR failed"),
                 }
-            }
-        });
-        Some(tx)
-    } else {
-        None
-    };
+            });
+            Some(tx)
+        } else {
+            None
+        };
 
     // ── audio encoder task ────────────────────────────────────────────────────
     let (audio_emb_tx, mut audio_emb_rx) = mpsc::channel::<AudioEmbedding>(32);
