@@ -5,7 +5,7 @@
 /// B=64. Prints throughput in traces/s and relative speedup.
 ///
 /// Run: cargo run --release -p somnus-perception --bin bench_nrem_batch
-use burn::backend::wgpu::WgpuDevice;
+use burn::backend::ndarray::NdArrayDevice;
 use somnus_perception::PerceptionProcessor;
 use std::time::Instant;
 
@@ -45,7 +45,7 @@ fn run_batched(proc: &mut PerceptionProcessor, traces: &[[Vec<f32>; 5]], batch_s
 }
 
 fn main() {
-    let device = WgpuDevice::DefaultDevice;
+    let device = NdArrayDevice::Cpu;
     println!("Generating {N_TRACES} synthetic traces…");
     let traces: Vec<[Vec<f32>; 5]> = (0..N_TRACES).map(random_regional).collect();
 

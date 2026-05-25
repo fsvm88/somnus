@@ -34,7 +34,7 @@ use action::ActionDecoder;
 use whisper_asr::WhisperDecoder;
 
 use anyhow::Result;
-use burn::backend::wgpu::WgpuDevice;
+use burn::backend::ndarray::NdArrayDevice;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use somnus_encoding::{
@@ -555,7 +555,7 @@ async fn main() -> Result<()> {
     };
 
     // ── perception processor ──────────────────────────────────────────────────
-    let mut perception = PerceptionProcessor::new(WgpuDevice::DefaultDevice);
+    let mut perception = PerceptionProcessor::new(NdArrayDevice::Cpu);
     perception.set_prior_beta(args.prior_beta);
     perception.set_settle_steps(args.settle_steps);
     perception.set_settle_beta(args.settle_beta);
@@ -625,7 +625,7 @@ async fn main() -> Result<()> {
 
     // ── action decoder ────────────────────────────────────────────────────────
     let mut decoder: Option<ActionDecoder> = if args.action {
-        match ActionDecoder::new(&args.models_dir, WgpuDevice::DefaultDevice) {
+        match ActionDecoder::new(&args.models_dir, NdArrayDevice::Cpu) {
             Ok(mut d) => {
                 let dec_w = args
                     .memory_dir

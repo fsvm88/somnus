@@ -9,7 +9,10 @@
 /// mean(text_target_embeddings) from text-bypass queries.
 use anyhow::{bail, Result};
 use burn::{
-    backend::{wgpu::WgpuDevice, Autodiff, Wgpu},
+    backend::{
+        ndarray::{NdArray, NdArrayDevice},
+        Autodiff,
+    },
     module::Module,
     nn::{Linear, LinearConfig},
     optim::adaptor::OptimizerAdaptor,
@@ -28,7 +31,7 @@ const EPISODE_DIM: usize = 640;
 const PROJ_LR: f64 = 1e-4;
 const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
 
-type TrainB = Autodiff<Wgpu>;
+type TrainB = Autodiff<NdArray>;
 type ProjOptim = OptimizerAdaptor<AdamW, ProjModel<TrainB>, TrainB>;
 
 #[derive(Module, Debug)]
@@ -48,13 +51,13 @@ pub struct ActionDecoder {
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
     pub gain: [f32; 5],
-    device: WgpuDevice,
+    device: NdArrayDevice,
 }
 
 impl ActionDecoder {
     /// Load all model artifacts from `models_dir`.
     /// Returns Err if any required file is absent.
-    pub fn new(models_dir: &std::path::Path, device: WgpuDevice) -> Result<Self> {
+    pub fn new(models_dir: &std::path::Path, device: NdArrayDevice) -> Result<Self> {
         let gain_path = models_dir.join("qwen25_gain.onnx");
         let lm_path = models_dir.join("qwen25_lm.onnx");
         let embed_path = models_dir.join("qwen25_embed_table.safetensors");

@@ -9,7 +9,10 @@ pub use region::{KWtaLayer, RegionId, SparseActivation, K_ACTIVE, N_UNITS};
 pub use sae::SaeDecoder;
 
 use burn::{
-    backend::{wgpu::WgpuDevice, Autodiff, Wgpu},
+    backend::{
+        ndarray::{NdArray, NdArrayDevice},
+        Autodiff,
+    },
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
     optim::adaptor::OptimizerAdaptor,
@@ -19,7 +22,7 @@ use burn::{
 };
 use std::collections::VecDeque;
 
-pub type TrainB = Autodiff<Wgpu>;
+pub type TrainB = Autodiff<NdArray>;
 type PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>;
 
 /// Per-region input dimensions. Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
@@ -73,7 +76,7 @@ pub struct PerceptionModel<B: burn::tensor::backend::Backend> {
 }
 
 impl PerceptionModel<TrainB> {
-    pub fn new(device: &WgpuDevice) -> Self {
+    pub fn new(device: &NdArrayDevice) -> Self {
         Self {
             speech_layer: KWtaLayer::new(RegionId::AudioSpeech, 384, device),
             env_layer: KWtaLayer::new(RegionId::AudioEnv, 512, device),
@@ -110,7 +113,7 @@ pub struct PerceptionProcessor {
     model: Option<PerceptionModel<TrainB>>,
     optimizer: PercOptim,
     current_lr: f64,
-    device: WgpuDevice,
+    device: NdArrayDevice,
 
     prior_predictions: [Option<Vec<f32>>; 5],
     prior_beta: f32,
@@ -125,7 +128,7 @@ pub struct PerceptionProcessor {
 }
 
 impl PerceptionProcessor {
-    pub fn new(device: WgpuDevice) -> Self {
+    pub fn new(device: NdArrayDevice) -> Self {
         let model = PerceptionModel::new(&device);
         let optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
         Self {
@@ -429,7 +432,7 @@ impl PerceptionProcessor {
                 for &i in &act.indices {
                     mask_vec[i as usize] = 1.0;
                 }
-                let mask_inner: Tensor<Wgpu, 2> =
+                let mask_inner: Tensor<NdArray, 2> =
                     Tensor::from_data(TensorData::new(mask_vec, [1, n]), &device);
                 let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
                 let sparse_z = z * mask;
@@ -523,7 +526,7 @@ impl PerceptionProcessor {
                 };
 
                 let n_units = flat_masks.len() / b;
-                let mask_inner: Tensor<Wgpu, 2> =
+                let mask_inner: Tensor<NdArray, 2> =
                     Tensor::from_data(TensorData::new(flat_masks, [b, n_units]), &device);
                 let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
                 let sparse_z = z_batch * mask;
@@ -862,8 +865,8 @@ impl PerceptionProcessor {
             let new_n = old_n + n_new;
 
             // Encoder weight shape: [n_in, n_units] — grow by appending new columns (dim 1).
-            let old_w: Tensor<Wgpu, 2> = layer.linear.weight.val().inner();
-            let new_cols: Tensor<Wgpu, 2> =
+            let old_w: Tensor<NdArray, 2> = layer.linear.weight.val().inner();
+            let new_cols: Tensor<NdArray, 2> =
                 Tensor::random([n_in, n_new], Distribution::Normal(0.0, 0.01), &device);
             let new_w: Tensor<TrainB, 2> =
                 Tensor::from_inner(Tensor::cat(vec![old_w, new_cols], 1));
@@ -876,8 +879,8 @@ impl PerceptionProcessor {
         {
             // Decoder weight shape: [n_units, n_in] — grow by appending new rows (dim 0).
             let decoder = Self::decoder_mut(model, region);
-            let old_w: Tensor<Wgpu, 2> = decoder.decoder.weight.val().inner();
-            let new_rows: Tensor<Wgpu, 2> = Tensor::zeros([n_new, n_in], &device);
+            let old_w: Tensor<NdArray, 2> = decoder.decoder.weight.val().inner();
+            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, n_in], &device);
             let new_w: Tensor<TrainB, 2> =
                 Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_w);
