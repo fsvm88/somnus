@@ -20,7 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde_json         = "1"
 candle-core        = "0.10"
 candle-nn          = "0.10"
-burn               = { version = "0.21", features = ["wgpu", "autodiff", "ndarray"] }
+burn               = { version = "0.21", features = ["wgpu", "autodiff", "ndarray", "simd"] }
+burn-ndarray       = { version = "0.21", features = ["multi-threads", "simd"] }
 safetensors        = "0.7"
 hnsw_rs            = "0.3"
 memmap2            = "0.9"
