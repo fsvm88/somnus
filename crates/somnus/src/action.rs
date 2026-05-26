@@ -200,6 +200,7 @@ impl ActionDecoder {
     ///
     /// Loss: cosine MSE — MSE between L2-normalised mean(projected region tokens) and
     /// normalised mean(text token embeddings). Bounded in [0, 4]; magnitude-invariant.
+    #[allow(dead_code)]
     pub fn projection_step(&mut self, episode: &[f32], target_ids: &[u32]) -> Result<f32> {
         if target_ids.is_empty() {
             return Ok(0.0);
@@ -242,6 +243,68 @@ impl ActionDecoder {
         let loss_val: f32 = loss.clone().into_scalar();
 
         // Take/replace pattern for the optimizer step.
+        let model = self.model.take().unwrap();
+        let grads = loss.backward();
+        let grads_p = GradientsParams::from_grads(grads, &model);
+        let model = self.optimizer.step(PROJ_LR, model, grads_p);
+        self.model = Some(model);
+
+        Ok(loss_val)
+    }
+
+    /// Batched surrogate projection training step. Processes all lang-tagged
+    /// traces in a replay batch with a single forward+backward+optimizer call
+    /// instead of one per trace, amortising the 2.87M-param AdamW step.
+    pub fn projection_step_batch(&mut self, pairs: &[(&[f32], &[u32])]) -> Result<f32> {
+        let valid: Vec<_> = pairs.iter().filter(|(_, ids)| !ids.is_empty()).collect();
+        if valid.is_empty() {
+            return Ok(0.0);
+        }
+        let n = valid.len();
+
+        // Compute normalized text means per trace (pure Rust, no grad).
+        let mut text_targets = vec![0.0f32; n * LM_HIDDEN];
+        for (i, (_, ids)) in valid.iter().enumerate() {
+            let mut mean = vec![0.0f32; LM_HIDDEN];
+            for &id in *ids {
+                let row =
+                    &self.embed_table[id as usize * LM_HIDDEN..(id as usize + 1) * LM_HIDDEN];
+                for (a, b) in mean.iter_mut().zip(row) {
+                    *a += b;
+                }
+            }
+            let scale = 1.0 / ids.len() as f32;
+            for v in &mut mean {
+                *v *= scale;
+            }
+            let norm = (mean.iter().map(|x| x * x).sum::<f32>() + 1e-8).sqrt();
+            for (j, v) in mean.iter().enumerate() {
+                text_targets[i * LM_HIDDEN + j] = v / norm;
+            }
+        }
+
+        // Stack episodes: [N, EPISODE_DIM].
+        let flat_eps: Vec<f32> = valid
+            .iter()
+            .flat_map(|(ep, _)| ep.iter().copied())
+            .collect();
+        let ep_t: Tensor<TrainB, 2> =
+            Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
+
+        let model = self.model.as_ref().unwrap();
+        let proj_out = model.projection.forward(ep_t); // [N, N_REGIONS * LM_HIDDEN]
+        let proj_out = proj_out.reshape([n, N_REGIONS, LM_HIDDEN]); // [N, N_REGIONS, LM_HIDDEN]
+        let proj_sum = proj_out.sum_dim(1).reshape([n, LM_HIDDEN]); // [N, LM_HIDDEN]
+        let sq_sum = proj_sum.clone().powf_scalar(2.0).sum_dim(1); // [N, 1]
+        let norm = (sq_sum + 1e-8f32).sqrt(); // [N, 1]
+        let proj_unit = proj_sum / norm; // [N, LM_HIDDEN]
+
+        let text_data = TensorData::new(text_targets, [n, LM_HIDDEN]);
+        let text_unit: Tensor<TrainB, 2> = Tensor::from_data(text_data, &self.device);
+
+        let loss = (proj_unit - text_unit).powf_scalar(2.0).mean();
+        let loss_val: f32 = loss.clone().into_scalar();
+
         let model = self.model.take().unwrap();
         let grads = loss.backward();
         let grads_p = GradientsParams::from_grads(grads, &model);

@@ -1,41 +1,50 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-25
-> **Last commit on main:** a0a5939 — Migrate somnus-perception and ActionDecoder/LangEmbedder from candle to burn+wgpu
+> **Last updated:** 2026-05-26
+> **Last commit on main:** (pending commit — NREM speed optimizations)
 > **Branch:** `main`
 
-## Status: burn+wgpu migration complete
+## Status: NREM speed optimizations implemented
 
-All candle-core/candle-nn usage removed from the codebase. The workspace no longer depends on candle in `somnus-perception` or `somnus`.
+### campaign_no_walks — COMPLETED (15 sessions × 3 cycles)
+- Memory dir: `memory/gpu_campaign_mem3`
+- Final metrics: output_mse≈0.40, warm_recall_l2≈0.84, gist_recall_rate≈0.61
+- **No language traces generated** (decoder_trainable=0 in last sessions — ASR likely not triggering at 20-char threshold on these clips)
 
-### Completed this arc (Tasks 1–7)
-- **T1**: Added burn 0.21 + wgpu + autodiff to workspace deps
-- **T2**: region.rs → KWtaLayer with `#[derive(Module, Debug)]`, k-WTA forward, homeostatic duty-cycle tracking
-- **T3**: sae.rs → SaeDecoder with mse_loss_batch
-- **T4**: binding.rs → BindingArea with `activation::softmax`
-- **T5**: lib.rs → PerceptionModel<B> + PerceptionProcessor (full rewrite, ~600 lines)
-- **T6**: action.rs ActionDecoder projection → burn TrainB ProjModel; embed_table → Vec<f32> via safetensors; main.rs LangEmbedder → pure-Rust mean-pool
-- **T7**: Removed candle from somnus-perception/Cargo.toml and somnus/Cargo.toml; added safetensors = "0.7"
+### NREM speed investigation + fixes (this session)
 
-### Build/test status (as of a0a5939)
-- `cargo build --workspace` — clean
-- `cargo clippy --workspace -- -D warnings` — clean
-- `cargo test -p somnus-perception` — 12/12 pass (8 unit + 4 GPU integration)
-- `cargo test --workspace` — all pass
+#### Root cause of slow NREM (21 tr/s in campaign_no_walks)
+1. `burn-ndarray` features fix (prev session): fixed the primary bottleneck; raised peak to ~168 tr/s
+2. **`projection_step` per-trace sequential backward**: each call does a full AdamW step on the 640→4480 (2.87M param) projection MLP. At ~10% lang density (campaign_no_walks), that's 6.4 calls × ~427ms = 2.7s wasted per batch of 64, vs 299ms for replay+wake combined.
 
-## Key burn 0.21 API facts (for future sessions)
-- `type TrainB = Autodiff<Wgpu>` — autodiff backend for training
-- `#[derive(Module, Debug)]` on model structs — don't add explicit Clone (Module derive provides it)
-- `#[module(skip)]` for non-tensor fields (duty_cycle: Vec<f32>, n_units: usize, region: RegionId)
-- `PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>` — import path: `burn::optim::adaptor::OptimizerAdaptor`
-- `Param::id` is a Copy field (not a method, no `.clone()` needed)
-- `activation::softmax(tensor, dim)` — not `.softmax()` method on Tensor
-- `save_file` consumes model → clone via `.as_ref().unwrap().clone()` first
-- Take/replace pattern for optimizer step (burn value-semantics optimizer)
-- `TensorData::new(vec, shape).to_vec::<f32>()` for CPU readback
+#### Fixes applied (uncommitted)
+1. **`projection_step_batch`** added to `crates/somnus/src/action.rs`: batches all lang-tagged traces in a replay batch into one forward+backward+optimizer call instead of N sequential calls. Identical training semantics (mini-batch SGD instead of per-sample SGD; with N=6-12, this is negligible difference).
+2. **Sleep.rs updated**: NREM loop now calls `dec.projection_step_batch(&proj_pairs)` per batch instead of per-trace loop.
+3. **Per-phase timing instrumentation** added to `run_sleep_cycle` in `sleep.rs`: logs `replay_ms_avg`, `wake_ms_avg`, `proj_ms_avg`, `total_ms` at end of each NREM cycle.
+4. **Default `replay_batch_size` bumped 64→128** in `main.rs`: bench shows 55% more throughput; production test showed 14% improvement (168→239 tr/s without projection).
+
+#### Measured throughput (no projection, talking_head.mp4, 1638 traces)
+- batch=64: replay=168ms, wake=131ms, total=7804ms → **210 tr/s**
+- batch=128: replay=289ms, wake=238ms, total=6860ms → **239 tr/s**
+
+#### Projected throughput with projection (estimate, 10% lang density, batch=128)
+- Old (per-trace): 21 tr/s
+- New (batched, N=12.8 per batch): estimated 130-160 tr/s
+
+### Build status (current, uncommitted)
+- `cargo build --release` — clean
+- `cargo clippy -p somnus -p somnus-perception -- -D warnings` — clean
 
 ## Next queued work
-- Evaluate `campaign_speech_first` results: check asr_count/cycle, lang_cos trajectory
-- Validate that GPU is actually being used during training (burn's wgpu backend should dispatch to ROCm/Vulkan on RX 9070 XT)
-- Phase 9b (mic/webcam live capture) — pending
-- Phase 11b (creative REM) — pending
+1. **Commit the NREM speed changes** (projection_step_batch + timing + batch_size=128)
+2. **Run new campaign** with optimized binary to verify projection speedup with real lang traces
+   - Use `--lang-oversample 9` and `--asr-min-chars 5` to ensure lang traces are generated
+   - Watch for `NREM phase timings` log: `proj_ms_avg` should drop dramatically
+3. **Phase 9b** (mic/webcam live capture) — pending
+4. **Phase 11b** (creative REM) — pending
+
+## Key facts
+- `burn-ndarray` features need to be listed in each crate's `Cargo.toml` (workspace dep is just a template)
+- Both `crates/somnus/Cargo.toml` and `crates/somnus-perception/Cargo.toml` now have `burn-ndarray = { workspace = true }`
+- `projection_step` (per-trace) kept with `#[allow(dead_code)]` — useful for debugging
+- No region growth occurred in campaign_no_walks (gist thresholds not triggered)

@@ -228,8 +228,8 @@ struct Args {
 
     /// Number of traces processed per forward+backward pass during NREM replay.
     /// Higher values amortise optimizer overhead and improve BLAS utilisation.
-    /// 0 or 1 = sequential (original behaviour). Default: 64.
-    #[arg(long, default_value = "64")]
+    /// 0 or 1 = sequential (original behaviour). Default: 128.
+    #[arg(long, default_value = "128")]
     replay_batch_size: usize,
 
     /// Minimum number of NREM traces replayed before the salience gate can

@@ -284,6 +284,12 @@ pub fn run_sleep_cycle(
     // Effective batch size: fall back to 1 (sequential) when 0 is passed.
     let batch_size = replay_batch_size.max(1);
 
+    // Per-phase timing accumulators (microseconds).
+    let mut replay_us_total = 0u64;
+    let mut wake_us_total = 0u64;
+    let mut proj_us_total = 0u64;
+    let mut n_batches = 0u64;
+
     let mut batch_start = 0usize; // index into `traces` of the current batch start
     while batch_start < n_traces {
         let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD
@@ -310,6 +316,7 @@ pub fn run_sleep_cycle(
 
         // ── k-WTA + SAE replay (batched) ─────────────────────────────────────
         let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _)| r).collect();
+        let t_replay = Instant::now();
         match perception.replay_step_batch(&regionals) {
             Ok(loss) => {
                 loss_ewma = if batch_start == 0 {
@@ -322,9 +329,11 @@ pub fn run_sleep_cycle(
             }
             Err(e) => tracing::warn!(?e, "replay_step_batch error — skipping batch"),
         }
+        replay_us_total += t_replay.elapsed().as_micros() as u64;
 
         // ── Output head replay (batched, ADR 0010) ───────────────────────────
         let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _)| ep.as_slice()).collect();
+        let t_wake = Instant::now();
         match perception.wake_reconstruct_step_batch(&ep_slices, &regionals) {
             Ok(mse) => {
                 total_output_mse += mse;
@@ -332,6 +341,7 @@ pub fn run_sleep_cycle(
             }
             Err(e) => tracing::warn!(?e, "output head batch replay error"),
         }
+        wake_us_total += t_wake.elapsed().as_micros() as u64;
 
         // ── Adaptive exit checks (10b) ────────────────────────────────────────
         if sleep_loss_target > 0.0 && batch_start > 0 && loss_ewma < sleep_loss_target {
@@ -354,25 +364,46 @@ pub fn run_sleep_cycle(
             break;
         }
 
-        // ── Projection training: per-trace (separate optimizer, ADR 0012) ────
+        // ── Projection training: batched (separate optimizer, ADR 0012) ────────
+        let t_proj = Instant::now();
         if let Some(ref mut dec) = decoder {
-            for (episode_vec, _, text_target) in batch {
-                if let Some(ids) = text_target {
-                    match dec.projection_step(episode_vec, ids) {
-                        Ok(loss) => {
-                            total_proj_loss += loss;
-                            proj_loss_n += 1;
-                            if loss > proj_loss_max {
-                                proj_loss_max = loss;
-                            }
+            let proj_pairs: Vec<(&[f32], &[u32])> = batch
+                .iter()
+                .filter_map(|(ep, _, ids)| ids.as_ref().map(|ids| (ep.as_slice(), ids.as_slice())))
+                .collect();
+            if !proj_pairs.is_empty() {
+                match dec.projection_step_batch(&proj_pairs) {
+                    Ok(loss) => {
+                        let cnt = proj_pairs.len();
+                        total_proj_loss += loss * cnt as f32;
+                        proj_loss_n += cnt;
+                        if loss > proj_loss_max {
+                            proj_loss_max = loss;
                         }
-                        Err(e) => tracing::warn!(?e, "projection_step error"),
                     }
+                    Err(e) => tracing::warn!(?e, "projection_step_batch error"),
                 }
             }
         }
+        proj_us_total += t_proj.elapsed().as_micros() as u64;
+        n_batches += 1;
 
         batch_start = batch_end;
+    }
+
+    let replay_ms_avg = replay_us_total.checked_div(n_batches).unwrap_or(0) / 1000;
+    let wake_ms_avg = wake_us_total.checked_div(n_batches).unwrap_or(0) / 1000;
+    let proj_ms_avg = proj_us_total.checked_div(n_batches).unwrap_or(0) / 1000;
+    let total_ms = (replay_us_total + wake_us_total + proj_us_total) / 1000;
+    if n_batches > 0 {
+        tracing::info!(
+            n_batches,
+            replay_ms_avg,
+            wake_ms_avg,
+            proj_ms_avg,
+            total_ms,
+            "NREM phase timings"
+        );
     }
 
     // Log projection weight norm after NREM for cross-session spike diagnostics.
