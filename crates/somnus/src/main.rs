@@ -8,6 +8,15 @@ mod whisper_asr;
 pub(crate) fn migraphx_session(path: &std::path::Path) -> anyhow::Result<ort::session::Session> {
     use ort::AsPointer;
     let mut builder = ort::session::Session::builder()?;
+    // Leave ~half of cores free for burn-ndarray's matmul thread pool.
+    // MIGraphX does the heavy lifting on GPU; the CPU threads here are
+    // only used for pre/post-processing and graph fallback ops.
+    let (intra, inter) = onnx_thread_budget();
+    builder = builder
+        .with_intra_threads(intra)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_inter_threads(inter)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let name = std::ffi::CString::new("MIGraphXExecutionProvider").unwrap();
     let status = unsafe {
         (ort::api().SessionOptionsAppendExecutionProvider)(
@@ -27,7 +36,27 @@ pub(crate) fn migraphx_session(path: &std::path::Path) -> anyhow::Result<ort::se
 /// CPU-only session for models with dynamic shapes (Whisper decoder, Qwen LM).
 /// MIGraphX requires static shapes; these models grow their sequence dimension at runtime.
 pub(crate) fn cpu_session(path: &std::path::Path) -> anyhow::Result<ort::session::Session> {
-    Ok(ort::session::Session::builder()?.commit_from_file(path)?)
+    let (intra, inter) = onnx_thread_budget();
+    Ok(ort::session::Session::builder()?
+        .with_intra_threads(intra)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .with_inter_threads(inter)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .commit_from_file(path)?)
+}
+
+/// Compute (intra_op, inter_op) thread counts for ONNX sessions.
+///
+/// Reserves roughly half the logical cores for burn-ndarray's rayon thread pool.
+/// Both pools compete for the same hardware threads during NREM replay, so this
+/// cap prevents ONNX from starving burn's matmul workers.
+fn onnx_thread_budget() -> (usize, usize) {
+    let total = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let intra = (total / 2).max(1);
+    let inter = (total / 4).max(1);
+    (intra, inter)
 }
 
 use action::ActionDecoder;
