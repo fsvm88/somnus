@@ -314,11 +314,12 @@ pub fn run_sleep_cycle(
         let lr = nrem_lr(batch_start, n_traces, loss_ewma, prev_ewma);
         perception.set_learning_rate(lr);
 
-        // ── k-WTA + SAE replay (batched) ─────────────────────────────────────
+        // ── Fused SAE replay + output-head training (single backward) ───────
         let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _)| r).collect();
+        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _)| ep.as_slice()).collect();
         let t_replay = Instant::now();
-        match perception.replay_step_batch(&regionals) {
-            Ok(loss) => {
+        match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
+            Ok((loss, mse)) => {
                 loss_ewma = if batch_start == 0 {
                     loss
                 } else {
@@ -326,22 +327,14 @@ pub fn run_sleep_cycle(
                 };
                 total_train_loss += loss * batch.len() as f32;
                 traces_replayed += batch.len();
-            }
-            Err(e) => tracing::warn!(?e, "replay_step_batch error — skipping batch"),
-        }
-        replay_us_total += t_replay.elapsed().as_micros() as u64;
-
-        // ── Output head replay (batched, ADR 0010) ───────────────────────────
-        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _)| ep.as_slice()).collect();
-        let t_wake = Instant::now();
-        match perception.wake_reconstruct_step_batch(&ep_slices, &regionals) {
-            Ok(mse) => {
                 total_output_mse += mse;
                 output_mse_n += 1;
             }
-            Err(e) => tracing::warn!(?e, "output head batch replay error"),
+            Err(e) => tracing::warn!(?e, "fused_replay_wake_step_batch error — skipping batch"),
         }
-        wake_us_total += t_wake.elapsed().as_micros() as u64;
+        let fused_us = t_replay.elapsed().as_micros() as u64;
+        replay_us_total += fused_us / 2;
+        wake_us_total += fused_us / 2;
 
         // ── Adaptive exit checks (10b) ────────────────────────────────────────
         if sleep_loss_target > 0.0 && batch_start > 0 && loss_ewma < sleep_loss_target {
