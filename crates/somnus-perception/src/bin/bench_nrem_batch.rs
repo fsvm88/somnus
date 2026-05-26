@@ -51,7 +51,7 @@ fn main() {
 
     println!("Warming up JIT / allocators (1 sequential pass, not timed)…");
     {
-        let mut proc = PerceptionProcessor::new(device.clone());
+        let mut proc = PerceptionProcessor::new(device);
         let _ = run_sequential(&mut proc, &traces[..32]);
     }
 
@@ -65,7 +65,7 @@ fn main() {
 
     for &bs in BATCH_SIZES {
         // Fresh processor each run so optimizer state + duty cycles start equal.
-        let mut proc = PerceptionProcessor::new(device.clone());
+        let mut proc = PerceptionProcessor::new(device);
 
         let t0 = Instant::now();
         if bs == 1 {

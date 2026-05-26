@@ -282,16 +282,28 @@ impl ActionDecoder {
 
     /// Load projection weights from a burn binary file.
     pub fn load_weights(&mut self, path: &std::path::Path) -> Result<()> {
-        let model = self.model.take().unwrap();
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        // Extract path string before taking the model so a bad-path error
+        // doesn't leave self.model = None.
         let path_str = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("non-UTF8 path"))?;
-        let model = model
-            .load_file(path_str, &recorder, &self.device)
-            .map_err(|e| anyhow::anyhow!("load_weights failed: {e}"))?;
-        self.model = Some(model);
-        Ok(())
+        let model = self.model.take().unwrap();
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        match model.load_file(path_str, &recorder, &self.device) {
+            Ok(loaded) => {
+                self.model = Some(loaded);
+                Ok(())
+            }
+            Err(e) => {
+                // load_file consumes the model; restore a fresh one so callers
+                // remain functional after a failed weight restore.
+                let projection = LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
+                    .with_bias(false)
+                    .init::<TrainB>(&self.device);
+                self.model = Some(ProjModel { projection });
+                Err(anyhow::anyhow!("load_weights failed: {e}"))
+            }
+        }
     }
 
     // ── private helpers ───────────────────────────────────────────────────────

@@ -154,7 +154,7 @@ impl PerceptionProcessor {
     /// Ingest a 384-dim Whisper speech embedding.
     /// Updates AudioSpeech and Symbolic regions (same input, independent weights).
     pub fn ingest_speech(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device.clone();
+        let device = self.device;
         let gained_speech = apply_gain(values, self.region_gain[0]);
         let gained_symbolic = apply_gain(values, self.region_gain[3]);
         let (speech_input, speech_cos) = self.blend_with_prior(&gained_speech, 0);
@@ -212,7 +212,7 @@ impl PerceptionProcessor {
 
     /// Ingest a 512-dim CLAP env embedding.
     pub fn ingest_env(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device.clone();
+        let device = self.device;
         let gained = apply_gain(values, self.region_gain[1]);
         let (input, cosine) = self.blend_with_prior(&gained, 1);
         if let Some(c) = cosine {
@@ -252,7 +252,7 @@ impl PerceptionProcessor {
 
     /// Ingest a 384-dim DINOv2 visual embedding.
     pub fn ingest_visual(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device.clone();
+        let device = self.device;
         let gained = apply_gain(values, self.region_gain[2]);
         let (input, cosine) = self.blend_with_prior(&gained, 2);
         if let Some(c) = cosine {
@@ -292,7 +292,7 @@ impl PerceptionProcessor {
 
     /// Ingest a 896-dim language embedding (Qwen mean-pooled token embeddings).
     pub fn ingest_language(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device.clone();
+        let device = self.device;
         self.last_language_input = Some(values.to_vec());
         let gained = apply_gain(values, self.region_gain[4]);
         let (input, cosine) = self.blend_with_prior(&gained, 4);
@@ -352,7 +352,7 @@ impl PerceptionProcessor {
     }
 
     fn refresh_language_cache(&mut self) {
-        let device = self.device.clone();
+        let device = self.device;
         if let Some(emb) = self.last_language_input.clone() {
             let act = self
                 .model
@@ -377,7 +377,7 @@ impl PerceptionProcessor {
             self.latest[3].as_ref(),
         ) {
             (Some(sp), Some(en), Some(vi), Some(sy)) => {
-                let device = self.device.clone();
+                let device = self.device;
                 let lang_zero = SparseActivation {
                     region: RegionId::Language,
                     indices: vec![],
@@ -407,7 +407,7 @@ impl PerceptionProcessor {
 
     /// Run one training step on a stored episode trace (SAE reconstruction loss).
     pub fn replay_step(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<f32> {
-        let device = self.device.clone();
+        let device = self.device;
         let mut total_loss: Option<Tensor<TrainB, 1>> = None;
         let mut n_terms = 0usize;
 
@@ -476,7 +476,7 @@ impl PerceptionProcessor {
         if batch.is_empty() {
             return Ok(0.0);
         }
-        let device = self.device.clone();
+        let device = self.device;
         let mut total_loss: Option<Tensor<TrainB, 1>> = None;
         let mut n_terms = 0usize;
 
@@ -573,7 +573,7 @@ impl PerceptionProcessor {
         if episodes.is_empty() {
             return Ok(0.0);
         }
-        let device = self.device.clone();
+        let device = self.device;
         let ep_dim = EPISODE_DIM;
         let mut total_loss: Option<Tensor<TrainB, 1>> = None;
         let mut n = 0usize;
@@ -650,7 +650,7 @@ impl PerceptionProcessor {
         episode: &[f32],
         regional: &[Vec<f32>; 5],
     ) -> PerceptionResult<f32> {
-        let device = self.device.clone();
+        let device = self.device;
         let ep_t: Tensor<TrainB, 2> = Tensor::from_data(
             TensorData::new(episode.to_vec(), [1, episode.len()]),
             &device,
@@ -702,7 +702,7 @@ impl PerceptionProcessor {
 
     /// Measure SAE reconstruction MSE per region (inference, no weight update).
     pub fn measure_mse(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<[f32; 5]> {
-        let device = self.device.clone();
+        let device = self.device;
         let mut result = [0.0f32; 5];
         for (idx, input) in regional.iter().enumerate() {
             if input.is_empty() {
@@ -751,7 +751,7 @@ impl PerceptionProcessor {
         regional_b: &[Vec<f32>; 5],
         alpha: f32,
     ) -> PerceptionResult<Vec<f32>> {
-        let device = self.device.clone();
+        let device = self.device;
         let lang_zero = SparseActivation {
             region: RegionId::Language,
             indices: vec![],
@@ -795,7 +795,7 @@ impl PerceptionProcessor {
         episode: &[f32],
         regional: &[Vec<f32>; 5],
     ) -> PerceptionResult<f32> {
-        let device = self.device.clone();
+        let device = self.device;
         let ep_t: Tensor<TrainB, 2> =
             Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
         let model = self.model.as_ref().unwrap();
@@ -855,7 +855,7 @@ impl PerceptionProcessor {
 
     /// Grow a region by appending `n_new` units with small random encoder weights.
     pub fn grow_region(&mut self, region: RegionId, n_new: usize) {
-        let device = self.device.clone();
+        let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model.as_mut().unwrap();
 
@@ -894,7 +894,7 @@ impl PerceptionProcessor {
     /// Prune low-magnitude grown units from a region (Phase 12c).
     /// Only removes units with index >= N_UNITS. Returns number pruned.
     pub fn prune_region(&mut self, region: RegionId, prune_fraction: f32) -> usize {
-        let device = self.device.clone();
+        let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model.as_mut().unwrap();
 
@@ -1057,17 +1057,43 @@ impl PerceptionProcessor {
 
     /// Load weights from a binary file written by `save_weights`.
     pub fn load_weights(&mut self, path: &std::path::Path) -> PerceptionResult<()> {
-        let device = self.device.clone();
-        let model = self.model.take().unwrap();
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        let device = self.device;
+        // Extract path string before taking the model so an invalid-path error
+        // doesn't leave self.model = None.
         let path_str = path
             .to_str()
             .ok_or_else(|| PerceptionError::Burn("invalid path".into()))?;
-        let model = model
-            .load_file(path_str, &recorder, &device)
-            .map_err(|e| PerceptionError::Burn(e.to_string()))?;
-        self.model = Some(model);
-        Ok(())
+        let saved_sizes = self.region_sizes();
+        let model = self.model.take().unwrap();
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        match model.load_file(path_str, &recorder, &device) {
+            Ok(loaded) => {
+                self.model = Some(loaded);
+                Ok(())
+            }
+            Err(e) => {
+                // load_file consumes the model whether it succeeds or not.
+                // Restore a fresh model grown to the same sizes so all callers
+                // remain functional after a failed weight restore.
+                self.model = Some(PerceptionModel::new(&device));
+                for (i, &region) in [
+                    RegionId::AudioSpeech,
+                    RegionId::AudioEnv,
+                    RegionId::Visual,
+                    RegionId::Symbolic,
+                    RegionId::Language,
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let n_new = saved_sizes[i].saturating_sub(N_UNITS);
+                    if n_new > 0 {
+                        self.grow_region(region, n_new);
+                    }
+                }
+                Err(PerceptionError::Burn(e.to_string()))
+            }
+        }
     }
 
     /// Pre-grow regions to `sizes`, then load weights.
@@ -1095,7 +1121,7 @@ impl PerceptionProcessor {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn settle_episode(&self, ep: &EpisodeVector) -> (EpisodeVector, usize) {
-        let device = self.device.clone();
+        let device = self.device;
         let model = self.model.as_ref().unwrap();
         let mut current = ep.clone();
 
@@ -1178,7 +1204,7 @@ impl PerceptionProcessor {
     }
 
     fn update_prior_predictions(&mut self, episode: &[f32]) {
-        let device = self.device.clone();
+        let device = self.device;
         let ep_t: Tensor<TrainB, 2> =
             Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
         let preds = {
