@@ -1,65 +1,64 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-29
-> **Last commit on main:** a1540bc — Cap ONNX intra/inter-op threads dynamically
-> **Branch:** `main` (uncommitted changes — see below)
+> **Last commit on main:** 958a18c — A: Temporal binding via GRU over episode sequence
+> **Branch:** `main`
 
-## Status: Campaign running + wake optimizations implemented (uncommitted)
-
----
-
-## campaign_20260526_231637 — COMPLETED (sessions 1–10)
-
-Sessions 1–8 complete as of this session. Session 9 in progress when last checked, session 10 pending.
-
-Parameters: `SESSIONS=10 CYCLES=5 CAPACITY=8192 --lang-oversample 9 --asr-min-chars 5 --replay-batch-size 128`
-
-Trend: `warm_recall_l2` converges cleanly each session (1.8→0.18 by cycle 5). `mean_loss` declining across sessions. All good.
+## Status: Full architectural roundup complete — ready for new campaign
 
 ---
 
-## Wake phase bottleneck investigation — DONE
+## All changes committed this session
 
-Profiled session 7 log (52.5 min total):
-- **Real bottleneck: `wake_reconstruct_step` backward+optimizer** — 315ms median per frame, ~4190 frames/session ≈ 22 min/session.
-- Settle iter cost: only 7.8ms median (misread in initial bucket analysis due to multi-thread log interleaving).
-- NREM: only 1.9 min/session — not worth optimizing.
-
----
-
-## Wake optimizations — IMPLEMENTED, NOT COMMITTED
-
-### Change 1: Parallelize 5 output heads with rayon (Task #1)
-**Files:** `crates/somnus-perception/src/lib.rs`, `crates/somnus-perception/Cargo.toml`, `Cargo.toml`  
-**What:** `settle_episode` and `update_prior_predictions` now use `rayon::par_iter` for the 5 head forward passes and 5 SAE forward_no_dc passes.  
-**Expected impact: LOW** — settle is only 7ms per iter × 3267 iters ≈ 16s per session. Advisor flagged this as likely a no-op or regression vs. burn-ndarray's existing multi-thread pool. Should benchmark before shipping, potentially revert.
-
-### Change 2: `--wake-reconstruct-interval N` (Task #2)
-**Files:** `crates/somnus/src/main.rs`  
-**What:** New CLI arg (default=1 = original behavior). At N=4, runs backward+optimizer only every 4th episode instead of every frame. Counter resets each sleep cycle.  
-**Expected impact: HIGH** — at N=4, saves ~75% of 22 min/session = ~16 min → session from ~42 min to ~26 min.  
-**Caveat:** Changes learning dynamics (fewer head gradient updates). `mean_output_mse_wake` will rise. Don't compare pre/post campaigns directly on that metric.
+| Task | Commit | What changed |
+|------|--------|--------------|
+| B | af9d4d6 | Growth threshold 0.5→0.85; removed broken warm_recall_poor gate |
+| C | af9d4d6 | Episodes L2-normalised before HNSW — better cosine-equivalent recall |
+| E | af9d4d6 | EpisodeTrace.salience; NREM replays novel traces first |
+| F | a6940aa | Symbolic: cross_modal_proj 2176→384; convergence layer not speech copy |
+| D | 93ba871 | EmaOutputHeads α=0.99; inference decoupled from autodiff training path |
+| G | 98c5775 | --max-warm-records; rebuild_from_recent during sleep |
+| H | DROPPED | Wake time-boxed; wgpu has zero wall-clock benefit |
+| A | 958a18c | GRU(640→256) temporal binding; wm_seq replaces wm_mean_vec |
 
 ---
 
-## Next queued work
+## Key architectural state
 
-1. **Stop current campaign once done** (it will finish on its own; no action needed now).
-2. **Commit the two changes** — run `cargo test` first, then commit.
-3. **Benchmark Task #1** to verify rayon actually helps:
-   - `cargo run --release -p somnus-perception --bin bench_nrem_batch` exists but tests NREM, not settle.
-   - Add a tiny bench that times `settle_episode` serial vs parallel, or just time a short session.
-   - If flat/negative, revert the rayon parallelization and remove the dep.
-4. **Run a new campaign with the new binary** at `--wake-reconstruct-interval 4` to measure speed/quality trade-off.
-5. **Task #3 (future):** Port `PerceptionModel` to `burn-wgpu` backend to GPU-accelerate the backward pass. This targets the 315ms/frame `wake_reconstruct_step`. Write ADR first — wgpu+MIGraphX compete for the same GPU (RDNA4/gfx1201). Experiment in `experiments/` first.
+- **Episode space changed** (C + A + F): existing snapshots are INCOMPATIBLE
+- **Start fresh `--memory-dir`** for the next campaign
+- **EPISODE_DIM = 640** unchanged — memory/serialisation interfaces stable
+- **New params in binding**: GRU ~688k + temporal_proj ~164k ≈ 852k total
+- **Growth should now fire** at gist_recall < 0.85 (was 0.5, rarely hit)
+- **Symbolic now a convergence layer**: cross-modal context, not speech echo
+- **EMA heads**: inference runs on NdArray copy (no autodiff), training on live model
+
+---
+
+## Next campaign recommendation
+
+```bash
+SESSIONS=10 CYCLES=5 CAPACITY=8192 \
+MEMORY_DIR=memory/campaign_post_roundup \
+EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --working-memory-size 8 --max-warm-records 200000" \
+scripts/train_campaign.sh
+```
+
+Watch for:
+- `grew=true` firing in metrics (B fixed threshold)
+- `prior_cosine_mean[3]` (symbolic) behaving differently from `[0]` (speech)
+- `gist_recall_rate` trajectory vs old campaigns
+- Any instability from GRU temporal context (first sessions may be noisier)
 
 ---
 
 ## Key facts
 
-- `--replay-batch-size 128` is hardcoded in `train_campaign.sh` — do NOT pass it in `EXTRA_ARGS`
-- `burn-ndarray` features need listing in each crate's `Cargo.toml` individually
-- `--asr-min-chars 5` needed for noisy-audio clips (default 20 too high)
-- Dynamic ONNX thread cap: on 32-thread machine → intra=16, inter=8
-- `wake_reconstruct_step` backward pass: 315ms median, 712ms mean (heavy outliers)
-- Real settle cost: 7.8ms median per iter — burn-ndarray's own multi-thread already handles it
+- `--replay-batch-size 128` hardcoded in `train_campaign.sh`
+- `--asr-min-chars 5` for noisy-audio clips
+- `--max-warm-records 200000` for long runs (~500 MB HNSW cap)
+- Wake schedule trigger at 602s/cycle — not fill-based; compute speedups have no wall-clock effect
+- H was dropped: wake_reconstruct is 17ms (not 315ms); interval=4 experiment proved time-box dominates
+- EMA_ALPHA = 0.99
+- CROSS_MODAL_DIM = 2176 (speech+env+visual+language inputs to symbolic)
+- GRU_HIDDEN = 256
