@@ -171,6 +171,11 @@ struct Args {
     #[arg(long, default_value = "10")]
     gain_interval: usize,
 
+    /// Run wake_reconstruct_step every N episodes. Higher values reduce CPU overhead at
+    /// the cost of less frequent output-head gradient updates. N=1 is the original behaviour.
+    #[arg(long, default_value = "1")]
+    wake_reconstruct_interval: usize,
+
     /// Maximum tokens to generate per query (ADR 0012).
     #[arg(long, default_value = "128")]
     action_max_tokens: usize,
@@ -734,6 +739,7 @@ async fn main() -> Result<()> {
     let mut prior_cosine_counts: [usize; 5] = [0; 5];
     let mut lang_ingest_count: usize = 0;
     let mut gain_episode_counter: usize = 0;
+    let mut wake_reconstruct_counter: usize = 0;
     // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
     // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
     // cosine_ewma: exponentially weighted moving average (α = COSINE_EWMA_ALPHA).
@@ -1173,6 +1179,8 @@ async fn main() -> Result<()> {
                         &recall,
                         args.action_gain,
                         &mut decoder,
+                        &mut wake_reconstruct_counter,
+                        args.wake_reconstruct_interval,
                     ) {
                         lang_ingest_count += 1;
                         if ep {
@@ -1342,6 +1350,7 @@ async fn main() -> Result<()> {
                     prior_cosine_counts = [0; 5];
                     lang_ingest_count = 0;
                     gain_episode_counter = 0;
+                    wake_reconstruct_counter = 0;
                     cosine_ewma = None;
                     cosine_baseline = None;
                     cosine_baseline_accum = 0.0;
@@ -1377,13 +1386,16 @@ async fn main() -> Result<()> {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                                    match perception.wake_reconstruct_step(&ep.0, regional) {
-                                        Ok(mse) => {
-                                            wake_output_mse_sum += mse as f64;
-                                            wake_output_mse_n += 1;
-                                            tracing::info!(output_mse = mse, "wake reconstruction");
+                                    wake_reconstruct_counter += 1;
+                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                        match perception.wake_reconstruct_step(&ep.0, regional) {
+                                            Ok(mse) => {
+                                                wake_output_mse_sum += mse as f64;
+                                                wake_output_mse_n += 1;
+                                                tracing::info!(output_mse = mse, "wake reconstruction");
+                                            }
+                                            Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                         }
-                                        Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                     }
                                     wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
@@ -1423,13 +1435,16 @@ async fn main() -> Result<()> {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                                    match perception.wake_reconstruct_step(&ep.0, regional) {
-                                        Ok(mse) => {
-                                            wake_output_mse_sum += mse as f64;
-                                            wake_output_mse_n += 1;
-                                            tracing::info!(output_mse = mse, "wake reconstruction");
+                                    wake_reconstruct_counter += 1;
+                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                        match perception.wake_reconstruct_step(&ep.0, regional) {
+                                            Ok(mse) => {
+                                                wake_output_mse_sum += mse as f64;
+                                                wake_output_mse_n += 1;
+                                                tracing::info!(output_mse = mse, "wake reconstruction");
+                                            }
+                                            Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                         }
-                                        Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                     }
                                     wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
@@ -1473,6 +1488,8 @@ async fn main() -> Result<()> {
                             &recall,
                             args.action_gain,
                             &mut decoder,
+                            &mut wake_reconstruct_counter,
+                            args.wake_reconstruct_interval,
                         ) {
                             lang_ingest_count += 1;
                             if ep {
@@ -1605,6 +1622,8 @@ fn ingest_language_line(
     recall: &RecollectionLayer,
     action_gain: bool,
     decoder: &mut Option<ActionDecoder>,
+    wake_reconstruct_counter: &mut usize,
+    wake_reconstruct_interval: usize,
 ) -> Option<(bool, Option<f32>, [Option<f32>; 5])> {
     let Some(le) = lang_embedder else { return None };
     let emb = match le.embed(text) {
@@ -1621,15 +1640,20 @@ fn ingest_language_line(
             let ep_produced = out.episode.is_some();
             let cosines = out.prior_cosines;
             let mse = if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                match perception.wake_reconstruct_step(&ep.0, regional) {
-                    Ok(mse) => {
-                        tracing::info!(output_mse = mse, "wake reconstruction");
-                        Some(mse)
+                *wake_reconstruct_counter += 1;
+                if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval) {
+                    match perception.wake_reconstruct_step(&ep.0, regional) {
+                        Ok(mse) => {
+                            tracing::info!(output_mse = mse, "wake reconstruction");
+                            Some(mse)
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "wake reconstruct error");
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(?e, "wake reconstruct error");
-                        None
-                    }
+                } else {
+                    None
                 }
             } else {
                 None

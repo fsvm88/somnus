@@ -9,6 +9,7 @@ cpal               = "0.17"
 crossbeam-channel  = "0.5"
 ffmpeg-next        = "8"
 ndarray            = "0.17"
+rayon              = "1.12"
 nokhwa             = { version = "0.10", features = ["input-native"] }
 ort                = { version = "2.0.0-rc.12", features = ["load-dynamic", "ndarray"] }
 rubato             = "0.16"

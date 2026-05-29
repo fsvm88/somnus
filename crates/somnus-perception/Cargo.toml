@@ -12,3 +12,7 @@ tracing      = { workspace = true }
 [[bin]]
 name = "bench_nrem_batch"
 path = "src/bin/bench_nrem_batch.rs"
+
+[[bin]]
+name = "bench_wake_percep"
+path = "src/bin/bench_wake_percep.rs"

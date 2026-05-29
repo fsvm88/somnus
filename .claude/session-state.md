@@ -1,50 +1,65 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-26
-> **Last commit on main:** (pending commit — NREM speed optimizations)
-> **Branch:** `main`
+> **Last updated:** 2026-05-29
+> **Last commit on main:** a1540bc — Cap ONNX intra/inter-op threads dynamically
+> **Branch:** `main` (uncommitted changes — see below)
 
-## Status: NREM speed optimizations implemented
+## Status: Campaign running + wake optimizations implemented (uncommitted)
 
-### campaign_no_walks — COMPLETED (15 sessions × 3 cycles)
-- Memory dir: `memory/gpu_campaign_mem3`
-- Final metrics: output_mse≈0.40, warm_recall_l2≈0.84, gist_recall_rate≈0.61
-- **No language traces generated** (decoder_trainable=0 in last sessions — ASR likely not triggering at 20-char threshold on these clips)
+---
 
-### NREM speed investigation + fixes (this session)
+## campaign_20260526_231637 — COMPLETED (sessions 1–10)
 
-#### Root cause of slow NREM (21 tr/s in campaign_no_walks)
-1. `burn-ndarray` features fix (prev session): fixed the primary bottleneck; raised peak to ~168 tr/s
-2. **`projection_step` per-trace sequential backward**: each call does a full AdamW step on the 640→4480 (2.87M param) projection MLP. At ~10% lang density (campaign_no_walks), that's 6.4 calls × ~427ms = 2.7s wasted per batch of 64, vs 299ms for replay+wake combined.
+Sessions 1–8 complete as of this session. Session 9 in progress when last checked, session 10 pending.
 
-#### Fixes applied (uncommitted)
-1. **`projection_step_batch`** added to `crates/somnus/src/action.rs`: batches all lang-tagged traces in a replay batch into one forward+backward+optimizer call instead of N sequential calls. Identical training semantics (mini-batch SGD instead of per-sample SGD; with N=6-12, this is negligible difference).
-2. **Sleep.rs updated**: NREM loop now calls `dec.projection_step_batch(&proj_pairs)` per batch instead of per-trace loop.
-3. **Per-phase timing instrumentation** added to `run_sleep_cycle` in `sleep.rs`: logs `replay_ms_avg`, `wake_ms_avg`, `proj_ms_avg`, `total_ms` at end of each NREM cycle.
-4. **Default `replay_batch_size` bumped 64→128** in `main.rs`: bench shows 55% more throughput; production test showed 14% improvement (168→239 tr/s without projection).
+Parameters: `SESSIONS=10 CYCLES=5 CAPACITY=8192 --lang-oversample 9 --asr-min-chars 5 --replay-batch-size 128`
 
-#### Measured throughput (no projection, talking_head.mp4, 1638 traces)
-- batch=64: replay=168ms, wake=131ms, total=7804ms → **210 tr/s**
-- batch=128: replay=289ms, wake=238ms, total=6860ms → **239 tr/s**
+Trend: `warm_recall_l2` converges cleanly each session (1.8→0.18 by cycle 5). `mean_loss` declining across sessions. All good.
 
-#### Projected throughput with projection (estimate, 10% lang density, batch=128)
-- Old (per-trace): 21 tr/s
-- New (batched, N=12.8 per batch): estimated 130-160 tr/s
+---
 
-### Build status (current, uncommitted)
-- `cargo build --release` — clean
-- `cargo clippy -p somnus -p somnus-perception -- -D warnings` — clean
+## Wake phase bottleneck investigation — DONE
+
+Profiled session 7 log (52.5 min total):
+- **Real bottleneck: `wake_reconstruct_step` backward+optimizer** — 315ms median per frame, ~4190 frames/session ≈ 22 min/session.
+- Settle iter cost: only 7.8ms median (misread in initial bucket analysis due to multi-thread log interleaving).
+- NREM: only 1.9 min/session — not worth optimizing.
+
+---
+
+## Wake optimizations — IMPLEMENTED, NOT COMMITTED
+
+### Change 1: Parallelize 5 output heads with rayon (Task #1)
+**Files:** `crates/somnus-perception/src/lib.rs`, `crates/somnus-perception/Cargo.toml`, `Cargo.toml`  
+**What:** `settle_episode` and `update_prior_predictions` now use `rayon::par_iter` for the 5 head forward passes and 5 SAE forward_no_dc passes.  
+**Expected impact: LOW** — settle is only 7ms per iter × 3267 iters ≈ 16s per session. Advisor flagged this as likely a no-op or regression vs. burn-ndarray's existing multi-thread pool. Should benchmark before shipping, potentially revert.
+
+### Change 2: `--wake-reconstruct-interval N` (Task #2)
+**Files:** `crates/somnus/src/main.rs`  
+**What:** New CLI arg (default=1 = original behavior). At N=4, runs backward+optimizer only every 4th episode instead of every frame. Counter resets each sleep cycle.  
+**Expected impact: HIGH** — at N=4, saves ~75% of 22 min/session = ~16 min → session from ~42 min to ~26 min.  
+**Caveat:** Changes learning dynamics (fewer head gradient updates). `mean_output_mse_wake` will rise. Don't compare pre/post campaigns directly on that metric.
+
+---
 
 ## Next queued work
-1. **Commit the NREM speed changes** (projection_step_batch + timing + batch_size=128)
-2. **Run new campaign** with optimized binary to verify projection speedup with real lang traces
-   - Use `--lang-oversample 9` and `--asr-min-chars 5` to ensure lang traces are generated
-   - Watch for `NREM phase timings` log: `proj_ms_avg` should drop dramatically
-3. **Phase 9b** (mic/webcam live capture) — pending
-4. **Phase 11b** (creative REM) — pending
+
+1. **Stop current campaign once done** (it will finish on its own; no action needed now).
+2. **Commit the two changes** — run `cargo test` first, then commit.
+3. **Benchmark Task #1** to verify rayon actually helps:
+   - `cargo run --release -p somnus-perception --bin bench_nrem_batch` exists but tests NREM, not settle.
+   - Add a tiny bench that times `settle_episode` serial vs parallel, or just time a short session.
+   - If flat/negative, revert the rayon parallelization and remove the dep.
+4. **Run a new campaign with the new binary** at `--wake-reconstruct-interval 4` to measure speed/quality trade-off.
+5. **Task #3 (future):** Port `PerceptionModel` to `burn-wgpu` backend to GPU-accelerate the backward pass. This targets the 315ms/frame `wake_reconstruct_step`. Write ADR first — wgpu+MIGraphX compete for the same GPU (RDNA4/gfx1201). Experiment in `experiments/` first.
+
+---
 
 ## Key facts
-- `burn-ndarray` features need to be listed in each crate's `Cargo.toml` (workspace dep is just a template)
-- Both `crates/somnus/Cargo.toml` and `crates/somnus-perception/Cargo.toml` now have `burn-ndarray = { workspace = true }`
-- `projection_step` (per-trace) kept with `#[allow(dead_code)]` — useful for debugging
-- No region growth occurred in campaign_no_walks (gist thresholds not triggered)
+
+- `--replay-batch-size 128` is hardcoded in `train_campaign.sh` — do NOT pass it in `EXTRA_ARGS`
+- `burn-ndarray` features need listing in each crate's `Cargo.toml` individually
+- `--asr-min-chars 5` needed for noisy-audio clips (default 20 too high)
+- Dynamic ONNX thread cap: on 32-thread machine → intra=16, inter=8
+- `wake_reconstruct_step` backward pass: 315ms median, 712ms mean (heavy outliers)
+- Real settle cost: 7.8ms median per iter — burn-ndarray's own multi-thread already handles it

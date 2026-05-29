@@ -2326,6 +2326,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
+ "burn-ndarray",
  "clap",
  "crossbeam-channel",
  "somnus-encoding",
@@ -2374,6 +2375,7 @@ name = "somnus-perception"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-ndarray",
  "thiserror 2.0.18",
  "tracing",
 ]
