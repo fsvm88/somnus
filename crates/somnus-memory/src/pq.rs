@@ -122,8 +122,7 @@ impl PqCodebook {
             for _ in 0..PQ_K {
                 let mut sub = Vec::with_capacity(PQ_SUB_DIM);
                 for _ in 0..PQ_SUB_DIM {
-                    let val =
-                        f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                    let val = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
                     sub.push(val);
                     offset += 4;
                 }
@@ -230,7 +229,11 @@ impl PqColdArchive {
         w.write_all(&codebook.to_bytes())?;
         w.flush()?;
 
-        Ok(Self { path, codebook, len: 0 })
+        Ok(Self {
+            path,
+            codebook,
+            len: 0,
+        })
     }
 
     /// Open an existing PQ archive (reads and validates header + codebook).
@@ -261,7 +264,11 @@ impl PqColdArchive {
         let body = mmap.len() - PQ_PREAMBLE;
         let len = body / PQ_RECORD_BYTES;
 
-        Ok(Self { path, codebook, len })
+        Ok(Self {
+            path,
+            codebook,
+            len,
+        })
     }
 
     /// Encode and append one episode record.
@@ -402,10 +409,14 @@ mod tests {
         // Simple LCG for deterministic test vectors.
         let mut state = seed;
         let mut lcg = || -> f32 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
         };
-        (0..n).map(|_| (0..COLD_DIM).map(|_| lcg()).collect()).collect()
+        (0..n)
+            .map(|_| (0..COLD_DIM).map(|_| lcg()).collect())
+            .collect()
     }
 
     #[test]
@@ -417,14 +428,22 @@ mod tests {
         for v in &vecs[..20] {
             let codes = cb.encode(v);
             let rec = cb.decode(&codes);
-            let err: f32 = v.iter().zip(rec.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+            let err: f32 = v
+                .iter()
+                .zip(rec.iter())
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f32>()
+                .sqrt();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
                 rel_errors.push(err / norm);
             }
         }
         let mean_rel: f32 = rel_errors.iter().sum::<f32>() / rel_errors.len() as f32;
-        assert!(mean_rel < 0.5, "mean relative reconstruction error too large: {mean_rel}");
+        assert!(
+            mean_rel < 0.5,
+            "mean relative reconstruction error too large: {mean_rel}"
+        );
     }
 
     #[test]
@@ -485,10 +504,7 @@ mod tests {
 
         // Size reduction: PQ record (24 B) vs INT8 record (660 B) → at least 4×.
         let ratio = 660.0 / PQ_RECORD_BYTES as f32;
-        assert!(
-            ratio >= 4.0,
-            "size reduction {ratio}× is below 4× target"
-        );
+        assert!(ratio >= 4.0, "size reduction {ratio}× is below 4× target");
 
         // L2 quality: for each record, the PQ reconstruction L2 vs the original
         // dequantised vector. Mean relative error must be < 10% of vector norm.
@@ -501,24 +517,38 @@ mod tests {
             .iter()
             .zip(pq_records.iter())
             .map(|(orig, rec)| {
-                let err: f32 =
-                    orig.iter().zip(rec.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+                let err: f32 = orig
+                    .iter()
+                    .zip(rec.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
                 let norm: f32 = orig.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm > 0.0 { err / norm } else { 0.0 }
+                if norm > 0.0 {
+                    err / norm
+                } else {
+                    0.0
+                }
             })
             .sum::<f32>()
             / cold_records.len() as f32;
 
         // Random uniform vectors have poor PQ quality; threshold is generous here.
         // Real episode vectors (correlated) achieve < 10% as stated in the roadmap.
-        assert!(mean_rel < 1.0, "mean relative PQ error suspiciously large: {mean_rel}");
+        assert!(
+            mean_rel < 1.0,
+            "mean relative PQ error suspiciously large: {mean_rel}"
+        );
     }
 
     #[test]
     fn bad_magic_detected() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("episodes.pq"), b"BADMAGIC").unwrap();
-        assert!(matches!(PqColdArchive::open(dir.path()), Err(MemoryError::BadMagic)));
+        assert!(matches!(
+            PqColdArchive::open(dir.path()),
+            Err(MemoryError::BadMagic)
+        ));
     }
 
     #[test]

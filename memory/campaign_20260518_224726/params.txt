@@ -1,6 +1,0 @@
-SESSIONS=20
-CYCLES=3
-CLIPS=clips/talking_head.mp4 clips/urban.mp4 clips/animation.mp4 clips/nature.mp4
-MEMORY_DIR=memory
-EXTRA_ARGS=
-started=2026-05-18T22:47:31+01:00

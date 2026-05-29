@@ -1,5 +1,7 @@
 # Claude state — project memory (.claude/mind.mv2) is tracked; lock files are not
 .claude/*.lock
+.claude/projects/
+" .claude"/
 
 # Rust build artifacts
 target/
@@ -20,18 +22,26 @@ models/*.onnx.data
 scripts/.venv/
 experiments/**/.claude/
 
+# Experiment build byproducts (source is tracked; binaries are not)
+experiments/*/target/
+experiments/*/Cargo.lock
+
 # generated test artifacts
 test.mp4
 *.ndjson
 
-# Large regenerable runtime artifacts
-memory/snapshot/
-memory/warm/
-memory/episodes.cold
+# Runtime data — everything under memory/ is regenerable at runtime.
+# Nothing here belongs in version control.
+memory/
 memory_baseline_backup/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Input data and large binary assets
+data/
 clips/
 models/*.safetensors
 models/qwen25_tokenizer.json
 models/whisper_tokenizer.json
-memory/somnus.pid
-scripts/__pycache__/

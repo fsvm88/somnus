@@ -102,4 +102,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # somnus exited; this is normal — suppress the error
+        sys.stderr.close()
+        sys.exit(0)

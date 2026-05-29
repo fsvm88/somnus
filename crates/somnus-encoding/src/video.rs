@@ -5,8 +5,8 @@ use ndarray::Array4;
 use ort::{session::Session, value::TensorRef};
 
 use crate::{
-    audio::mean_pool_2d, preprocess::image::frame_to_tensor, session_with_migraphx,
-    EncodingError, EncodingResult,
+    audio::mean_pool_2d, preprocess::image::frame_to_tensor, session_with_migraphx, EncodingError,
+    EncodingResult,
 };
 
 pub struct VideoEmbedding {

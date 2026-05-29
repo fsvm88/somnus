@@ -63,7 +63,10 @@ impl WhisperDecoder {
 
         // Padded token buffer: prefix tokens + zeros for the rest.
         let mut padded = vec![0i64; DECODER_MAX_SEQ];
-        padded[0] = SOT; padded[1] = EN; padded[2] = TRANSCRIBE; padded[3] = NO_TIMESTAMPS;
+        padded[0] = SOT;
+        padded[1] = EN;
+        padded[2] = TRANSCRIBE;
+        padded[3] = NO_TIMESTAMPS;
         let mut generated: Vec<u32> = Vec::new();
 
         let enc_tensor_base = enc_arr.clone();
