@@ -156,6 +156,13 @@ struct Args {
     #[arg(long, default_value = "0")]
     working_memory_size: usize,
 
+    /// Cap on the number of records in the warm HNSW index. When warm reaches
+    /// this limit, the index is rebuilt during sleep keeping only the most recent
+    /// N records from cold. 0 = unlimited (default). Suggested: 200_000 for
+    /// long-running sessions to bound RAM usage (~500 MB at 640-dim f32).
+    #[arg(long, default_value = "0")]
+    max_warm_records: usize,
+
     /// Enable ActionDecoder: per-episode LM forward for gain modulation + stdin generation (ADR 0012).
     /// Requires qwen25_lm.onnx, qwen25_embed_table.safetensors, qwen25_tokenizer.json in --models-dir.
     #[arg(long, default_value = "false")]
@@ -611,7 +618,7 @@ async fn main() -> Result<()> {
 
     // Restore from snapshot if available; otherwise start fresh.
     let mut snapshot_found = false;
-    let (mut episodic, semantic) =
+    let (mut episodic, mut semantic) =
         match load_snapshot(&args.memory_dir, args.episodic_capacity, EPISODE_DIM) {
             Ok(Some((ep, sem))) => {
                 snapshot_found = true;
@@ -648,6 +655,10 @@ async fn main() -> Result<()> {
                 )
             }
         };
+
+    if args.max_warm_records > 0 {
+        semantic.set_max_records(args.max_warm_records);
+    }
 
     if args.settle_steps > 0 && !snapshot_found {
         tracing::warn!(
@@ -1255,6 +1266,7 @@ async fn main() -> Result<()> {
                 args.replay_batch_size,
                 args.nrem_min_traces,
                 args.lang_oversample,
+                args.max_warm_records,
             ) {
                 Ok(stats) => {
                     sleep_cycle_count += 1;

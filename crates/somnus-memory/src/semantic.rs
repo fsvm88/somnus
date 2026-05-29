@@ -1,6 +1,10 @@
 use std::{collections::HashMap, fs, path::Path};
 
-use hnsw_rs::{api::AnnT, hnswio::HnswIo, prelude::{DistL2, Hnsw}};
+use hnsw_rs::{
+    api::AnnT,
+    hnswio::HnswIo,
+    prelude::{DistL2, Hnsw},
+};
 
 use crate::episode::EpisodeRecord;
 
@@ -18,14 +22,23 @@ const SEARCH_EF: usize = 64;
 ///
 /// Insert policy in Phase 4: eager — every perceived episode is inserted immediately.
 /// Sleep-gated consolidation is Phase 5.
+///
+/// `max_records`: when > 0, inserts are dropped once this limit is reached.
+/// Use `rebuild_from_recent` during sleep to replace the index with a fresh one
+/// covering only the most recent N records from cold (proper LRU eviction).
 pub struct SemanticStore {
     index: Hnsw<'static, f32, DistL2>,
     records: HashMap<usize, EpisodeRecord>,
     dim: usize,
+    max_records: usize,
 }
 
 impl SemanticStore {
     pub fn new(dim: usize) -> Self {
+        Self::with_max(dim, 0)
+    }
+
+    pub fn with_max(dim: usize, max_records: usize) -> Self {
         let index = Hnsw::<'static, f32, DistL2>::new(
             HNSW_M,
             HNSW_MAX_ELEM,
@@ -37,14 +50,52 @@ impl SemanticStore {
             index,
             records: HashMap::new(),
             dim,
+            max_records,
         }
     }
 
+    pub fn set_max_records(&mut self, max: usize) {
+        self.max_records = max;
+    }
+
     /// Insert an episode into the HNSW index and the sidecar map.
+    /// Silently skips when `max_records > 0` and the cap has been reached.
+    /// New records still land in cold; use `rebuild_from_recent` to refresh warm.
     pub fn insert(&mut self, record: EpisodeRecord) {
+        if self.max_records > 0 && self.records.len() >= self.max_records {
+            return;
+        }
         let id = record.id as usize;
         self.index.insert((&record.values, id));
         self.records.insert(id, record);
+    }
+
+    /// Replace warm with a fresh HNSW built from the most recent `n` records in `cold`.
+    /// Called during sleep when warm has exceeded its cap. Returns the number of
+    /// records loaded. Does nothing (returns 0) if cold is empty or n == 0.
+    pub fn rebuild_from_recent(&mut self, cold: &crate::cold::ColdArchive, n: usize) -> usize {
+        if n == 0 || cold.is_empty() {
+            return 0;
+        }
+        let total = cold.len();
+        let skip = total.saturating_sub(n);
+
+        let mut fresh = SemanticStore::with_max(self.dim, self.max_records);
+        let mut loaded = 0usize;
+        if let Ok(iter) = cold.iter() {
+            for (i, result) in iter.enumerate() {
+                if i < skip {
+                    continue;
+                }
+                if let Ok(record) = result {
+                    fresh.index.insert((&record.values, record.id as usize));
+                    fresh.records.insert(record.id as usize, record);
+                    loaded += 1;
+                }
+            }
+        }
+        *self = fresh;
+        loaded
     }
 
     /// Return up to `k` nearest episodes to `cue`, sorted by ascending L2 distance.
@@ -102,6 +153,7 @@ impl SemanticStore {
             index,
             records: HashMap::new(),
             dim,
+            max_records: 0,
         }
     }
 
@@ -126,8 +178,8 @@ impl SemanticStore {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Sidecar
-        let encoded = bincode::serialize(&self.records)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let encoded =
+            bincode::serialize(&self.records).map_err(|e| std::io::Error::other(e.to_string()))?;
         fs::write(warm_dir.join("records.bin"), encoded)?;
 
         Ok(())
@@ -162,15 +214,19 @@ impl SemanticStore {
 
         // Sidecar records
         let sidecar_bytes = fs::read(&sidecar_path).ok()?;
-        let records: HashMap<usize, EpisodeRecord> =
-            bincode::deserialize(&sidecar_bytes).ok()?;
+        let records: HashMap<usize, EpisodeRecord> = bincode::deserialize(&sidecar_bytes).ok()?;
 
         // HNSW — leak HnswIo so the returned Hnsw<'static, ...> is valid
         let io = Box::new(HnswIo::new(warm_dir, "index"));
         let io_static: &'static mut HnswIo = Box::leak(io);
         let index: Hnsw<'static, f32, DistL2> = io_static.load_hnsw().ok()?;
 
-        Some(Self { index, records, dim: episode_dim })
+        Some(Self {
+            index,
+            records,
+            dim: episode_dim,
+            max_records: 0,
+        })
     }
 }
 

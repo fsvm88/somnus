@@ -216,6 +216,7 @@ pub fn run_sleep_cycle(
     replay_batch_size: usize,
     nrem_min_traces: usize,
     lang_oversample: usize,
+    max_warm_records: usize,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -550,6 +551,19 @@ pub fn run_sleep_cycle(
             spilled += 1;
         }
         tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
+
+        // Warm HNSW size management: if warm has exceeded the cap, rebuild from the
+        // most recent max_warm_records entries in cold so the index stays bounded.
+        if max_warm_records > 0 && recall.warm.len() > max_warm_records {
+            let t0 = Instant::now();
+            let loaded = recall.warm.rebuild_from_recent(&recall.cold, max_warm_records);
+            tracing::info!(
+                loaded,
+                max_warm_records,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "warm HNSW rebuilt from recent cold records"
+            );
+        }
     }
 
     // ── REM-like: measure MSE + trigger growth ────────────────────────────────
