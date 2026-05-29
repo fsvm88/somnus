@@ -241,8 +241,8 @@ impl PerceptionProcessor {
 
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
-        let wm = self.wm_mean_vec();
-        let (episode, regional_inputs) = self.try_bind(wm.as_deref());
+        let wm = self.wm_seq();
+        let (episode, regional_inputs) = self.try_bind(Some(&wm));
         let episode = self.maybe_settle_and_update(episode, speech_cos);
         self.push_to_wm(&episode);
 
@@ -286,8 +286,8 @@ impl PerceptionProcessor {
 
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
-        let wm = self.wm_mean_vec();
-        let (episode, regional_inputs) = self.try_bind(wm.as_deref());
+        let wm = self.wm_seq();
+        let (episode, regional_inputs) = self.try_bind(Some(&wm));
         let episode = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
@@ -328,8 +328,8 @@ impl PerceptionProcessor {
 
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
-        let wm = self.wm_mean_vec();
-        let (episode, regional_inputs) = self.try_bind(wm.as_deref());
+        let wm = self.wm_seq();
+        let (episode, regional_inputs) = self.try_bind(Some(&wm));
         let episode = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
@@ -370,8 +370,8 @@ impl PerceptionProcessor {
         self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
 
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
-        let wm = self.wm_mean_vec();
-        let (episode, regional_inputs) = self.try_bind(wm.as_deref());
+        let wm = self.wm_seq();
+        let (episode, regional_inputs) = self.try_bind(Some(&wm));
         let episode = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
@@ -485,10 +485,15 @@ impl PerceptionProcessor {
         }
     }
 
+    /// Returns the working memory as an ordered episode sequence (oldest first).
+    fn wm_seq(&self) -> Vec<Vec<f32>> {
+        self.working_memory.iter().cloned().collect()
+    }
+
     #[allow(clippy::type_complexity)]
     fn try_bind(
         &self,
-        wm_context: Option<&[f32]>,
+        episode_sequence: Option<&[Vec<f32>]>,
     ) -> (Option<EpisodeVector>, Option<[Vec<f32>; 5]>) {
         match (
             self.latest[0].as_ref(),
@@ -507,7 +512,7 @@ impl PerceptionProcessor {
                 let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
                 let ep = self.model.as_ref().unwrap().binding.forward(
                     &[sp, en, vi, sy, lang],
-                    wm_context,
+                    episode_sequence,
                     &device,
                 );
                 let regional = [
@@ -1486,20 +1491,6 @@ impl PerceptionProcessor {
                 (blended, Some(cosine))
             }
         }
-    }
-
-    fn wm_mean_vec(&self) -> Option<Vec<f32>> {
-        if self.wm_size == 0 || self.working_memory.is_empty() {
-            return None;
-        }
-        let n = self.working_memory.len() as f32;
-        let mut mean = vec![0.0f32; EPISODE_DIM];
-        for ep in &self.working_memory {
-            for (m, v) in mean.iter_mut().zip(ep.iter()) {
-                *m += v / n;
-            }
-        }
-        Some(mean)
     }
 
     fn push_to_wm(&mut self, episode: &Option<EpisodeVector>) {

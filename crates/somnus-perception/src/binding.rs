@@ -1,6 +1,6 @@
 use burn::{
     module::Module,
-    nn::{Linear, LinearConfig},
+    nn::{Gru, GruConfig, Linear, LinearConfig},
     tensor::{activation, backend::Backend, Tensor, TensorData},
 };
 
@@ -12,6 +12,11 @@ pub const EPISODE_DIM: usize = 640;
 /// output can be flattened directly to the episode vector — no final linear.
 const D_PROJ: usize = 128;
 const _: () = assert!(5 * D_PROJ == EPISODE_DIM);
+
+/// GRU hidden size for temporal context. Produces a GRU_HIDDEN-dim summary of
+/// the recent episode sequence, projected to EPISODE_DIM and reshaped to
+/// [5, D_PROJ] for K/V augmentation — same slot layout as the old WM mean.
+const GRU_HIDDEN: usize = 256;
 
 /// Fixed-size episode vector produced by the binding area.
 /// Always EPISODE_DIM elements (f32).
@@ -40,6 +45,12 @@ pub struct BindingArea<B: Backend> {
     pub(crate) w_q: Linear<B>,
     pub(crate) w_k: Linear<B>,
     pub(crate) w_v: Linear<B>,
+    /// GRU over recent episode sequence → temporal context token for K/V.
+    /// Replaces the old WM mean-vector approach with a learned recurrence.
+    pub(crate) temporal_gru: Gru<B>,
+    /// Projects GRU final hidden state [GRU_HIDDEN] → [EPISODE_DIM] so it can
+    /// be reshaped to [5, D_PROJ] and appended to K and V.
+    pub(crate) temporal_proj: Linear<B>,
 }
 
 impl<B: Backend> BindingArea<B> {
@@ -63,6 +74,10 @@ impl<B: Backend> BindingArea<B> {
             w_q: attn(),
             w_k: attn(),
             w_v: attn(),
+            temporal_gru: GruConfig::new(EPISODE_DIM, GRU_HIDDEN, false).init(device),
+            temporal_proj: LinearConfig::new(GRU_HIDDEN, EPISODE_DIM)
+                .with_bias(false)
+                .init(device),
         }
     }
 
@@ -70,13 +85,15 @@ impl<B: Backend> BindingArea<B> {
     /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
     /// Language may be a zero SparseActivation when no text is available.
     ///
-    /// `wm_context`: optional EPISODE_DIM-dim working-memory mean vector (10d).
-    /// When present it is reshaped to [5, D_PROJ] and appended to K and V, giving
-    /// the region queries temporal context without adding new learned weights.
+    /// `episode_sequence`: optional slice of recent episode vectors (newest last),
+    /// each EPISODE_DIM-dim. Run through the temporal GRU; the final hidden state
+    /// is projected to [5, D_PROJ] and appended to K and V. This replaces the
+    /// previous WM-mean approach with a learned recurrent temporal context.
+    /// Pass `None` (or empty) for the first episode or during settle.
     pub fn forward(
         &self,
         acts: &[&SparseActivation; 5],
-        wm_context: Option<&[f32]>,
+        episode_sequence: Option<&[Vec<f32>]>,
         device: &B::Device,
     ) -> EpisodeVector {
         let region_projs = [
@@ -105,11 +122,21 @@ impl<B: Backend> BindingArea<B> {
         // Q from current regions only: [5, D_PROJ]
         let q: Tensor<B, 2> = self.w_q.forward(x.clone());
 
-        // K and V from current regions + optional working-memory context.
-        let (k, v) = if let Some(wm) = wm_context {
-            debug_assert_eq!(wm.len(), EPISODE_DIM);
-            let wm_t = Tensor::<B, 2>::from_data(TensorData::new(wm.to_vec(), [5, D_PROJ]), device);
-            let x_ext: Tensor<B, 2> = Tensor::cat(vec![x, wm_t], 0); // [10, D_PROJ]
+        // K and V: current regions + optional GRU temporal context token.
+        let (k, v) = if let Some(seq) = episode_sequence.filter(|s| !s.is_empty()) {
+            let seq_len = seq.len();
+            let flat: Vec<f32> = seq.iter().flat_map(|ep| ep.iter().copied()).collect();
+            let seq_t: Tensor<B, 3> = Tensor::from_data(
+                TensorData::new(flat, [1, seq_len, EPISODE_DIM]),
+                device,
+            );
+            // Run GRU; take final hidden state [1, GRU_HIDDEN]
+            let gru_out: Tensor<B, 3> = self.temporal_gru.forward(seq_t, None);
+            let hidden: Tensor<B, 2> = gru_out.narrow(1, seq_len - 1, 1).squeeze_dim::<2>(1);
+            // Project → [1, EPISODE_DIM] → reshape → [5, D_PROJ]
+            let ctx: Tensor<B, 2> = self.temporal_proj.forward(hidden);
+            let ctx_tokens: Tensor<B, 2> = ctx.reshape([5, D_PROJ]);
+            let x_ext: Tensor<B, 2> = Tensor::cat(vec![x, ctx_tokens], 0); // [10, D_PROJ]
             (self.w_k.forward(x_ext.clone()), self.w_v.forward(x_ext))
         } else {
             (self.w_k.forward(x.clone()), self.w_v.forward(x))
