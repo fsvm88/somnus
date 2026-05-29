@@ -20,10 +20,16 @@ pub struct EpisodeRecord {
 /// current. Used as the decoder projection training signal during NREM (ADR 0012).
 /// Not persisted to the cold archive or snapshot; lost on restart (hot-tier only).
 ///
+/// `salience` is the L2 distance to the nearest warm-memory neighbour at encode time.
+/// High salience = novel (far from anything previously consolidated). Used to prioritise
+/// replay: novel traces are replayed first so they are not skipped on early NREM exit.
+/// Defaults to f32::MAX when warm memory is empty (first session).
+///
 /// The cold archive stores EpisodeRecord only; per-region encoder inputs are hot-tier data.
 #[derive(Debug, Clone)]
 pub struct EpisodeTrace {
     pub record: EpisodeRecord,
     pub regional: [Vec<f32>; 5],
     pub text_target: Option<Vec<u32>>,
+    pub salience: f32,
 }

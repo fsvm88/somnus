@@ -26,7 +26,13 @@ impl EpisodicBuffer {
 
     /// Push a trace; returns the assigned id.
     /// `regional` contains the per-region encoder embeddings for this episode.
-    pub fn push(&mut self, timestamp_secs: f64, values: Vec<f32>, regional: [Vec<f32>; 5]) -> u64 {
+    pub fn push(
+        &mut self,
+        timestamp_secs: f64,
+        values: Vec<f32>,
+        regional: [Vec<f32>; 5],
+        salience: f32,
+    ) -> u64 {
         if self.buf.len() == self.capacity {
             self.buf.pop_front();
             // Adjust checkpoint: if the evicted element was before the checkpoint,
@@ -45,6 +51,7 @@ impl EpisodicBuffer {
             },
             regional,
             text_target: None,
+            salience,
         });
         id
     }
@@ -107,6 +114,7 @@ impl EpisodicBuffer {
             },
             regional,
             text_target: None,
+            salience: f32::MAX,
         });
     }
 
@@ -146,10 +154,10 @@ mod tests {
     fn evicts_oldest_at_capacity() {
         let mut buf = EpisodicBuffer::new(3);
         let (ts, vals, reg) = make_trace(0);
-        let id0 = buf.push(ts, vals, reg);
+        let id0 = buf.push(ts, vals, reg, f32::MAX);
         for i in 1..4 {
             let (ts, vals, reg) = make_trace(i);
-            buf.push(ts, vals, reg);
+            buf.push(ts, vals, reg, f32::MAX);
         }
         assert_eq!(buf.len(), 3);
         assert!(buf.iter_traces().all(|t| t.record.id != id0));
@@ -160,7 +168,7 @@ mod tests {
         let mut buf = EpisodicBuffer::new(10);
         for i in 0..5 {
             let (ts, vals, reg) = make_trace(i);
-            let id = buf.push(ts, vals, reg);
+            let id = buf.push(ts, vals, reg, f32::MAX);
             assert_eq!(id, i as u64);
         }
     }
@@ -169,7 +177,7 @@ mod tests {
     fn regional_stored_correctly() {
         let mut buf = EpisodicBuffer::new(10);
         let regional = [vec![1.0f32; 4], vec![2.0f32; 5], vec![], vec![], vec![]];
-        buf.push(0.0, vec![0.0; 4], regional.clone());
+        buf.push(0.0, vec![0.0; 4], regional.clone(), f32::MAX);
         let trace = buf.iter_traces().next().unwrap();
         assert_eq!(trace.regional[0], vec![1.0f32; 4]);
         assert_eq!(trace.regional[1], vec![2.0f32; 5]);

@@ -28,10 +28,9 @@ const GROWTH_BATCH: usize = 64;
 const SALIENCE_THRESHOLD: usize = 16;
 /// Mean warm-recall L2 above this threshold supplements the MSE growth signal.
 /// Only applied when warm had pre-spill entries (i.e., cross-cycle/cross-session data).
-/// Calibrated 2026-05-14: same-content (single looped video) warm-recall L2 ranges 1.6–3.5
-/// (median 2.3, max 3.5). Threshold of 15.0 gives ~4× margin above that maximum, so same-content
-/// cycling never triggers growth while genuinely novel input (expected L2 >> 5) will.
-const WARM_RECALL_GROWTH_THRESHOLD: f32 = 15.0;
+/// Kept for the warm_recall_poor log field but no longer gates growth directly —
+/// gist_recall_rate is the primary growth signal (see GIST_GROWTH_THRESHOLD).
+const WARM_RECALL_GROWTH_THRESHOLD: f32 = 5.0;
 
 /// Neuromodulated learning rate schedule for NREM replay.
 ///
@@ -120,7 +119,9 @@ const GIST_MAX_ITER: usize = 20;
 /// Minimum warm-store size to attempt gist clustering.
 const GIST_MIN_WARM: usize = GIST_K;
 /// Growth fires when gist-recall rate is below this fraction.
-const GIST_GROWTH_THRESHOLD: f32 = 0.5;
+/// Raised from 0.5: with 4-clip loops gist trivially hits 1.0 post-NREM,
+/// so 0.5 never fired. 0.85 requires tight gist before suppressing growth.
+const GIST_GROWTH_THRESHOLD: f32 = 0.85;
 /// Minimum gist recall rate for pruning to be considered safe (12c).
 const PRUNE_GIST_THRESHOLD: f32 = 0.8;
 
@@ -237,7 +238,7 @@ pub fn run_sleep_cycle(
     // Always start from 0 each cycle: language-priority ordering makes the
     // cross-cycle checkpoint unnecessary and would misplace prioritized traces.
     episodic.replay_checkpoint = 0;
-    type TraceSnapshot = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>);
+    type TraceSnapshot = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32);
     let mut traces: Vec<TraceSnapshot> = episodic
         .iter_traces()
         .map(|t| {
@@ -245,12 +246,18 @@ pub fn run_sleep_cycle(
                 t.record.values.clone(),
                 t.regional.clone(),
                 t.text_target.clone(),
+                t.salience,
             )
         })
         .collect();
-    // Language-priority ordering: stable sort puts language-tagged traces first.
-    // Every cycle — even one interrupted at the floor — replays all language traces.
-    traces.sort_by_key(|(_, _, txt)| if txt.is_some() { 0usize } else { 1 });
+    // Language-priority first; then within each group sort by salience descending
+    // so the most novel (high L2 from warm) traces are replayed first and are
+    // never skipped on early NREM exit.
+    traces.sort_by(|(_, _, a_txt, a_sal), (_, _, b_txt, b_sal)| {
+        let a_lang = a_txt.is_some() as u8;
+        let b_lang = b_txt.is_some() as u8;
+        b_lang.cmp(&a_lang).then(b_sal.partial_cmp(a_sal).unwrap_or(std::cmp::Ordering::Equal))
+    });
 
     // Language oversampling: prepend lang_oversample extra copies of language-tagged
     // traces before the full sorted list. With lang_oversample=9 the projection sees
@@ -258,7 +265,7 @@ pub fn run_sleep_cycle(
     if lang_oversample > 0 {
         let lang_traces: Vec<_> = traces
             .iter()
-            .filter(|(_, _, txt)| txt.is_some())
+            .filter(|(_, _, txt, _)| txt.is_some())
             .cloned()
             .collect();
         if !lang_traces.is_empty() {
@@ -278,7 +285,7 @@ pub fn run_sleep_cycle(
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
 
-    let decoder_trainable_records = traces.iter().filter(|(_, _, t)| t.is_some()).count();
+    let decoder_trainable_records = traces.iter().filter(|(_, _, t, _)| t.is_some()).count();
     tracing::info!(decoder_trainable_records, "NREM: decoder-trainable traces");
 
     // Effective batch size: fall back to 1 (sequential) when 0 is passed.
@@ -315,8 +322,8 @@ pub fn run_sleep_cycle(
         perception.set_learning_rate(lr);
 
         // ── Fused SAE replay + output-head training (single backward) ───────
-        let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _)| r).collect();
-        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _)| ep.as_slice()).collect();
+        let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _, _)| r).collect();
+        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _, _)| ep.as_slice()).collect();
         let t_replay = Instant::now();
         match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
             Ok((loss, mse)) => {
@@ -362,7 +369,7 @@ pub fn run_sleep_cycle(
         if let Some(ref mut dec) = decoder {
             let proj_pairs: Vec<(&[f32], &[u32])> = batch
                 .iter()
-                .filter_map(|(ep, _, ids)| ids.as_ref().map(|ids| (ep.as_slice(), ids.as_slice())))
+                .filter_map(|(ep, _, ids, _)| ids.as_ref().map(|ids| (ep.as_slice(), ids.as_slice())))
                 .collect();
             if !proj_pairs.is_empty() {
                 match dec.projection_step_batch(&proj_pairs) {
@@ -568,9 +575,11 @@ pub fn run_sleep_cycle(
             }
         }
 
-        // Growth trigger: prefer gist-recall quality signal (10c); fall back to SAE MSE
-        // when warm store is too small to cluster (gist_recall_rate is None).
-        let warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
+        // Growth trigger: gist-recall is the primary signal; SAE MSE fallback when warm
+        // is too small to cluster. warm_recall_poor is logged but no longer gates growth —
+        // the WARM_RECALL_GROWTH_THRESHOLD (15.0) was calibrated too conservatively and
+        // prevented growth even when gist was poor.
+        let _warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
         let gist_poor = gist_recall_rate.is_none_or(|r| r < GIST_GROWTH_THRESHOLD);
         let region_ids = [
             RegionId::AudioSpeech,
@@ -586,7 +595,7 @@ pub fn run_sleep_cycle(
             } else {
                 per_region_mse[i] > GROWTH_THRESHOLD
             };
-            if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor && warm_recall_poor {
+            if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor {
                 tracing::info!(
                     region = ?region,
                     mse = per_region_mse[i],

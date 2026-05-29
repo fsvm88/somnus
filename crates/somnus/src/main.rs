@@ -1757,9 +1757,15 @@ fn record_episode(
                 .clone()
                 .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
 
+        // L2-normalise the episode vector so HNSW uses cosine-equivalent distance.
+        let ep_norm = {
+            let mag = ep.0.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+            ep.0.iter().map(|x| x / mag).collect::<Vec<f32>>()
+        };
+
         // Recollection: find similar past episodes from warm memory.
-        let neighbours = recall.query_warm_with_dist(&ep.0, top_k);
-        let (episode_vec, blended) = if let Some(&(dist, rec)) = neighbours.first() {
+        let neighbours = recall.query_warm_with_dist(&ep_norm, top_k);
+        let (episode_vec, blended, salience) = if let Some(&(dist, rec)) = neighbours.first() {
             tracing::info!(
                 top1_id = rec.id,
                 top1_timestamp_secs = rec.timestamp_secs,
@@ -1768,21 +1774,20 @@ fn record_episode(
                 "recollection"
             );
             if dist < RECALL_BLEND_THRESHOLD {
-                let v: Vec<f32> = ep
-                    .0
+                let v: Vec<f32> = ep_norm
                     .iter()
                     .zip(rec.values.iter())
                     .map(|(&cur, &ret)| (1.0 - RECALL_BLEND_ALPHA) * cur + RECALL_BLEND_ALPHA * ret)
                     .collect();
-                (v, true)
+                (v, true, dist)
             } else {
-                (ep.0.clone(), false)
+                (ep_norm.clone(), false, dist)
             }
         } else {
-            (ep.0.clone(), false)
+            (ep_norm.clone(), false, f32::MAX)
         };
 
-        let id = episodic.push(ts_secs, episode_vec.clone(), regional);
+        let id = episodic.push(ts_secs, episode_vec.clone(), regional, salience);
         tracing::info!(
             dim = episode_vec.len(),
             episode_id = id,

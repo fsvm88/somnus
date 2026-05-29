@@ -342,16 +342,8 @@ mod tests {
         let path = dir.path().join("episodic.bin");
 
         let mut buf = EpisodicBuffer::new(10);
-        buf.push(
-            1.0,
-            vec![0.1f32; 640],
-            [vec![1.0f32; 384], vec![2.0f32; 512], vec![], vec![], vec![]],
-        );
-        buf.push(
-            2.0,
-            vec![0.2f32; 640],
-            [vec![], vec![], vec![3.0f32; 384], vec![4.0f32; 384], vec![]],
-        );
+        buf.push(1.0, vec![0.1f32; 640], [vec![1.0f32; 384], vec![2.0f32; 512], vec![], vec![], vec![]], f32::MAX);
+        buf.push(2.0, vec![0.2f32; 640], [vec![], vec![], vec![3.0f32; 384], vec![4.0f32; 384], vec![]], f32::MAX);
 
         save_episodic(&buf, &path).unwrap();
         let restored = load_episodic(&path, 10).unwrap();
@@ -370,16 +362,8 @@ mod tests {
     fn snapshot_round_trip() {
         let dir = TempDir::new().unwrap();
         let mut buf = EpisodicBuffer::new(4);
-        buf.push(
-            1.0,
-            vec![0.1f32; 4],
-            [vec![1.0f32; 2], vec![], vec![], vec![], vec![]],
-        );
-        buf.push(
-            2.0,
-            vec![0.2f32; 4],
-            [vec![], vec![2.0f32; 2], vec![], vec![], vec![]],
-        );
+        buf.push(1.0, vec![0.1f32; 4], [vec![1.0f32; 2], vec![], vec![], vec![], vec![]], f32::MAX);
+        buf.push(2.0, vec![0.2f32; 4], [vec![], vec![2.0f32; 2], vec![], vec![], vec![]], f32::MAX);
 
         save_snapshot(&buf, dir.path()).unwrap();
         let result = load_snapshot(dir.path(), 4, 4).unwrap();
