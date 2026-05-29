@@ -25,6 +25,58 @@ use std::collections::VecDeque;
 pub type TrainB = Autodiff<NdArray>;
 type PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>;
 
+/// EMA (exponential moving average) copies of the 5 output heads, used for all
+/// inference paths (top-down prior generation, settling).  Updated after every
+/// wake_reconstruct_step; decoupled from the autodiff training heads so that
+/// noisy per-frame gradients don't immediately destabilise prior prediction.
+const EMA_ALPHA: f32 = 0.99;
+
+struct EmaOutputHeads {
+    heads: [burn::tensor::Tensor<NdArray, 2>; 5],
+}
+
+impl EmaOutputHeads {
+    fn from_model(model: &PerceptionModel<TrainB>) -> Self {
+        Self {
+            heads: [
+                model.speech_head.weight.val().inner(),
+                model.env_head.weight.val().inner(),
+                model.visual_head.weight.val().inner(),
+                model.symbolic_head.weight.val().inner(),
+                model.language_head.weight.val().inner(),
+            ],
+        }
+    }
+
+    fn update(&mut self, model: &PerceptionModel<TrainB>) {
+        let live = [
+            model.speech_head.weight.val().inner(),
+            model.env_head.weight.val().inner(),
+            model.visual_head.weight.val().inner(),
+            model.symbolic_head.weight.val().inner(),
+            model.language_head.weight.val().inner(),
+        ];
+        for (ema, w) in self.heads.iter_mut().zip(live) {
+            *ema = ema.clone() * EMA_ALPHA + w * (1.0 - EMA_ALPHA);
+        }
+    }
+
+    /// Inference-only head forward: ep_data @ head.T → Vec<f32>.
+    /// Uses NdArray directly with no autodiff overhead.
+    fn predict(&self, ep_data: &[f32], idx: usize, device: &NdArrayDevice) -> Vec<f32> {
+        let ep_t: burn::tensor::Tensor<NdArray, 2> = burn::tensor::Tensor::from_data(
+            TensorData::new(ep_data.to_vec(), [1, ep_data.len()]),
+            device,
+        );
+        // burn stores weight as [d_input, d_output]; forward is x @ weight (no transpose).
+        ep_t.matmul(self.heads[idx].clone())
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap()
+    }
+}
+
 /// Per-region input dimensions. Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
 pub const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 896];
 
@@ -126,6 +178,11 @@ pub struct PerceptionProcessor {
     current_lr: f64,
     device: NdArrayDevice,
 
+    /// EMA copies of the output heads used for all inference paths (prior, settle).
+    /// Decoupled from the autodiff training heads so gradient noise doesn't
+    /// immediately destabilise prior prediction.
+    ema_heads: EmaOutputHeads,
+
     prior_predictions: [Option<Vec<f32>>; 5],
     prior_beta: f32,
     latest: [Option<SparseActivation>; 5],
@@ -141,10 +198,12 @@ pub struct PerceptionProcessor {
 impl PerceptionProcessor {
     pub fn new(device: NdArrayDevice) -> Self {
         let model = PerceptionModel::new(&device);
+        let ema_heads = EmaOutputHeads::from_model(&model);
         let optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
         Self {
             model: Some(model),
             optimizer,
+            ema_heads,
             current_lr: TrainConfig::default().lr,
             device,
             prior_predictions: [None, None, None, None, None],
@@ -902,6 +961,7 @@ impl PerceptionProcessor {
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
             let model = self.optimizer.step(self.current_lr, model, grads_p);
+            self.ema_heads.update(&model);
             self.model = Some(model);
             Ok(loss_val / n.max(1) as f32)
         } else {
@@ -1279,6 +1339,7 @@ impl PerceptionProcessor {
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         match model.load_file(path_str, &recorder, &device) {
             Ok(loaded) => {
+                self.ema_heads = EmaOutputHeads::from_model(&loaded);
                 self.model = Some(loaded);
                 Ok(())
             }
@@ -1337,26 +1398,10 @@ impl PerceptionProcessor {
         let mut current = ep.clone();
 
         for iter in 0..self.settle_steps {
-            let cur_t: Tensor<TrainB, 2> = Tensor::from_data(
-                TensorData::new(current.0.clone(), [1, EPISODE_DIM]),
-                &device,
-            );
-
+            // Use EMA heads for inference — no autodiff overhead, stable priors.
             let mut preds: [Vec<f32>; 5] = Default::default();
-            let heads = [
-                &model.speech_head,
-                &model.env_head,
-                &model.visual_head,
-                &model.symbolic_head,
-                &model.language_head,
-            ];
-            for (i, head) in heads.iter().enumerate() {
-                preds[i] = head
-                    .forward(cur_t.clone())
-                    .into_data()
-                    .convert::<f32>()
-                    .to_vec()
-                    .unwrap();
+            for i in 0..5 {
+                preds[i] = self.ema_heads.predict(&current.0, i, &device);
             }
 
             let mut acts: [Option<SparseActivation>; 5] = Default::default();
@@ -1416,30 +1461,8 @@ impl PerceptionProcessor {
 
     fn update_prior_predictions(&mut self, episode: &[f32]) {
         let device = self.device;
-        let ep_t: Tensor<TrainB, 2> =
-            Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
-        let preds = {
-            let model = self.model.as_ref().unwrap();
-            let heads = [
-                &model.speech_head,
-                &model.env_head,
-                &model.visual_head,
-                &model.symbolic_head,
-                &model.language_head,
-            ];
-            let mut out = [vec![], vec![], vec![], vec![], vec![]];
-            for (i, head) in heads.iter().enumerate() {
-                out[i] = head
-                    .forward(ep_t.clone())
-                    .into_data()
-                    .convert::<f32>()
-                    .to_vec()
-                    .unwrap();
-            }
-            out
-        };
-        for (i, p) in preds.into_iter().enumerate() {
-            self.prior_predictions[i] = Some(p);
+        for i in 0..5 {
+            self.prior_predictions[i] = Some(self.ema_heads.predict(episode, i, &device));
         }
     }
 
