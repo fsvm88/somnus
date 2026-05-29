@@ -28,6 +28,10 @@ type PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>;
 /// Per-region input dimensions. Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
 pub const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 896];
 
+/// Input dimension for the symbolic cross-modal projection:
+/// speech(384) + env(512) + visual(384) + language(896). Missing modalities are zero-padded.
+pub const CROSS_MODAL_DIM: usize = 384 + 512 + 384 + 896;
+
 /// prior_cosine below this gate activates settling (ADR 0011).
 const SETTLE_COSINE_GATE: f32 = 0.85;
 
@@ -73,6 +77,10 @@ pub struct PerceptionModel<B: burn::tensor::backend::Backend> {
     pub visual_head: Linear<B>,
     pub symbolic_head: Linear<B>,
     pub language_head: Linear<B>,
+    /// Projects concatenated cross-modal encoder inputs → 384-dim symbolic input.
+    /// Input: [speech(384) | env(512) | visual(384) | language(896)] = 2176-dim,
+    /// zero-padded for any missing modality.
+    pub cross_modal_proj: Linear<B>,
 }
 
 impl PerceptionModel<TrainB> {
@@ -103,6 +111,9 @@ impl PerceptionModel<TrainB> {
                 .init(device),
             language_head: LinearConfig::new(EPISODE_DIM, 896)
                 .with_bias(false)
+                .init(device),
+            cross_modal_proj: LinearConfig::new(CROSS_MODAL_DIM, 384)
+                .with_bias(true)
                 .init(device),
         }
     }
@@ -152,48 +163,28 @@ impl PerceptionProcessor {
     // ── Ingest ──────────────────────────────────────────────────────────────
 
     /// Ingest a 384-dim Whisper speech embedding.
-    /// Updates AudioSpeech and Symbolic regions (same input, independent weights).
+    /// Updates AudioSpeech region, then recomputes Symbolic from all available cross-modal inputs.
     pub fn ingest_speech(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
         let device = self.device;
         let gained_speech = apply_gain(values, self.region_gain[0]);
-        let gained_symbolic = apply_gain(values, self.region_gain[3]);
         let (speech_input, speech_cos) = self.blend_with_prior(&gained_speech, 0);
-        let (symbolic_input, symbolic_cos) = self.blend_with_prior(&gained_symbolic, 3);
         if let Some(c) = speech_cos {
             tracing::info!(region = "speech", prior_cosine = c, "top-down prior");
         }
-        if let Some(c) = symbolic_cos {
-            tracing::info!(region = "symbolic", prior_cosine = c, "top-down prior");
-        }
 
-        let (speech_act, symbolic_act) = {
-            let model = self.model.as_mut().unwrap();
-            let sa = model.speech_layer.forward(&speech_input, &device);
-            let ya = model.symbolic_layer.forward(&symbolic_input, &device);
-            (sa, ya)
-        };
-
-        let (speech_err, symbolic_err) = {
-            let model = self.model.as_ref().unwrap();
-            let se = model
-                .speech_decoder
-                .reconstruction_error(values, &speech_act, &device);
-            let ye = model
-                .symbolic_decoder
-                .reconstruction_error(values, &symbolic_act, &device);
-            (se, ye)
-        };
+        let speech_act = self.model.as_mut().unwrap().speech_layer.forward(&speech_input, &device);
+        let speech_err = self.model.as_ref().unwrap()
+            .speech_decoder
+            .reconstruction_error(values, &speech_act, &device);
 
         self.latest[RegionId::AudioSpeech.as_index()] = Some(speech_act);
-        self.latest[RegionId::Symbolic.as_index()] = Some(symbolic_act);
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
-        self.latest_inputs[RegionId::Symbolic.as_index()] = Some(values.to_vec());
 
+        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
         let wm = self.wm_mean_vec();
         let (episode, regional_inputs) = self.try_bind(wm.as_deref());
-        let min_cos = min_cosine_2(speech_cos, symbolic_cos);
-        let episode = self.maybe_settle_and_update(episode, min_cos);
+        let episode = self.maybe_settle_and_update(episode, speech_cos);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -234,6 +225,7 @@ impl PerceptionProcessor {
         self.latest[RegionId::AudioEnv.as_index()] = Some(act);
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
+        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
         let wm = self.wm_mean_vec();
         let (episode, regional_inputs) = self.try_bind(wm.as_deref());
@@ -242,8 +234,9 @@ impl PerceptionProcessor {
 
         let mut prior_cosines = [None; 5];
         prior_cosines[1] = cosine;
+        prior_cosines[3] = symbolic_cos;
         Ok(PerceptionOutput {
-            recon_errors: vec![(RegionId::AudioEnv, err)],
+            recon_errors: vec![(RegionId::AudioEnv, err), (RegionId::Symbolic, symbolic_err)],
             episode,
             regional_inputs,
             prior_cosines,
@@ -274,6 +267,7 @@ impl PerceptionProcessor {
         self.latest[RegionId::Visual.as_index()] = Some(act);
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
+        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
         let wm = self.wm_mean_vec();
         let (episode, regional_inputs) = self.try_bind(wm.as_deref());
@@ -282,8 +276,9 @@ impl PerceptionProcessor {
 
         let mut prior_cosines = [None; 5];
         prior_cosines[2] = cosine;
+        prior_cosines[3] = symbolic_cos;
         Ok(PerceptionOutput {
-            recon_errors: vec![(RegionId::Visual, err)],
+            recon_errors: vec![(RegionId::Visual, err), (RegionId::Symbolic, symbolic_err)],
             episode,
             regional_inputs,
             prior_cosines,
@@ -315,15 +310,17 @@ impl PerceptionProcessor {
         self.latest[RegionId::Language.as_index()] = Some(act);
         self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
 
+        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         let wm = self.wm_mean_vec();
         let (episode, regional_inputs) = self.try_bind(wm.as_deref());
         let episode = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
+        prior_cosines[3] = symbolic_cos;
         prior_cosines[4] = cosine;
         Ok(PerceptionOutput {
-            recon_errors: vec![(RegionId::Language, err)],
+            recon_errors: vec![(RegionId::Language, err), (RegionId::Symbolic, symbolic_err)],
             episode,
             regional_inputs,
             prior_cosines,
@@ -349,6 +346,70 @@ impl PerceptionProcessor {
         } else {
             None
         }
+    }
+
+    /// Recompute the Symbolic region as a cross-modal convergence layer.
+    ///
+    /// Concatenates the current encoder embeddings for speech(384), env(512), visual(384),
+    /// and language(896), zero-padding any missing modality, then projects through
+    /// `cross_modal_proj` (2176→384) before running the symbolic k-WTA.  Called before
+    /// every `try_bind` so symbolic always reflects the most current cross-modal picture.
+    ///
+    /// Returns (symbolic_prior_cosine, symbolic_reconstruction_err).
+    fn compute_symbolic_cross_modal(&mut self) -> (Option<f32>, f32) {
+        let device = self.device;
+
+        // Build 2176-dim concat: [speech(384) | env(512) | visual(384) | language(896)]
+        let mut concat = vec![0.0f32; CROSS_MODAL_DIM];
+        let offsets = [(0, 384), (384, 512), (896, 384), (1280, 896)]; // (offset, dim) per region idx [0,1,2,4]
+        let region_indices = [0usize, 1, 2, 4];
+        for (&region_idx, &(offset, dim)) in region_indices.iter().zip(offsets.iter()) {
+            if let Some(inp) = &self.latest_inputs[region_idx] {
+                let len = inp.len().min(dim);
+                concat[offset..offset + len].copy_from_slice(&inp[..len]);
+            }
+        }
+
+        // Project to 384-dim
+        let concat_t: Tensor<TrainB, 2> = Tensor::from_data(
+            TensorData::new(concat, [1, CROSS_MODAL_DIM]),
+            &device,
+        );
+        let projected: Vec<f32> = self
+            .model
+            .as_ref()
+            .unwrap()
+            .cross_modal_proj
+            .forward(concat_t)
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+
+        // Blend with prior and encode through symbolic k-WTA
+        let gained = apply_gain(&projected, self.region_gain[3]);
+        let (symbolic_input, symbolic_cos) = self.blend_with_prior(&gained, 3);
+        if let Some(c) = symbolic_cos {
+            tracing::info!(region = "symbolic", prior_cosine = c, "top-down prior");
+        }
+        let symbolic_act = self
+            .model
+            .as_mut()
+            .unwrap()
+            .symbolic_layer
+            .forward(&symbolic_input, &device);
+        let symbolic_err = self
+            .model
+            .as_ref()
+            .unwrap()
+            .symbolic_decoder
+            .reconstruction_error(&projected, &symbolic_act, &device);
+
+        self.latest[RegionId::Symbolic.as_index()] = Some(symbolic_act);
+        // Store the projected embedding as symbolic's input for NREM replay and settling.
+        self.latest_inputs[RegionId::Symbolic.as_index()] = Some(projected);
+
+        (symbolic_cos, symbolic_err)
     }
 
     fn refresh_language_cache(&mut self) {
@@ -1472,14 +1533,6 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
         0.0
     } else {
         dot / (na * nb)
-    }
-}
-
-fn min_cosine_2(a: Option<f32>, b: Option<f32>) -> Option<f32> {
-    match (a, b) {
-        (None, None) => None,
-        (Some(x), None) | (None, Some(x)) => Some(x),
-        (Some(x), Some(y)) => Some(x.min(y)),
     }
 }
 
