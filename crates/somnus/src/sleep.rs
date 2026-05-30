@@ -261,8 +261,13 @@ pub fn run_sleep_cycle(
     // Always start from 0 each cycle: language-priority ordering makes the
     // cross-cycle checkpoint unnecessary and would misplace prioritized traces.
     episodic.replay_checkpoint = 0;
-    type TraceSnapshot = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32);
-    let mut traces: Vec<TraceSnapshot> = episodic
+    // Fifth field: precomputed LM hidden state (Gap 6 distillation target).
+    type TraceSnapshot = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32, Option<Vec<f32>>);
+
+    // Precompute LM hidden states before the NREM loop so the hot path doesn't
+    // pay the lm_session cost per batch. text_hidden_states is &self (inference
+    // only), so we borrow decoder immutably here, before the mutable NREM step.
+    let raw_traces: Vec<(Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32)> = episodic
         .iter_traces()
         .map(|t| {
             (
@@ -273,10 +278,26 @@ pub fn run_sleep_cycle(
             )
         })
         .collect();
+    let lm_hidden_targets: Vec<Option<Vec<f32>>> = if let Some(ref mut dec) = decoder {
+        raw_traces
+            .iter()
+            .map(|(_, _, ids, _)| {
+                ids.as_ref()
+                    .and_then(|ids| dec.text_hidden_states(ids).ok())
+            })
+            .collect()
+    } else {
+        vec![None; raw_traces.len()]
+    };
+    let mut traces: Vec<TraceSnapshot> = raw_traces
+        .into_iter()
+        .zip(lm_hidden_targets)
+        .map(|((ep, reg, ids, sal), lm_h)| (ep, reg, ids, sal, lm_h))
+        .collect();
     // Language-priority first; then within each group sort by salience descending
     // so the most novel (high L2 from warm) traces are replayed first and are
     // never skipped on early NREM exit.
-    traces.sort_by(|(_, _, a_txt, a_sal), (_, _, b_txt, b_sal)| {
+    traces.sort_by(|(_, _, a_txt, a_sal, _), (_, _, b_txt, b_sal, _)| {
         let a_lang = a_txt.is_some() as u8;
         let b_lang = b_txt.is_some() as u8;
         b_lang.cmp(&a_lang).then(b_sal.partial_cmp(a_sal).unwrap_or(std::cmp::Ordering::Equal))
@@ -288,7 +309,7 @@ pub fn run_sleep_cycle(
     if lang_oversample > 0 {
         let lang_traces: Vec<_> = traces
             .iter()
-            .filter(|(_, _, txt, _)| txt.is_some())
+            .filter(|(_, _, txt, _, _)| txt.is_some())
             .cloned()
             .collect();
         if !lang_traces.is_empty() {
@@ -308,7 +329,7 @@ pub fn run_sleep_cycle(
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
 
-    let decoder_trainable_records = traces.iter().filter(|(_, _, t, _)| t.is_some()).count();
+    let decoder_trainable_records = traces.iter().filter(|(_, _, t, _, _)| t.is_some()).count();
     tracing::info!(decoder_trainable_records, "NREM: decoder-trainable traces");
 
     // Effective batch size: fall back to 1 (sequential) when 0 is passed.
@@ -344,7 +365,7 @@ pub fn run_sleep_cycle(
         let prev_ewma = loss_ewma;
         let non_sentinel: Vec<f32> = batch
             .iter()
-            .map(|(_, _, _, s)| *s)
+            .map(|(_, _, _, s, _)| *s)
             .filter(|&s| s < f32::MAX / 2.0)
             .collect();
         let batch_salience = if non_sentinel.is_empty() {
@@ -356,8 +377,8 @@ pub fn run_sleep_cycle(
         perception.set_learning_rate(lr);
 
         // ── Fused SAE replay + output-head training (single backward) ───────
-        let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _, _)| r).collect();
-        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _, _)| ep.as_slice()).collect();
+        let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _, _, _)| r).collect();
+        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _, _, _)| ep.as_slice()).collect();
         let t_replay = Instant::now();
         match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
             Ok((loss, mse)) => {
@@ -398,24 +419,26 @@ pub fn run_sleep_cycle(
             break;
         }
 
-        // ── Projection training: batched (separate optimizer, ADR 0012) ────────
+        // ── Projection distillation: LM hidden-state targets (Gap 6) ────────────
         let t_proj = Instant::now();
         if let Some(ref mut dec) = decoder {
-            let proj_pairs: Vec<(&[f32], &[u32])> = batch
+            let distill_pairs: Vec<(&[f32], &[f32])> = batch
                 .iter()
-                .filter_map(|(ep, _, ids, _)| ids.as_ref().map(|ids| (ep.as_slice(), ids.as_slice())))
+                .filter_map(|(ep, _, _, _, lm_h)| {
+                    lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
+                })
                 .collect();
-            if !proj_pairs.is_empty() {
-                match dec.projection_step_batch(&proj_pairs) {
+            if !distill_pairs.is_empty() {
+                match dec.projection_step_batch_distill(&distill_pairs) {
                     Ok(loss) => {
-                        let cnt = proj_pairs.len();
+                        let cnt = distill_pairs.len();
                         total_proj_loss += loss * cnt as f32;
                         proj_loss_n += cnt;
                         if loss > proj_loss_max {
                             proj_loss_max = loss;
                         }
                     }
-                    Err(e) => tracing::warn!(?e, "projection_step_batch error"),
+                    Err(e) => tracing::warn!(?e, "projection_step_batch_distill error"),
                 }
             }
         }

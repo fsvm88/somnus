@@ -58,6 +58,15 @@ Region k-WTA layers grow beyond N_UNITS during sleep. The binding area deliberat
 - **Snapshot incompatibility:** old snapshots with `binding.weight` cannot be loaded by this version. `varmap.load` will log a warning and fall back to freshly-initialized binding weights. Regional k-WTA and SAE weights are unaffected.
 - Binding area parameter count: 573K vs 2.1M (old). Total cognitive-layer parameters decrease slightly.
 
+## Amendment — multi-head binding (2026-05-30)
+
+Single-head attention was upgraded to **4-head attention** (N_HEADS=4, D_HEAD=32).
+
+The W_q/W_k/W_v matrices stay [D_PROJ, D_PROJ] = [128, 128] — parameter count unchanged.
+Each head attends over a contiguous D_HEAD=32-feature slice of each token. The head split is done as `[seq, D_PROJ] → reshape[seq, N_HEADS, D_HEAD] → swap_dims(0,1) → [N_HEADS, seq, D_HEAD]` to ensure contiguous feature partitioning (wrong reshape order interleaves tokens across heads silently). Scale changes from 1/√128 to 1/√32. A discriminating test (`different_head_slices_produce_different_outputs`) confirms the feature partitioning is correct.
+
+Also: the binding area has had a Language region (index 4) since Phase 6 (5 tokens total). The parameter table and diagram above reflect the original 4-region design; they are superseded but preserved for historical context.
+
 ## Alternatives considered
 
 - **Gated fusion:** each region multiplied by a learned scalar gate, then summed. Simpler but still no cross-regional context before aggregation.

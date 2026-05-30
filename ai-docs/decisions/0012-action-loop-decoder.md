@@ -122,6 +122,17 @@ This is well-defined; gain and prior are complementary — gain is a scalar mult
 
 **Circular target risk.** The projection trains against text-bypass targets. If text bypass is used heavily and always with the same phrasing, the decoder will overfit to the user's vocabulary rather than the sensory content. Vary text-bypass phrasing to cover different aspects of what the system is perceiving.
 
+## Amendment — distillation target for projection training (2026-05-30)
+
+The projection training target was changed from **static embed-table mean** to **LM contextualised hidden states**.
+
+Previously: for a language-tagged trace, project episode → region tokens → MSE against mean(embed_table[text_target_ids]).
+Now: text_target tokens are embedded, run through the full Qwen transformer (qwen25_lm.onnx, `last_hidden_state` output), mean-pooled over token positions, and L2-normalised. The projection then trains toward this contextualised target. The key difference: the static embed-table mean is a bag-of-embeddings (inter-token relationships discarded); the LM hidden state captures how Qwen contextualises the entire text sequence. Neither requires gradient through the frozen LM — the LM runs via ONNX/ORT in inference mode; only the projection (Burn/AdamW) is updated.
+
+`qwen25_lm.onnx` already exported `last_hidden_state` (Qwen25LMWrapper in export_models.py emits both `last_hidden_state` and `logits`); the Rust code was simply not reading it. No new model export needed.
+
+LM hidden states are precomputed once per NREM cycle (before the replay loop) so the ORT session cost is not on the hot NREM path. The `projection_step_batch` method (old embed-table target) is retained but marked `#[allow(dead_code)]`.
+
 ## Alternatives considered
 
 - **Separate gain and decoder (options 2 and 3 independently):** doubling the architectural surface for no benefit — the LLM forward pass needed for generation already produces the attention weights needed for gain. Rejected.

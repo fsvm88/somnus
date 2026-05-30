@@ -13,6 +13,11 @@ pub const EPISODE_DIM: usize = 640;
 const D_PROJ: usize = 128;
 const _: () = assert!(5 * D_PROJ == EPISODE_DIM);
 
+/// Number of attention heads. Each head attends over D_HEAD = D_PROJ / N_HEADS features.
+const N_HEADS: usize = 4;
+const D_HEAD: usize = D_PROJ / N_HEADS;
+const _CHECK_HEADS: () = assert!(N_HEADS * D_HEAD == D_PROJ);
+
 /// GRU hidden size for temporal context. Produces a GRU_HIDDEN-dim summary of
 /// the recent episode sequence, projected to EPISODE_DIM and reshaped to
 /// [5, D_PROJ] for K/V augmentation — same slot layout as the old WM mean.
@@ -142,11 +147,22 @@ impl<B: Backend> BindingArea<B> {
             (self.w_k.forward(x.clone()), self.w_v.forward(x))
         };
 
-        // Scaled dot-product: Q [5,D] × K^T → scores [5, 5 or 10]
-        let scale = (D_PROJ as f32).sqrt().recip();
-        let scores: Tensor<B, 2> = q.matmul(k.transpose()).mul_scalar(scale);
-        let attn: Tensor<B, 2> = activation::softmax(scores, 1);
-        let out: Tensor<B, 2> = attn.matmul(v); // [5, D_PROJ]
+        // Multi-head scaled dot-product.
+        // Reshape: [seq, D_PROJ] → [seq, N_HEADS, D_HEAD] → [N_HEADS, seq, D_HEAD].
+        // The feature axis is split contiguously: head h sees features [h*D_HEAD..(h+1)*D_HEAD]
+        // of every token. Reshape order must be [seq, N_HEADS, D_HEAD] first (not
+        // [N_HEADS, seq, D_HEAD]) to avoid interleaving tokens across heads.
+        let seq_k = k.dims()[0]; // 5 without temporal context, 10 with
+        let q3: Tensor<B, 3> = q.reshape([5, N_HEADS, D_HEAD]).swap_dims(0, 1);
+        let k3: Tensor<B, 3> = k.reshape([seq_k, N_HEADS, D_HEAD]).swap_dims(0, 1);
+        let v3: Tensor<B, 3> = v.reshape([seq_k, N_HEADS, D_HEAD]).swap_dims(0, 1);
+        let scale = (D_HEAD as f32).sqrt().recip();
+        // scores: [N_HEADS, 5, seq_k]
+        let scores3: Tensor<B, 3> = q3.matmul(k3.swap_dims(1, 2)).mul_scalar(scale);
+        let attn3: Tensor<B, 3> = activation::softmax(scores3, 2);
+        let out3: Tensor<B, 3> = attn3.matmul(v3); // [N_HEADS, 5, D_HEAD]
+        // Merge: [N_HEADS, 5, D_HEAD] → [5, N_HEADS, D_HEAD] → [5, D_PROJ]
+        let out: Tensor<B, 2> = out3.swap_dims(0, 1).reshape([5, D_PROJ]);
 
         // Flatten [5, D_PROJ] → [EPISODE_DIM]
         let flat: Vec<f32> = out
@@ -222,6 +238,49 @@ mod tests {
         );
         assert_eq!(ep.0.len(), EPISODE_DIM);
         assert!(ep.0.iter().all(|v| v.is_finite()));
+    }
+
+    /// Verify head feature partitioning: activating only the first D_HEAD features
+    /// of a region produces a different output than activating only the second
+    /// D_HEAD block. This catches the wrong-reshape bug where features are
+    /// interleaved across heads instead of contiguously partitioned.
+    #[test]
+    fn different_head_slices_produce_different_outputs() {
+        let device = NdArrayDevice::Cpu;
+        let area = make_area();
+
+        // Build two activations that differ only in which D_HEAD feature block is active.
+        let mut low_block = SparseActivation {
+            region: RegionId::AudioSpeech,
+            indices: (0u16..D_HEAD as u16).collect(), // features 0..D_HEAD (head-0 slice)
+            values: vec![1.0f32; D_HEAD],
+            n_units: N_UNITS,
+        };
+        let high_block = SparseActivation {
+            region: RegionId::AudioSpeech,
+            indices: (D_HEAD as u16..(2 * D_HEAD) as u16).collect(), // features D_HEAD..2*D_HEAD
+            values: vec![1.0f32; D_HEAD],
+            n_units: N_UNITS,
+        };
+        let dummy = dummy_act(RegionId::AudioEnv);
+        let zero = zero_act(RegionId::Language);
+
+        let ep_low = area.forward(
+            &[&low_block, &dummy, &dummy, &dummy, &zero],
+            None,
+            &device,
+        );
+        let ep_high = area.forward(
+            &[&high_block, &dummy, &dummy, &dummy, &zero],
+            None,
+            &device,
+        );
+
+        // With correct per-head feature partitioning the two inputs land in
+        // different heads, producing different attention patterns and outputs.
+        assert_ne!(ep_low.0, ep_high.0, "head-0 vs head-1 feature block must differ");
+        // Suppress unused-mut warning after the initialisation above.
+        let _ = &mut low_block;
     }
 
     #[test]

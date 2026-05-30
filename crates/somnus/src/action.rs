@@ -252,9 +252,52 @@ impl ActionDecoder {
         Ok(loss_val)
     }
 
-    /// Batched surrogate projection training step. Processes all lang-tagged
-    /// traces in a replay batch with a single forward+backward+optimizer call
-    /// instead of one per trace, amortising the 2.87M-param AdamW step.
+    /// Compute L2-normalised mean LM hidden state for a token sequence.
+    ///
+    /// Embeds `token_ids` via the frozen embed table, runs them through the full
+    /// LM transformer (qwen25_lm.onnx, `last_hidden_state` output), and returns
+    /// the mean-pooled, L2-normalised [LM_HIDDEN] vector.
+    ///
+    /// Used as the distillation target for projection training: richer than the
+    /// static embed-table mean because Qwen contextualises the tokens before
+    /// pooling, encoding inter-token relationships.
+    pub fn text_hidden_states(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
+        if token_ids.is_empty() {
+            return Ok(vec![0.0; LM_HIDDEN]);
+        }
+        let embeds = self.embed_flat(token_ids)?;
+        let n = token_ids.len();
+        let input = Array3::from_shape_vec((1, n, LM_HIDDEN), embeds)
+            .map_err(|e| anyhow::anyhow!("shape error: {e}"))?;
+        let tensor = TensorRef::from_array_view(&input)?;
+        let outputs = self.lm_session.run(ort::inputs!["inputs_embeds" => tensor])?;
+        let (shape, hidden_data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+        if shape.len() < 3 {
+            bail!("unexpected last_hidden_state shape: {:?}", shape);
+        }
+        let hidden = hidden_data.to_vec();
+        // Mean-pool over token positions.
+        let mut mean = vec![0.0f32; LM_HIDDEN];
+        for tok in 0..n {
+            for d in 0..LM_HIDDEN {
+                mean[d] += hidden[tok * LM_HIDDEN + d];
+            }
+        }
+        let scale = 1.0 / n as f32;
+        for v in &mut mean {
+            *v *= scale;
+        }
+        // L2-normalise.
+        let norm = (mean.iter().map(|x| x * x).sum::<f32>() + 1e-8).sqrt();
+        for v in &mut mean {
+            *v /= norm;
+        }
+        Ok(mean)
+    }
+
+    /// Batched surrogate projection training step (embed-table mean target).
+    /// Superseded by `projection_step_batch_distill`; retained for reference.
+    #[allow(dead_code)]
     pub fn projection_step_batch(&mut self, pairs: &[(&[f32], &[u32])]) -> Result<f32> {
         let valid: Vec<_> = pairs.iter().filter(|(_, ids)| !ids.is_empty()).collect();
         if valid.is_empty() {
@@ -303,6 +346,57 @@ impl ActionDecoder {
         let text_unit: Tensor<TrainB, 2> = Tensor::from_data(text_data, &self.device);
 
         let loss = (proj_unit - text_unit).powf_scalar(2.0).mean();
+        let loss_val: f32 = loss.clone().into_scalar();
+
+        let model = self.model.take().unwrap();
+        let grads = loss.backward();
+        let grads_p = GradientsParams::from_grads(grads, &model);
+        let model = self.optimizer.step(PROJ_LR, model, grads_p);
+        self.model = Some(model);
+
+        Ok(loss_val)
+    }
+
+    /// Distillation-based projection training step (Gap 6).
+    ///
+    /// Targets are precomputed LM hidden states (from `text_hidden_states`),
+    /// already mean-pooled and L2-normalised to [LM_HIDDEN]. This replaces the
+    /// static embed-table mean target used by `projection_step_batch`: Qwen's
+    /// transformer contextualises the text tokens before pooling, so the target
+    /// encodes inter-token relationships rather than a bag-of-embeddings sum.
+    ///
+    /// `pairs`: (episode_vec [EPISODE_DIM], lm_hidden_target [LM_HIDDEN])
+    pub fn projection_step_batch_distill(&mut self, pairs: &[(&[f32], &[f32])]) -> Result<f32> {
+        let valid: Vec<_> = pairs.iter().filter(|(_, h)| !h.is_empty()).collect();
+        if valid.is_empty() {
+            return Ok(0.0);
+        }
+        let n = valid.len();
+
+        let flat_hidden: Vec<f32> = valid
+            .iter()
+            .flat_map(|(_, h)| h.iter().copied())
+            .collect();
+        let flat_eps: Vec<f32> = valid
+            .iter()
+            .flat_map(|(ep, _)| ep.iter().copied())
+            .collect();
+        let ep_t: Tensor<TrainB, 2> =
+            Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
+
+        let model = self.model.as_ref().unwrap();
+        let proj_out = model.projection.forward(ep_t); // [N, N_REGIONS * LM_HIDDEN]
+        let proj_out = proj_out.reshape([n, N_REGIONS, LM_HIDDEN]);
+        let proj_sum = proj_out.sum_dim(1).reshape([n, LM_HIDDEN]);
+        let sq_sum = proj_sum.clone().powf_scalar(2.0).sum_dim(1);
+        let norm = (sq_sum + 1e-8f32).sqrt();
+        let proj_unit = proj_sum / norm; // [N, LM_HIDDEN], L2-normalised
+
+        // Targets are already normalised; load as detached tensor.
+        let target_t: Tensor<TrainB, 2> =
+            Tensor::from_data(TensorData::new(flat_hidden, [n, LM_HIDDEN]), &self.device);
+
+        let loss = (proj_unit - target_t).powf_scalar(2.0).mean();
         let loss_val: f32 = loss.clone().into_scalar();
 
         let model = self.model.take().unwrap();
