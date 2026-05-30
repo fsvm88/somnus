@@ -116,6 +116,28 @@ impl ColdArchive {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Rewrite the archive keeping only the most recent `n` records.
+    ///
+    /// Cheap for large archives: reads only the tail slice and rewrites in one pass.
+    /// No-op if `n >= self.len`.
+    pub fn truncate_to_recent(&mut self, n: usize) -> MemoryResult<()> {
+        if n >= self.len {
+            return Ok(());
+        }
+        let keep_start = HEADER_BYTES + (self.len - n) * RECORD_BYTES;
+        let keep_bytes = {
+            let file = File::open(&self.path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            mmap[keep_start..keep_start + n * RECORD_BYTES].to_vec()
+        };
+        let mut w = BufWriter::new(File::create(&self.path)?);
+        w.write_all(MAGIC)?;
+        w.write_all(&keep_bytes)?;
+        w.flush()?;
+        self.len = n;
+        Ok(())
+    }
 }
 
 pub struct ColdIter {
@@ -215,5 +237,46 @@ mod tests {
         assert_eq!(archive.len(), 5);
         let ids: Vec<u64> = archive.iter().unwrap().map(|r| r.unwrap().id).collect();
         assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn truncate_to_recent_keeps_tail() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        for i in 0..10u64 {
+            archive.append(&make_record(i, i as f32 * 0.1)).unwrap();
+        }
+        archive.truncate_to_recent(4).unwrap();
+        assert_eq!(archive.len(), 4);
+        let ids: Vec<u64> = archive.iter().unwrap().map(|r| r.unwrap().id).collect();
+        assert_eq!(ids, vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn truncate_noop_when_n_gte_len() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        for i in 0..3u64 {
+            archive.append(&make_record(i, 0.5)).unwrap();
+        }
+        archive.truncate_to_recent(5).unwrap();
+        assert_eq!(archive.len(), 3);
+        archive.truncate_to_recent(3).unwrap();
+        assert_eq!(archive.len(), 3);
+    }
+
+    #[test]
+    fn truncate_file_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        for i in 0..8u64 {
+            archive.append(&make_record(i, i as f32 * 0.05)).unwrap();
+        }
+        archive.truncate_to_recent(3).unwrap();
+        // Reopen and verify length + ids.
+        let archive2 = ColdArchive::open(dir.path()).unwrap();
+        assert_eq!(archive2.len(), 3);
+        let ids: Vec<u64> = archive2.iter().unwrap().map(|r| r.unwrap().id).collect();
+        assert_eq!(ids, vec![5, 6, 7]);
     }
 }

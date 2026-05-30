@@ -175,6 +175,13 @@ struct Args {
     #[arg(long, default_value = "0")]
     max_warm_records: usize,
 
+    /// Cap on the number of records in the cold archive. When the archive exceeds
+    /// this limit during sleep, the oldest records are dropped and the file is
+    /// rewritten keeping only the most recent N. 0 = unlimited (default).
+    /// Suggested: 500_000 for multi-day runs (~330 MB at 640-dim INT8).
+    #[arg(long, default_value = "0")]
+    max_cold_records: usize,
+
     /// Enable ActionDecoder: per-episode LM forward for gain modulation + stdin generation (ADR 0012).
     /// Requires qwen25_lm.onnx, qwen25_embed_table.safetensors, qwen25_tokenizer.json in --models-dir.
     #[arg(long, default_value = "false")]
@@ -1292,6 +1299,7 @@ async fn main() -> Result<()> {
                 args.nrem_min_traces,
                 args.lang_oversample,
                 args.max_warm_records,
+                args.max_cold_records,
             ) {
                 Ok(stats) => {
                     sleep_cycle_count += 1;

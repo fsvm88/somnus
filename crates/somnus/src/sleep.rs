@@ -263,6 +263,7 @@ pub fn run_sleep_cycle(
     nrem_min_traces: usize,
     lang_oversample: usize,
     max_warm_records: usize,
+    max_cold_records: usize,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -673,6 +674,20 @@ pub fn run_sleep_cycle(
                 elapsed_ms = t0.elapsed().as_millis(),
                 "warm HNSW rebuilt from recent cold records"
             );
+        }
+
+        // Cold archive size management: truncate to the most recent N records so
+        // the on-disk archive doesn't grow unboundedly across sessions.
+        if max_cold_records > 0 && recall.cold.len() > max_cold_records {
+            let before = recall.cold.len();
+            match recall.cold.truncate_to_recent(max_cold_records) {
+                Ok(()) => tracing::info!(
+                    before,
+                    after = max_cold_records,
+                    "cold archive truncated to recent records"
+                ),
+                Err(e) => tracing::warn!(?e, "cold archive truncation failed"),
+            }
         }
     }
 
