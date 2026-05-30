@@ -1397,9 +1397,12 @@ async fn main() -> Result<()> {
                         match result {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                                let ep_salience = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval)
+                                        && ep_salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD
+                                    {
                                         match perception.wake_reconstruct_step(&ep.0, regional) {
                                             Ok(mse) => {
                                                 wake_output_mse_sum += mse as f64;
@@ -1414,7 +1417,6 @@ async fn main() -> Result<()> {
                                         update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
                                     }
                                 }
-                                record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if !startup_query_fired && out.episode.is_some() {
                                     startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
@@ -1446,9 +1448,12 @@ async fn main() -> Result<()> {
                         match perception.ingest_visual(&emb.values) {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                                let ep_salience = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval)
+                                        && ep_salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD
+                                    {
                                         match perception.wake_reconstruct_step(&ep.0, regional) {
                                             Ok(mse) => {
                                                 wake_output_mse_sum += mse as f64;
@@ -1463,7 +1468,6 @@ async fn main() -> Result<()> {
                                         update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
                                     }
                                 }
-                                record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if !startup_query_fired && out.episode.is_some() {
                                     startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
@@ -1618,6 +1622,12 @@ const RECALL_BLEND_ALPHA: f32 = 0.1;
 /// beyond this distance is dissimilar enough that blending would inject noise.
 const RECALL_BLEND_THRESHOLD: f32 = 5.5;
 
+/// Minimum salience (warm-recall L2) for wake_reconstruct_step to fire.
+/// Below this the frame is familiar enough that output-head gradient updates
+/// would mostly reinforce already-converged predictions. f32::MAX (no warm
+/// neighbour yet) always passes so reconstruction runs on fresh memory dirs.
+const WAKE_RECONSTRUCT_SALIENCE_THRESHOLD: f32 = 2.0;
+
 // ── language ingest helper ────────────────────────────────────────────────────
 
 /// Embed one stdin line and run the full episode lifecycle through `ingest_language`.
@@ -1651,9 +1661,12 @@ fn ingest_language_line(
             let ts = Timestamp::now();
             let ep_produced = out.episode.is_some();
             let cosines = out.prior_cosines;
+            let ep_salience = record_episode(&out, &ts, sink, episodic, top_k, recall);
             let mse = if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                 *wake_reconstruct_counter += 1;
-                if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval) {
+                if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval)
+                    && ep_salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD
+                {
                     match perception.wake_reconstruct_step(&ep.0, regional) {
                         Ok(mse) => {
                             tracing::info!(output_mse = mse, "wake reconstruction");
@@ -1670,7 +1683,6 @@ fn ingest_language_line(
             } else {
                 None
             };
-            record_episode(&out, &ts, sink, episodic, top_k, recall);
             // Auto-grounding (ADR 0014): every language ingest (stdin or ASR) becomes
             // a text_target on the episode that was just pushed. This trains the
             // ActionDecoder projection during NREM without requiring manual queries.
@@ -1750,6 +1762,8 @@ fn maybe_startup_query(
 /// Push an episode into the hot buffer (without touching warm tier — sleep does that).
 /// Queries warm memory first; blends the top-1 retrieved vector into the stored
 /// episode when it is within RECALL_BLEND_THRESHOLD (L2).
+/// Returns the salience value stored with the episode (warm-recall L2, or f32::MAX
+/// when warm is empty). Callers use this to gate wake_reconstruct_step.
 fn record_episode(
     out: &somnus_perception::PerceptionOutput,
     ts: &Timestamp,
@@ -1757,66 +1771,68 @@ fn record_episode(
     episodic: &mut EpisodicBuffer,
     top_k: usize,
     recall: &RecollectionLayer,
-) {
+) -> f32 {
     for &(region, err) in &out.recon_errors {
         tracing::debug!(region = ?region, recon_mse = err, "reconstruction error");
     }
-    if let Some(ep) = &out.episode {
-        let ts_secs = wall_secs(&ts.wall);
+    let Some(ep) = &out.episode else {
+        return f32::MAX;
+    };
+    let ts_secs = wall_secs(&ts.wall);
 
-        let regional =
-            out.regional_inputs
-                .clone()
-                .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
+    let regional =
+        out.regional_inputs
+            .clone()
+            .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
 
-        // L2-normalise the episode vector so HNSW uses cosine-equivalent distance.
-        let ep_norm = {
-            let mag = ep.0.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-            ep.0.iter().map(|x| x / mag).collect::<Vec<f32>>()
-        };
+    // L2-normalise the episode vector so HNSW uses cosine-equivalent distance.
+    let ep_norm = {
+        let mag = ep.0.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+        ep.0.iter().map(|x| x / mag).collect::<Vec<f32>>()
+    };
 
-        // Recollection: find similar past episodes from warm memory.
-        let neighbours = recall.query_warm_with_dist(&ep_norm, top_k);
-        let (episode_vec, blended, salience) = if let Some(&(dist, rec)) = neighbours.first() {
-            tracing::info!(
-                top1_id = rec.id,
-                top1_timestamp_secs = rec.timestamp_secs,
-                l2_dist = dist,
-                retrieved = neighbours.len(),
-                "recollection"
-            );
-            if dist < RECALL_BLEND_THRESHOLD {
-                let v: Vec<f32> = ep_norm
-                    .iter()
-                    .zip(rec.values.iter())
-                    .map(|(&cur, &ret)| (1.0 - RECALL_BLEND_ALPHA) * cur + RECALL_BLEND_ALPHA * ret)
-                    .collect();
-                (v, true, dist)
-            } else {
-                (ep_norm.clone(), false, dist)
-            }
-        } else {
-            (ep_norm.clone(), false, f32::MAX)
-        };
-
-        let id = episodic.push(ts_secs, episode_vec.clone(), regional, salience);
+    // Recollection: find similar past episodes from warm memory.
+    let neighbours = recall.query_warm_with_dist(&ep_norm, top_k);
+    let (episode_vec, blended, salience) = if let Some(&(dist, rec)) = neighbours.first() {
         tracing::info!(
-            dim = episode_vec.len(),
-            episode_id = id,
-            blended,
-            "episode vector"
+            top1_id = rec.id,
+            top1_timestamp_secs = rec.timestamp_secs,
+            l2_dist = dist,
+            retrieved = neighbours.len(),
+            "recollection"
         );
+        if dist < RECALL_BLEND_THRESHOLD {
+            let v: Vec<f32> = ep_norm
+                .iter()
+                .zip(rec.values.iter())
+                .map(|(&cur, &ret)| (1.0 - RECALL_BLEND_ALPHA) * cur + RECALL_BLEND_ALPHA * ret)
+                .collect();
+            (v, true, dist)
+        } else {
+            (ep_norm.clone(), false, dist)
+        }
+    } else {
+        (ep_norm.clone(), false, f32::MAX)
+    };
 
-        let line = serde_json::json!({
-            "type":           "episode",
-            "id":             id,
-            "timestamp_secs": ts_secs,
-            "dim":            episode_vec.len(),
-            "values":         episode_vec,
-        })
-        .to_string();
-        sink_write(sink, &line);
-    }
+    let id = episodic.push(ts_secs, episode_vec.clone(), regional, salience);
+    tracing::info!(
+        dim = episode_vec.len(),
+        episode_id = id,
+        blended,
+        "episode vector"
+    );
+
+    let line = serde_json::json!({
+        "type":           "episode",
+        "id":             id,
+        "timestamp_secs": ts_secs,
+        "dim":            episode_vec.len(),
+        "values":         episode_vec,
+    })
+    .to_string();
+    sink_write(sink, &line);
+    salience
 }
 
 /// Accumulate per-region prior cosines into running sums/counts for metrics.

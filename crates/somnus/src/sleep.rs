@@ -45,8 +45,19 @@ const WARM_RECALL_GROWTH_THRESHOLD: f32 = 5.0;
 const LR_MAX: f64 = 1e-3;
 const LR_MIN: f64 = 1e-5;
 const LR_STAGNANT_SCALE: f64 = 0.25; // multiplier when loss has plateaued
+/// Upper bound on warm-recall L2 used for salience normalisation. Traces above
+/// this distance are treated as maximally novel; below proportionally so.
+const LR_SALIENCE_CAP: f32 = 10.0;
+/// Maximum LR multiplier for maximally novel (high warm-recall L2) traces.
+/// Multiplier is linearly interpolated from 1.0 (familiar) to this value (novel).
+const LR_SALIENCE_MAX_SCALE: f64 = 2.0;
 
-fn nrem_lr(step: usize, total: usize, loss_ewma: f32, prev_ewma: f32) -> f64 {
+/// Neuromodulated LR: cosine annealing × loss-trend gate × salience boost.
+///
+/// `batch_salience` — mean warm-recall L2 of the batch (high = novel).
+/// Sentinel value f32::MAX (no warm neighbour yet, first run) maps to 0.5
+/// novelty so the schedule stays well-behaved on fresh memory directories.
+fn nrem_lr(step: usize, total: usize, loss_ewma: f32, prev_ewma: f32, batch_salience: f32) -> f64 {
     // Cosine annealing: full cycle from LR_MAX → LR_MIN
     let t = if total > 1 {
         step as f64 / (total - 1) as f64
@@ -69,7 +80,18 @@ fn nrem_lr(step: usize, total: usize, loss_ewma: f32, prev_ewma: f32) -> f64 {
         }
     };
 
-    cosine * trend_scale
+    // Salience boost: novel traces replay at higher LR so the model spends more
+    // gradient budget on content it has seen least. f32::MAX sentinel (no warm
+    // neighbour) maps to 0.5 — neutral, not max — to avoid inflated LR on the
+    // very first cycle when warm is empty and all saliences are sentinel.
+    let salience_norm = if batch_salience >= f32::MAX / 2.0 {
+        0.5_f64
+    } else {
+        (batch_salience / LR_SALIENCE_CAP).clamp(0.0, 1.0) as f64
+    };
+    let salience_scale = 1.0 + (LR_SALIENCE_MAX_SCALE - 1.0) * salience_norm;
+
+    cosine * trend_scale * salience_scale
 }
 
 #[allow(dead_code)]
@@ -318,8 +340,19 @@ pub fn run_sleep_cycle(
         let batch = &traces[batch_start..batch_end];
 
         // Neuromodulated lr: use step index at batch start (cosine schedule is slow).
+        // Salience = mean warm-recall L2 of the batch (sentinel f32::MAX excluded from mean).
         let prev_ewma = loss_ewma;
-        let lr = nrem_lr(batch_start, n_traces, loss_ewma, prev_ewma);
+        let non_sentinel: Vec<f32> = batch
+            .iter()
+            .map(|(_, _, _, s)| *s)
+            .filter(|&s| s < f32::MAX / 2.0)
+            .collect();
+        let batch_salience = if non_sentinel.is_empty() {
+            f32::MAX
+        } else {
+            non_sentinel.iter().sum::<f32>() / non_sentinel.len() as f32
+        };
+        let lr = nrem_lr(batch_start, n_traces, loss_ewma, prev_ewma, batch_salience);
         perception.set_learning_rate(lr);
 
         // ── Fused SAE replay + output-head training (single backward) ───────
@@ -670,6 +703,9 @@ pub fn run_sleep_cycle(
     // real and synthetic (blended) episodes to confirm synthetics are novel to
     // the trained output heads.
     let mut synthetics_produced = 0usize;
+    // Collected during REM synthesis; pushed to episodic after clear so the
+    // next NREM cycle trains on creative recombinations (item 1).
+    let mut synth_traces: Vec<(Vec<f32>, [Vec<f32>; 5], f32)> = Vec::new();
     let mut mean_synthetic_output_mse: Option<f32> = None;
     let mut mean_real_inference_mse: Option<f32> = None;
 
@@ -714,6 +750,22 @@ pub fn run_sleep_cycle(
                 match perception.synthesize_episode(reg_a, reg_b, REM_SYNTH_ALPHA) {
                     Ok(synth_ep) => {
                         synthetics_produced += 1;
+                        // Blend regional inputs with the same alpha used for synthesis so
+                        // NREM can train on the synthetic's own encoder representation.
+                        let synth_regional: [Vec<f32>; 5] = std::array::from_fn(|k| {
+                            let a = &reg_a[k];
+                            let b = &reg_b[k];
+                            if a.is_empty() || b.is_empty() {
+                                vec![]
+                            } else {
+                                a.iter()
+                                    .zip(b.iter())
+                                    .map(|(&x, &y)| REM_SYNTH_ALPHA * x + (1.0 - REM_SYNTH_ALPHA) * y)
+                                    .collect()
+                            }
+                        });
+                        // Salience = source-pair L2 distance (how different the parents were).
+                        synth_traces.push((synth_ep.clone(), synth_regional, l2));
                         // Measure novelty: MSE of both source regionals against the synthetic.
                         let mse_a = perception.measure_output_mse_inference(&synth_ep, reg_a);
                         let mse_b = perception.measure_output_mse_inference(&synth_ep, reg_b);
@@ -749,6 +801,23 @@ pub fn run_sleep_cycle(
     if !was_interrupted {
         episodic.clear();
         tracing::info!("hot buffer cleared after spill");
+
+        // Seed REM synthetic traces into the hot buffer so the next NREM cycle
+        // trains on creative recombinations. L2-normalise for cosine-equivalent
+        // recall (matching how real episodes are stored by record_episode).
+        if !synth_traces.is_empty() {
+            let synth_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let n_synth = synth_traces.len();
+            for (ep, regional, salience) in synth_traces {
+                let mag = ep.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+                let ep_norm: Vec<f32> = ep.iter().map(|x| x / mag).collect();
+                episodic.push(synth_ts, ep_norm, regional, salience);
+            }
+            tracing::info!(n_synth, "REM synthetics seeded into episodic buffer");
+        }
     }
 
     // ── Snapshot ──────────────────────────────────────────────────────────────

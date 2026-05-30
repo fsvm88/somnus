@@ -1405,8 +1405,8 @@ impl PerceptionProcessor {
         for iter in 0..self.settle_steps {
             // Use EMA heads for inference — no autodiff overhead, stable priors.
             let mut preds: [Vec<f32>; 5] = Default::default();
-            for i in 0..5 {
-                preds[i] = self.ema_heads.predict(&current.0, i, &device);
+            for (i, pred) in preds.iter_mut().enumerate() {
+                *pred = self.ema_heads.predict(&current.0, i, &device);
             }
 
             let mut acts: [Option<SparseActivation>; 5] = Default::default();
