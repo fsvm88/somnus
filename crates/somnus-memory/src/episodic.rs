@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::episode::{EpisodeRecord, EpisodeTrace};
+use crate::episode::{EpisodeRecord, EpisodeTrace, IngestSource};
 
 /// Hot-tier episodic buffer: a bounded ring of recent episode traces.
 ///
@@ -32,6 +32,7 @@ impl EpisodicBuffer {
         values: Vec<f32>,
         regional: [Vec<f32>; 5],
         salience: f32,
+        ingest_source: IngestSource,
     ) -> u64 {
         if self.buf.len() == self.capacity {
             self.buf.pop_front();
@@ -48,6 +49,7 @@ impl EpisodicBuffer {
                 id,
                 timestamp_secs,
                 values,
+                ingest_source,
             },
             regional,
             text_target: None,
@@ -111,6 +113,7 @@ impl EpisodicBuffer {
                 id,
                 timestamp_secs,
                 values,
+                ingest_source: IngestSource::Unknown,
             },
             regional,
             text_target: None,
@@ -154,10 +157,10 @@ mod tests {
     fn evicts_oldest_at_capacity() {
         let mut buf = EpisodicBuffer::new(3);
         let (ts, vals, reg) = make_trace(0);
-        let id0 = buf.push(ts, vals, reg, f32::MAX);
+        let id0 = buf.push(ts, vals, reg, f32::MAX, IngestSource::Unknown);
         for i in 1..4 {
             let (ts, vals, reg) = make_trace(i);
-            buf.push(ts, vals, reg, f32::MAX);
+            buf.push(ts, vals, reg, f32::MAX, IngestSource::Unknown);
         }
         assert_eq!(buf.len(), 3);
         assert!(buf.iter_traces().all(|t| t.record.id != id0));
@@ -168,7 +171,7 @@ mod tests {
         let mut buf = EpisodicBuffer::new(10);
         for i in 0..5 {
             let (ts, vals, reg) = make_trace(i);
-            let id = buf.push(ts, vals, reg, f32::MAX);
+            let id = buf.push(ts, vals, reg, f32::MAX, IngestSource::Unknown);
             assert_eq!(id, i as u64);
         }
     }
@@ -178,7 +181,7 @@ mod tests {
     fn text_target_survives_push() {
         let mut buf = EpisodicBuffer::new(10);
         let (ts, vals, reg) = make_trace(0);
-        buf.push(ts, vals, reg, 1.0);
+        buf.push(ts, vals, reg, 1.0, IngestSource::Unknown);
         buf.set_last_text_target(vec![1u32, 2, 3]);
         let target = buf.iter_traces().next().and_then(|t| t.text_target.clone());
         assert_eq!(target, Some(vec![1u32, 2, 3]));
@@ -190,7 +193,7 @@ mod tests {
         let mut buf = EpisodicBuffer::new(10);
         for i in 0..5 {
             let (ts, vals, reg) = make_trace(i);
-            buf.push(ts, vals, reg, f32::MAX);
+            buf.push(ts, vals, reg, f32::MAX, IngestSource::Unknown);
         }
         assert_eq!(buf.len(), 5);
         buf.replay_checkpoint = 3;
@@ -204,7 +207,7 @@ mod tests {
     fn regional_stored_correctly() {
         let mut buf = EpisodicBuffer::new(10);
         let regional = [vec![1.0f32; 4], vec![2.0f32; 5], vec![], vec![], vec![]];
-        buf.push(0.0, vec![0.0; 4], regional.clone(), f32::MAX);
+        buf.push(0.0, vec![0.0; 4], regional.clone(), f32::MAX, IngestSource::Unknown);
         let trace = buf.iter_traces().next().unwrap();
         assert_eq!(trace.regional[0], vec![1.0f32; 4]);
         assert_eq!(trace.regional[1], vec![2.0f32; 5]);

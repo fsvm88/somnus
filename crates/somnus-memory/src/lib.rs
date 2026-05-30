@@ -8,7 +8,7 @@ pub mod semantic;
 pub mod snapshot;
 
 pub use cold::ColdArchive;
-pub use episode::{EpisodeRecord, EpisodeTrace};
+pub use episode::{EpisodeRecord, EpisodeTrace, IngestSource};
 pub use episodic::EpisodicBuffer;
 pub use error::{MemoryError, MemoryResult};
 pub use pq::{convert_cold_to_pq, PqCodebook, PqColdArchive, PQ_K, PQ_M, PQ_SUB_DIM};

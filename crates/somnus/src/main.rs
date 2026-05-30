@@ -83,8 +83,8 @@ use somnus_encoding::{
     VideoEmbedding, VideoEncoder,
 };
 use somnus_memory::{
-    load_region_sizes, load_snapshot, weights_path, ColdArchive, EpisodicBuffer, RecollectionLayer,
-    SemanticStore,
+    load_region_sizes, load_snapshot, weights_path, ColdArchive, EpisodicBuffer, IngestSource,
+    RecollectionLayer, SemanticStore,
 };
 use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
 use somnus_sensory::{
@@ -1311,6 +1311,7 @@ async fn main() -> Result<()> {
                         mean_output_mse = stats.mean_output_mse,
                         warm_recall_l2 = ?stats.warm_recall_l2,
                         mean_proj_loss = ?stats.mean_proj_loss,
+                        cross_modal_gist_entropy = ?stats.cross_modal_gist_entropy,
                         decoder_trainable = stats.decoder_trainable_records,
                         interrupted   = stats.was_interrupted,
                         nrem_exit     = stats.nrem_exit_reason,
@@ -1361,7 +1362,8 @@ async fn main() -> Result<()> {
                             "mean_output_mse":   stats.mean_output_mse,
                             "per_region_mse":    stats.per_region_mse,
                             "warm_recall_l2":    stats.warm_recall_l2,
-                            "gist_recall_rate":  stats.gist_recall_rate,
+                            "gist_recall_rate":        stats.gist_recall_rate,
+                            "cross_modal_gist_entropy": stats.cross_modal_gist_entropy,
                             "was_interrupted":   stats.was_interrupted,
                             "nrem_exit_reason":  stats.nrem_exit_reason,
                             "region_sizes":      region_sizes,
@@ -1888,7 +1890,18 @@ fn record_episode(
         (ep_norm.clone(), false, f32::MAX)
     };
 
-    let id = episodic.push(ts_secs, episode_vec.clone(), regional, salience);
+    // Derive source tag from which regional inputs were non-empty.
+    // Regions: 0=Speech, 1=Env, 2=Visual, 3=Symbolic, 4=Language.
+    let active: Vec<usize> = (0..5).filter(|&i| !regional[i].is_empty()).collect();
+    let ingest_source = match active.as_slice() {
+        [0] => IngestSource::Speech,
+        [1] => IngestSource::Env,
+        [2] | [3] => IngestSource::Visual,
+        [4] => IngestSource::Language,
+        _ if active.is_empty() => IngestSource::Unknown,
+        _ => IngestSource::Mixed,
+    };
+    let id = episodic.push(ts_secs, episode_vec.clone(), regional, salience, ingest_source);
     tracing::info!(
         dim = episode_vec.len(),
         episode_id = id,

@@ -7,7 +7,7 @@ use std::{
 use memmap2::Mmap;
 
 use crate::{
-    episode::EpisodeRecord,
+    episode::{EpisodeRecord, IngestSource},
     error::{MemoryError, MemoryResult},
 };
 
@@ -16,16 +16,18 @@ use crate::{
 /// are incompatible; MAGIC bumped so they fail gracefully.
 pub const COLD_DIM: usize = 640;
 
-const MAGIC: &[u8; 8] = b"SMNCOLD1";
+// Bumped from SMNCOLD1: added ingest_source byte per record (Gap 8 / ADR 0021).
+const MAGIC: &[u8; 8] = b"SMNCOLD2";
 
 // Per-record layout (little-endian):
-//   id:        u64   8 B
-//   timestamp: f64   8 B
-//   scale:     f32   4 B
-//   values:    [i8; COLD_DIM]  512 B
+//   id:            u64   8 B
+//   timestamp:     f64   8 B
+//   scale:         f32   4 B
+//   values:        [i8; COLD_DIM]  640 B
+//   ingest_source: u8    1 B
 //   ──────────────────────
-//   total:            532 B
-const RECORD_BYTES: usize = 8 + 8 + 4 + COLD_DIM;
+//   total:               661 B
+const RECORD_BYTES: usize = 8 + 8 + 4 + COLD_DIM + 1;
 const HEADER_BYTES: usize = 8; // just the magic
 
 /// Append-only cold archive for episode vectors.
@@ -92,6 +94,7 @@ impl ColdArchive {
         w.write_all(unsafe {
             std::slice::from_raw_parts(quantised.as_ptr() as *const u8, COLD_DIM)
         })?;
+        w.write_all(&[record.ingest_source as u8])?;
         w.flush()?;
         self.len += 1;
         Ok(())
@@ -166,6 +169,7 @@ impl Iterator for ColdIter {
         let scale = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
         let qbytes = &bytes[20..20 + COLD_DIM];
         let values: Vec<f32> = qbytes.iter().map(|&b| (b as i8) as f32 * scale).collect();
+        let ingest_source = IngestSource::from_u8(bytes[20 + COLD_DIM]);
 
         self.pos += RECORD_BYTES;
         self.yielded += 1;
@@ -173,6 +177,7 @@ impl Iterator for ColdIter {
             id,
             timestamp_secs: ts,
             values,
+            ingest_source,
         }))
     }
 }
@@ -187,6 +192,7 @@ mod tests {
             id,
             timestamp_secs: id as f64,
             values: vec![val; COLD_DIM],
+            ingest_source: IngestSource::Unknown,
         }
     }
 
@@ -278,5 +284,30 @@ mod tests {
         assert_eq!(archive2.len(), 3);
         let ids: Vec<u64> = archive2.iter().unwrap().map(|r| r.unwrap().id).collect();
         assert_eq!(ids, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn ingest_source_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        let sources = [
+            IngestSource::Speech,
+            IngestSource::Env,
+            IngestSource::Visual,
+            IngestSource::Language,
+            IngestSource::Mixed,
+            IngestSource::Unknown,
+        ];
+        for (i, &src) in sources.iter().enumerate() {
+            let mut rec = make_record(i as u64, 0.1);
+            rec.ingest_source = src;
+            archive.append(&rec).unwrap();
+        }
+        let back: Vec<_> = archive
+            .iter()
+            .unwrap()
+            .map(|r| r.unwrap().ingest_source)
+            .collect();
+        assert_eq!(back, sources);
     }
 }

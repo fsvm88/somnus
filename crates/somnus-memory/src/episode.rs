@@ -1,3 +1,32 @@
+/// Which modality (or combination) produced the episode vector.
+///
+/// Derived at push time from which regional encoder inputs were non-empty.
+/// Stored in the cold archive (1 byte per record) so cross-modal gist analysis
+/// can run across sessions once cold→warm promotion is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum IngestSource {
+    Speech   = 0,
+    Env      = 1,
+    Visual   = 2,
+    Language = 3,
+    Mixed    = 4,
+    Unknown  = 255,
+}
+
+impl IngestSource {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Speech,
+            1 => Self::Env,
+            2 => Self::Visual,
+            3 => Self::Language,
+            4 => Self::Mixed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A single perceived episode: the binding area's output at one moment in time.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EpisodeRecord {
@@ -5,8 +34,10 @@ pub struct EpisodeRecord {
     pub id: u64,
     /// Wall-clock seconds since Unix epoch at the time of perception.
     pub timestamp_secs: f64,
-    /// 512-dim episode vector from the binding area.
+    /// 640-dim episode vector from the binding area.
     pub values: Vec<f32>,
+    /// Which modality (or combination) produced this episode.
+    pub ingest_source: IngestSource,
 }
 
 /// Hot-tier episode trace: the episode record plus the raw encoder inputs for all regions.

@@ -239,6 +239,7 @@ mod tests {
             id,
             timestamp_secs: id as f64,
             values: vec![val; 8],
+            ingest_source: crate::episode::IngestSource::Unknown,
         }
     }
 
@@ -353,6 +354,7 @@ mod tests {
                 id: i,
                 timestamp_secs: i as f64,
                 values: (0..COLD_DIM).map(|j| i as f32 + j as f32 * 0.001).collect(),
+                ingest_source: crate::episode::IngestSource::Unknown,
             };
             cold.append(&rec).unwrap();
         }

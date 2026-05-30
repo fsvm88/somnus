@@ -355,6 +355,7 @@ impl Iterator for PqIter {
             id,
             timestamp_secs: ts,
             values,
+            ingest_source: crate::episode::IngestSource::Unknown,
         }))
     }
 }
@@ -470,6 +471,7 @@ mod tests {
                 id: i as u64,
                 timestamp_secs: i as f64,
                 values: v.clone(),
+                ingest_source: crate::episode::IngestSource::Unknown,
             })
             .unwrap();
         }
@@ -495,6 +497,7 @@ mod tests {
                 id: i as u64,
                 timestamp_secs: i as f64,
                 values: v.clone(),
+                ingest_source: crate::episode::IngestSource::Unknown,
             })
             .unwrap();
         }

@@ -347,12 +347,14 @@ mod tests {
             vec![0.1f32; 640],
             [vec![1.0f32; 384], vec![2.0f32; 512], vec![], vec![], vec![]],
             f32::MAX,
+            crate::episode::IngestSource::Unknown,
         );
         buf.push(
             2.0,
             vec![0.2f32; 640],
             [vec![], vec![], vec![3.0f32; 384], vec![4.0f32; 384], vec![]],
             f32::MAX,
+            crate::episode::IngestSource::Unknown,
         );
 
         save_episodic(&buf, &path).unwrap();
@@ -377,12 +379,14 @@ mod tests {
             vec![0.1f32; 4],
             [vec![1.0f32; 2], vec![], vec![], vec![], vec![]],
             f32::MAX,
+            crate::episode::IngestSource::Unknown,
         );
         buf.push(
             2.0,
             vec![0.2f32; 4],
             [vec![], vec![2.0f32; 2], vec![], vec![], vec![]],
             f32::MAX,
+            crate::episode::IngestSource::Unknown,
         );
 
         save_snapshot(&buf, dir.path()).unwrap();
@@ -409,6 +413,7 @@ mod tests {
                     id: i,
                     timestamp_secs: i as f64,
                     values: vec![i as f32 * 0.1; dim],
+                    ingest_source: crate::episode::IngestSource::Unknown,
                 })
                 .unwrap();
         }

@@ -14,7 +14,8 @@ use std::{
 
 use anyhow::Result;
 use somnus_memory::{
-    save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, RecollectionLayer,
+    save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, IngestSource,
+    RecollectionLayer,
 };
 use somnus_perception::{PerceptionProcessor, RegionId, N_UNITS};
 
@@ -130,6 +131,10 @@ pub struct SleepStats {
     /// Mean output-head MSE on real episodes measured post-NREM (inference mode).
     /// None when traces_for_rem is empty.
     pub mean_real_inference_mse: Option<f32>,
+    /// Mean Shannon entropy of ingest_source distribution per gist cluster (Gap 8 / ADR 0021).
+    /// None when warm is too small to cluster or all episodes have Unknown source.
+    /// High = diverse modalities in same cluster (cross-modal grounding).
+    pub cross_modal_gist_entropy: Option<f32>,
     /// Regions that had grown units pruned during REM (12c).
     pub regions_pruned: Vec<RegionId>,
     /// Total grown units removed across all pruned regions.
@@ -576,12 +581,13 @@ pub fn run_sleep_cycle(
     let mut total_units_pruned: usize = 0;
     let mut warm_recall_l2: Option<f32> = None;
     let mut gist_recall_rate: Option<f32> = None;
+    let mut cross_modal_gist_entropy: Option<f32> = None;
 
     // Collect traces once for reuse in both warm probe and MSE measurement.
-    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5])> = if !was_interrupted {
+    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5], IngestSource)> = if !was_interrupted {
         episodic
             .iter_traces()
-            .map(|t| (t.record.values.clone(), t.regional.clone()))
+            .map(|t| (t.record.values.clone(), t.regional.clone(), t.record.ingest_source))
             .collect()
     } else {
         vec![]
@@ -609,8 +615,11 @@ pub fn run_sleep_cycle(
         let mut total_l2 = 0.0f32;
         let mut n_probed = 0usize;
         let mut gist_matches = 0usize;
+        // Per-cluster source-type counts for cross-modal entropy (Gap 8).
+        // cluster_sources[k] maps IngestSource u8 → count.
+        let mut cluster_sources: Vec<[u32; 6]> = vec![[0u32; 6]; GIST_K];
 
-        for (ep_vec, _) in &traces_for_rem {
+        for (ep_vec, _, src) in &traces_for_rem {
             if let Some((dist, neighbor)) =
                 recall.warm.query_with_dist(ep_vec, 1).into_iter().next()
             {
@@ -622,6 +631,16 @@ pub fn run_sleep_cycle(
                     if probe_cluster == neighbor_cluster {
                         gist_matches += 1;
                     }
+                    // Bin the source into the cluster histogram (Unknown → slot 5).
+                    let slot = match src {
+                        IngestSource::Speech   => 0,
+                        IngestSource::Env      => 1,
+                        IngestSource::Visual   => 2,
+                        IngestSource::Language => 3,
+                        IngestSource::Mixed    => 4,
+                        IngestSource::Unknown  => 5,
+                    };
+                    cluster_sources[probe_cluster][slot] += 1;
                 }
             }
         }
@@ -632,12 +651,43 @@ pub fn run_sleep_cycle(
             if gist_available {
                 let rate = gist_matches as f32 / n_probed as f32;
                 gist_recall_rate = Some(rate);
+
+                // Shannon entropy per cluster (bits), averaged over occupied clusters.
+                // Only count known-source episodes (slots 0–4); skip slot 5 (Unknown).
+                let entropy_sum: f32 = cluster_sources
+                    .iter()
+                    .filter_map(|counts| {
+                        let total: u32 = counts[0..5].iter().sum();
+                        if total < 2 {
+                            return None; // need ≥2 known-source eps to compute entropy
+                        }
+                        let n = total as f32;
+                        let h: f32 = counts[0..5]
+                            .iter()
+                            .filter(|&&c| c > 0)
+                            .map(|&c| {
+                                let p = c as f32 / n;
+                                -p * p.log2()
+                            })
+                            .sum();
+                        Some(h)
+                    })
+                    .sum();
+                let n_occupied = cluster_sources
+                    .iter()
+                    .filter(|counts| counts[0..5].iter().sum::<u32>() >= 2)
+                    .count();
+                if n_occupied > 0 {
+                    cross_modal_gist_entropy = Some(entropy_sum / n_occupied as f32);
+                }
+
                 tracing::info!(
                     mean_l2,
                     pre_spill_warm_len,
                     gist_recall_rate = rate,
                     gist_matches,
                     n_probed,
+                    cross_modal_gist_entropy = ?cross_modal_gist_entropy,
                     "warm recall + gist probe"
                 );
             } else {
@@ -698,7 +748,7 @@ pub fn run_sleep_cycle(
     let t_rem2 = Instant::now();
     if !was_interrupted {
         // Measure SAE reconstruction quality without updating weights.
-        for (_, regional) in &traces_for_rem {
+        for (_, regional, _) in &traces_for_rem {
             match perception.measure_mse(regional) {
                 Ok(mse) => {
                     for i in 0..5 {
@@ -813,7 +863,7 @@ pub fn run_sleep_cycle(
         let mut real_mse_n = 0usize;
         for j in 0..real_sample_n {
             let idx = j * step / real_sample_n;
-            let (ep_vec, regional) = &traces_for_rem[idx];
+            let (ep_vec, regional, _) = &traces_for_rem[idx];
             match perception.measure_output_mse_inference(ep_vec, regional) {
                 Ok(mse) => {
                     real_mse_total += mse;
@@ -837,8 +887,8 @@ pub fn run_sleep_cycle(
                 if synthetics_produced >= REM_SYNTH_MAX_N {
                     break 'outer;
                 }
-                let (ep_a, reg_a) = &traces_for_rem[i];
-                let (_, reg_b) = &traces_for_rem[j];
+                let (ep_a, reg_a, _) = &traces_for_rem[i];
+                let (_, reg_b, _) = &traces_for_rem[j];
                 let l2 = l2_sq(ep_a, &traces_for_rem[j].0).sqrt();
                 if l2 < REM_SYNTH_MIN_L2 {
                     continue;
@@ -912,7 +962,7 @@ pub fn run_sleep_cycle(
             for (ep, regional, salience) in synth_traces {
                 let mag = ep.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
                 let ep_norm: Vec<f32> = ep.iter().map(|x| x / mag).collect();
-                episodic.push(synth_ts, ep_norm, regional, salience);
+                episodic.push(synth_ts, ep_norm, regional, salience, IngestSource::Mixed);
             }
             tracing::info!(n_synth, "REM synthetics seeded into episodic buffer");
         }
@@ -964,6 +1014,7 @@ pub fn run_sleep_cycle(
         nrem_exit_reason,
         warm_recall_l2,
         gist_recall_rate,
+        cross_modal_gist_entropy,
         mean_proj_loss,
         proj_loss_max: proj_loss_max_opt,
         decoder_trainable_records,
