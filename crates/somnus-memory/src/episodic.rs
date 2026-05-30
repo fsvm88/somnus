@@ -173,6 +173,33 @@ mod tests {
         }
     }
 
+    /// text_target set via set_last_text_target is visible on the trace (ADR 0012).
+    #[test]
+    fn text_target_survives_push() {
+        let mut buf = EpisodicBuffer::new(10);
+        let (ts, vals, reg) = make_trace(0);
+        buf.push(ts, vals, reg, 1.0);
+        buf.set_last_text_target(vec![1u32, 2, 3]);
+        let target = buf.iter_traces().next().and_then(|t| t.text_target.clone());
+        assert_eq!(target, Some(vec![1u32, 2, 3]));
+    }
+
+    /// clear() empties the buffer and resets the checkpoint (sleep controller contract).
+    #[test]
+    fn clear_empties_buffer_and_resets_checkpoint() {
+        let mut buf = EpisodicBuffer::new(10);
+        for i in 0..5 {
+            let (ts, vals, reg) = make_trace(i);
+            buf.push(ts, vals, reg, f32::MAX);
+        }
+        assert_eq!(buf.len(), 5);
+        buf.replay_checkpoint = 3;
+        buf.clear();
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+        assert_eq!(buf.replay_checkpoint, 0);
+    }
+
     #[test]
     fn regional_stored_correctly() {
         let mut buf = EpisodicBuffer::new(10);

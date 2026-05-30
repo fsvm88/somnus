@@ -302,4 +302,63 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].id, 5);
     }
+
+    /// query_with_dist returns (distance, record) pairs with finite distances.
+    /// Used by sleep.rs for the gist probe and salience computation.
+    #[test]
+    fn query_with_dist_returns_finite_distances() {
+        let mut store = SemanticStore::new(8);
+        for i in 0..5u64 {
+            store.insert(make_record(i, i as f32 * 0.1));
+        }
+        let cue = vec![0.2f32; 8];
+        let results = store.query_with_dist(&cue, 2);
+        assert_eq!(results.len(), 2);
+        for (dist, _rec) in &results {
+            assert!(dist.is_finite() && *dist >= 0.0, "distance not finite/non-negative: {dist}");
+        }
+        // Nearest neighbour should be closer than the second.
+        assert!(results[0].0 <= results[1].0, "results not sorted by distance");
+    }
+
+    /// sample_values returns at most max_n items and never panics on small stores.
+    /// Used by sleep.rs gist k-means.
+    #[test]
+    fn sample_values_respects_limit() {
+        let mut store = SemanticStore::new(8);
+        for i in 0..20u64 {
+            store.insert(make_record(i, i as f32));
+        }
+        let sample = store.sample_values(5);
+        assert!(sample.len() <= 5, "sample exceeds max_n limit");
+        assert!(!sample.is_empty());
+        for v in &sample {
+            assert_eq!(v.len(), 8);
+        }
+        // Also works on empty store.
+        let empty = SemanticStore::new(8);
+        assert!(empty.sample_values(10).is_empty());
+    }
+
+    /// rebuild_from_recent fills warm from cold, capped at n.
+    /// Used in sleep.rs when warm HNSW exceeds max_warm_records.
+    #[test]
+    fn rebuild_from_recent_fills_from_cold() {
+        use crate::cold::{ColdArchive, COLD_DIM};
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cold = ColdArchive::open(dir.path()).unwrap();
+        // Cold archive requires COLD_DIM=640 vectors.
+        for i in 0..10u64 {
+            let rec = EpisodeRecord {
+                id: i,
+                timestamp_secs: i as f64,
+                values: (0..COLD_DIM).map(|j| i as f32 + j as f32 * 0.001).collect(),
+            };
+            cold.append(&rec).unwrap();
+        }
+        let mut store = SemanticStore::new(COLD_DIM);
+        let loaded = store.rebuild_from_recent(&cold, 5);
+        assert_eq!(loaded, 5, "should load exactly 5 (the cap)");
+        assert_eq!(store.len(), 5);
+    }
 }
