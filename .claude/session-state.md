@@ -1,34 +1,27 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-29
-> **Last commit on main:** 719c3db — Housekeeping: gitignore runtime artifacts
-> **Branch:** `main` (clean, pushed to Codeberg)
+> **Last updated:** 2026-05-30
+> **Last commit on main:** 1769bdd — Gap fixes: synthetic NREM replay, salience-gated wake reconstruct, salience → NREM LR
+> **Branch:** `main` (clean, not yet pushed to Codeberg)
 
-## Status: Ready for new campaign + architectural gap queue identified
+## Status: Gap queue complete — ready for first post-roundup campaign
 
 ---
 
 ## Completed this session
 
-All architectural improvements from the roundup committed and pushed:
+Gap queue items 1–3 committed (ADR 0019):
 
-| Task | Commit | What changed |
+| Item | Commit | What changed |
 |------|--------|--------------|
-| B | af9d4d6 | Growth threshold 0.5→0.85; removed broken warm_recall_poor gate |
-| C | af9d4d6 | Episodes L2-normalised before HNSW — better cosine-equivalent recall |
-| E | af9d4d6 | EpisodeTrace.salience; NREM replays novel traces first |
-| F | a6940aa | Symbolic: cross_modal_proj 2176→384; convergence layer not speech copy |
-| D | 93ba871 | EmaOutputHeads α=0.99; inference decoupled from autodiff training path |
-| G | 98c5775 | --max-warm-records; rebuild_from_recent during sleep |
-| A | 958a18c | GRU(640→256) temporal binding; wm_seq replaces wm_mean_vec |
-| H | DROPPED | Wake time-boxed; wgpu has zero wall-clock benefit |
-| cleanup | 719c3db | .gitignore covers memory/, data/, experiments byproducts; 750k line removal |
-
-memory/ trimmed from ~81 GB to ~400 MB. All pushed.
+| 1 | 1769bdd | REM synthetics pushed to episodic after clear; blended regionals; source-pair L2 as salience |
+| 2 | 1769bdd | `record_episode` returns salience; `wake_reconstruct_step` gated on salience > 2.0 |
+| 3 | 1769bdd | `nrem_lr` takes `batch_salience`; novel traces get up to 2× LR; sentinel f32::MAX → 0.5 novelty |
+| 4 | DROPPED | Last-token pooling rests on false premise: static embed table, not Qwen forward pass; mean-pool is better |
 
 ---
 
-## Next campaign (run this first tomorrow)
+## Next campaign (run this first)
 
 ```bash
 SESSIONS=10 CYCLES=5 CAPACITY=8192 \
@@ -38,24 +31,15 @@ scripts/train_campaign.sh
 ```
 
 **Watch for:**
-- `grew=true` in metrics (B fixed threshold — should fire on novel content)
-- `prior_cosine_mean[3]` (symbolic) diverging from `[0]` (speech) — signals cross-modal learning
-- Temporal GRU stability in early sessions (may be noisy first 2–3 cycles)
-- Any NaN/inf (GRU adds ~852k params, first campaign with new binding)
+- `grew=true` in metrics — should fire on novel content (gap B fixed threshold)
+- `prior_cosine_mean[3]` (symbolic) diverging from `[0]` (speech) — cross-modal learning signal
+- `synthetics_produced > 0` per cycle (gap 1 working)
+- `mean_output_mse_wake` lower than pre-roundup baseline (gap 2 effect: fewer familiar-frame grads)
+- Any NaN/inf (GRU adds ~852k params; first campaign with new binding + salience LR)
 
 ---
 
-## Architectural gaps — prioritised queue for next session
-
-### Low effort, high value (do first)
-
-1. **Synthetic NREM replay** — REM produces synthetics, measures them, then discards. Wire them into the episodic buffer so the next NREM cycle trains on them. Infrastructure exists; it's just plumbing.
-
-2. **Salience-gated wake reconstruction** — skip `wake_reconstruct_step` when salience is below a threshold (familiar frame, low novelty). Focuses gradient signal. The salience score is already computed at encode time.
-
-3. **Neuromodulation → NREM LR** — wire the per-trace salience score into `nrem_lr()`. High-salience (novel) traces should replay at higher LR. Currently LR schedule ignores novelty entirely.
-
-4. **Language last-token pooling** — change language embedder from mean-pool to last-token of Qwen2.5. Short ASR fragments (5–30 chars) get worse mean-pool representations than last-token (causal LM has full context at last position).
+## Remaining gap queue
 
 ### Medium effort
 
@@ -81,13 +65,14 @@ scripts/train_campaign.sh
 - CROSS_MODAL_DIM = 2176 (speech+env+visual+language → symbolic)
 - GRU_HIDDEN = 256 in binding area
 - All existing memory snapshots are **incompatible** — always use fresh --memory-dir
+- WAKE_RECONSTRUCT_SALIENCE_THRESHOLD = 2.0 (below same-content p95 of 4.1)
+- LR_SALIENCE_CAP = 10.0, LR_SALIENCE_MAX_SCALE = 2.0 (max NREM LR = 2e-3)
+- Language last-token pooling is NOT low-effort: requires Qwen LM forward pass (medium effort, no ADR yet)
 
 ---
 
-## Key findings from this session
+## Key findings this session
 
-- Wake is time-boxed at 602s/cycle regardless of per-frame compute cost
-- wake_reconstruct is 17ms (not 315ms — 315ms was multi-thread log noise)
-- interval=4 experiment: freed compute → more frames → more NREM → +3–5 min sessions (net zero)
-- Growth never fired because GIST_GROWTH_THRESHOLD=0.5 + broken warm_recall_poor gate
-- Symbolic was a dead-end copy of speech; now a cross-modal convergence layer
+- `synthesize_episode` returns episode vec only (not regionals) — blended regionals computed separately in sleep.rs
+- `record_episode` now called before `wake_reconstruct_step` at all wake call sites (audio, video, language)
+- Pre-existing `clippy::needless_range_loop` in `settle_episode` fixed as part of this commit
