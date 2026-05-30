@@ -35,14 +35,26 @@ pub(crate) fn migraphx_session(path: &std::path::Path) -> anyhow::Result<ort::se
 
 /// CPU-only session for models with dynamic shapes (Whisper decoder, Qwen LM).
 /// MIGraphX requires static shapes; these models grow their sequence dimension at runtime.
-pub(crate) fn cpu_session(path: &std::path::Path) -> anyhow::Result<ort::session::Session> {
+///
+/// `profile_prefix`: when `Some`, enables ORT Chrome-trace profiling. ORT writes
+/// `<prefix>_<timestamp>.json`. Call `session.end_profiling()` before process exit
+/// to flush the file — `process::exit(0)` skips destructors and loses the data.
+pub(crate) fn cpu_session(
+    path: &std::path::Path,
+    profile_prefix: Option<&std::path::Path>,
+) -> anyhow::Result<ort::session::Session> {
     let (intra, inter) = onnx_thread_budget();
-    Ok(ort::session::Session::builder()?
+    let mut builder = ort::session::Session::builder()?
         .with_intra_threads(intra)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_inter_threads(inter)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .commit_from_file(path)?)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(prefix) = profile_prefix {
+        builder = builder
+            .with_profiling(prefix)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(builder.commit_from_file(path)?)
 }
 
 /// Compute (intra_op, inter_op) thread counts for ONNX sessions.
@@ -293,6 +305,14 @@ struct Args {
     /// Increases the projection training budget without adding new data.
     #[arg(long, default_value = "0")]
     lang_oversample: usize,
+
+    /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
+    /// Writes `<dir>/qwen25_lm_<timestamp>.json` — open in https://ui.perfetto.dev
+    /// or chrome://tracing. Profiling data is flushed before process exit.
+    /// GPU sessions (Whisper encoder, CLAP, DINOv2, Qwen gain) are covered by
+    /// rocprof instead; see scripts/profile.sh.
+    #[arg(long)]
+    ort_profile_dir: Option<PathBuf>,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -670,7 +690,7 @@ async fn main() -> Result<()> {
 
     // ── action decoder ────────────────────────────────────────────────────────
     let mut decoder: Option<ActionDecoder> = if args.action {
-        match ActionDecoder::new(&args.models_dir, NdArrayDevice::Cpu) {
+        match ActionDecoder::new(&args.models_dir, NdArrayDevice::Cpu, args.ort_profile_dir.as_deref()) {
             Ok(mut d) => {
                 let dec_w = args
                     .memory_dir
@@ -751,6 +771,11 @@ async fn main() -> Result<()> {
     let mut lang_ingest_count: usize = 0;
     let mut gain_episode_counter: usize = 0;
     let mut wake_reconstruct_counter: usize = 0;
+    // Per-cycle encode timing (ms) — reset after each sleep cycle.
+    let mut speech_encode_total_ms: u64 = 0;
+    let mut env_encode_total_ms: u64 = 0;
+    let mut video_encode_total_ms: u64 = 0;
+    let mut gain_update_total_ms: u64 = 0;
     // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
     // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
     // cosine_ewma: exponentially weighted moving average (α = COSINE_EWMA_ALPHA).
@@ -1353,6 +1378,10 @@ async fn main() -> Result<()> {
                             "spill_wall_ms":              stats.spill_wall_ms,
                             "snapshot_wall_ms":           stats.snapshot_wall_ms,
                             "lm_hidden_computed":         stats.lm_hidden_computed,
+                            "speech_encode_total_ms":     speech_encode_total_ms,
+                            "env_encode_total_ms":        env_encode_total_ms,
+                            "video_encode_total_ms":      video_encode_total_ms,
+                            "gain_update_total_ms":       gain_update_total_ms,
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1369,6 +1398,10 @@ async fn main() -> Result<()> {
                     lang_ingest_count = 0;
                     gain_episode_counter = 0;
                     wake_reconstruct_counter = 0;
+                    speech_encode_total_ms = 0;
+                    env_encode_total_ms = 0;
+                    video_encode_total_ms = 0;
+                    gain_update_total_ms = 0;
                     cosine_ewma = None;
                     cosine_baseline = None;
                     cosine_baseline_accum = 0.0;
@@ -1396,6 +1429,10 @@ async fn main() -> Result<()> {
                     Some(emb) => {
                         let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &audio_emb_json(&emb));
+                        match emb.source {
+                            AudioEncoderSource::Speech => speech_encode_total_ms += emb.encode_ms,
+                            AudioEncoderSource::Env    => env_encode_total_ms    += emb.encode_ms,
+                        }
                         let result = match emb.source {
                             AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
                             AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
@@ -1431,10 +1468,12 @@ async fn main() -> Result<()> {
                                     if gain_episode_counter.is_multiple_of(args.gain_interval) {
                                         if let Some(ep) = &out.episode {
                                             if let Some(ref mut dec) = decoder {
+                                                let t_gain = std::time::Instant::now();
                                                 match dec.update_gain(&ep.0) {
                                                     Ok(()) => perception.set_region_gain(dec.gain),
                                                     Err(e) => tracing::warn!(?e, "gain update failed"),
                                                 }
+                                                gain_update_total_ms += t_gain.elapsed().as_millis() as u64;
                                             }
                                         }
                                     }
@@ -1451,6 +1490,7 @@ async fn main() -> Result<()> {
                     Some(emb) => {
                         let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &video_emb_json(&emb));
+                        video_encode_total_ms += emb.encode_ms;
                         match perception.ingest_visual(&emb.values) {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
@@ -1482,10 +1522,12 @@ async fn main() -> Result<()> {
                                     if gain_episode_counter.is_multiple_of(args.gain_interval) {
                                         if let Some(ep) = &out.episode {
                                             if let Some(ref mut dec) = decoder {
+                                                let t_gain = std::time::Instant::now();
                                                 match dec.update_gain(&ep.0) {
                                                     Ok(()) => perception.set_region_gain(dec.gain),
                                                     Err(e) => tracing::warn!(?e, "gain update failed"),
                                                 }
+                                                gain_update_total_ms += t_gain.elapsed().as_millis() as u64;
                                             }
                                         }
                                     }
@@ -1607,6 +1649,18 @@ async fn main() -> Result<()> {
             sink_flush(&mut sink);
             info!("file source exhausted — exiting");
             break;
+        }
+    }
+
+    // Flush ORT profiling data before skipping destructors via process::exit.
+    // process::exit(0) skips Drop, so profile files would be lost without this explicit call.
+    // Only lm_session (CPU) is profiled; GPU sessions use rocprof instead.
+    if args.ort_profile_dir.is_some() {
+        if let Some(ref mut dec) = decoder {
+            match dec.end_profiling() {
+                Ok(path) => info!(path, "ORT lm_session profile written"),
+                Err(e) => tracing::warn!(?e, "ORT profile flush failed"),
+            }
         }
     }
 

@@ -38,7 +38,10 @@ impl WhisperDecoder {
             );
         }
         // MIGraphX does not support encoder-decoder cross-attention; use CPU.
-        let session = crate::cpu_session(&dec_path)?;
+        // Whisper decoder is moved into a spawn_blocking thread; we can't call
+        // end_profiling() on it before exit, so ORT profiling is disabled here.
+        // Use the flamegraph (perf) for CPU cost analysis of the ASR path.
+        let session = crate::cpu_session(&dec_path, None)?;
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("whisper tokenizer load failed: {e}"))?;
         Ok(Self { session, tokenizer })

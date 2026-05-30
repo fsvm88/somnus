@@ -57,7 +57,14 @@ pub struct ActionDecoder {
 impl ActionDecoder {
     /// Load all model artifacts from `models_dir`.
     /// Returns Err if any required file is absent.
-    pub fn new(models_dir: &std::path::Path, device: NdArrayDevice) -> Result<Self> {
+    ///
+    /// `ort_profile_dir`: when `Some`, enables ORT Chrome-trace profiling for
+    /// lm_session (CPU). Call `end_profiling()` before process exit to flush.
+    pub fn new(
+        models_dir: &std::path::Path,
+        device: NdArrayDevice,
+        ort_profile_dir: Option<&std::path::Path>,
+    ) -> Result<Self> {
         let gain_path = models_dir.join("qwen25_gain.onnx");
         let lm_path = models_dir.join("qwen25_lm.onnx");
         let embed_path = models_dir.join("qwen25_embed_table.safetensors");
@@ -69,7 +76,8 @@ impl ActionDecoder {
         }
 
         let gain_session = crate::migraphx_session(&gain_path)?;
-        let lm_session = crate::cpu_session(&lm_path)?;
+        let lm_profile_prefix = ort_profile_dir.map(|d| d.join("qwen25_lm"));
+        let lm_session = crate::cpu_session(&lm_path, lm_profile_prefix.as_deref())?;
 
         let bytes = std::fs::read(&embed_path)?;
         let st = SafeTensors::deserialize(&bytes)
@@ -404,6 +412,17 @@ impl ActionDecoder {
         self.model = Some(model);
 
         Ok(loss_val)
+    }
+
+    /// Flush the ORT Chrome-trace profile for lm_session.
+    /// Must be called before `process::exit(0)` when `--ort-profile-dir` is set;
+    /// the profile file is only written on explicit `end_profiling` or normal drop,
+    /// neither of which happens with the MIGraphX-workaround exit.
+    /// Returns the path written, or an error if profiling was not enabled.
+    pub fn end_profiling(&mut self) -> Result<String> {
+        self.lm_session
+            .end_profiling()
+            .map_err(|e| anyhow::anyhow!("end_profiling failed: {e}"))
     }
 
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {

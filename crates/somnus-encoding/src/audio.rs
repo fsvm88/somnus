@@ -13,6 +13,8 @@ pub struct AudioEmbedding {
     pub source: AudioEncoderSource,
     pub values: Vec<f32>, // 384 (Speech) or 512 (Env)
     pub timestamp: Timestamp,
+    /// Wall time for this encode call (mel computation + ORT inference), in milliseconds.
+    pub encode_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +56,7 @@ impl AudioEncoder {
         pcm_16k: &[f32],
         ts: Timestamp,
     ) -> EncodingResult<(AudioEmbedding, Vec<f32>)> {
+        let t0 = std::time::Instant::now();
         debug_assert_eq!(pcm_16k.len(), WHISPER_SAMPLES);
         if pcm_16k.len() != WHISPER_SAMPLES {
             return Err(EncodingError::WrongLength {
@@ -87,6 +90,7 @@ impl AudioEncoder {
                 source: AudioEncoderSource::Speech,
                 values,
                 timestamp: ts,
+                encode_ms: t0.elapsed().as_millis() as u64,
             },
             hidden_flat,
         ))
@@ -94,6 +98,7 @@ impl AudioEncoder {
 
     /// Encode 480 000 f32 samples @ 48 kHz → 512-dim env embedding.
     pub fn encode_env(&mut self, pcm_48k: &[f32], ts: Timestamp) -> EncodingResult<AudioEmbedding> {
+        let t0 = std::time::Instant::now();
         debug_assert_eq!(pcm_48k.len(), CLAP_SAMPLES);
         if pcm_48k.len() != CLAP_SAMPLES {
             return Err(EncodingError::WrongLength {
@@ -125,6 +130,7 @@ impl AudioEncoder {
             source: AudioEncoderSource::Env,
             values,
             timestamp: ts,
+            encode_ms: t0.elapsed().as_millis() as u64,
         })
     }
 }

@@ -12,6 +12,8 @@ use crate::{
 pub struct VideoEmbedding {
     pub values: Vec<f32>, // 384-dim, DINOv2 mean-pooled patch tokens
     pub timestamp: Timestamp,
+    /// Wall time for this encode call (resize + normalise + ORT inference), in milliseconds.
+    pub encode_ms: u64,
 }
 
 pub struct VideoEncoder {
@@ -29,6 +31,7 @@ impl VideoEncoder {
     /// Internally: converts to RGB24, resizes to 224×224, ImageNet-normalises,
     /// runs DINOv2, mean-pools the 256 patch tokens (skips CLS token 0).
     pub fn encode(&mut self, frame: &VideoFrame) -> EncodingResult<VideoEmbedding> {
+        let t0 = std::time::Instant::now();
         let tensor_flat = frame_to_tensor(frame)?;
         // Shape: (1, 3, 224, 224)
         let arr = Array4::from_shape_vec((1, 3, 224, 224), tensor_flat)
@@ -52,6 +55,7 @@ impl VideoEncoder {
         Ok(VideoEmbedding {
             values,
             timestamp: frame.timestamp.clone(),
+            encode_ms: t0.elapsed().as_millis() as u64,
         })
     }
 }
