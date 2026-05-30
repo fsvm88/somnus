@@ -47,7 +47,11 @@ const LR_MIN: f64 = 1e-5;
 const LR_STAGNANT_SCALE: f64 = 0.25; // multiplier when loss has plateaued
 /// Upper bound on warm-recall L2 used for salience normalisation. Traces above
 /// this distance are treated as maximally novel; below proportionally so.
-const LR_SALIENCE_CAP: f32 = 10.0;
+///
+/// Recalibrated for L2-normalised episode vectors: max possible L2 between unit
+/// vectors is 2.0 (orthogonal/opposite). Previous value of 10.0 was calibrated
+/// on un-normalised vectors and capped effective salience boost to ~20% of intent.
+const LR_SALIENCE_CAP: f32 = 2.0;
 /// Maximum LR multiplier for maximally novel (high warm-recall L2) traces.
 /// Multiplier is linearly interpolated from 1.0 (familiar) to this value (novel).
 const LR_SALIENCE_MAX_SCALE: f64 = 2.0;
@@ -162,7 +166,15 @@ const PRUNE_GIST_THRESHOLD: f32 = 0.8;
 /// Interpolation weight for REM creative blending (11b). α=0.5 → equal mix.
 const REM_SYNTH_ALPHA: f32 = 0.5;
 /// Minimum L2 distance between an episode pair to count as genuinely different content (11b).
-const REM_SYNTH_MIN_L2: f32 = 2.0;
+///
+/// Recalibrated for L2-normalised episode vectors (max distance = 2.0):
+///   ~0.0–0.3: same moment / same clip
+///   ~0.3–0.8: similar content
+///   ~1.0–1.5: different content (target range for synthesis)
+///   ~1.5–2.0: nearly opposite (rare)
+/// Previous value of 2.0 was calibrated on un-normalised vectors and was at the
+/// maximum possible distance for unit vectors, so no pairs ever qualified.
+const REM_SYNTH_MIN_L2: f32 = 1.0;
 /// Maximum number of synthetic episodes produced per sleep cycle (11b).
 const REM_SYNTH_MAX_N: usize = 8;
 

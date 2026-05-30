@@ -1677,16 +1677,21 @@ async fn main() -> Result<()> {
 const RECALL_BLEND_ALPHA: f32 = 0.1;
 
 /// L2 distance below which we blend the retrieved episode into the current one.
-/// Calibrated 2026-05-14: wake-time recall L2 on same-content (single looped video) has
-/// p95=4.1 and max=5.3. Threshold of 5.5 covers the same-content distribution; any episode
-/// beyond this distance is dissimilar enough that blending would inject noise.
-const RECALL_BLEND_THRESHOLD: f32 = 5.5;
+/// Recalibrated for L2-normalised episode vectors (max L2 = 2.0).
+/// Original value (5.5) was calibrated on un-normalised vectors (p95=4.1, max=5.3).
+/// For unit vectors, same-content repeats land at dist ≈ 0.05–0.3; different content
+/// at ≈ 1.0–1.8. Threshold of 0.5 blends within the same-content distribution only —
+/// preserving the intent of "recall shapes future recall for familiar episodes" while
+/// rejecting cross-content noise injection.
+const RECALL_BLEND_THRESHOLD: f32 = 0.5;
 
 /// Minimum salience (warm-recall L2) for wake_reconstruct_step to fire.
-/// Below this the frame is familiar enough that output-head gradient updates
-/// would mostly reinforce already-converged predictions. f32::MAX (no warm
-/// neighbour yet) always passes so reconstruction runs on fresh memory dirs.
-const WAKE_RECONSTRUCT_SALIENCE_THRESHOLD: f32 = 2.0;
+/// Recalibrated for L2-normalised episode vectors (max L2 = 2.0).
+/// Original value of 2.0 was at the maximum possible distance for unit vectors,
+/// so reconstruction effectively only fired when warm was empty (f32::MAX sentinel).
+/// 0.8 fires on content that is genuinely novel (dist > 0.8 ≈ cosine_sim < 0.68)
+/// while skipping familiar repeats. f32::MAX always passes (fresh memory dir).
+const WAKE_RECONSTRUCT_SALIENCE_THRESHOLD: f32 = 0.8;
 
 // ── language ingest helper ────────────────────────────────────────────────────
 
