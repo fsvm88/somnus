@@ -20,8 +20,9 @@ The hot EpisodicBuffer is upgraded from `EpisodeRecord` (id + timestamp + episod
 
 ```
 EpisodeTrace {
-    record:   EpisodeRecord,         // id, timestamp_secs, episode vector (512-dim)
-    regional: [Vec<f32>; 4],         // encoder embeddings: [speech(384), env(512), visual(384), symbolic(384)]
+    record:   EpisodeRecord,         // id, timestamp_secs, episode vector (640-dim; was 512 at Phase 5)
+    regional: [Vec<f32>; 5],         // encoder embeddings: [speech(384), env(512), visual(384), symbolic(384), language(896)]
+                                     // (was [4] at Phase 5; language added in Phase 6, ADR 0013)
 }
 ```
 
@@ -142,7 +143,7 @@ On startup, if `memory/snapshot/` exists, restore:
 
 **Why rebuild instead of persisting the HNSW file?** `hnsw_rs::Hnsw::load_hnsw` has a lifetime tied to the `HnswIo` loader (to support mmap). Storing `Hnsw<'static>` in `SemanticStore` while also persisting across calls would require unsafe lifetime erasure. Rebuilding from the cold archive (which is already durable) sidesteps the problem cleanly. The rebuild is O(N log N) in cold-archive size; at Phase 5 scale (< 10K records) this is fast enough on startup. If cold archives grow to 100K+ records, HNSW file persistence becomes worth the unsafe complexity — defer to that milestone.
 
-**Quantization note:** cold archive vectors are INT8-quantised with per-vector scale. Dequantised L2 distances will differ slightly (~0.1 per 512-dim vector) from the original f32 values. This is well below the calibrated `RECALL_BLEND_THRESHOLD=5.5`, so existing thresholds remain valid.
+**Quantization note:** cold archive vectors are INT8-quantised with per-vector scale. Dequantised L2 distances will differ slightly from original f32 values. Episode vectors are 640-dim (Phase 5 was 512-dim; grew with Phase 6 language region). `RECALL_BLEND_THRESHOLD=5.5` remains valid for L2-normalised 640-dim vectors.
 
 ### 10. Eager insert removed from wake path
 

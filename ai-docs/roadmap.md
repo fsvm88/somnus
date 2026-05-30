@@ -166,7 +166,7 @@ Current REM probe uses SAE reconstruction MSE — a low-level signal. The archit
 The architecture mentions working memory as a transient context buffer during wake — holding the current conversational or environmental context across episodes without writing to semantic memory. Currently each episode is processed independently.
 
 - Add a fixed-capacity ring of recent episode vectors (`--working-memory-size`, default 0 = disabled).
-- During binding, the WM mean ([EPISODE_DIM]) is reshaped to [5, D_PROJ] and appended to K and V (Q remains [5, D_PROJ] so output shape is unchanged). No new learned weights.
+- During binding, the episode ring is fed through a GRU (input=EPISODE_DIM=640, hidden=GRU_HIDDEN=256); final hidden state is projected to [5, D_PROJ=128] and appended to K and V. Q stays [5, 128], output shape is unchanged. GRU adds ~852K learned parameters. (This supersedes the originally-described WM-mean-pool approach, which was replaced in the architectural roundup — see ADR 0008 amendment.)
 - Working memory is cleared on sleep entry (wake-local by design).
 - Validated: model trained with WM=8 on talking_head clip; re-running WITH WM=8 vs WITHOUT (WM=0) on same snapshot — output_mse consistently 40–50% lower with WM (e.g., episode 6: 0.29 vs 0.58). Output heads learned to predict from WM-augmented episodes; disabling WM reverts to a higher-MSE distribution.
 

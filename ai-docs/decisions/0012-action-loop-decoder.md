@@ -18,9 +18,9 @@ Option 2 alone was rejected: internal gain modulation is functionally close to w
 
 Add an **`ActionDecoder`** component consisting of:
 
-1. A **learned projection** from episode vector space into the frozen LLM's embedding space, structured as 4 region tokens.
+1. A **learned projection** from episode vector space into the frozen LLM's embedding space, structured as 5 region tokens.
 2. A **frozen small LLM** (Qwen2.5-0.5B, default) that processes the region tokens and, when queried, generates text.
-3. A **gain modulation** path: the LLM's self-attention weights over the 4 region tokens — computed on every episode, with no generation — feed back as per-region gain multipliers into the next episode's k-WTA inputs.
+3. A **gain modulation** path: the LLM's hidden-state L2 norms over the 5 region tokens — computed on every episode, with no generation — feed back as per-region gain multipliers into the next episode's k-WTA inputs.
 
 ### Model choice
 
@@ -34,9 +34,9 @@ Alternative: **TinyLlama-1.1B** (hidden dim 2048, ~2.2 GB FP16) if generation qu
 ### Projection
 
 ```
-episode_vector [512]
-  ↓  linear(512, 4 × 896)   ← learned; ~1.8 M params
-  ↓  reshape → region_tokens [4, 896]
+episode_vector [640]
+  ↓  linear(640, 5 × 896)   ← learned; ~2.87 M params
+  ↓  reshape → region_tokens [5, 896]
 ```
 
 Region token layout (fixed order):
@@ -47,20 +47,23 @@ Region token layout (fixed order):
 | 1     | audio-env     |
 | 2     | visual        |
 | 3     | symbolic      |
+| 4     | language      |
 
-The projection is a single `linear_no_bias(EPISODE_DIM, 4 * LM_HIDDEN)`. No per-region sub-projections; the model learns to route internally.
+The projection is a single `linear_no_bias(EPISODE_DIM, 5 * LM_HIDDEN)`. No per-region sub-projections; the model learns to route internally.
 
 ### Gain modulation (every episode, no generation)
 
 After an episode vector is produced (post-settling, ADR 0011):
 
-1. Run the projection → `region_tokens [4, 896]`.
-2. Run one LLM forward pass over the 4 tokens (no autoregressive generation; a single non-causal or causal pass with the 4-token sequence). Extract the self-attention weights of the **last layer, last head** at position 3 (symbolic token) attending to positions 0–3.
-3. Softmax over the 4 weights → `attn [4]` summing to 1.0.
-4. Scale to gain multipliers: `gain_i = clip(attn_i × 4.0, 0.5, 2.0)`. Clipping prevents runaway amplification.
-5. Store `gain [4]` on `PerceptionProcessor`. On the **next** episode's `ingest_*` call, multiply each region's encoder embedding by its gain before the k-WTA forward pass.
+1. Run the projection → `region_tokens [5, 896]`.
+2. Run one LLM forward pass (gain session, transformer-only, static [1,5,896] input, no LM head) over the 5 tokens. Extract the per-position hidden-state L2 norms → `norms [5]`.
+3. Softmax over norms with temperature 10 → `attn [5]` summing to 1.0.
+4. Scale to gain multipliers: `gain_i = clip(attn_i × 5.0, 0.5, 2.0)`. Clipping prevents runaway amplification.
+5. Store `gain [5]` on `PerceptionProcessor`. On the **next** episode's `ingest_*` call, multiply each region's encoder embedding by its gain before the k-WTA forward pass.
 
-Gain multipliers are reset to `[1.0, 1.0, 1.0, 1.0]` at each sleep entry so a stale prior does not persist across the wake/sleep boundary.
+Gain multipliers are reset to `[1.0; 5]` at each sleep entry so a stale prior does not persist across the wake/sleep boundary.
+
+Note: the original design extracted attention weights from the last layer/last head at position 3. The implementation uses per-position hidden-state L2 norms instead — a simpler and more stable signal that doesn't depend on a specific head's attention pattern.
 
 The cognitive interpretation: "how much the language system cares about each perceptual region shapes what the perceptual system emphasises next." This parallels linguistic priming of visual attention and is architecturally consistent with the top-down prior path (ADR 0010).
 
@@ -78,12 +81,12 @@ Query handling is non-blocking: a dedicated `tokio::task` reads stdin; queries a
 
 ### Training signal
 
-**Text bypass is the decoder's training signal.** When text is injected via `--text-bypass`, the input string is tokenized and stored as `text_target: Option<Vec<u32>>` on the corresponding `EpisodeRecord`. Episodes without text bypass carry `None`.
+**Text bypass is the decoder's training signal.** When text is injected via stdin, the input string is tokenized and stored as `text_target: Option<Vec<u32>>` on the corresponding `EpisodeRecord`. Episodes without text carry `None`. Auto-grounding (ADR 0014) ensures every language ingest automatically produces a text_target without requiring manual queries.
 
 During NREM replay, for each `EpisodeRecord` where `text_target.is_some()`:
 
 1. Run `replay_step` as normal (SAE + output-head reconstruction).
-2. Additionally: run the projection on the episode's stored vector → `region_tokens`, then run LLM forward with `[region_tokens | text_target_embeddings[:-1]]` → logits, cross-entropy vs. `text_target[1:]`. Backprop through the projection only (LLM frozen). AdamW step for the projection parameters (separate parameter group from the cognitive layer so NREM neuromodulation — ADR 0008 cosine schedule — does not touch LR for the projection; projection uses a fixed LR of 1e-4).
+2. Additionally (current implementation — see amendment for details): precompute LM hidden-state distillation targets by running text tokens through `qwen25_lm.onnx` and mean-pooling. Run the projection on the stored episode vector → normalised mean of region tokens. Minimise MSE between projection output and LM hidden target. AdamW step for projection only (fixed LR=1e-4, separate from cognitive layer).
 
 Cold-start: with no text-bypass history the projection is never trained and generation is incoherent. This is the correct failure mode — it reflects how much the system has been taught. A startup INFO log reports the count of `text_target`-bearing records in the current episodic buffer so the training density is visible.
 
@@ -106,7 +109,7 @@ Cold-start: with no text-bypass history the projection is never trained and gene
 
 **EpisodeRecord schema change.** `text_target: Option<Vec<u32>>` added. Old cold-archive records are compatible (field treated as None). Snapshot restore unaffected.
 
-**VarMap.** One new key: `action_decoder.projection.weight` (shape `[4 * LM_HIDDEN, EPISODE_DIM]`). Old snapshots missing this key get fresh-initialized projection (logged at INFO); generation is incoherent until trained.
+**VarMap.** One new key: `action_decoder.projection.weight` (shape `[5 * LM_HIDDEN, EPISODE_DIM]` = `[4480, 640]`). Old snapshots missing this key get fresh-initialized projection (logged at INFO); generation is incoherent until trained.
 
 **Training density.** The projection trains only on episodes with text bypass. Sessions without any text bypass produce no decoder training signal. The binary logs `decoder_trainable_records` at each NREM entry; if this is consistently 0, the decoder is not learning.
 

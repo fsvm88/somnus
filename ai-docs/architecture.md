@@ -2,7 +2,7 @@
 
 > **Status:** working sketch. Reflects decisions through the vision discussion (Q1/Q2/Q3 + sub-Q1). Subject to further change as research matures. Update this doc when subsystem boundaries shift; record the *why* in an ADR.
 >
-> **Implementation state (2026-05-10):** Phases 1–4 implemented. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv2-S/14 (384-dim) via ORT. `crates/somnus-perception` runs four k-WTA layers (n=1024, k=20) + binding area → 512-dim episode vectors + SAE decoders for reconstruction error. `crates/somnus-memory` implements the three-tier memory hierarchy: `EpisodicBuffer` (bounded ring, hot), `SemanticStore` (hnsw_rs HNSW over episode vectors, warm), `ColdArchive` (INT8-quantised append-only binary, cold), `RecollectionLayer` (warm query live; cold→warm promotion stubbed for Phase 5). The `somnus` binary wires all crates end-to-end. Phase 5 (sleep cycle + consolidation) is next.
+> **Implementation state (2026-05-30):** Phases 1–14 + architectural roundup + gap fixes implemented. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv2-S/14 (384-dim) via ORT. `crates/somnus-perception` runs five k-WTA layers (n=1024, k=20) — audio-speech, audio-env, visual, symbolic, language — plus 4-head cross-attention binding area with GRU temporal context (GRU_HIDDEN=256) → 640-dim episode vectors + SAE decoders for reconstruction error. `crates/somnus-memory` implements the three-tier memory hierarchy: `EpisodicBuffer` (bounded ring, hot), `SemanticStore` (hnsw_rs HNSW over episode vectors, warm), `ColdArchive` (INT8-quantised append-only binary, cold), `RecollectionLayer` (warm query + cold→warm promotion). The `somnus` binary wires all crates end-to-end with a full sleep cycle (NREM + REM), text bypass, auto-grounding, action decoder (Qwen2.5-0.5B projection + gain modulation), and eval harness.
 
 somnus is decomposed by **function**, in loose correspondence with brain systems. Four shaping commitments:
 
@@ -66,7 +66,7 @@ The carve-up is revisable; what matters is that subsystems are *replaceable* and
 
                   ┌──────────────────────────────────────┐
                   │  ActionDecoder                        │
-                  │  projection (512 → 4×896) +           │
+                  │  projection (640 → 5×896) +           │
                   │  frozen Qwen2.5-0.5B                 │
                   │                                      │
                   │  every episode: attn weights →        │
@@ -102,6 +102,7 @@ Initial regions (revisable, see open questions):
 - **audio-env** — concepts grounded in environmental sound (objects, events).
 - **visual** — concepts grounded in visual experience.
 - **symbolic** — concepts that are linguistically *named*, regardless of which sense brought them in. Receives input from audio-speech and from text bypass.
+- **language** — continuous embedding of text tokens via the Qwen2.5 embed table (896-dim mean-pooled). Fed from stdin text and Whisper ASR transcripts. Provides a training signal for the action decoder projection during NREM.
 
 Discretization (e.g., a VQ-style codebook layer over continuous embeddings, or an emergent symbolic-discrete sub-region) is **out of scope for early phases**. It can be added later when reasoning over abstract concepts becomes a research target — biology and modern ML both suggest discrete symbols emerge from continuous representations, not the other way around.
 
@@ -191,13 +192,13 @@ Sleep is **interruptible by high-salience external events** (loud novel sound, m
 
 Tracked here so they don't get lost. Resolutions become ADRs.
 
-- ~~**Initial regional set.**~~ Resolved in ADR 0005: all four regions from Phase 3 (audio-speech, audio-env, visual, symbolic). Symbolic fed from audio-speech until text bypass arrives (Phase 6+).
+- ~~**Initial regional set.**~~ Resolved in ADR 0005: four regions from Phase 3 (audio-speech, audio-env, visual, symbolic). Phase 6 (ADR 0013) added the language region (index 4, 896-dim Qwen2.5 embed). Five regions total.
 - ~~**Encoder specifics.**~~ Resolved in ADR 0003: Whisper-tiny (speech, 384-dim) + CLAP-HTSAT-unfused (env, 512-dim) + DINOv2-S/14 (visual, 384-dim).
 - **Growth mechanism.** Cascade-Correlation-style unit addition? At what granularity (single unit, group, sub-cluster)? How do new units integrate with sparse codes?
 - ~~**Recollection-layer implementation.**~~ Resolved in ADR 0006: `hnsw_rs` HNSW (L2 distance) for warm tier; cold→warm promotion stubbed for Phase 5.
 - **Compression strategy.** Quantization, structured pruning, knowledge distillation, or layered combination? When is content moved cold vs. dropped?
 - ~~**Sparse-coding scheme.**~~ Resolved in ADR 0005: k-WTA with per-unit duty-cycle boosting, n=1024, k=20 (2% sparsity). Per-region weights; shared hyperparameters.
 - **Sleep-cycle time budget.** How to split a sleep cycle between NREM-like work (replay, homeostatic downscaling, compression) and REM-like work (generative replay, self-probe, growth, future creative recombination), and how to schedule within each stage.
-- ~~**Action loop.**~~ Resolved in ADR 0012: region-token projection (linear 512→4×896) + frozen Qwen2.5-0.5B. Per-episode LLM attention weights drive per-region gain modulation; full autoregressive decode on stdin query. Text-bypass provides decoder training signal during NREM.
+- ~~**Action loop.**~~ Resolved in ADR 0012: region-token projection (linear 640→5×896) + frozen Qwen2.5-0.5B. Per-episode LLM attention weights drive per-region gain modulation; full autoregressive decode on stdin query. NREM projection training uses LM contextualised hidden-state distillation targets (ADR 0012 amendment).
 - **Scheduling.** Async tasks, dedicated threads, event loop? How do real-time wake constraints coexist with batch sleep work?
 - **Tensor representation.** Single shared tensor type across subsystems, or each subsystem picks its own?

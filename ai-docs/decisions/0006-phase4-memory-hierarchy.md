@@ -48,9 +48,9 @@ magic:     b"SMNCOLD\0"   (8 B, header only)
 id:        u64            (8 B)
 timestamp: f64            (8 B, seconds since Unix epoch)
 scale:     f32            (4 B, dequant: v = q_i8 * scale)
-values:    [i8; 512]      (512 B)
+values:    [i8; 640]      (640 B)  ← was 512 at Phase 4; grew to 640 with Phase 6 language region
 ─────────────────────────
-total per record: 532 B
+total per record: 660 B  ← was 532 B at Phase 4
 ```
 
 **Quantisation:** `scale = max(|values|) / 127.0`; per-vector, not per-archive. Guards against the all-zero case with `scale = 1.0` fallback. Expected error < 0.8% of max magnitude per element.

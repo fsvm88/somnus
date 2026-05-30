@@ -15,7 +15,7 @@ ADR 0010 explicitly deferred this: "iterative refinement … is an incremental u
 
 After `try_bind` produces an episode vector, run a fixed-budget settling loop before storing the episode or updating the inter-episode priors (ADR 0010). Each iteration:
 
-1. Feed the *current* episode vector through the four output heads (inference mode, no grad) to generate per-region predictions.
+1. Feed the *current* episode vector through the five output heads (inference mode, no grad) to generate per-region predictions.
 2. Blend each prediction with the corresponding raw encoder input:
 
    ```
@@ -50,13 +50,13 @@ When `settle_steps > 0` but no prior snapshot exists (output heads are still ran
 
 **Duty-cycle integrity.** Settling uses `forward_no_dc` throughout; the primary `forward` call (from the ingest path, before settling begins) still updates duty cycles once per encoder input. Homeostasis is unaffected.
 
-**Latency.** Each settling step runs: 4 × output head forward + 4 × k-WTA linear forward + binding attention forward. All on CPU; estimated ~0.5–2 ms per iteration at default sizes. With `settle_steps = 3` this adds ≤6 ms per episode — acceptable for the current non-real-time research loop.
+**Latency.** Each settling step runs: 5 × output head forward + 5 × k-WTA linear forward + binding attention forward (including GRU temporal context). All on CPU; estimated ~0.5–2 ms per iteration at default sizes. With `settle_steps = 3` this adds ≤6 ms per episode — acceptable for the current non-real-time research loop.
 
 **No new weights.** `forward_no_dc` is a pure read path on existing k-WTA weights. No new parameters.
 
 **`regional_inputs` vs. episode vector divergence.** The settled episode vector may not be exactly reconstructible from the stored `regional` (raw encoder) inputs via a single forward pass, because settling applies blended (not raw) inputs. This is intentional: the settled representation is the *refined belief*, while `regional` preserves the *ground-truth observation* for training. This parallels the ADR 0010 wake/sleep inconsistency (acceptable at small β).
 
-**SETTLE_EPS calibration.** `1.0` is a placeholder. The correct value depends on the episode vector magnitude (expected L2 norm ~20–40 for 512-dim unit-Gaussian initialised binding weights). Multi-session runs with `INFO`-level delta logging will reveal typical convergence behaviour.
+**SETTLE_EPS calibration.** Calibrated value is 4.0 (`SETTLE_EPS=4.0` in the recommended campaign config). Typical episode vector L2 norm is higher for 640-dim than the original 512-dim estimate. Session metrics show settling typically converges in 1–2 iterations at this threshold.
 
 ## Alternatives considered
 

@@ -7,11 +7,11 @@
 
 The architecture doc commits to a bidirectional binding area: the integrative layer both composes regional inputs into an episode (bottom-up) and sends top-down signals back to the regions to bias their interpretation of the next input. The canonical example is McGurk-style disambiguation: visual evidence of mouth motion should raise the prior on "speech" in the audio-speech region, surfacing a faint voice that bottom-up audio alone would suppress under noise.
 
-ADR 0009 added output heads that map the episode vector (512-dim) back to each region's encoder dimension — exactly the feedback signal needed. The top-down prior mechanism reuses those heads at no extra parameter cost.
+ADR 0009 added output heads that map the episode vector (640-dim) back to each region's encoder dimension — exactly the feedback signal needed. The top-down prior mechanism reuses those heads at no extra parameter cost.
 
 ## Decision
 
-After each episode is produced, run the four output heads in inference mode to generate **predicted encoder embeddings** for each region. On the *next* encoder input, blend the raw embedding with the stored prediction:
+After each episode is produced, run the five output heads in inference mode to generate **predicted encoder embeddings** for each region. On the *next* encoder input, blend the raw embedding with the stored prediction:
 
 ```
 biased_input_i = (1 - β) * raw_encoder_i + β * prior_prediction_i
@@ -27,7 +27,7 @@ When β > 0 and a prior exists, log the cosine similarity between the prior pred
 
 ### No new weights
 
-The four output heads are the feedback path. `prior_predictions: [Option<Vec<f32>>; 4]` is added as a field on `PerceptionProcessor` and updated after every episode. Plain `Vec<f32>` — detached from the computation graph, no gradient tracking needed.
+The five output heads are the feedback path. `prior_predictions: [Option<Vec<f32>>; 5]` is a field on `PerceptionProcessor`, updated after every episode. The language head (index 4) participates but its prior is only non-None after an episode with language input. Plain `Vec<f32>` — detached from the computation graph, no gradient tracking needed.
 
 ### Timing
 
