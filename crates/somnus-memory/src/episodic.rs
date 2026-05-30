@@ -101,6 +101,7 @@ impl EpisodicBuffer {
         timestamp_secs: f64,
         values: Vec<f32>,
         regional: [Vec<f32>; 5],
+        ingest_source: IngestSource,
     ) {
         if self.buf.len() == self.capacity {
             self.buf.pop_front();
@@ -113,7 +114,7 @@ impl EpisodicBuffer {
                 id,
                 timestamp_secs,
                 values,
-                ingest_source: IngestSource::Unknown,
+                ingest_source,
             },
             regional,
             text_target: None,

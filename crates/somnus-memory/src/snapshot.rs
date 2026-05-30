@@ -38,7 +38,7 @@ use crate::{
 //
 // Bumped to SMNHOT01 in Phase 6 (ADR 0013) to distinguish 4-region (Phase 5)
 // from 5-region (Phase 6) snapshots. Old snapshots fail with BadMagic.
-const EPISODIC_MAGIC: &[u8; 8] = b"SMNHOT01";
+const EPISODIC_MAGIC: &[u8; 8] = b"SMNHOT02";
 
 pub fn save_episodic(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {
     let file = fs::File::create(path)?;
@@ -64,6 +64,7 @@ pub fn save_episodic(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {
                 w.write_all(&v.to_le_bytes())?;
             }
         }
+        w.write_all(&[r.ingest_source as u8])?;
     }
     w.flush()?;
     Ok(())
@@ -95,16 +96,20 @@ pub fn load_episodic(path: &Path, capacity: usize) -> MemoryResult<EpisodicBuffe
             *slot = read_f32_vec(&mut r, rn)?;
         }
 
+        let mut src_byte = [0u8; 1];
+        r.read_exact(&mut src_byte)?;
+        let ingest_source = crate::episode::IngestSource::from_u8(src_byte[0]);
+
         if id > max_id {
             max_id = id;
         }
-        traces.push((id, ts, ep_values, regional));
+        traces.push((id, ts, ep_values, regional, ingest_source));
     }
 
     let mut buf = EpisodicBuffer::new(capacity);
     // Replay all traces with correct ids via the pub(crate) id-aware push.
-    for (id, ts, values, regional) in traces {
-        buf.push_with_id(id, ts, values, regional);
+    for (id, ts, values, regional, ingest_source) in traces {
+        buf.push_with_id(id, ts, values, regional, ingest_source);
     }
     buf.set_next_id(max_id + 1);
     Ok(buf)
@@ -354,7 +359,7 @@ mod tests {
             vec![0.2f32; 640],
             [vec![], vec![], vec![3.0f32; 384], vec![4.0f32; 384], vec![]],
             f32::MAX,
-            crate::episode::IngestSource::Unknown,
+            crate::episode::IngestSource::Visual,
         );
 
         save_episodic(&buf, &path).unwrap();
@@ -366,8 +371,10 @@ mod tests {
         assert_eq!(traces[0].regional[0], vec![1.0f32; 384]);
         assert_eq!(traces[0].regional[1], vec![2.0f32; 512]);
         assert!(traces[0].regional[2].is_empty());
+        assert_eq!(traces[0].record.ingest_source, crate::episode::IngestSource::Unknown);
         assert_eq!(traces[1].record.timestamp_secs, 2.0);
         assert_eq!(traces[1].regional[2], vec![3.0f32; 384]);
+        assert_eq!(traces[1].record.ingest_source, crate::episode::IngestSource::Visual);
     }
 
     #[test]
