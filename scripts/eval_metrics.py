@@ -311,6 +311,75 @@ def plot_timing_breakdown(records, out_path, x_labels):
     print(f"  wrote {out_path}")
 
 
+def plot_wake_timing(records, out_path, x_labels):
+    """Wake-phase encode and gain timing per cycle.
+
+    Two sub-plots:
+      Top: stacked bar of total ms spent per wake cycle on each encode path.
+      Bottom: per-episode averages (total_ms / wake_episodes), revealing whether
+              per-frame cost is changing rather than just total volume.
+
+    Skips silently if no wake-timing fields exist (pre-instrumentation records).
+    """
+    WAKE_FIELDS = [
+        ("speech_encode_total_ms", "speech encode (Whisper)", "#4c8ef5"),
+        ("env_encode_total_ms",    "env encode (CLAP)",       "#98c379"),
+        ("video_encode_total_ms",  "video encode (DINOv2)",   "#c678dd"),
+        ("gain_update_total_ms",   "gain update (Qwen)",      "#e5c07b"),
+    ]
+    has_any = any(
+        any(get(r, f) is not None for f, _, _ in WAKE_FIELDS)
+        for r in records
+    )
+    if not has_any:
+        print(f"  skip: no wake timing fields in records — {out_path} not written")
+        return
+
+    x = np.arange(len(records))
+    fig, (ax_top, ax_bot) = plt.subplots(
+        2, 1, figsize=(max(8, len(records) * 0.5), 7),
+        gridspec_kw={"height_ratios": [2, 1]},
+    )
+    draw_session_lines(ax_top, records)
+    draw_session_lines(ax_bot, records)
+
+    # Top: stacked totals (seconds)
+    bottoms = np.zeros(len(records))
+    for field, label, color in WAKE_FIELDS:
+        vals = np.array([float(get(r, field) or 0) for r in records])
+        ax_top.bar(x, vals / 1000.0, bottom=bottoms / 1000.0,
+                   color=color, label=label, width=0.7)
+        bottoms += vals
+
+    ax_top.set_title("Wake-phase encode & gain timing per cycle")
+    ax_top.set_ylabel("total wall time (s)")
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([""] * len(x))
+    ax_top.legend(loc="upper right", fontsize=8)
+    ax_top.grid(True, axis="y", alpha=0.3)
+
+    # Bottom: per-episode averages (ms per episode)
+    episodes = np.array([float(get(r, "wake_episodes") or 1) for r in records])
+    episodes = np.maximum(episodes, 1)  # avoid divide-by-zero on empty wake cycles
+    for field, label, color in WAKE_FIELDS:
+        vals = np.array([float(get(r, field) or 0) for r in records])
+        ax_bot.plot(x, vals / episodes, color=color, linewidth=1.5,
+                    marker="o", markersize=4, label=label)
+
+    ax_bot.set_title("Per-episode averages")
+    ax_bot.set_ylabel("ms / episode")
+    ax_bot.set_xlabel("sleep cycle")
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    ax_bot.legend(loc="upper right", fontsize=8)
+    ax_bot.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -352,6 +421,9 @@ def main():
     plot_timing_breakdown(records,
                           os.path.join(out_dir, "timing_breakdown.png"),
                           x_labels)
+    plot_wake_timing(records,
+                     os.path.join(out_dir, "wake_timing.png"),
+                     x_labels)
     print("Done.")
 
 
