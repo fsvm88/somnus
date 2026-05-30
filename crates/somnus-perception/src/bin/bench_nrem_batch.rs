@@ -124,7 +124,10 @@ fn main() {
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         replay_results.push((bs, ms, N_TRACES as f64 / (ms / 1000.0)));
     }
-    print_table("replay_step_batch (SAE only, backward reference)", &replay_results);
+    print_table(
+        "replay_step_batch (SAE only, backward reference)",
+        &replay_results,
+    );
 
     // ── fused replay+wake ──────────────────────────────────────────────────────
     let mut fused_results = Vec::new();
@@ -134,10 +137,7 @@ fn main() {
         if bs == 1 {
             // sequential fused as baseline
             for (t, e) in traces.iter().zip(episodes.iter()) {
-                let _ = proc.fused_replay_wake_step_batch(
-                    &[t],
-                    &[e.as_slice()],
-                );
+                let _ = proc.fused_replay_wake_step_batch(&[t], &[e.as_slice()]);
             }
         } else {
             run_fused(&mut proc, &traces, &episodes, bs);

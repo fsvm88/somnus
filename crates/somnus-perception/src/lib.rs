@@ -231,8 +231,16 @@ impl PerceptionProcessor {
             tracing::info!(region = "speech", prior_cosine = c, "top-down prior");
         }
 
-        let speech_act = self.model.as_mut().unwrap().speech_layer.forward(&speech_input, &device);
-        let speech_err = self.model.as_ref().unwrap()
+        let speech_act = self
+            .model
+            .as_mut()
+            .unwrap()
+            .speech_layer
+            .forward(&speech_input, &device);
+        let speech_err = self
+            .model
+            .as_ref()
+            .unwrap()
             .speech_decoder
             .reconstruction_error(values, &speech_act, &device);
 
@@ -295,7 +303,10 @@ impl PerceptionProcessor {
         prior_cosines[1] = cosine;
         prior_cosines[3] = symbolic_cos;
         Ok(PerceptionOutput {
-            recon_errors: vec![(RegionId::AudioEnv, err), (RegionId::Symbolic, symbolic_err)],
+            recon_errors: vec![
+                (RegionId::AudioEnv, err),
+                (RegionId::Symbolic, symbolic_err),
+            ],
             episode,
             regional_inputs,
             prior_cosines,
@@ -379,7 +390,10 @@ impl PerceptionProcessor {
         prior_cosines[3] = symbolic_cos;
         prior_cosines[4] = cosine;
         Ok(PerceptionOutput {
-            recon_errors: vec![(RegionId::Language, err), (RegionId::Symbolic, symbolic_err)],
+            recon_errors: vec![
+                (RegionId::Language, err),
+                (RegionId::Symbolic, symbolic_err),
+            ],
             episode,
             regional_inputs,
             prior_cosines,
@@ -430,10 +444,8 @@ impl PerceptionProcessor {
         }
 
         // Project to 384-dim
-        let concat_t: Tensor<TrainB, 2> = Tensor::from_data(
-            TensorData::new(concat, [1, CROSS_MODAL_DIM]),
-            &device,
-        );
+        let concat_t: Tensor<TrainB, 2> =
+            Tensor::from_data(TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device);
         let projected: Vec<f32> = self
             .model
             .as_ref()
@@ -799,7 +811,11 @@ impl PerceptionProcessor {
                     .iter()
                     .filter_map(|r| {
                         let v = &r[region_idx];
-                        if v.is_empty() { None } else { Some(v) }
+                        if v.is_empty() {
+                            None
+                        } else {
+                            Some(v)
+                        }
                     })
                     .collect();
                 if valid.is_empty() {
@@ -813,11 +829,21 @@ impl PerceptionProcessor {
                     Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
 
                 let (z_batch, flat_masks) = match region_idx {
-                    0 => model.speech_layer.forward_tracked_batch(input_batch.clone(), b),
-                    1 => model.env_layer.forward_tracked_batch(input_batch.clone(), b),
-                    2 => model.visual_layer.forward_tracked_batch(input_batch.clone(), b),
-                    3 => model.symbolic_layer.forward_tracked_batch(input_batch.clone(), b),
-                    4 => model.language_layer.forward_tracked_batch(input_batch.clone(), b),
+                    0 => model
+                        .speech_layer
+                        .forward_tracked_batch(input_batch.clone(), b),
+                    1 => model
+                        .env_layer
+                        .forward_tracked_batch(input_batch.clone(), b),
+                    2 => model
+                        .visual_layer
+                        .forward_tracked_batch(input_batch.clone(), b),
+                    3 => model
+                        .symbolic_layer
+                        .forward_tracked_batch(input_batch.clone(), b),
+                    4 => model
+                        .language_layer
+                        .forward_tracked_batch(input_batch.clone(), b),
                     _ => unreachable!(),
                 };
 
@@ -837,7 +863,10 @@ impl PerceptionProcessor {
                     4 => model.language_decoder.mse_loss_batch(target, sparse_z),
                     _ => unreachable!(),
                 };
-                sae_loss = Some(match sae_loss { None => region_loss, Some(a) => a + region_loss });
+                sae_loss = Some(match sae_loss {
+                    None => region_loss,
+                    Some(a) => a + region_loss,
+                });
                 sae_n_terms += 1;
             }
         } // &mut borrow of model ends here
@@ -853,7 +882,11 @@ impl PerceptionProcessor {
                     .zip(batch.iter())
                     .filter_map(|(&ep, &r)| {
                         let inp = &r[head_idx];
-                        if inp.is_empty() { None } else { Some((ep, inp)) }
+                        if inp.is_empty() {
+                            None
+                        } else {
+                            Some((ep, inp))
+                        }
                     })
                     .collect();
                 if valid_pairs.is_empty() {
@@ -887,7 +920,10 @@ impl PerceptionProcessor {
                     }
                 };
                 let h_loss: Tensor<TrainB, 1> = (pred - target_batch).powi_scalar(2).mean();
-                wake_loss = Some(match wake_loss { None => h_loss, Some(a) => a + h_loss });
+                wake_loss = Some(match wake_loss {
+                    None => h_loss,
+                    Some(a) => a + h_loss,
+                });
                 wake_n_terms += 1;
             }
         }
@@ -1197,9 +1233,7 @@ impl PerceptionProcessor {
         // L1 norm of unit i = sum over rows j of abs(enc_flat[j * current_n + i]).
         let mut grown_norms: Vec<(usize, f32)> = (N_UNITS..current_n)
             .map(|i| {
-                let norm: f32 = (0..n_in)
-                    .map(|j| enc_flat[j * current_n + i].abs())
-                    .sum();
+                let norm: f32 = (0..n_in).map(|j| enc_flat[j * current_n + i].abs()).sum();
                 (i, norm)
             })
             .collect();
@@ -1214,7 +1248,9 @@ impl PerceptionProcessor {
         let new_enc_flat: Vec<f32> = (0..n_in)
             .flat_map(|j| {
                 let enc = &enc_flat;
-                keep.iter().map(move |&i| enc[j * current_n + i]).collect::<Vec<_>>()
+                keep.iter()
+                    .map(move |&i| enc[j * current_n + i])
+                    .collect::<Vec<_>>()
             })
             .collect();
 
@@ -1505,10 +1541,7 @@ impl PerceptionProcessor {
         }
     }
 
-    fn layer_mut(
-        model: &mut PerceptionModel<TrainB>,
-        region: RegionId,
-    ) -> &mut KWtaLayer<TrainB> {
+    fn layer_mut(model: &mut PerceptionModel<TrainB>, region: RegionId) -> &mut KWtaLayer<TrainB> {
         match region {
             RegionId::AudioSpeech => &mut model.speech_layer,
             RegionId::AudioEnv => &mut model.env_layer,

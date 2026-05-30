@@ -1347,6 +1347,12 @@ async fn main() -> Result<()> {
                             "mean_synthetic_output_mse":  stats.mean_synthetic_output_mse,
                             "regions_pruned":             stats.regions_pruned.len(),
                             "total_units_pruned":         stats.total_units_pruned,
+                            "nrem_wall_ms":               stats.nrem_wall_ms,
+                            "distill_precompute_ms":      stats.distill_precompute_ms,
+                            "rem_wall_ms":                stats.rem_wall_ms,
+                            "spill_wall_ms":              stats.spill_wall_ms,
+                            "snapshot_wall_ms":           stats.snapshot_wall_ms,
+                            "lm_hidden_computed":         stats.lm_hidden_computed,
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1780,10 +1786,10 @@ fn record_episode(
     };
     let ts_secs = wall_secs(&ts.wall);
 
-    let regional =
-        out.regional_inputs
-            .clone()
-            .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
+    let regional = out
+        .regional_inputs
+        .clone()
+        .unwrap_or([vec![], vec![], vec![], vec![], vec![]]);
 
     // L2-normalise the episode vector so HNSW uses cosine-equivalent distance.
     let ep_norm = {

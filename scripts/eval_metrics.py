@@ -264,6 +264,53 @@ def plot_sleep_triggers(records, out_path):
     print(f"  wrote {out_path}")
 
 
+def plot_timing_breakdown(records, out_path, x_labels):
+    """Stacked bar chart showing sleep-cycle phase timing per cycle.
+
+    Tolerates records that predate the timing fields (shows them as zero).
+    Stacks: NREM replay, distillation precompute, REM work, spill, snapshot.
+    An "other" bar absorbs unmeasured overhead so bars don't imply 100% coverage.
+    """
+    TIMING_FIELDS = [
+        ("nrem_wall_ms",          "NREM replay",          "#4c8ef5"),
+        ("distill_precompute_ms", "distill precompute",   "#e5c07b"),
+        ("rem_wall_ms",           "REM (probe+grow+synth)","#98c379"),
+        ("spill_wall_ms",         "spill hot→cold/warm",  "#c678dd"),
+        ("snapshot_wall_ms",      "snapshot writes",      "#e06c75"),
+    ]
+    has_any = any(
+        any(get(r, f) is not None for f, _, _ in TIMING_FIELDS)
+        for r in records
+    )
+    if not has_any:
+        # All records predate timing instrumentation — skip rather than crash.
+        print(f"  skip: no timing fields in records — {out_path} not written")
+        return
+
+    x = np.arange(len(records))
+    fig, ax = plt.subplots(figsize=(max(8, len(records) * 0.5), 5))
+    draw_session_lines(ax, records)
+
+    bottoms = np.zeros(len(records))
+    for field, label, color in TIMING_FIELDS:
+        vals = np.array([float(get(r, field) or 0) for r in records])
+        ax.bar(x, vals / 1000.0, bottom=bottoms / 1000.0,
+               color=color, label=label, width=0.7)
+        bottoms += vals
+
+    ax.set_title("Sleep-cycle phase timing breakdown")
+    ax.set_ylabel("wall time (s)")
+    ax.set_xlabel("sleep cycle")
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -302,6 +349,9 @@ def main():
                         x_labels)
     plot_sleep_triggers(records,
                         os.path.join(out_dir, "sleep_triggers.png"))
+    plot_timing_breakdown(records,
+                          os.path.join(out_dir, "timing_breakdown.png"),
+                          x_labels)
     print("Done.")
 
 

@@ -270,7 +270,9 @@ impl ActionDecoder {
         let input = Array3::from_shape_vec((1, n, LM_HIDDEN), embeds)
             .map_err(|e| anyhow::anyhow!("shape error: {e}"))?;
         let tensor = TensorRef::from_array_view(&input)?;
-        let outputs = self.lm_session.run(ort::inputs!["inputs_embeds" => tensor])?;
+        let outputs = self
+            .lm_session
+            .run(ort::inputs!["inputs_embeds" => tensor])?;
         let (shape, hidden_data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
         if shape.len() < 3 {
             bail!("unexpected last_hidden_state shape: {:?}", shape);
@@ -310,8 +312,7 @@ impl ActionDecoder {
         for (i, (_, ids)) in valid.iter().enumerate() {
             let mut mean = vec![0.0f32; LM_HIDDEN];
             for &id in *ids {
-                let row =
-                    &self.embed_table[id as usize * LM_HIDDEN..(id as usize + 1) * LM_HIDDEN];
+                let row = &self.embed_table[id as usize * LM_HIDDEN..(id as usize + 1) * LM_HIDDEN];
                 for (a, b) in mean.iter_mut().zip(row) {
                     *a += b;
                 }
@@ -373,10 +374,7 @@ impl ActionDecoder {
         }
         let n = valid.len();
 
-        let flat_hidden: Vec<f32> = valid
-            .iter()
-            .flat_map(|(_, h)| h.iter().copied())
-            .collect();
+        let flat_hidden: Vec<f32> = valid.iter().flat_map(|(_, h)| h.iter().copied()).collect();
         let flat_eps: Vec<f32> = valid
             .iter()
             .flat_map(|(ep, _)| ep.iter().copied())

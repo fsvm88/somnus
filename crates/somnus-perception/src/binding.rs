@@ -131,10 +131,8 @@ impl<B: Backend> BindingArea<B> {
         let (k, v) = if let Some(seq) = episode_sequence.filter(|s| !s.is_empty()) {
             let seq_len = seq.len();
             let flat: Vec<f32> = seq.iter().flat_map(|ep| ep.iter().copied()).collect();
-            let seq_t: Tensor<B, 3> = Tensor::from_data(
-                TensorData::new(flat, [1, seq_len, EPISODE_DIM]),
-                device,
-            );
+            let seq_t: Tensor<B, 3> =
+                Tensor::from_data(TensorData::new(flat, [1, seq_len, EPISODE_DIM]), device);
             // Run GRU; take final hidden state [1, GRU_HIDDEN]
             let gru_out: Tensor<B, 3> = self.temporal_gru.forward(seq_t, None);
             let hidden: Tensor<B, 2> = gru_out.narrow(1, seq_len - 1, 1).squeeze_dim::<2>(1);
@@ -161,7 +159,7 @@ impl<B: Backend> BindingArea<B> {
         let scores3: Tensor<B, 3> = q3.matmul(k3.swap_dims(1, 2)).mul_scalar(scale);
         let attn3: Tensor<B, 3> = activation::softmax(scores3, 2);
         let out3: Tensor<B, 3> = attn3.matmul(v3); // [N_HEADS, 5, D_HEAD]
-        // Merge: [N_HEADS, 5, D_HEAD] → [5, N_HEADS, D_HEAD] → [5, D_PROJ]
+                                                   // Merge: [N_HEADS, 5, D_HEAD] → [5, N_HEADS, D_HEAD] → [5, D_PROJ]
         let out: Tensor<B, 2> = out3.swap_dims(0, 1).reshape([5, D_PROJ]);
 
         // Flatten [5, D_PROJ] → [EPISODE_DIM]
@@ -240,6 +238,43 @@ mod tests {
         assert!(ep.0.iter().all(|v| v.is_finite()));
     }
 
+    /// Test the temporal-context path (seq_k=10): episode_sequence is populated,
+    /// GRU produces a context token, K and V become [10, D_PROJ].
+    /// This is the common case in real runs (--working-memory-size 8) and exercises
+    /// the multi-head reshape at a variable seq_k that differs from the 5-token case.
+    #[test]
+    fn output_with_temporal_context_is_finite_and_differs() {
+        let device = NdArrayDevice::Cpu;
+        let area = make_area();
+        let acts = [
+            &dummy_act(RegionId::AudioSpeech),
+            &dummy_act(RegionId::AudioEnv),
+            &dummy_act(RegionId::Visual),
+            &dummy_act(RegionId::Symbolic),
+            &zero_act(RegionId::Language),
+        ];
+        // 8 past episodes matching --working-memory-size 8.
+        // GRU reduces them to a single context token; K/V become [5+5=10, D_PROJ].
+        let past: Vec<Vec<f32>> = (0..8)
+            .map(|i| {
+                (0..EPISODE_DIM)
+                    .map(|j| ((i + j) as f32 * 0.001).sin())
+                    .collect()
+            })
+            .collect();
+        let ep_ctx = area.forward(&acts, Some(&past), &device);
+        let ep_no_ctx = area.forward(&acts, None, &device);
+        assert_eq!(ep_ctx.0.len(), EPISODE_DIM);
+        assert!(
+            ep_ctx.0.iter().all(|v| v.is_finite()),
+            "temporal-context output has non-finite values"
+        );
+        assert_ne!(
+            ep_ctx.0, ep_no_ctx.0,
+            "temporal context should produce a different episode vector"
+        );
+    }
+
     /// Verify head feature partitioning: activating only the first D_HEAD features
     /// of a region produces a different output than activating only the second
     /// D_HEAD block. This catches the wrong-reshape bug where features are
@@ -265,20 +300,15 @@ mod tests {
         let dummy = dummy_act(RegionId::AudioEnv);
         let zero = zero_act(RegionId::Language);
 
-        let ep_low = area.forward(
-            &[&low_block, &dummy, &dummy, &dummy, &zero],
-            None,
-            &device,
-        );
-        let ep_high = area.forward(
-            &[&high_block, &dummy, &dummy, &dummy, &zero],
-            None,
-            &device,
-        );
+        let ep_low = area.forward(&[&low_block, &dummy, &dummy, &dummy, &zero], None, &device);
+        let ep_high = area.forward(&[&high_block, &dummy, &dummy, &dummy, &zero], None, &device);
 
         // With correct per-head feature partitioning the two inputs land in
         // different heads, producing different attention patterns and outputs.
-        assert_ne!(ep_low.0, ep_high.0, "head-0 vs head-1 feature block must differ");
+        assert_ne!(
+            ep_low.0, ep_high.0,
+            "head-0 vs head-1 feature block must differ"
+        );
         // Suppress unused-mut warning after the initialisation above.
         let _ = &mut low_block;
     }

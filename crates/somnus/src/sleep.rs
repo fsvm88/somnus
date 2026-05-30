@@ -130,6 +130,18 @@ pub struct SleepStats {
     pub regions_pruned: Vec<RegionId>,
     /// Total grown units removed across all pruned regions.
     pub total_units_pruned: usize,
+    /// Wall time for the NREM batch-replay loop (ms).
+    pub nrem_wall_ms: u64,
+    /// Wall time to precompute LM hidden-state targets for Gap-6 distillation (ms).
+    pub distill_precompute_ms: u64,
+    /// Wall time for all REM work: warm probe + MSE measurement + growth + pruning + synthesis (ms).
+    pub rem_wall_ms: u64,
+    /// Wall time for hot→cold/warm spill and optional warm-HNSW rebuild (ms).
+    pub spill_wall_ms: u64,
+    /// Wall time for snapshot writes (perception weights, warm HNSW, region sizes) (ms).
+    pub snapshot_wall_ms: u64,
+    /// Number of language-tagged traces for which a valid LM hidden-state target was computed.
+    pub lm_hidden_computed: usize,
 }
 
 /// Number of gist clusters for REM self-probe (10c).
@@ -242,6 +254,8 @@ pub fn run_sleep_cycle(
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
+    // rem_wall_ms is accumulated across two REM sub-sections; the others are one-shot.
+    let mut rem_wall_ms = 0u64;
 
     let mut traces_replayed = 0usize;
     let mut total_train_loss = 0.0f32;
@@ -261,13 +275,21 @@ pub fn run_sleep_cycle(
     // Always start from 0 each cycle: language-priority ordering makes the
     // cross-cycle checkpoint unnecessary and would misplace prioritized traces.
     episodic.replay_checkpoint = 0;
+    // Inner tuple for building raw traces before LM hidden states are attached.
+    type RawTrace = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32);
     // Fifth field: precomputed LM hidden state (Gap 6 distillation target).
-    type TraceSnapshot = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32, Option<Vec<f32>>);
+    type TraceSnapshot = (
+        Vec<f32>,
+        [Vec<f32>; 5],
+        Option<Vec<u32>>,
+        f32,
+        Option<Vec<f32>>,
+    );
 
     // Precompute LM hidden states before the NREM loop so the hot path doesn't
     // pay the lm_session cost per batch. text_hidden_states is &self (inference
     // only), so we borrow decoder immutably here, before the mutable NREM step.
-    let raw_traces: Vec<(Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32)> = episodic
+    let raw_traces: Vec<RawTrace> = episodic
         .iter_traces()
         .map(|t| {
             (
@@ -278,6 +300,7 @@ pub fn run_sleep_cycle(
             )
         })
         .collect();
+    let t_distill = Instant::now();
     let lm_hidden_targets: Vec<Option<Vec<f32>>> = if let Some(ref mut dec) = decoder {
         raw_traces
             .iter()
@@ -289,6 +312,13 @@ pub fn run_sleep_cycle(
     } else {
         vec![None; raw_traces.len()]
     };
+    let lm_hidden_computed = lm_hidden_targets.iter().filter(|h| h.is_some()).count();
+    let distill_precompute_ms = t_distill.elapsed().as_millis() as u64;
+    tracing::info!(
+        lm_hidden_computed,
+        distill_precompute_ms,
+        "distillation targets precomputed"
+    );
     let mut traces: Vec<TraceSnapshot> = raw_traces
         .into_iter()
         .zip(lm_hidden_targets)
@@ -300,7 +330,11 @@ pub fn run_sleep_cycle(
     traces.sort_by(|(_, _, a_txt, a_sal, _), (_, _, b_txt, b_sal, _)| {
         let a_lang = a_txt.is_some() as u8;
         let b_lang = b_txt.is_some() as u8;
-        b_lang.cmp(&a_lang).then(b_sal.partial_cmp(a_sal).unwrap_or(std::cmp::Ordering::Equal))
+        b_lang.cmp(&a_lang).then(
+            b_sal
+                .partial_cmp(a_sal)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
 
     // Language oversampling: prepend lang_oversample extra copies of language-tagged
@@ -328,6 +362,7 @@ pub fn run_sleep_cycle(
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
+    let t_nrem = Instant::now();
 
     let decoder_trainable_records = traces.iter().filter(|(_, _, t, _, _)| t.is_some()).count();
     tracing::info!(decoder_trainable_records, "NREM: decoder-trainable traces");
@@ -503,10 +538,12 @@ pub fn run_sleep_cycle(
         None
     };
 
+    let nrem_wall_ms = t_nrem.elapsed().as_millis() as u64;
     tracing::info!(
         traces_replayed,
         mean_train_loss,
         mean_output_mse,
+        nrem_wall_ms,
         "NREM replay complete"
     );
 
@@ -516,6 +553,7 @@ pub fn run_sleep_cycle(
     }
 
     // ── REM pre-spill: warm recall probe ─────────────────────────────────────
+    let t_rem = Instant::now();
     // Run BEFORE spill so warm only contains prior-cycle entries. Querying after
     // spill would find exact matches (L2=0) from the just-inserted current records.
     let mut per_region_mse = [0.0f32; 5];
@@ -596,6 +634,8 @@ pub fn run_sleep_cycle(
     }
 
     // ── Compression: spill hot → cold; consolidate into warm ─────────────────
+    rem_wall_ms += t_rem.elapsed().as_millis() as u64;
+    let t_spill = Instant::now();
     if !was_interrupted {
         let mut spilled = 0usize;
         for record in episodic.iter_records() {
@@ -612,7 +652,9 @@ pub fn run_sleep_cycle(
         // most recent max_warm_records entries in cold so the index stays bounded.
         if max_warm_records > 0 && recall.warm.len() > max_warm_records {
             let t0 = Instant::now();
-            let loaded = recall.warm.rebuild_from_recent(&recall.cold, max_warm_records);
+            let loaded = recall
+                .warm
+                .rebuild_from_recent(&recall.cold, max_warm_records);
             tracing::info!(
                 loaded,
                 max_warm_records,
@@ -622,7 +664,11 @@ pub fn run_sleep_cycle(
         }
     }
 
+    let spill_wall_ms = t_spill.elapsed().as_millis() as u64;
+    tracing::info!(spill_wall_ms, "spill complete");
+
     // ── REM-like: measure MSE + trigger growth ────────────────────────────────
+    let t_rem2 = Instant::now();
     if !was_interrupted {
         // Measure SAE reconstruction quality without updating weights.
         for (_, regional) in &traces_for_rem {
@@ -783,7 +829,9 @@ pub fn run_sleep_cycle(
                             } else {
                                 a.iter()
                                     .zip(b.iter())
-                                    .map(|(&x, &y)| REM_SYNTH_ALPHA * x + (1.0 - REM_SYNTH_ALPHA) * y)
+                                    .map(|(&x, &y)| {
+                                        REM_SYNTH_ALPHA * x + (1.0 - REM_SYNTH_ALPHA) * y
+                                    })
                                     .collect()
                             }
                         });
@@ -843,7 +891,11 @@ pub fn run_sleep_cycle(
         }
     }
 
+    rem_wall_ms += t_rem2.elapsed().as_millis() as u64;
+    tracing::info!(rem_wall_ms, "REM complete");
+
     // ── Snapshot ──────────────────────────────────────────────────────────────
+    let t_snapshot = Instant::now();
     if !was_interrupted {
         if let Err(e) = save_snapshot(episodic, memory_dir) {
             tracing::warn!(?e, "episodic snapshot write failed");
@@ -864,6 +916,16 @@ pub fn run_sleep_cycle(
         }
         tracing::info!("snapshot written");
     }
+    let snapshot_wall_ms = t_snapshot.elapsed().as_millis() as u64;
+    tracing::info!(
+        nrem_wall_ms,
+        distill_precompute_ms,
+        rem_wall_ms,
+        spill_wall_ms,
+        snapshot_wall_ms,
+        total_wall_ms = sleep_start.elapsed().as_millis() as u64,
+        "sleep cycle phase timings"
+    );
 
     Ok(SleepStats {
         traces_replayed,
@@ -883,5 +945,101 @@ pub fn run_sleep_cycle(
         mean_real_inference_mse,
         regions_pruned,
         total_units_pruned,
+        nrem_wall_ms,
+        distill_precompute_ms,
+        rem_wall_ms,
+        spill_wall_ms,
+        snapshot_wall_ms,
+        lm_hidden_computed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── nrem_lr schedule tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn nrem_lr_cosine_decreases_step0_to_last() {
+        let lr_first = nrem_lr(0, 20, 0.0, 0.0, f32::MAX);
+        let lr_last = nrem_lr(19, 20, 0.0, 0.0, f32::MAX);
+        assert!(
+            lr_first > lr_last,
+            "cosine LR should be highest at step 0 (got {lr_first:.2e}) and lowest at last step (got {lr_last:.2e})"
+        );
+    }
+
+    #[test]
+    fn nrem_lr_stagnant_gate_reduces_lr() {
+        // worsening: loss_ewma > prev_ewma by >1% → trend_scale = LR_STAGNANT_SCALE
+        // plateau:   |improvement| ≤ 1% → trend_scale = 0.5
+        // Both use step=5 (not 0) so the trend gate is active.
+        let plateau = nrem_lr(5, 20, 1.0, 1.0, 0.0); // improvement = 0
+        let worsening = nrem_lr(5, 20, 1.05, 1.0, 0.0); // improvement = -0.05
+        assert!(
+            worsening < plateau,
+            "worsening loss should reduce LR below plateau (worsening={worsening:.2e}, plateau={plateau:.2e})"
+        );
+        // Worsening should apply the LR_STAGNANT_SCALE=0.25 multiplier vs plateau's 0.5
+        let ratio = worsening / plateau;
+        assert!(
+            (ratio - LR_STAGNANT_SCALE / 0.5).abs() < 0.05,
+            "worsening/plateau ratio should be ~{:.2} (got {ratio:.3})",
+            LR_STAGNANT_SCALE / 0.5
+        );
+    }
+
+    #[test]
+    fn nrem_lr_salience_boost_scales_lr() {
+        // step=0: prev_ewma check is bypassed → trend_scale=1.0 for both
+        let no_salience = nrem_lr(0, 20, 0.0, 0.0, 0.0); // norm=0 → scale=1.0
+        let max_salience = nrem_lr(0, 20, 0.0, 0.0, LR_SALIENCE_CAP); // norm=1 → scale=LR_SALIENCE_MAX_SCALE
+        let expected_ratio = LR_SALIENCE_MAX_SCALE;
+        let actual_ratio = max_salience / no_salience;
+        assert!(
+            (actual_ratio - expected_ratio).abs() < 0.01,
+            "max-salience LR should be {expected_ratio}× no-salience (got {actual_ratio:.3})"
+        );
+    }
+
+    #[test]
+    fn nrem_lr_sentinel_matches_half_salience() {
+        // f32::MAX sentinel maps to 0.5 novelty; LR_SALIENCE_CAP/2 also maps to 0.5 novelty.
+        let sentinel = nrem_lr(0, 20, 0.0, 0.0, f32::MAX);
+        let half_cap = nrem_lr(0, 20, 0.0, 0.0, LR_SALIENCE_CAP * 0.5);
+        let rel_diff = (sentinel - half_cap).abs() / sentinel.max(1e-12);
+        assert!(
+            rel_diff < 1e-6,
+            "sentinel and 0.5×cap should give identical LR (diff={rel_diff:.2e})"
+        );
+    }
+
+    // ── kmeans tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn kmeans_separates_two_tight_clusters() {
+        // Two clusters far apart in 1D.
+        let mut points: Vec<Vec<f32>> = (0..20).map(|_| vec![0.1f32]).collect();
+        points.extend((0..20).map(|_| vec![9.9f32]));
+        let centroids = kmeans(&points, 2, 20);
+        assert_eq!(centroids.len(), 2);
+        let lo = centroids[0][0].min(centroids[1][0]);
+        let hi = centroids[0][0].max(centroids[1][0]);
+        assert!(lo < 1.0, "lower centroid should be near 0, got {lo}");
+        assert!(hi > 9.0, "upper centroid should be near 10, got {hi}");
+    }
+
+    #[test]
+    fn kmeans_handles_fewer_points_than_k() {
+        let points = vec![vec![1.0f32], vec![2.0f32]];
+        let centroids = kmeans(&points, 5, 10); // k > n
+        assert_eq!(centroids.len(), 2, "k is clamped to point count");
+    }
+
+    #[test]
+    fn kmeans_empty_returns_empty() {
+        let centroids = kmeans(&[], 4, 10);
+        assert!(centroids.is_empty());
+    }
 }
