@@ -50,7 +50,7 @@ System requirement: `libavcodec`, `libavformat`, `libavutil`, `libswresample`, `
 
 ## Vector retrieval
 
-- **`usearch`** — **[committed]** HNSW index for warm semantic memory (Phase 4). Supports FP16 vectors natively; best-maintained Rust HNSW crate. See `research/vector-retrieval.md`.
+- **`hnsw_rs`** — **[committed]** HNSW index for warm semantic memory (Phase 4). Pure-Rust implementation; chosen over `usearch` for simpler FFI story (see ADR 0006). See `research/vector-retrieval.md`.
 - Flat search (no crate) — Phase 1–3 before the index is needed.
 - `memmap2` — candidate for cold-tier disk access (Phase 4+).
 
@@ -61,7 +61,7 @@ Three-tier hierarchy is architecturally committed (`architecture.md`); crate cho
 | Tier | Medium | Crate(s) |
 |------|--------|-----------|
 | Hot (episodic) | VRAM / candle tensors | `candle-core` |
-| Warm (semantic) | RAM | `usearch` (HNSW) + plain `Vec` |
+| Warm (semantic) | RAM | `hnsw_rs` (HNSW) + plain `Vec` |
 | Cold (archive) | Disk | `memmap2` + custom binary format |
 
 Embedded KV (`redb`, `fjall`, `sled`) and SQL (`rusqlite`, `sqlx`) are candidates only if the cold-tier format outgrows hand-rolled serialization.

@@ -1085,7 +1085,7 @@ fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
 - One `candle::Tensor` weight matrix per region; updated during sleep only
 
 **`somnus-memory`** (Phase 4)
-- Deps: `somnus-perception`, `usearch` (HNSW), `memmap2` (cold tier)
+- Deps: `somnus-perception`, `hnsw_rs` (HNSW; superseded usearch per ADR 0006), `memmap2` (cold tier)
 - Three storage structs: `EpisodicBuffer` (hot/VRAM), `SemanticStore` (warm/RAM),
   `ColdArchive` (disk)
 - HNSW index managed inside `SemanticStore`; rebuilt lazily when tombstone

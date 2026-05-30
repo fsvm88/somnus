@@ -1897,7 +1897,7 @@ fn record_episode(
         [0] => IngestSource::Speech,
         [1] => IngestSource::Env,
         [2] => IngestSource::Visual,
-        [3] => IngestSource::Mixed,
+        [3] => IngestSource::Unknown,
         [4] => IngestSource::Language,
         _ if active.is_empty() => IngestSource::Unknown,
         _ => IngestSource::Mixed,

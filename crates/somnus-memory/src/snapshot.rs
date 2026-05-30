@@ -37,7 +37,8 @@ use crate::{
 //   for each of 5 regions: n_reg_vals(u16,2) + reg_values([f32; n_reg_vals])
 //
 // Bumped to SMNHOT01 in Phase 6 (ADR 0013) to distinguish 4-region (Phase 5)
-// from 5-region (Phase 6) snapshots. Old snapshots fail with BadMagic.
+// from 5-region (Phase 6) snapshots. Bumped to SMNHOT02 (Gap 8) to add
+// ingest_source byte per trace. Old snapshots fail with BadMagic.
 const EPISODIC_MAGIC: &[u8; 8] = b"SMNHOT02";
 
 pub fn save_episodic(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {

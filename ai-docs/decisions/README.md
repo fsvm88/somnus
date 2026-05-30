@@ -70,3 +70,6 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0016](0016-phase12a-eval-harness.md) | Phase 12a metrics eval harness | accepted |
 | [0017](0017-phase12b-hnsw-persistence.md) | Phase 12b HNSW warm-index persistence | accepted |
 | [0018](0018-phase12c-regional-distillation.md) | Phase 12c regional unit pruning | accepted |
+| [0019](0019-gap-fixes-synthetic-replay-salience-gate-nrem-lr.md) | Gap fixes: synthetic replay, salience-gated wake reconstruct, salience → NREM LR | accepted |
+| [0020](0020-systematic-forgetting-cold-truncation.md) | Systematic forgetting: bounded cold archive | accepted |
+| [0021](0021-cross-modal-gist-entropy.md) | Cross-modal gist entropy: ingest_source and concept probe | accepted |
