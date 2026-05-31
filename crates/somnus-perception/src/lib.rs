@@ -1342,6 +1342,35 @@ impl PerceptionProcessor {
         self.settle_beta = beta;
     }
 
+    /// Detach all model parameters from the accumulated autodiff graph and reset the optimizer.
+    ///
+    /// burn's global AutodiffServer accumulates stale backward-step entries each time the
+    /// optimizer writes the same ParamId. After N optimizer steps the backward() traversal
+    /// must cross an N-step chain even though the forward graph is constant-depth — causing
+    /// the 100-500x NREM slowdown observed within each session.
+    ///
+    /// Calling this before the NREM loop re-wraps every parameter as a fresh leaf tensor
+    /// with a new ParamId, letting the server free accumulated entries on the next backward.
+    /// Equivalent to what grow_region / prune_region do incidentally (hence why post-growth
+    /// NREM cycles are always fast).
+    pub fn refresh_autodiff_state(&mut self) {
+        use burn::module::ModuleMapper;
+        struct GraphDetacher;
+        impl ModuleMapper<TrainB> for GraphDetacher {
+            fn map_float<const D: usize>(
+                &mut self,
+                param: Param<Tensor<TrainB, D>>,
+            ) -> Param<Tensor<TrainB, D>> {
+                let (_, tensor, mapper) = param.consume();
+                let fresh = Tensor::from_inner(tensor.inner()).require_grad();
+                Param::from_mapped_value(ParamId::new(), fresh, mapper)
+            }
+        }
+        let model = self.model.take().unwrap();
+        self.model = Some(model.map(&mut GraphDetacher));
+        self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+    }
+
     pub fn region_sizes(&self) -> [usize; 5] {
         let m = self.model.as_ref().unwrap();
         [

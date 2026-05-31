@@ -402,6 +402,15 @@ pub fn run_sleep_cycle(
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
+
+    // Detach all parameters from burn's global AutodiffServer before the NREM loop.
+    // Without this, backward() cost grows O(total_prior_optimizer_steps) across cycles
+    // because the server accumulates stale graph entries keyed by ParamId. Refreshing
+    // replaces every ParamId, freeing accumulated entries on the next backward() call.
+    let t_refresh = Instant::now();
+    perception.refresh_autodiff_state();
+    tracing::info!(refresh_ms = t_refresh.elapsed().as_millis(), "NREM: autodiff state refreshed");
+
     let t_nrem = Instant::now();
 
     let decoder_trainable_records = traces.iter().filter(|(_, _, t, _, _)| t.is_some()).count();
