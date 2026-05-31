@@ -110,6 +110,9 @@ pub struct PerceptionOutput {
     pub prior_cosines: [Option<f32>; 5],
     /// Settling iterations actually run for this episode (0 = gate did not fire or settle_steps=0).
     pub settle_iters: usize,
+    /// L2 distance between the pre-settle and post-settle episode vectors (0.0 when settle_iters=0).
+    /// Reveals whether SETTLE_EPS is a tight or trivial convergence criterion.
+    pub settle_delta: f32,
 }
 
 /// All trainable parameters for the cognitive layer.
@@ -253,7 +256,7 @@ impl PerceptionProcessor {
         self.refresh_language_cache();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let (episode, settle_iters) = self.maybe_settle_and_update(episode, speech_cos);
+        let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, speech_cos);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -267,6 +270,7 @@ impl PerceptionProcessor {
             episode,
             regional_inputs,
             settle_iters,
+            settle_delta,
             prior_cosines,
         })
     }
@@ -299,7 +303,7 @@ impl PerceptionProcessor {
         self.refresh_language_cache();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let (episode, settle_iters) = self.maybe_settle_and_update(episode, cosine);
+        let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -313,6 +317,7 @@ impl PerceptionProcessor {
             episode,
             regional_inputs,
             settle_iters,
+            settle_delta,
             prior_cosines,
         })
     }
@@ -345,7 +350,7 @@ impl PerceptionProcessor {
         self.refresh_language_cache();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let (episode, settle_iters) = self.maybe_settle_and_update(episode, cosine);
+        let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -357,6 +362,7 @@ impl PerceptionProcessor {
             regional_inputs,
             prior_cosines,
             settle_iters,
+            settle_delta,
         })
     }
 
@@ -388,7 +394,7 @@ impl PerceptionProcessor {
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let (episode, settle_iters) = self.maybe_settle_and_update(episode, cosine);
+        let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -403,29 +409,30 @@ impl PerceptionProcessor {
             regional_inputs,
             prior_cosines,
             settle_iters,
+            settle_delta,
         })
     }
 
-    /// Returns `(episode, settle_iters)` where `settle_iters` is 0 when the gate did
-    /// not fire or `settle_steps == 0`, and 1..=settle_steps otherwise.
+    /// Returns `(episode, settle_iters, settle_delta)`.
+    /// `settle_iters` is 0 and `settle_delta` is 0.0 when the gate did not fire or
+    /// `settle_steps == 0`.
     fn maybe_settle_and_update(
         &mut self,
         episode: Option<EpisodeVector>,
         cosine: Option<f32>,
-    ) -> (Option<EpisodeVector>, usize) {
+    ) -> (Option<EpisodeVector>, usize, f32) {
         if let Some(ep) = episode {
             let should_settle =
                 self.settle_steps > 0 && cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
-            let (refined, iters) = if should_settle {
-                let (r, n) = self.settle_episode(&ep);
-                (r, n)
+            let (refined, iters, delta) = if should_settle {
+                self.settle_episode(&ep)
             } else {
-                (ep, 0)
+                (ep, 0, 0.0)
             };
             self.update_prior_predictions(&refined.0);
-            (Some(refined), iters)
+            (Some(refined), iters, delta)
         } else {
-            (None, 0)
+            (None, 0, 0.0)
         }
     }
 
@@ -1441,10 +1448,14 @@ impl PerceptionProcessor {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn settle_episode(&self, ep: &EpisodeVector) -> (EpisodeVector, usize) {
+    /// Returns `(refined_episode, iters_run, final_delta)`.
+    /// `final_delta` is the L2 distance between the last two episode estimates (0.0 if the
+    /// activation guard broke before any delta was computed).
+    fn settle_episode(&self, ep: &EpisodeVector) -> (EpisodeVector, usize, f32) {
         let device = self.device;
         let model = self.model.as_ref().unwrap();
         let mut current = ep.clone();
+        let mut last_delta = 0.0f32;
 
         for iter in 0..self.settle_steps {
             // Use EMA heads for inference — no autodiff overhead, stable priors.
@@ -1497,15 +1508,16 @@ impl PerceptionProcessor {
                 .map(|(a, b)| (a - b).powi(2))
                 .sum::<f32>()
                 .sqrt();
-            tracing::info!(iter, delta, "settle delta");
+            last_delta = delta;
+            tracing::debug!(iter, delta, "settle delta");
             let converged = delta < SETTLE_EPS;
             current = refined;
             if converged {
-                return (current, iter + 1);
+                return (current, iter + 1, last_delta);
             }
         }
 
-        (current, self.settle_steps)
+        (current, self.settle_steps, last_delta)
     }
 
     fn update_prior_predictions(&mut self, episode: &[f32]) {
