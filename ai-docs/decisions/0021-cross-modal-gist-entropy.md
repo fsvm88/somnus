@@ -25,7 +25,8 @@ were non-empty:
 
 - region 0 only → Speech
 - region 1 only → Env
-- region 2 or 3 only → Visual (visual + symbolic are both scene-level)
+- region 2 only → Visual
+- region 3 only → Unknown (Symbolic is a derived convergence layer, not a raw encoder input)
 - region 4 only → Language
 - 2+ non-empty → Mixed
 - none non-empty → Unknown

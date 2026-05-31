@@ -29,13 +29,13 @@ Item 4 from the original gap list (language last-token pooling) was dropped: `La
 
 ### 2 — Salience-gated wake reconstruction
 
-**What:** `wake_reconstruct_step` is skipped when the episode's warm-recall L2 distance is below `WAKE_RECONSTRUCT_SALIENCE_THRESHOLD = 2.0`.
+**What:** `wake_reconstruct_step` is skipped when the episode's warm-recall L2 distance is below `WAKE_RECONSTRUCT_SALIENCE_THRESHOLD = 0.8`.
 
 **Why:** Familiar frames (low warm-recall L2 = close to many prior episodes) produce near-zero gradient: the output heads already predict them well. Spending backward passes on them wastes compute and can reinforce stale predictions if the model has already converged on that content.
 
 **Salience source:** warm-recall L2 computed inside `record_episode`, which is now called *before* `wake_reconstruct_step` at all three call sites (audio, video, language). This avoids a double warm query and uses a single consistent salience definition throughout wake processing. Episodes with no warm neighbours (first run, fresh memory dir) return `f32::MAX`, which always passes the gate.
 
-**Threshold:** 2.0 is below the same-content p95 of 4.1 (calibrated 2026-05-14). Content within L2=2.0 is effectively identical across frames; above that, reconstruction gradients carry genuine information.
+**Threshold:** 0.8 (recalibrated from 2.0 after L2-normalisation was added to `record_episode`; unit vectors have max L2=2.0, so the original 2.0 threshold passed everything). Content within L2=0.8 is effectively identical across frames; above that, reconstruction gradients carry genuine information.
 
 ### 3 — Salience → NREM LR
 
@@ -45,6 +45,6 @@ Item 4 from the original gap list (language last-token pooling) was dropped: `La
 
 **Sentinel handling:** `f32::MAX` (no warm neighbour — first cycle of a fresh run) maps to 0.5 novelty (neutral multiplier ~1.5×). This avoids the inf/NaN risk the advisor flagged: if all traces are sentinel, salience = f32::MAX, which is caught by the `>= f32::MAX / 2.0` guard before normalisation.
 
-**Bounds:** `LR_SALIENCE_CAP = 10.0` normalises raw L2 to [0, 1]; `LR_SALIENCE_MAX_SCALE = 2.0` caps the multiplier. Combined max LR = `LR_MAX × LR_SALIENCE_MAX_SCALE = 2e-3`, still well within a stable AdamW range at these batch sizes.
+**Bounds:** `LR_SALIENCE_CAP = 2.0` normalises raw L2 to [0, 1] (recalibrated from 10.0 for L2-normalised unit vectors whose max distance is 2.0); `LR_SALIENCE_MAX_SCALE = 2.0` caps the multiplier. Combined max LR = `LR_MAX × LR_SALIENCE_MAX_SCALE = 2e-3`, still well within a stable AdamW range at these batch sizes.
 
 **Interaction with sort order:** traces are already sorted salience-descending before NREM, so high-salience batches appear early in the cycle when cosine annealing is also at peak LR. The two effects compound deliberately.

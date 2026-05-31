@@ -770,8 +770,8 @@ pub fn run_sleep_cycle(
 
         // Growth trigger: gist-recall is the primary signal; SAE MSE fallback when warm
         // is too small to cluster. warm_recall_poor is logged but no longer gates growth —
-        // the WARM_RECALL_GROWTH_THRESHOLD (15.0) was calibrated too conservatively and
-        // prevented growth even when gist was poor.
+        // WARM_RECALL_GROWTH_THRESHOLD (5.0) proved too noisy a signal; gist_poor is more
+        // reliable for deciding when regions need more capacity.
         let _warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
         let gist_poor = gist_recall_rate.is_none_or(|r| r < GIST_GROWTH_THRESHOLD);
         let region_ids = [

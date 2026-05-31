@@ -34,7 +34,8 @@ use crate::{
 // Header: magic(8B) + count(u64,8B) = 16B
 // Per trace (little-endian):
 //   id(u64,8) + ts(f64,8) + n_ep_vals(u32,4) + ep_values([f32; n_ep_vals]) +
-//   for each of 5 regions: n_reg_vals(u16,2) + reg_values([f32; n_reg_vals])
+//   for each of 5 regions: n_reg_vals(u16,2) + reg_values([f32; n_reg_vals]) +
+//   ingest_source(u8,1)
 //
 // Bumped to SMNHOT01 in Phase 6 (ADR 0013) to distinguish 4-region (Phase 5)
 // from 5-region (Phase 6) snapshots. Bumped to SMNHOT02 (Gap 8) to add

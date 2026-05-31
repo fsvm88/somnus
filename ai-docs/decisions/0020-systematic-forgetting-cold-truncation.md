@@ -24,7 +24,7 @@ records via `ColdArchive::truncate_to_recent(n)`.
 rewrite is atomic enough for a research setting (the old file is overwritten in place;
 a crash mid-write leaves a partial file detectable by size check on reopen).
 
-The cold archive format uses fixed-size records (`RECORD_BYTES = 532` bytes at `COLD_DIM=640`),
+The cold archive format uses fixed-size records (`RECORD_BYTES = 661` bytes at `COLD_DIM=640`: 8B id + 8B timestamp + 4B scale + 640B quantised values + 1B ingest_source),
 so "last N records" is a direct byte-offset calculation with no parsing required.
 
 ## Suggested value
