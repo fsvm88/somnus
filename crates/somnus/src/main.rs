@@ -1426,6 +1426,7 @@ async fn main() -> Result<()> {
                             "spill_wall_ms":              stats.spill_wall_ms,
                             "snapshot_wall_ms":           stats.snapshot_wall_ms,
                             "lm_hidden_computed":         stats.lm_hidden_computed,
+                            "lm_hidden_unique":           stats.lm_hidden_unique,
                             "speech_encode_total_ms":     speech_encode_total_ms,
                             "env_encode_total_ms":        env_encode_total_ms,
                             "video_encode_total_ms":      video_encode_total_ms,

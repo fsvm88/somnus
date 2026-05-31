@@ -4,6 +4,7 @@
 /// exits early if set. Language-tagged traces are replayed first each cycle
 /// so they are never skipped even when the salience gate fires early.
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -151,6 +152,9 @@ pub struct SleepStats {
     pub snapshot_wall_ms: u64,
     /// Number of language-tagged traces for which a valid LM hidden-state target was computed.
     pub lm_hidden_computed: usize,
+    /// Unique LM inference calls made (deduplicated by token-id content).
+    /// With lang_oversample=9, this ≈ lm_hidden_computed / 10.
+    pub lm_hidden_unique: usize,
     /// Total replay list length fed to the NREM loop (unique + oversampled copies).
     /// Coverage = traces_replayed / nrem_budget_traces.
     pub nrem_budget_traces: usize,
@@ -324,22 +328,34 @@ pub fn run_sleep_cycle(
         })
         .collect();
     let t_distill = Instant::now();
-    let lm_hidden_targets: Vec<Option<Vec<f32>>> = if let Some(ref mut dec) = decoder {
-        raw_traces
-            .iter()
-            .map(|(_, _, ids, _)| {
-                ids.as_ref()
-                    .and_then(|ids| dec.text_hidden_states(ids).ok())
-            })
-            .collect()
-    } else {
-        vec![None; raw_traces.len()]
-    };
+    // Deduplicate LM inference by token-id content. With lang_oversample=N, each
+    // language trace appears N+1 times in raw_traces; without dedup that means N+1
+    // identical ORT sessions for the same text. Cache keyed on Vec<u32> so each
+    // unique text pays the LM cost exactly once.
+    let (lm_hidden_targets, lm_hidden_unique): (Vec<Option<Vec<f32>>>, usize) =
+        if let Some(ref mut dec) = decoder {
+            let mut cache: HashMap<Vec<u32>, Option<Vec<f32>>> = HashMap::new();
+            let targets = raw_traces
+                .iter()
+                .map(|(_, _, ids, _)| match ids {
+                    Some(ids) => cache
+                        .entry(ids.clone())
+                        .or_insert_with(|| dec.text_hidden_states(ids).ok())
+                        .clone(),
+                    None => None,
+                })
+                .collect();
+            let unique = cache.len();
+            (targets, unique)
+        } else {
+            (vec![None; raw_traces.len()], 0)
+        };
     let lm_hidden_computed = lm_hidden_targets.iter().filter(|h| h.is_some()).count();
     let distill_precompute_ms = t_distill.elapsed().as_millis() as u64;
     let nrem_unique_traces = raw_traces.len();
     tracing::info!(
         lm_hidden_computed,
+        lm_hidden_unique,
         distill_precompute_ms,
         "distillation targets precomputed"
     );
@@ -1035,6 +1051,7 @@ pub fn run_sleep_cycle(
         spill_wall_ms,
         snapshot_wall_ms,
         lm_hidden_computed,
+        lm_hidden_unique,
         nrem_budget_traces: n_traces,
         nrem_unique_traces,
     })
