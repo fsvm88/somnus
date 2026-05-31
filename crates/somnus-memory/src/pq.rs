@@ -5,7 +5,9 @@
 ///
 /// Design constants (fixed; changing invalidates existing PQ files):
 ///   PQ_M=8 subspaces × PQ_K=256 centroids × PQ_SUB_DIM=80 floats each.
-///   Per-record bytes: id(8) + ts(8) + codes(8) = 24, vs 660 for INT8 → 27.5× reduction.
+///   Per-record bytes: id(8) + ts(8) + codes(8) = 24, vs 661 for INT8 → 27.5× reduction.
+///   Note: `ingest_source` is not stored in the PQ format (added in Gap 8 after PQ was
+///   designed); reconstructed records default to `IngestSource::Unknown`.
 ///   Codebook: 8 × 256 × 80 × 4 = 655 360 bytes, stored once at the file head.
 use std::{
     fs::{File, OpenOptions},
@@ -505,8 +507,8 @@ mod tests {
         let pq = convert_cold_to_pq(&cold, pq_dir.path()).unwrap();
         assert_eq!(pq.len(), cold.len());
 
-        // Size reduction: PQ record (24 B) vs INT8 record (660 B) → at least 4×.
-        let ratio = 660.0 / PQ_RECORD_BYTES as f32;
+        // Size reduction: PQ record (24 B) vs INT8 record (661 B) → at least 4×.
+        let ratio = 661.0 / PQ_RECORD_BYTES as f32;
         assert!(ratio >= 4.0, "size reduction {ratio}× is below 4× target");
 
         // L2 quality: for each record, the PQ reconstruction L2 vs the original
@@ -556,8 +558,8 @@ mod tests {
 
     #[test]
     fn record_bytes_constant() {
-        // 24 B per record → 27.5× reduction vs 660 B INT8 record.
+        // 24 B per record → 27.5× reduction vs 661 B INT8 record.
         assert_eq!(PQ_RECORD_BYTES, 24);
-        assert!(660 / PQ_RECORD_BYTES >= 27);
+        assert!(661 / PQ_RECORD_BYTES >= 27);
     }
 }

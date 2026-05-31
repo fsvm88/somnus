@@ -64,7 +64,7 @@ On mismatch, cold-rebuild and overwrite the dump.
 ```
 memory/
   warm/
-    version          # 6 bytes: magic SMNWARM + u16 version
+    version          # 6 bytes: magic 'SMNW' (4 B) + u16 version (2 B)
     index.hnsw.data
     index.hnsw.graph
     records.bin      # bincode-encoded HashMap<u64, EpisodeRecord>
