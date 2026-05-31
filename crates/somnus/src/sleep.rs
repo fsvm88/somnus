@@ -151,6 +151,11 @@ pub struct SleepStats {
     pub snapshot_wall_ms: u64,
     /// Number of language-tagged traces for which a valid LM hidden-state target was computed.
     pub lm_hidden_computed: usize,
+    /// Total replay list length fed to the NREM loop (unique + oversampled copies).
+    /// Coverage = traces_replayed / nrem_budget_traces.
+    pub nrem_budget_traces: usize,
+    /// Unique episodes in the episodic buffer at sleep time (before language oversampling).
+    pub nrem_unique_traces: usize,
 }
 
 /// Number of gist clusters for REM self-probe (10c).
@@ -332,6 +337,7 @@ pub fn run_sleep_cycle(
     };
     let lm_hidden_computed = lm_hidden_targets.iter().filter(|h| h.is_some()).count();
     let distill_precompute_ms = t_distill.elapsed().as_millis() as u64;
+    let nrem_unique_traces = raw_traces.len();
     tracing::info!(
         lm_hidden_computed,
         distill_precompute_ms,
@@ -1029,6 +1035,8 @@ pub fn run_sleep_cycle(
         spill_wall_ms,
         snapshot_wall_ms,
         lm_hidden_computed,
+        nrem_budget_traces: n_traces,
+        nrem_unique_traces,
     })
 }
 

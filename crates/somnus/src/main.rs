@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod action;
 mod sleep;
 mod whisper_asr;
@@ -778,6 +780,18 @@ async fn main() -> Result<()> {
     let mut lang_ingest_count: usize = 0;
     let mut gain_episode_counter: usize = 0;
     let mut wake_reconstruct_counter: usize = 0;
+    // ADR 0022 instrumentation additions.
+    let mut salience_sum: f64 = 0.0;
+    let mut salience_n: usize = 0;
+    let mut salience_min: f32 = f32::MAX;
+    let mut high_salience_episodes: usize = 0;
+    let mut blend_count: usize = 0;
+    let mut wake_reconstruct_throttle_passed: usize = 0;
+    let mut episodes_speech: usize = 0;
+    let mut episodes_env: usize = 0;
+    let mut episodes_visual: usize = 0;
+    let mut episodes_language: usize = 0;
+    let mut episodes_mixed: usize = 0;
     // Per-cycle encode timing (ms) — reset after each sleep cycle.
     let mut speech_encode_total_ms: u64 = 0;
     let mut env_encode_total_ms: u64 = 0;
@@ -1212,7 +1226,7 @@ async fn main() -> Result<()> {
         while !lang_closed {
             match lang_rx.try_recv() {
                 Ok(text) => {
-                    if let Some((ep, mse, cosines)) = ingest_language_line(
+                    if let Some(r) = ingest_language_line(
                         &text,
                         &lang_embedder,
                         &mut perception,
@@ -1226,9 +1240,9 @@ async fn main() -> Result<()> {
                         args.wake_reconstruct_interval,
                     ) {
                         lang_ingest_count += 1;
-                        if ep {
+                        if r.episode_produced {
                             wake_episodes += 1;
-                            if let Some(m) = episode_cosine_mean(&cosines) {
+                            if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
                                 update_perf_ewma(
                                     m,
                                     &mut cosine_ewma,
@@ -1240,12 +1254,13 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
-                        if let Some(m) = mse {
-                            wake_output_mse_sum += m as f64;
-                            wake_output_mse_n += 1;
+                        if let Some(m) = r.reconstruct_mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
+                        if r.throttle_passed { wake_reconstruct_throttle_passed += 1; }
+                        if let Some(ref es) = r.ep_stats {
+                            accumulate_salience(es, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
                         }
                         accumulate_cosines(
-                            &cosines,
+                            &r.prior_cosines,
                             &mut prior_cosine_sums,
                             &mut prior_cosine_counts,
                         );
@@ -1348,6 +1363,13 @@ async fn main() -> Result<()> {
                                 }
                             })
                             .collect();
+                        // ADR 0022: salience stats (None when warm was empty all cycle).
+                        let mean_salience_wake = if salience_n > 0 {
+                            Some(salience_sum / salience_n as f64)
+                        } else {
+                            None
+                        };
+                        let min_salience_wake = if salience_n > 0 { Some(salience_min) } else { None };
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs_f64())
@@ -1358,6 +1380,8 @@ async fn main() -> Result<()> {
                             "ts":                ts,
                             "sleep_trigger":     sleep_trigger,
                             "traces_replayed":   stats.traces_replayed,
+                            "nrem_budget_traces":        stats.nrem_budget_traces,
+                            "nrem_unique_traces":        stats.nrem_unique_traces,
                             "mean_loss":         stats.mean_train_loss,
                             "mean_output_mse":   stats.mean_output_mse,
                             "per_region_mse":    stats.per_region_mse,
@@ -1367,11 +1391,25 @@ async fn main() -> Result<()> {
                             "was_interrupted":   stats.was_interrupted,
                             "nrem_exit_reason":  stats.nrem_exit_reason,
                             "region_sizes":      region_sizes,
+                            "warm_len":          recall.warm.len(),
+                            "cold_len":          recall.cold.len(),
                             "grew":              grew,
                             "regions_grown":     stats.regions_grown.iter().map(|r| r.as_index()).collect::<Vec<_>>(),
                             "wake_episodes":     wake_episodes,
+                            "episodes_speech":   episodes_speech,
+                            "episodes_env":      episodes_env,
+                            "episodes_visual":   episodes_visual,
+                            "episodes_language": episodes_language,
+                            "episodes_mixed":    episodes_mixed,
                             "asr_count":         cycle_asr,
                             "lang_ingest_count": lang_ingest_count,
+                            "mean_salience_wake":       mean_salience_wake,
+                            "min_salience_wake":        min_salience_wake,
+                            "high_salience_episodes":   high_salience_episodes,
+                            "blend_count":              blend_count,
+                            "wake_reconstruct_attempts":       wake_reconstruct_counter,
+                            "wake_reconstruct_throttle_passed": wake_reconstruct_throttle_passed,
+                            "wake_reconstruct_fired":          wake_output_mse_n,
                             "mean_output_mse_wake": mean_mse_wake,
                             "prior_cosine_mean": prior_cosine_mean,
                             "mean_proj_loss":    stats.mean_proj_loss,
@@ -1408,6 +1446,18 @@ async fn main() -> Result<()> {
                     lang_ingest_count = 0;
                     gain_episode_counter = 0;
                     wake_reconstruct_counter = 0;
+                    // ADR 0022 counters.
+                    salience_sum = 0.0;
+                    salience_n = 0;
+                    salience_min = f32::MAX;
+                    high_salience_episodes = 0;
+                    blend_count = 0;
+                    wake_reconstruct_throttle_passed = 0;
+                    episodes_speech = 0;
+                    episodes_env = 0;
+                    episodes_visual = 0;
+                    episodes_language = 0;
+                    episodes_mixed = 0;
                     speech_encode_total_ms = 0;
                     env_encode_total_ms = 0;
                     video_encode_total_ms = 0;
@@ -1450,19 +1500,23 @@ async fn main() -> Result<()> {
                         match result {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
-                                let ep_salience = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                if let Some(ref rec) = rec {
+                                    accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval)
-                                        && ep_salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD
-                                    {
-                                        match perception.wake_reconstruct_step(&ep.0, regional) {
-                                            Ok(mse) => {
-                                                wake_output_mse_sum += mse as f64;
-                                                wake_output_mse_n += 1;
-                                                tracing::info!(output_mse = mse, "wake reconstruction");
+                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                        wake_reconstruct_throttle_passed += 1;
+                                        if rec.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
+                                            match perception.wake_reconstruct_step(&ep.0, regional) {
+                                                Ok(mse) => {
+                                                    wake_output_mse_sum += mse as f64;
+                                                    wake_output_mse_n += 1;
+                                                    tracing::info!(output_mse = mse, "wake reconstruction");
+                                                }
+                                                Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                             }
-                                            Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                         }
                                     }
                                     wake_episodes += 1;
@@ -1504,19 +1558,23 @@ async fn main() -> Result<()> {
                         match perception.ingest_visual(&emb.values) {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
-                                let ep_salience = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
+                                if let Some(ref rec) = rec {
+                                    accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval)
-                                        && ep_salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD
-                                    {
-                                        match perception.wake_reconstruct_step(&ep.0, regional) {
-                                            Ok(mse) => {
-                                                wake_output_mse_sum += mse as f64;
-                                                wake_output_mse_n += 1;
-                                                tracing::info!(output_mse = mse, "wake reconstruction");
+                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                        wake_reconstruct_throttle_passed += 1;
+                                        if rec.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
+                                            match perception.wake_reconstruct_step(&ep.0, regional) {
+                                                Ok(mse) => {
+                                                    wake_output_mse_sum += mse as f64;
+                                                    wake_output_mse_n += 1;
+                                                    tracing::info!(output_mse = mse, "wake reconstruction");
+                                                }
+                                                Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                             }
-                                            Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                         }
                                     }
                                     wake_episodes += 1;
@@ -1552,7 +1610,7 @@ async fn main() -> Result<()> {
             maybe = lang_rx.recv(), if !lang_closed => {
                 match maybe {
                     Some(text) => {
-                        if let Some((ep, mse, cosines)) = ingest_language_line(
+                        if let Some(r) = ingest_language_line(
                             &text,
                             &lang_embedder,
                             &mut perception,
@@ -1566,14 +1624,18 @@ async fn main() -> Result<()> {
                             args.wake_reconstruct_interval,
                         ) {
                             lang_ingest_count += 1;
-                            if ep {
+                            if r.episode_produced {
                                 wake_episodes += 1;
-                                if let Some(m) = episode_cosine_mean(&cosines) {
+                                if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
                                     update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
                                 }
                             }
-                            if let Some(m) = mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
-                            accumulate_cosines(&cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                            if let Some(m) = r.reconstruct_mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
+                            if r.throttle_passed { wake_reconstruct_throttle_passed += 1; }
+                            if let Some(ref es) = r.ep_stats {
+                                accumulate_salience(es, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                            }
+                            accumulate_cosines(&r.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                         }
                     }
                     None => { lang_closed = true; }
@@ -1705,9 +1767,19 @@ const WAKE_RECONSTRUCT_SALIENCE_THRESHOLD: f32 = 0.8;
 
 // ── language ingest helper ────────────────────────────────────────────────────
 
+/// Result returned by `ingest_language_line` (ADR 0022).
+struct LangIngestResult {
+    episode_produced: bool,
+    reconstruct_mse: Option<f32>,
+    prior_cosines: [Option<f32>; 5],
+    /// Per-episode stats for cycle-level accumulation; None when no episode was produced.
+    ep_stats: Option<RecordedEpisode>,
+    /// True when the wake_reconstruct throttle interval passed (before the salience gate).
+    throttle_passed: bool,
+}
+
 /// Embed one stdin line and run the full episode lifecycle through `ingest_language`.
-/// No-op (returns false) when `lang_embedder` is None.
-/// Returns (episode_produced, output_mse, prior_cosines).
+/// No-op when `lang_embedder` is None.
 #[allow(clippy::too_many_arguments)]
 fn ingest_language_line(
     text: &str,
@@ -1721,7 +1793,7 @@ fn ingest_language_line(
     decoder: &mut Option<ActionDecoder>,
     wake_reconstruct_counter: &mut usize,
     wake_reconstruct_interval: usize,
-) -> Option<(bool, Option<f32>, [Option<f32>; 5])> {
+) -> Option<LangIngestResult> {
     let Some(le) = lang_embedder else { return None };
     let emb = match le.embed(text) {
         Ok(v) => v,
@@ -1734,23 +1806,27 @@ fn ingest_language_line(
     match perception.ingest_language(&emb) {
         Ok(out) => {
             let ts = Timestamp::now();
-            let ep_produced = out.episode.is_some();
-            let cosines = out.prior_cosines;
-            let ep_salience = record_episode(&out, &ts, sink, episodic, top_k, recall);
-            let mse = if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+            let episode_produced = out.episode.is_some();
+            let prior_cosines = out.prior_cosines;
+            let ep_stats = record_episode(&out, &ts, sink, episodic, top_k, recall);
+            let mut throttle_passed = false;
+            let reconstruct_mse = if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                 *wake_reconstruct_counter += 1;
-                if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval)
-                    && ep_salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD
-                {
-                    match perception.wake_reconstruct_step(&ep.0, regional) {
-                        Ok(mse) => {
-                            tracing::info!(output_mse = mse, "wake reconstruction");
-                            Some(mse)
+                if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval) {
+                    throttle_passed = true;
+                    if ep_stats.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
+                        match perception.wake_reconstruct_step(&ep.0, regional) {
+                            Ok(mse) => {
+                                tracing::info!(output_mse = mse, "wake reconstruction");
+                                Some(mse)
+                            }
+                            Err(e) => {
+                                tracing::warn!(?e, "wake reconstruct error");
+                                None
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(?e, "wake reconstruct error");
-                            None
-                        }
+                    } else {
+                        None
                     }
                 } else {
                     None
@@ -1781,7 +1857,7 @@ fn ingest_language_line(
                     }
                 }
             }
-            Some((ep_produced, mse, cosines))
+            Some(LangIngestResult { episode_produced, reconstruct_mse, prior_cosines, ep_stats, throttle_passed })
         }
         Err(e) => {
             tracing::error!(?e, "perception error (language)");
@@ -1835,10 +1911,20 @@ fn maybe_startup_query(
 }
 
 /// Push an episode into the hot buffer (without touching warm tier — sleep does that).
+/// Per-episode stats returned by `record_episode` (ADR 0022).
+struct RecordedEpisode {
+    /// Warm-recall L2 distance. `f32::MAX` when warm memory is empty (no prior context).
+    salience: f32,
+    /// Whether the current episode was blended with the top-1 retrieved memory.
+    blended: bool,
+    /// Dominant modality tag derived from which regional inputs were non-empty.
+    source: IngestSource,
+}
+
 /// Queries warm memory first; blends the top-1 retrieved vector into the stored
 /// episode when it is within RECALL_BLEND_THRESHOLD (L2).
-/// Returns the salience value stored with the episode (warm-recall L2, or f32::MAX
-/// when warm is empty). Callers use this to gate wake_reconstruct_step.
+/// Returns `RecordedEpisode` with salience, blend flag, and source for the caller
+/// to accumulate cycle-level stats (ADR 0022). Returns `None` when no episode was produced.
 fn record_episode(
     out: &somnus_perception::PerceptionOutput,
     ts: &Timestamp,
@@ -1846,12 +1932,12 @@ fn record_episode(
     episodic: &mut EpisodicBuffer,
     top_k: usize,
     recall: &RecollectionLayer,
-) -> f32 {
+) -> Option<RecordedEpisode> {
     for &(region, err) in &out.recon_errors {
         tracing::debug!(region = ?region, recon_mse = err, "reconstruction error");
     }
     let Some(ep) = &out.episode else {
-        return f32::MAX;
+        return None;
     };
     let ts_secs = wall_secs(&ts.wall);
 
@@ -1919,7 +2005,43 @@ fn record_episode(
     })
     .to_string();
     sink_write(sink, &line);
-    salience
+    Some(RecordedEpisode { salience, blended, source: ingest_source })
+}
+
+/// Accumulate per-episode salience and modality stats into cycle-level counters (ADR 0022).
+/// Sentinel `f32::MAX` (warm memory empty) is excluded from salience sums and high_salience count.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_salience(
+    rec: &RecordedEpisode,
+    salience_sum: &mut f64,
+    salience_n: &mut usize,
+    salience_min: &mut f32,
+    high_salience_episodes: &mut usize,
+    blend_count: &mut usize,
+    episodes_speech: &mut usize,
+    episodes_env: &mut usize,
+    episodes_visual: &mut usize,
+    episodes_language: &mut usize,
+    episodes_mixed: &mut usize,
+) {
+    if rec.salience < f32::MAX / 2.0 {
+        *salience_sum += rec.salience as f64;
+        *salience_n += 1;
+        *salience_min = salience_min.min(rec.salience);
+        if rec.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD {
+            *high_salience_episodes += 1;
+        }
+    }
+    if rec.blended {
+        *blend_count += 1;
+    }
+    match rec.source {
+        IngestSource::Speech   => *episodes_speech   += 1,
+        IngestSource::Env      => *episodes_env      += 1,
+        IngestSource::Visual   => *episodes_visual   += 1,
+        IngestSource::Language => *episodes_language += 1,
+        _                      => *episodes_mixed    += 1,
+    }
 }
 
 /// Accumulate per-region prior cosines into running sums/counts for metrics.

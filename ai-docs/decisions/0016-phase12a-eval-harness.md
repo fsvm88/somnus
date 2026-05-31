@@ -61,3 +61,11 @@ All four charts generated from a single invocation on any `metrics_*.jsonl` file
 
 If the metrics schema changes substantially (new field names, structural refactor),
 the script must be updated. This is expected and acceptable.
+
+**2026-05-31 update (ADR 0022):** 14 new fields added — `mean_salience_wake`,
+`min_salience_wake`, `high_salience_episodes`, `blend_count`,
+`wake_reconstruct_attempts`, `wake_reconstruct_throttle_passed`,
+`wake_reconstruct_fired`, `episodes_speech`, `episodes_env`, `episodes_visual`,
+`episodes_language`, `episodes_mixed`, `warm_len`, `cold_len` — plus
+`nrem_budget_traces` and `nrem_unique_traces` in `SleepStats`. All new fields
+use `null` (not absent) when not applicable, matching the existing convention.
