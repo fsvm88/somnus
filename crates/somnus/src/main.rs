@@ -792,6 +792,8 @@ async fn main() -> Result<()> {
     let mut episodes_visual: usize = 0;
     let mut episodes_language: usize = 0;
     let mut episodes_mixed: usize = 0;
+    let mut settle_trigger_count: usize = 0;
+    let mut settle_iters_sum: usize = 0;
     // Per-cycle encode timing (ms) — reset after each sleep cycle.
     let mut speech_encode_total_ms: u64 = 0;
     let mut env_encode_total_ms: u64 = 0;
@@ -1256,6 +1258,7 @@ async fn main() -> Result<()> {
                         }
                         if let Some(m) = r.reconstruct_mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
                         if r.throttle_passed { wake_reconstruct_throttle_passed += 1; }
+                        if r.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += r.settle_iters; }
                         if let Some(ref es) = r.ep_stats {
                             accumulate_salience(es, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
                         }
@@ -1410,6 +1413,8 @@ async fn main() -> Result<()> {
                             "wake_reconstruct_attempts":       wake_reconstruct_counter,
                             "wake_reconstruct_throttle_passed": wake_reconstruct_throttle_passed,
                             "wake_reconstruct_fired":          wake_output_mse_n,
+                            "settle_trigger_count":  settle_trigger_count,
+                            "settle_iters_sum":      settle_iters_sum,
                             "mean_output_mse_wake": mean_mse_wake,
                             "prior_cosine_mean": prior_cosine_mean,
                             "mean_proj_loss":    stats.mean_proj_loss,
@@ -1459,6 +1464,8 @@ async fn main() -> Result<()> {
                     episodes_visual = 0;
                     episodes_language = 0;
                     episodes_mixed = 0;
+                    settle_trigger_count = 0;
+                    settle_iters_sum = 0;
                     speech_encode_total_ms = 0;
                     env_encode_total_ms = 0;
                     video_encode_total_ms = 0;
@@ -1501,6 +1508,7 @@ async fn main() -> Result<()> {
                         match result {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                                if out.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += out.settle_iters; }
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
                                     accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
@@ -1559,6 +1567,7 @@ async fn main() -> Result<()> {
                         match perception.ingest_visual(&emb.values) {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                                if out.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += out.settle_iters; }
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
                                     accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
@@ -1777,6 +1786,8 @@ struct LangIngestResult {
     ep_stats: Option<RecordedEpisode>,
     /// True when the wake_reconstruct throttle interval passed (before the salience gate).
     throttle_passed: bool,
+    /// Settling iterations run for this episode (0 = gate did not fire).
+    settle_iters: usize,
 }
 
 /// Embed one stdin line and run the full episode lifecycle through `ingest_language`.
@@ -1809,6 +1820,7 @@ fn ingest_language_line(
             let ts = Timestamp::now();
             let episode_produced = out.episode.is_some();
             let prior_cosines = out.prior_cosines;
+            let settle_iters = out.settle_iters;
             let ep_stats = record_episode(&out, &ts, sink, episodic, top_k, recall);
             let mut throttle_passed = false;
             let reconstruct_mse = if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
@@ -1858,7 +1870,7 @@ fn ingest_language_line(
                     }
                 }
             }
-            Some(LangIngestResult { episode_produced, reconstruct_mse, prior_cosines, ep_stats, throttle_passed })
+            Some(LangIngestResult { episode_produced, reconstruct_mse, prior_cosines, ep_stats, throttle_passed, settle_iters })
         }
         Err(e) => {
             tracing::error!(?e, "perception error (language)");

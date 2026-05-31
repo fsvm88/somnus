@@ -108,6 +108,8 @@ pub struct PerceptionOutput {
     pub regional_inputs: Option<[Vec<f32>; 5]>,
     /// per-region prior cosine similarities (indexed by region id 0–4).
     pub prior_cosines: [Option<f32>; 5],
+    /// Settling iterations actually run for this episode (0 = gate did not fire or settle_steps=0).
+    pub settle_iters: usize,
 }
 
 /// All trainable parameters for the cognitive layer.
@@ -251,7 +253,7 @@ impl PerceptionProcessor {
         self.refresh_language_cache();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let episode = self.maybe_settle_and_update(episode, speech_cos);
+        let (episode, settle_iters) = self.maybe_settle_and_update(episode, speech_cos);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -264,6 +266,7 @@ impl PerceptionProcessor {
             ],
             episode,
             regional_inputs,
+            settle_iters,
             prior_cosines,
         })
     }
@@ -296,7 +299,7 @@ impl PerceptionProcessor {
         self.refresh_language_cache();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let episode = self.maybe_settle_and_update(episode, cosine);
+        let (episode, settle_iters) = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -309,6 +312,7 @@ impl PerceptionProcessor {
             ],
             episode,
             regional_inputs,
+            settle_iters,
             prior_cosines,
         })
     }
@@ -341,7 +345,7 @@ impl PerceptionProcessor {
         self.refresh_language_cache();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let episode = self.maybe_settle_and_update(episode, cosine);
+        let (episode, settle_iters) = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -352,6 +356,7 @@ impl PerceptionProcessor {
             episode,
             regional_inputs,
             prior_cosines,
+            settle_iters,
         })
     }
 
@@ -383,7 +388,7 @@ impl PerceptionProcessor {
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         let wm = self.wm_seq();
         let (episode, regional_inputs) = self.try_bind(Some(&wm));
-        let episode = self.maybe_settle_and_update(episode, cosine);
+        let (episode, settle_iters) = self.maybe_settle_and_update(episode, cosine);
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -397,27 +402,30 @@ impl PerceptionProcessor {
             episode,
             regional_inputs,
             prior_cosines,
+            settle_iters,
         })
     }
 
+    /// Returns `(episode, settle_iters)` where `settle_iters` is 0 when the gate did
+    /// not fire or `settle_steps == 0`, and 1..=settle_steps otherwise.
     fn maybe_settle_and_update(
         &mut self,
         episode: Option<EpisodeVector>,
         cosine: Option<f32>,
-    ) -> Option<EpisodeVector> {
+    ) -> (Option<EpisodeVector>, usize) {
         if let Some(ep) = episode {
             let should_settle =
                 self.settle_steps > 0 && cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
-            let refined = if should_settle {
-                let (r, _) = self.settle_episode(&ep);
-                r
+            let (refined, iters) = if should_settle {
+                let (r, n) = self.settle_episode(&ep);
+                (r, n)
             } else {
-                ep
+                (ep, 0)
             };
             self.update_prior_predictions(&refined.0);
-            Some(refined)
+            (Some(refined), iters)
         } else {
-            None
+            (None, 0)
         }
     }
 
