@@ -88,6 +88,10 @@ pub const CROSS_MODAL_DIM: usize = 384 + 512 + 384 + 896;
 const SETTLE_COSINE_GATE: f32 = 0.85;
 
 /// L2 delta below which settling is considered converged (ADR 0011).
+/// Calibration note (2026-05-31): smoke tests show settle_delta_mean ≈ 0.46 on unit-normalised
+/// 640-dim episode vectors, so SETTLE_EPS=4.0 is trivially satisfied every first iteration.
+/// train_campaign.sh uses --settle-steps 1 to match this reality. If settle_steps is ever
+/// raised above 1, recalibrate SETTLE_EPS to ~0.1–0.2 to allow genuine multi-step convergence.
 const SETTLE_EPS: f32 = 4.0;
 
 pub struct TrainConfig {

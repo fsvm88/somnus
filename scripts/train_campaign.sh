@@ -97,7 +97,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --language \
             --action \
             --prior-beta 0.1 \
-            --settle-steps 3 \
+            --settle-steps 1 \
             --working-memory-size 8 \
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
@@ -115,7 +115,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --language \
             --action \
             --prior-beta 0.1 \
-            --settle-steps 3 \
+            --settle-steps 1 \
             --working-memory-size 8 \
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
