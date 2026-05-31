@@ -52,6 +52,9 @@ pub struct ActionDecoder {
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
     pub gain: [f32; 5],
     device: NdArrayDevice,
+    /// Cross-cycle LM hidden-state cache. Clips loop so token sequences repeat; after the first
+    /// cycle each unique text pays the ORT cost exactly once for the lifetime of the session.
+    lm_hidden_cache: std::collections::HashMap<Vec<u32>, Vec<f32>>,
 }
 
 impl ActionDecoder {
@@ -112,6 +115,7 @@ impl ActionDecoder {
             tokenizer,
             gain: [1.0; 5],
             device,
+            lm_hidden_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -273,6 +277,9 @@ impl ActionDecoder {
         if token_ids.is_empty() {
             return Ok(vec![0.0; LM_HIDDEN]);
         }
+        if let Some(cached) = self.lm_hidden_cache.get(token_ids) {
+            return Ok(cached.clone());
+        }
         let embeds = self.embed_flat(token_ids)?;
         let n = token_ids.len();
         let input = Array3::from_shape_vec((1, n, LM_HIDDEN), embeds)
@@ -302,6 +309,7 @@ impl ActionDecoder {
         for v in &mut mean {
             *v /= norm;
         }
+        self.lm_hidden_cache.insert(token_ids.to_vec(), mean.clone());
         Ok(mean)
     }
 

@@ -330,8 +330,9 @@ pub fn run_sleep_cycle(
     let t_distill = Instant::now();
     // Deduplicate LM inference by token-id content. With lang_oversample=N, each
     // language trace appears N+1 times in raw_traces; without dedup that means N+1
-    // identical ORT sessions for the same text. Cache keyed on Vec<u32> so each
-    // unique text pays the LM cost exactly once.
+    // identical ORT sessions for the same text. Per-cycle cache collapses within-cycle
+    // repeats; text_hidden_states() also maintains a cross-cycle cache so clip-loop
+    // repetitions across sleep cycles pay the ORT cost only once per session.
     let (lm_hidden_targets, lm_hidden_unique): (Vec<Option<Vec<f32>>>, usize) =
         if let Some(ref mut dec) = decoder {
             let mut cache: HashMap<Vec<u32>, Option<Vec<f32>>> = HashMap::new();
