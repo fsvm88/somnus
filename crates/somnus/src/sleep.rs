@@ -733,9 +733,13 @@ pub fn run_sleep_cycle(
         }
         tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
 
-        // Warm HNSW size management: if warm has exceeded the cap, rebuild from the
-        // most recent max_warm_records entries in cold so the index stays bounded.
-        if max_warm_records > 0 && recall.warm.len() > max_warm_records {
+        // Warm HNSW size management: rebuild whenever cold has grown past warm.
+        // The previous condition (warm.len() > max_warm_records) silently broke after the
+        // first rebuild: SemanticStore.insert() drops records once max_records is reached,
+        // so warm.len() never exceeds max_warm_records again and the index permanently
+        // diverges from cold. cold.len() > warm.len() fires every cycle once the cap is
+        // hit, keeping warm synchronised with the latest cold records.
+        if max_warm_records > 0 && recall.cold.len() > recall.warm.len() {
             let t0 = Instant::now();
             let loaded = recall
                 .warm
