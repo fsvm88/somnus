@@ -7,11 +7,17 @@ Usage:
     python scripts/eval_metrics.py --out-dir /tmp/plots memory/metrics.jsonl
 
 Reads one or more metrics_*.jsonl files (one JSON object per line) and writes
-four PNG files:
+ten PNG files:
   1. language_trajectory.png  — prior_cosine per region across all cycles
   2. growth_timeline.png      — cycles where growth fired, annotated
   3. per_region_mse.png       — per-region output_mse across cycles
   4. sleep_triggers.png       — sleep trigger and nrem exit reason distributions
+  5. timing_breakdown.png     — sleep-cycle phase wall times (stacked bars)
+  6. wake_timing.png          — wake-phase encode timing totals and per-episode
+  7. memory_growth.png        — warm/cold store sizes and spill cost over time
+  8. recall_quality.png       — salience trajectory, blend rate, reconstruction rate
+  9. settle_stats.png         — settle delta vs SETTLE_EPS, trigger fraction, mean iters
+ 10. modality_balance.png     — episode source breakdown and LM dedup efficiency
 """
 
 import argparse
@@ -380,6 +386,251 @@ def plot_wake_timing(records, out_path, x_labels):
     print(f"  wrote {out_path}")
 
 
+def plot_memory_growth(records, out_path, x_labels):
+    """warm/cold store sizes and spill wall time per cycle."""
+    has_mem = any(get(r, "warm_len") is not None for r in records)
+    if not has_mem:
+        print(f"  skip: no warm_len field — {out_path} not written")
+        return
+
+    x = np.arange(len(records))
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, len(records) * 0.5), 7),
+                                          gridspec_kw={"height_ratios": [3, 2]})
+    draw_session_lines(ax_top, records)
+    draw_session_lines(ax_bot, records)
+
+    warm = [get(r, "warm_len") for r in records]
+    cold = [get(r, "cold_len") for r in records]
+    for ys, label, color in [(warm, "warm (HNSW)", "#4c8ef5"), (cold, "cold (archive)", "#e06c75")]:
+        valid = [(xi, y) for xi, y in zip(x, ys) if y is not None]
+        if valid:
+            xs_v, ys_v = zip(*valid)
+            ax_top.plot(xs_v, ys_v, color=color, linewidth=1.8, marker="o", markersize=4, label=label)
+
+    ax_top.set_title("Memory store sizes over time")
+    ax_top.set_ylabel("records")
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([""] * len(x))
+    ax_top.legend(loc="upper left", fontsize=8)
+    ax_top.grid(True, alpha=0.3)
+
+    spill = [get(r, "spill_wall_ms") for r in records]
+    valid_s = [(xi, y) for xi, y in zip(x, spill) if y is not None]
+    if valid_s:
+        xs_v, ys_v = zip(*valid_s)
+        ax_bot.bar(xs_v, [y / 1000.0 for y in ys_v], color="#c678dd", width=0.7, label="spill_wall_ms")
+    ax_bot.set_title("Spill wall time (includes HNSW rebuild when warm > max)")
+    ax_bot.set_ylabel("wall time (s)")
+    ax_bot.set_xlabel("sleep cycle")
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    ax_bot.legend(loc="upper right", fontsize=8)
+    ax_bot.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+def plot_recall_quality(records, out_path, x_labels):
+    """Salience trajectory with threshold reference lines, blend rate, and reconstruction rate."""
+    has_sal = any(get(r, "mean_salience_wake") is not None for r in records)
+    if not has_sal:
+        print(f"  skip: no salience fields — {out_path} not written")
+        return
+
+    BLEND_THRESH = 0.5
+    RECONSTRUCT_THRESH = 0.8
+
+    x = np.arange(len(records))
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, len(records) * 0.5), 7),
+                                          gridspec_kw={"height_ratios": [3, 2]})
+    draw_session_lines(ax_top, records)
+    draw_session_lines(ax_bot, records)
+
+    mean_sal = [get(r, "mean_salience_wake") for r in records]
+    min_sal  = [get(r, "min_salience_wake")  for r in records]
+    for ys, label, color, lw in [
+        (mean_sal, "mean_salience_wake", "#4c8ef5", 2.0),
+        (min_sal,  "min_salience_wake",  "#e5c07b", 1.2),
+    ]:
+        valid = [(xi, y) for xi, y in zip(x, ys) if y is not None]
+        if valid:
+            xs_v, ys_v = zip(*valid)
+            ax_top.plot(xs_v, ys_v, color=color, linewidth=lw, marker="o", markersize=4, label=label)
+
+    ax_top.axhline(BLEND_THRESH,       color="#e06c75", linewidth=1.0, linestyle="--",
+                   label=f"blend threshold ({BLEND_THRESH})", alpha=0.8)
+    ax_top.axhline(RECONSTRUCT_THRESH, color="#c678dd", linewidth=1.0, linestyle=":",
+                   label=f"reconstruct threshold ({RECONSTRUCT_THRESH})", alpha=0.8)
+    ax_top.set_title("Warm-recall salience (L2 distance to nearest memory)")
+    ax_top.set_ylabel("L2 distance")
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([""] * len(x))
+    ax_top.legend(loc="upper right", fontsize=8)
+    ax_top.grid(True, alpha=0.3)
+
+    episodes = np.array([float(get(r, "wake_episodes") or 1) for r in records])
+    episodes = np.maximum(episodes, 1)
+    high_sal_frac = np.array([float(get(r, "high_salience_episodes") or 0) for r in records]) / episodes
+    blend_frac    = np.array([float(get(r, "blend_count")             or 0) for r in records]) / episodes
+    recon_frac    = np.array([float(get(r, "wake_reconstruct_fired")  or 0) for r in records]) / episodes
+
+    ax_bot.plot(x, high_sal_frac, color="#4c8ef5", linewidth=1.5, marker="o", markersize=4,
+                label="high_salience fraction")
+    ax_bot.plot(x, blend_frac,    color="#e06c75", linewidth=1.5, marker="s", markersize=4,
+                label="blend fraction")
+    ax_bot.plot(x, recon_frac,    color="#98c379", linewidth=1.5, marker="^", markersize=4,
+                label="reconstruct_fired fraction")
+    ax_bot.set_title("Recall engagement rates (fraction of wake episodes)")
+    ax_bot.set_ylabel("fraction")
+    ax_bot.set_ylim(0, 1.05)
+    ax_bot.set_xlabel("sleep cycle")
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    ax_bot.legend(loc="lower right", fontsize=8)
+    ax_bot.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+def plot_settle_stats(records, out_path, x_labels):
+    """Settle delta vs SETTLE_EPS, trigger fraction, and mean iterations per cycle."""
+    has_settle = any(get(r, "settle_delta_mean") is not None for r in records)
+    if not has_settle:
+        print(f"  skip: no settle_delta_mean field — {out_path} not written")
+        return
+
+    SETTLE_EPS = 4.0
+
+    x = np.arange(len(records))
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, len(records) * 0.5), 7),
+                                          gridspec_kw={"height_ratios": [2, 2]})
+    draw_session_lines(ax_top, records)
+    draw_session_lines(ax_bot, records)
+
+    deltas = [get(r, "settle_delta_mean") for r in records]
+    valid_d = [(xi, y) for xi, y in zip(x, deltas) if y is not None]
+    if valid_d:
+        xs_v, ys_v = zip(*valid_d)
+        ax_top.plot(xs_v, ys_v, color="#4c8ef5", linewidth=2.0, marker="o", markersize=4,
+                    label="settle_delta_mean")
+    ax_top.axhline(SETTLE_EPS, color="#e06c75", linewidth=1.0, linestyle="--",
+                   label=f"SETTLE_EPS ({SETTLE_EPS})", alpha=0.8)
+    ax_top.set_title("Settling convergence: mean L2 delta per settled episode")
+    ax_top.set_ylabel("L2 delta")
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([""] * len(x))
+    ax_top.legend(loc="upper right", fontsize=8)
+    ax_top.grid(True, alpha=0.3)
+
+    episodes = np.array([float(get(r, "wake_episodes") or 1) for r in records])
+    episodes = np.maximum(episodes, 1)
+    trigger_frac = np.array([float(get(r, "settle_trigger_count") or 0) for r in records]) / episodes
+
+    trigger_counts = np.array([float(get(r, "settle_trigger_count") or 0) for r in records])
+    iters_sum = np.array([float(get(r, "settle_iters_sum") or 0) for r in records])
+    mean_iters = np.where(trigger_counts > 0, iters_sum / trigger_counts, 0.0)
+
+    ax_bot.plot(x, trigger_frac, color="#98c379", linewidth=1.5, marker="o", markersize=4,
+                label="trigger fraction (gate fires / wake_episodes)")
+    ax_bot2 = ax_bot.twinx()
+    ax_bot2.plot(x, mean_iters, color="#c678dd", linewidth=1.5, marker="s", markersize=4,
+                 linestyle="--", label="mean iters per triggered episode")
+    ax_bot2.set_ylabel("mean iters", color="#c678dd")
+    ax_bot2.tick_params(axis="y", labelcolor="#c678dd")
+
+    ax_bot.set_title("Settle gate trigger rate and iteration count")
+    ax_bot.set_ylabel("fraction")
+    ax_bot.set_ylim(0, 1.05)
+    ax_bot.set_xlabel("sleep cycle")
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    lines1, labels1 = ax_bot.get_legend_handles_labels()
+    lines2, labels2 = ax_bot2.get_legend_handles_labels()
+    ax_bot.legend(lines1 + lines2, labels1 + labels2, loc="lower left", fontsize=8)
+    ax_bot.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
+def plot_modality_balance(records, out_path, x_labels):
+    """Episode source stacked bars and LM dedup efficiency per cycle."""
+    has_modal = any(get(r, "episodes_mixed") is not None for r in records)
+    if not has_modal:
+        print(f"  skip: no modality fields — {out_path} not written")
+        return
+
+    MODAL_FIELDS = [
+        ("episodes_speech",   "speech",   "#4c8ef5"),
+        ("episodes_env",      "env",      "#e06c75"),
+        ("episodes_visual",   "visual",   "#98c379"),
+        ("episodes_language", "language", "#e5c07b"),
+        ("episodes_mixed",    "mixed",    "#c678dd"),
+    ]
+
+    x = np.arange(len(records))
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, len(records) * 0.5), 7),
+                                          gridspec_kw={"height_ratios": [3, 2]})
+    draw_session_lines(ax_top, records)
+    draw_session_lines(ax_bot, records)
+
+    bottoms = np.zeros(len(records))
+    for field, label, color in MODAL_FIELDS:
+        vals = np.array([float(get(r, field) or 0) for r in records])
+        ax_top.bar(x, vals, bottom=bottoms, color=color, label=label, width=0.7)
+        bottoms += vals
+
+    ax_top.set_title("Episode source breakdown per cycle")
+    ax_top.set_ylabel("episode count")
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([""] * len(x))
+    ax_top.legend(loc="upper right", fontsize=8)
+    ax_top.grid(True, axis="y", alpha=0.3)
+
+    # LM dedup efficiency: unique / computed ratio and distill time
+    computed = np.array([float(get(r, "lm_hidden_computed") or 0) for r in records])
+    unique   = np.array([float(get(r, "lm_hidden_unique")   or 0) for r in records])
+    dedup_ratio = np.where(computed > 0, unique / computed, np.nan)
+
+    ax_bot.plot(x, dedup_ratio, color="#4c8ef5", linewidth=1.8, marker="o", markersize=4,
+                label="LM unique/computed (dedup efficiency)")
+    ax_bot.axhline(1.0, color="#888888", linewidth=0.8, linestyle="--", alpha=0.6)
+    ax_bot.set_ylim(0, 1.1)
+    ax_bot.set_ylabel("ratio (lower = more dedup)")
+
+    ax_bot2 = ax_bot.twinx()
+    distill = [get(r, "distill_precompute_ms") for r in records]
+    valid_t = [(xi, y) for xi, y in zip(x, distill) if y is not None]
+    if valid_t:
+        xs_v, ys_v = zip(*valid_t)
+        ax_bot2.plot(xs_v, [y / 1000.0 for y in ys_v], color="#e5c07b", linewidth=1.2,
+                     marker="s", markersize=3, linestyle="--", label="distill_precompute (s)")
+    ax_bot2.set_ylabel("distill time (s)", color="#e5c07b")
+    ax_bot2.tick_params(axis="y", labelcolor="#e5c07b")
+
+    ax_bot.set_title("LM dedup efficiency and distillation precompute time")
+    ax_bot.set_xlabel("sleep cycle")
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    lines1, labels1 = ax_bot.get_legend_handles_labels()
+    lines2, labels2 = ax_bot2.get_legend_handles_labels()
+    ax_bot.legend(lines1 + lines2, labels1 + labels2, loc="lower left", fontsize=8)
+    ax_bot.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -424,6 +675,18 @@ def main():
     plot_wake_timing(records,
                      os.path.join(out_dir, "wake_timing.png"),
                      x_labels)
+    plot_memory_growth(records,
+                       os.path.join(out_dir, "memory_growth.png"),
+                       x_labels)
+    plot_recall_quality(records,
+                        os.path.join(out_dir, "recall_quality.png"),
+                        x_labels)
+    plot_settle_stats(records,
+                      os.path.join(out_dir, "settle_stats.png"),
+                      x_labels)
+    plot_modality_balance(records,
+                          os.path.join(out_dir, "modality_balance.png"),
+                          x_labels)
     print("Done.")
 
 
