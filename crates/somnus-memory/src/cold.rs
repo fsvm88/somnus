@@ -102,12 +102,19 @@ impl ColdArchive {
 
     /// Iterate all records, dequantising each vector.
     pub fn iter(&self) -> MemoryResult<ColdIter> {
+        self.iter_from(0)
+    }
+
+    /// Iterate records starting at `start_record` (0-based index), skipping earlier ones.
+    /// Seeks directly to `HEADER_BYTES + start_record * RECORD_BYTES` — no soft-skip loop.
+    pub fn iter_from(&self, start_record: usize) -> MemoryResult<ColdIter> {
+        let start = start_record.min(self.len);
         let file = File::open(&self.path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         Ok(ColdIter {
             mmap,
-            pos: HEADER_BYTES,
-            len: self.len,
+            pos: HEADER_BYTES + start * RECORD_BYTES,
+            len: self.len - start, // remaining records, not total
             yielded: 0,
         })
     }

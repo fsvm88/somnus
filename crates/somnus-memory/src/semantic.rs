@@ -86,16 +86,12 @@ impl SemanticStore {
 
         let mut fresh = SemanticStore::with_max(self.dim, self.max_records);
         let mut loaded = 0usize;
-        if let Ok(iter) = cold.iter() {
-            for (i, result) in iter.enumerate() {
-                if i < skip {
-                    continue;
-                }
-                if let Ok(record) = result {
-                    fresh.index.insert((&record.values, record.id as usize));
-                    fresh.records.insert(record.id as usize, record);
-                    loaded += 1;
-                }
+        // iter_from seeks directly to the tail offset — no soft-skip loop over earlier records.
+        if let Ok(iter) = cold.iter_from(skip) {
+            for record in iter.flatten() {
+                fresh.index.insert((&record.values, record.id as usize));
+                fresh.records.insert(record.id as usize, record);
+                loaded += 1;
             }
         }
         *self = fresh;

@@ -135,11 +135,13 @@ impl<B: Backend> KWtaLayer<B> {
         let mut pairs: Vec<(u16, f32)> = top_k.iter().map(|&(i, _)| (i as u16, z_vec[i])).collect();
         pairs.sort_unstable_by_key(|(i, _)| *i);
 
-        let active_set: std::collections::HashSet<usize> = top_k.iter().map(|&(i, _)| i).collect();
-        for i in 0..n {
-            let fired = if active_set.contains(&i) { 1.0 } else { 0.0 };
-            self.duty_cycle[i] =
-                (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
+        // Update duty cycles: decay all, then boost active units.
+        // Avoids a HashSet allocation + O(n) membership-test loop.
+        for dc in self.duty_cycle.iter_mut() {
+            *dc *= 1.0 - DUTY_CYCLE_ALPHA;
+        }
+        for &(i, _) in top_k.iter() {
+            self.duty_cycle[i] += DUTY_CYCLE_ALPHA;
         }
 
         SparseActivation {
@@ -240,14 +242,13 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
             });
             let top_k = &indexed[split..];
 
-            let active: std::collections::HashSet<usize> = top_k.iter().map(|&(i, _)| i).collect();
-            for i in 0..n {
-                let fired = if active.contains(&i) { 1.0 } else { 0.0 };
-                self.duty_cycle[i] =
-                    (1.0 - DUTY_CYCLE_ALPHA) * self.duty_cycle[i] + DUTY_CYCLE_ALPHA * fired;
-                if fired > 0.0 {
-                    flat_masks[si * n + i] = 1.0;
-                }
+            // Decay all duty cycles, then boost active units and set mask bits.
+            for dc in self.duty_cycle.iter_mut() {
+                *dc *= 1.0 - DUTY_CYCLE_ALPHA;
+            }
+            for &(i, _) in top_k.iter() {
+                self.duty_cycle[i] += DUTY_CYCLE_ALPHA;
+                flat_masks[si * n + i] = 1.0;
             }
         }
 
