@@ -15,7 +15,11 @@ const WARM_VERSION: u16 = 1;
 const HNSW_M: usize = 16;
 const HNSW_MAX_ELEM: usize = 100_000;
 const HNSW_MAX_LAYERS: usize = 16;
-const HNSW_EF_C: usize = 400;
+// Reduced from 400: lower ef_construction speeds up spill inserts and warm rebuilds
+// (the dominant sleep-phase HNSW cost) at the cost of slightly weaker graph quality.
+// Recall impact is measurable via warm_recall_l2 and gist_recall_rate in NDJSON (ADR 0022).
+// Revisit if gist_recall_rate drops below acceptable threshold after a calibration run.
+const HNSW_EF_C: usize = 100;
 const SEARCH_EF: usize = 64;
 
 /// Warm-tier semantic store: HNSW index over episode vectors + sidecar record map.
