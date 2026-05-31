@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-05-31
-> **Last commit on main:** 20e9dee — Set settle_steps=1; document SETTLE_EPS miscalibration
+> **Last commit on main:** 7d91f80 — Fix 100-500x NREM slowdown: refresh autodiff state before each cycle
 > **Branch:** `main` (pushed to Codeberg)
 
-## Status: All perf/instrumentation work complete and pushed. 3-session smoke test run.
+## Status: NREM backward() bug fixed. All cycles now 1.3–1.4 ms/trace (was 1.4–98.6 ms/trace).
 
 ---
 
@@ -23,6 +23,9 @@
 | Perf C | a8d9fe7 | Settle loop stats in PerceptionOutput + NDJSON (settle_trigger_count, settle_iters_sum) |
 | Settle delta | 105f2a5 | Track settle_delta per episode; smoke test showed delta_mean=0.46 vs SETTLE_EPS=4.0 |
 | settle_steps fix | 20e9dee | settle_steps 3→1 in campaign script (was wasting 3× compute for 1 real iteration) |
+| Eval harness | c439fbc | 4 new panels: memory_growth, recall_quality, settle_stats, modality_balance |
+| HNSW rebuild fix | 59cb7a6 | cold.len() > warm.len() condition (previous warm.len() > max always false after first rebuild) |
+| NREM backward fix | 7d91f80 | refresh_autodiff_state() per cycle; burn global AutodiffServer accumulates ParamId chains → backward O(N) → O(1); 70× speedup |
 
 ---
 
