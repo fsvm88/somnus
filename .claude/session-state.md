@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-01
-> **Last commit on main:** 19f789d — Default wake_reconstruct_interval to 5; add to campaign script
-> **Branch:** `main` (pushed to Codeberg)
+> **Last commit on main:** 536b3f1 — EMA head predict: flat Vec<f32> matmul
+> **Branch:** `main` (not yet pushed this session)
 
-## Status: wake_reconstruct_interval=5 landed. Ready for longer campaign.
+## Status: Perception 5× faster (172→35ms/ep). Encode is now the dominant wall-clock cost. Ready for long campaign.
 
 ---
 
@@ -29,36 +29,34 @@
 | k-WTA + cold tail | 00db223 | k-WTA HashSet → two-pass duty-cycle; cold iter_from() O(1) seek for rebuild_from_recent |
 | Perf D (LM cache) | bc24928 | Cross-cycle LM hidden-state cache in ActionDecoder.lm_hidden_cache; reduces per-call ORT cost and eliminates outliers; full benefit requires clips to loop (long clips → gradual improvement over hundreds of cycles) |
 | Perf E (wake interval) | 19f789d | wake_reconstruct_interval default 1→5; explicit in campaign script; ~80% fewer wake backward passes |
+| perception_ms timing | 3923686 | 4-phase ingest breakdown (kwta/symbolic/bind/prior) in NDJSON; video_stride 2 in campaign script |
+| GRU cache (Perf F) | f9b7e60 | BindingArea carries gru_hidden across calls; 1 GRU step/ingest vs 8; bind 121→5.6ms/ep; **8.8× perception speedup** |
+| EMA flat matmul (Perf G) | 536b3f1 | EMA predict via flat Vec<f32> matmul (no burn tensor alloc); bottleneck is memory bandwidth, not dispatch — within noise |
 
 ---
 
-## Flamegraph findings (profiling run: 20 cycles, /tmp/somnus_perf2.data)
+## Perception perf summary (memory/smoke_prior_*)
 
-| Bucket | % total samples | Notes |
+| Phase | Before (ms/ep) | After (ms/ep) |
 |---|---|---|
-| ONNX runtime (libonnxruntime) | ~37% | Encoder inference during wake + LM hidden states during sleep. Unavoidable without model changes. |
-| burn autodiff graph overhead | ~9% | cleanup_orphaned_entries 3.1%, GraphLocator::select 1.3%, hashbrown 4.4%. Inherent to burn's autodiff; no handle from application code. |
-| Audio/mel preprocessing | ~0.5% | CLAP + Whisper mel in tokio workers. |
+| kwta | 4.0 | 2.1 |
+| symbolic | 6.0 | 3.1 |
+| bind | 121.0 | 7.7 |
+| prior | 26.0 | 7.9 |
+| **total perception** | **172** | **~35** |
+| encode (concurrent GPU) | — | speech 61 + env 10 + video 96 |
 
-Flamegraph SVG: `/tmp/somnus_perf2.data` (8 GB) + `/tmp/somnus_flamegraph.svg`
+Perception is **no longer the bottleneck** — encode dominates wall-clock but runs concurrently.
+Remaining ~35ms/ep is memory-bandwidth-bound (EMA weight reads ~6.5MB per predict round).
+Further wins require smaller models or batching, not code changes.
 
----
-
-## 40-cycle smoke test results (memory/smoke_0013)
-
-- `synthetics_produced=8` every cycle ✓
-- No BadMagic / panic / ERROR ✓
-- Symbolic episodes correctly tagged Unknown (not Visual) ✓
-- `cross_modal_gist_entropy` present from cycle 1 ✓
-- `mean_loss` declining over run: 0.055 → 0.034 ✓
-- `warm_recall_l2` declining: 0.216 → 0.172 ✓
-- `distill_precompute_ms`: 175–900 ms range (noisy; no clip-loop inflection yet — clips too long to loop in 40 cycles)
+wgpu attempted (commit 5dbf9c9) and reverted: AMD RX 9070 XT already claimed by MIGraphX ORT → conflict on first video frame (exit 101). Not retryable without running ONNX on CPU.
 
 ---
 
 ## Next
 
-**Longer campaign** — multi-session run to gather a clean learning trajectory with all fixes in place:
+**Longer campaign** — all perf fixes in place; encode is the rate limiter now:
 ```bash
 SESSIONS=10 CYCLES=5 CAPACITY=4096 \
 MEMORY_DIR=memory/campaign_$(date +%Y%m%d_%H%M) \
