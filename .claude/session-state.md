@@ -1,10 +1,10 @@
 # Session state — somnus
 
-> **Last updated:** 2026-05-31
-> **Last commit on main:** 7d91f80 — Fix 100-500x NREM slowdown: refresh autodiff state before each cycle
+> **Last updated:** 2026-06-01
+> **Last commit on main:** 19f789d — Default wake_reconstruct_interval to 5; add to campaign script
 > **Branch:** `main` (pushed to Codeberg)
 
-## Status: NREM backward() bug fixed. All cycles now 1.3–1.4 ms/trace (was 1.4–98.6 ms/trace).
+## Status: wake_reconstruct_interval=5 landed. Ready for longer campaign.
 
 ---
 
@@ -26,26 +26,45 @@
 | Eval harness | c439fbc | 4 new panels: memory_growth, recall_quality, settle_stats, modality_balance |
 | HNSW rebuild fix | 59cb7a6 | cold.len() > warm.len() condition (previous warm.len() > max always false after first rebuild) |
 | NREM backward fix | 7d91f80 | refresh_autodiff_state() per cycle; burn global AutodiffServer accumulates ParamId chains → backward O(N) → O(1); 70× speedup |
+| k-WTA + cold tail | 00db223 | k-WTA HashSet → two-pass duty-cycle; cold iter_from() O(1) seek for rebuild_from_recent |
+| Perf D (LM cache) | bc24928 | Cross-cycle LM hidden-state cache in ActionDecoder.lm_hidden_cache; reduces per-call ORT cost and eliminates outliers; full benefit requires clips to loop (long clips → gradual improvement over hundreds of cycles) |
+| Perf E (wake interval) | 19f789d | wake_reconstruct_interval default 1→5; explicit in campaign script; ~80% fewer wake backward passes |
 
 ---
 
-## Next: smoke test with Gap 7+8
+## Flamegraph findings (profiling run: 20 cycles, /tmp/somnus_perf2.data)
 
-Cold archive format changed (SMNCOLD1 → SMNCOLD2) and hot snapshot format changed
-(SMNHOT01 → SMNHOT02) — always use a fresh `--memory-dir`.
+| Bucket | % total samples | Notes |
+|---|---|---|
+| ONNX runtime (libonnxruntime) | ~37% | Encoder inference during wake + LM hidden states during sleep. Unavoidable without model changes. |
+| burn autodiff graph overhead | ~9% | cleanup_orphaned_entries 3.1%, GraphLocator::select 1.3%, hashbrown 4.4%. Inherent to burn's autodiff; no handle from application code. |
+| Audio/mel preprocessing | ~0.5% | CLAP + Whisper mel in tokio workers. |
 
+Flamegraph SVG: `/tmp/somnus_perf2.data` (8 GB) + `/tmp/somnus_flamegraph.svg`
+
+---
+
+## 40-cycle smoke test results (memory/smoke_0013)
+
+- `synthetics_produced=8` every cycle ✓
+- No BadMagic / panic / ERROR ✓
+- Symbolic episodes correctly tagged Unknown (not Visual) ✓
+- `cross_modal_gist_entropy` present from cycle 1 ✓
+- `mean_loss` declining over run: 0.055 → 0.034 ✓
+- `warm_recall_l2` declining: 0.216 → 0.172 ✓
+- `distill_precompute_ms`: 175–900 ms range (noisy; no clip-loop inflection yet — clips too long to loop in 40 cycles)
+
+---
+
+## Next
+
+**Longer campaign** — multi-session run to gather a clean learning trajectory with all fixes in place:
 ```bash
-SESSIONS=1 CYCLES=1 CAPACITY=512 \
-MEMORY_DIR=memory/smoke_$(date +%H%M) \
+SESSIONS=10 CYCLES=5 CAPACITY=4096 \
+MEMORY_DIR=memory/campaign_$(date +%Y%m%d_%H%M) \
 EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --max-warm-records 200000" \
 scripts/train_campaign.sh
 ```
-
-Watch for:
-- `synthetics_produced > 0` (validates REM_SYNTH_MIN_L2=1.0 fix)
-- `cross_modal_gist_entropy` appearing in sleep-cycle log (None in early cycles before warm builds up)
-- No BadMagic errors
-- Symbolic-only episodes tagged `Unknown` (not Visual or Mixed)
 
 ---
 
