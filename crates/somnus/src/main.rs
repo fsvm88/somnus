@@ -200,8 +200,8 @@ struct Args {
     gain_interval: usize,
 
     /// Run wake_reconstruct_step every N episodes. Higher values reduce CPU overhead at
-    /// the cost of less frequent output-head gradient updates. N=1 is the original behaviour.
-    #[arg(long, default_value = "1")]
+    /// the cost of less frequent output-head gradient updates. N=1 fires every episode.
+    #[arg(long, default_value = "5")]
     wake_reconstruct_interval: usize,
 
     /// Maximum tokens to generate per query (ADR 0012).

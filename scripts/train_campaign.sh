@@ -102,6 +102,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
+            --wake-reconstruct-interval 5 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
@@ -120,6 +121,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
+            --wake-reconstruct-interval 5 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
