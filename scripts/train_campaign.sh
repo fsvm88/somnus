@@ -103,6 +103,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
             --wake-reconstruct-interval 5 \
+            --video-stride 2 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
@@ -122,6 +123,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
             --wake-reconstruct-interval 5 \
+            --video-stride 2 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \

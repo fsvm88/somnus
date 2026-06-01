@@ -204,6 +204,11 @@ struct Args {
     #[arg(long, default_value = "5")]
     wake_reconstruct_interval: usize,
 
+    /// Encode only every Nth video frame through DINOv2. N=1 encodes all frames;
+    /// N=2 halves video encoder load with negligible scene-understanding loss.
+    #[arg(long, default_value = "1")]
+    video_stride: usize,
+
     /// Maximum tokens to generate per query (ADR 0012).
     #[arg(long, default_value = "128")]
     action_max_tokens: usize,
@@ -795,11 +800,12 @@ async fn main() -> Result<()> {
     let mut settle_trigger_count: usize = 0;
     let mut settle_iters_sum: usize = 0;
     let mut settle_delta_sum: f64 = 0.0;
-    // Per-cycle encode timing (ms) — reset after each sleep cycle.
+    // Per-cycle encode/perception timing (ms) — reset after each sleep cycle.
     let mut speech_encode_total_ms: u64 = 0;
     let mut env_encode_total_ms: u64 = 0;
     let mut video_encode_total_ms: u64 = 0;
     let mut gain_update_total_ms: u64 = 0;
+    let mut perception_total_ms: u64 = 0;
     // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
     // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
     // cosine_ewma: exponentially weighted moving average (α = COSINE_EWMA_ALPHA).
@@ -1115,6 +1121,7 @@ async fn main() -> Result<()> {
         let models_dir = args.models_dir.clone();
         let mut video_rx = video_rx;
         let pending = Arc::clone(&pending_embs);
+        let video_stride = args.video_stride.max(1);
         tokio::task::spawn_blocking(move || {
             let mut enc = match VideoEncoder::new(&models_dir) {
                 Ok(e) => e,
@@ -1126,7 +1133,12 @@ async fn main() -> Result<()> {
             let mut last_log = std::time::Instant::now();
             let mut frames_this_sec: u32 = 0;
             let mut total_ms_this_sec: u128 = 0;
+            let mut frame_counter: usize = 0;
             while let Some(frame) = video_rx.blocking_recv() {
+                frame_counter += 1;
+                if !frame_counter.is_multiple_of(video_stride) {
+                    continue;
+                }
                 let start = std::time::Instant::now();
                 match enc.encode(&frame) {
                     Ok(emb) => {
@@ -1438,6 +1450,7 @@ async fn main() -> Result<()> {
                             "env_encode_total_ms":        env_encode_total_ms,
                             "video_encode_total_ms":      video_encode_total_ms,
                             "gain_update_total_ms":       gain_update_total_ms,
+                            "perception_total_ms":        perception_total_ms,
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1473,6 +1486,7 @@ async fn main() -> Result<()> {
                     env_encode_total_ms = 0;
                     video_encode_total_ms = 0;
                     gain_update_total_ms = 0;
+                    perception_total_ms = 0;
                     cosine_ewma = None;
                     cosine_baseline = None;
                     cosine_baseline_accum = 0.0;
@@ -1504,10 +1518,12 @@ async fn main() -> Result<()> {
                             AudioEncoderSource::Speech => speech_encode_total_ms += emb.encode_ms,
                             AudioEncoderSource::Env    => env_encode_total_ms    += emb.encode_ms,
                         }
+                        let t_perc = std::time::Instant::now();
                         let result = match emb.source {
                             AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
                             AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
                         };
+                        perception_total_ms += t_perc.elapsed().as_millis() as u64;
                         match result {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
@@ -1567,6 +1583,7 @@ async fn main() -> Result<()> {
                         let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &video_emb_json(&emb));
                         video_encode_total_ms += emb.encode_ms;
+                        let t_perc = std::time::Instant::now();
                         match perception.ingest_visual(&emb.values) {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
@@ -1616,6 +1633,7 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => tracing::error!(?e, "perception error (video)"),
                         }
+                        perception_total_ms += t_perc.elapsed().as_millis() as u64;
                     }
                     None => { video_emb_closed = true; }
                 }
@@ -1637,6 +1655,7 @@ async fn main() -> Result<()> {
                             args.wake_reconstruct_interval,
                         ) {
                             lang_ingest_count += 1;
+                            perception_total_ms += r.perception_ms;
                             if r.episode_produced {
                                 wake_episodes += 1;
                                 if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
@@ -1793,6 +1812,8 @@ struct LangIngestResult {
     settle_iters: usize,
     /// Final L2 delta from the settle loop (0.0 when settle_iters=0).
     settle_delta: f32,
+    /// Wall-clock ms spent in `perception.ingest_language`.
+    perception_ms: u64,
 }
 
 /// Embed one stdin line and run the full episode lifecycle through `ingest_language`.
@@ -1820,8 +1841,10 @@ fn ingest_language_line(
         }
     };
     tracing::info!(chars = text.len(), "language ingest");
+    let t_perc = std::time::Instant::now();
     match perception.ingest_language(&emb) {
         Ok(out) => {
+            let perception_ms = t_perc.elapsed().as_millis() as u64;
             let ts = Timestamp::now();
             let episode_produced = out.episode.is_some();
             let prior_cosines = out.prior_cosines;
@@ -1876,7 +1899,7 @@ fn ingest_language_line(
                     }
                 }
             }
-            Some(LangIngestResult { episode_produced, reconstruct_mse, prior_cosines, ep_stats, throttle_passed, settle_iters, settle_delta })
+            Some(LangIngestResult { episode_produced, reconstruct_mse, prior_cosines, ep_stats, throttle_passed, settle_iters, settle_delta, perception_ms })
         }
         Err(e) => {
             tracing::error!(?e, "perception error (language)");
