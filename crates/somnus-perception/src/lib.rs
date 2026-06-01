@@ -32,20 +32,32 @@ type PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>;
 const EMA_ALPHA: f32 = 0.99;
 
 struct EmaOutputHeads {
+    /// EMA tensors for the weight update step (NdArray, no autodiff).
     heads: [burn::tensor::Tensor<NdArray, 2>; 5],
+    /// Flat row-major copies of the EMA weights for allocation-free inference.
+    /// Layout: [d_in × d_out] (burn stores weight as [d_in, d_out]).
+    /// Updated by `sync_flat` after every EMA weight update.
+    flat: [Vec<f32>; 5],
+    /// d_out for each head: [384, 512, 384, 384, 896].
+    d_out: [usize; 5],
 }
 
 impl EmaOutputHeads {
     fn from_model(model: &PerceptionModel<TrainB>) -> Self {
-        Self {
-            heads: [
-                model.speech_head.weight.val().inner(),
-                model.env_head.weight.val().inner(),
-                model.visual_head.weight.val().inner(),
-                model.symbolic_head.weight.val().inner(),
-                model.language_head.weight.val().inner(),
-            ],
-        }
+        let heads = [
+            model.speech_head.weight.val().inner(),
+            model.env_head.weight.val().inner(),
+            model.visual_head.weight.val().inner(),
+            model.symbolic_head.weight.val().inner(),
+            model.language_head.weight.val().inner(),
+        ];
+        let mut s = Self {
+            flat: Default::default(),
+            d_out: [0; 5],
+            heads,
+        };
+        s.sync_flat();
+        s
     }
 
     fn update(&mut self, model: &PerceptionModel<TrainB>) {
@@ -59,21 +71,34 @@ impl EmaOutputHeads {
         for (ema, w) in self.heads.iter_mut().zip(live) {
             *ema = ema.clone() * EMA_ALPHA + w * (1.0 - EMA_ALPHA);
         }
+        self.sync_flat();
     }
 
-    /// Inference-only head forward: ep_data @ head.T → Vec<f32>.
-    /// Uses NdArray directly with no autodiff overhead.
-    fn predict(&self, ep_data: &[f32], idx: usize, device: &NdArrayDevice) -> Vec<f32> {
-        let ep_t: burn::tensor::Tensor<NdArray, 2> = burn::tensor::Tensor::from_data(
-            TensorData::new(ep_data.to_vec(), [1, ep_data.len()]),
-            device,
-        );
-        // burn stores weight as [d_input, d_output]; forward is x @ weight (no transpose).
-        ep_t.matmul(self.heads[idx].clone())
-            .into_data()
-            .convert::<f32>()
-            .to_vec()
-            .unwrap()
+    /// Re-extract flat weight arrays from the EMA tensors.
+    fn sync_flat(&mut self) {
+        for (i, h) in self.heads.iter().enumerate() {
+            let dims = h.dims();
+            self.d_out[i] = dims[1];
+            self.flat[i] = h.clone().into_data().convert::<f32>().to_vec().unwrap();
+        }
+    }
+
+    /// Inference-only head forward: ep_data @ weight → Vec<f32>.
+    /// Plain Rust matmul — no tensor allocation overhead.
+    fn predict(&self, ep_data: &[f32], idx: usize) -> Vec<f32> {
+        let w = &self.flat[idx];
+        let d_out = self.d_out[idx];
+        let mut out = vec![0.0f32; d_out];
+        for (i, &x) in ep_data.iter().enumerate() {
+            if x == 0.0 {
+                continue;
+            }
+            let row = &w[i * d_out..(i + 1) * d_out];
+            for (o, &wij) in out.iter_mut().zip(row) {
+                *o += x * wij;
+            }
+        }
+        out
     }
 }
 
@@ -1575,7 +1600,7 @@ impl PerceptionProcessor {
             // Use EMA heads for inference — no autodiff overhead, stable priors.
             let mut preds: [Vec<f32>; 5] = Default::default();
             for (i, pred) in preds.iter_mut().enumerate() {
-                *pred = self.ema_heads.predict(&current.0, i, &device);
+                *pred = self.ema_heads.predict(&current.0, i);
             }
 
             let mut acts: [Option<SparseActivation>; 5] = Default::default();
@@ -1635,9 +1660,8 @@ impl PerceptionProcessor {
     }
 
     fn update_prior_predictions(&mut self, episode: &[f32]) {
-        let device = self.device;
         for i in 0..5 {
-            self.prior_predictions[i] = Some(self.ema_heads.predict(episode, i, &device));
+            self.prior_predictions[i] = Some(self.ema_heads.predict(episode, i));
         }
     }
 
