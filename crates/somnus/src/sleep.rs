@@ -710,7 +710,7 @@ pub fn run_sleep_cycle(
                     .filter(|counts| counts[0..5].iter().sum::<u32>() >= 2)
                     .count();
                 if n_occupied > 0 {
-                    cross_modal_gist_entropy = Some(entropy_sum / n_occupied as f32);
+                    cross_modal_gist_entropy = Some((entropy_sum / n_occupied as f32).max(0.0));
                 }
 
                 tracing::info!(
