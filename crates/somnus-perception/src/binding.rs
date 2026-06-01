@@ -56,6 +56,11 @@ pub struct BindingArea<B: Backend> {
     /// Projects GRU final hidden state [GRU_HIDDEN] → [EPISODE_DIM] so it can
     /// be reshaped to [5, D_PROJ] and appended to K and V.
     pub(crate) temporal_proj: Linear<B>,
+    /// Cached GRU hidden state from the previous forward pass (Vec<f32>, [1 × GRU_HIDDEN]).
+    /// Fed as the initial state when a new episode arrives, so the GRU only processes one
+    /// step per ingest instead of re-running the full WM window each time.
+    #[module(skip)]
+    pub(crate) gru_hidden: Option<Vec<f32>>,
 }
 
 impl<B: Backend> BindingArea<B> {
@@ -83,6 +88,7 @@ impl<B: Backend> BindingArea<B> {
             temporal_proj: LinearConfig::new(GRU_HIDDEN, EPISODE_DIM)
                 .with_bias(false)
                 .init(device),
+            gru_hidden: None,
         }
     }
 
@@ -90,15 +96,14 @@ impl<B: Backend> BindingArea<B> {
     /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
     /// Language may be a zero SparseActivation when no text is available.
     ///
-    /// `episode_sequence`: optional slice of recent episode vectors (newest last),
-    /// each EPISODE_DIM-dim. Run through the temporal GRU; the final hidden state
-    /// is projected to [5, D_PROJ] and appended to K and V. This replaces the
-    /// previous WM-mean approach with a learned recurrent temporal context.
-    /// Pass `None` (or empty) for the first episode or during settle.
+    /// `new_episode`: the single latest episode vector to feed into the GRU. The GRU
+    /// hidden state is cached across calls so only one GRU step is needed per ingest
+    /// rather than re-running the full WM window each time. Pass `None` for settle or
+    /// wake_reconstruct paths that have no new temporal context.
     pub fn forward(
-        &self,
+        &mut self,
         acts: &[&SparseActivation; 5],
-        episode_sequence: Option<&[Vec<f32>]>,
+        new_episode: Option<&Vec<f32>>,
         device: &B::Device,
     ) -> EpisodeVector {
         let region_projs = [
@@ -128,14 +133,21 @@ impl<B: Backend> BindingArea<B> {
         let q: Tensor<B, 2> = self.w_q.forward(x.clone());
 
         // K and V: current regions + optional GRU temporal context token.
-        let (k, v) = if let Some(seq) = episode_sequence.filter(|s| !s.is_empty()) {
-            let seq_len = seq.len();
-            let flat: Vec<f32> = seq.iter().flat_map(|ep| ep.iter().copied()).collect();
-            let seq_t: Tensor<B, 3> =
-                Tensor::from_data(TensorData::new(flat, [1, seq_len, EPISODE_DIM]), device);
-            // Run GRU; take final hidden state [1, GRU_HIDDEN]
-            let gru_out: Tensor<B, 3> = self.temporal_gru.forward(seq_t, None);
-            let hidden: Tensor<B, 2> = gru_out.narrow(1, seq_len - 1, 1).squeeze_dim::<2>(1);
+        // One GRU step with cached hidden state — O(1) instead of O(wm_size).
+        let (k, v) = if let Some(ep) = new_episode {
+            let seq_t: Tensor<B, 3> = Tensor::from_data(
+                TensorData::new(ep.clone(), [1, 1, EPISODE_DIM]),
+                device,
+            );
+            let init_hidden: Option<Tensor<B, 2>> = self.gru_hidden.as_ref().map(|h| {
+                Tensor::from_data(TensorData::new(h.clone(), [1, GRU_HIDDEN]), device)
+            });
+            let gru_out: Tensor<B, 3> = self.temporal_gru.forward(seq_t, init_hidden);
+            let hidden: Tensor<B, 2> = gru_out.narrow(1, 0, 1).squeeze_dim::<2>(1);
+            // Cache hidden state for the next call.
+            self.gru_hidden = Some(
+                hidden.clone().into_data().convert::<f32>().to_vec().unwrap(),
+            );
             // Project → [1, EPISODE_DIM] → reshape → [5, D_PROJ]
             let ctx: Tensor<B, 2> = self.temporal_proj.forward(hidden);
             let ctx_tokens: Tensor<B, 2> = ctx.reshape([5, D_PROJ]);
@@ -185,6 +197,7 @@ mod tests {
         BindingArea::new(&device)
     }
 
+
     fn dummy_act(region: RegionId) -> SparseActivation {
         SparseActivation {
             region,
@@ -206,7 +219,7 @@ mod tests {
     #[test]
     fn output_is_episode_dim() {
         let device = NdArrayDevice::Cpu;
-        let area = make_area();
+        let mut area = make_area();
         let acts = [
             &dummy_act(RegionId::AudioSpeech),
             &dummy_act(RegionId::AudioEnv),
@@ -222,7 +235,7 @@ mod tests {
     #[test]
     fn zero_language_slot_is_finite() {
         let device = NdArrayDevice::Cpu;
-        let area = make_area();
+        let mut area = make_area();
         let ep = area.forward(
             &[
                 &dummy_act(RegionId::AudioSpeech),
@@ -238,14 +251,12 @@ mod tests {
         assert!(ep.0.iter().all(|v| v.is_finite()));
     }
 
-    /// Test the temporal-context path (seq_k=10): episode_sequence is populated,
-    /// GRU produces a context token, K and V become [10, D_PROJ].
-    /// This is the common case in real runs (--working-memory-size 8) and exercises
-    /// the multi-head reshape at a variable seq_k that differs from the 5-token case.
+    /// Test the incremental GRU path: pass a new episode and verify the hidden-state
+    /// cache produces a finite, distinct output from the no-context case.
     #[test]
     fn output_with_temporal_context_is_finite_and_differs() {
         let device = NdArrayDevice::Cpu;
-        let area = make_area();
+        let mut area = make_area();
         let acts = [
             &dummy_act(RegionId::AudioSpeech),
             &dummy_act(RegionId::AudioEnv),
@@ -253,17 +264,12 @@ mod tests {
             &dummy_act(RegionId::Symbolic),
             &zero_act(RegionId::Language),
         ];
-        // 8 past episodes matching --working-memory-size 8.
-        // GRU reduces them to a single context token; K/V become [5+5=10, D_PROJ].
-        let past: Vec<Vec<f32>> = (0..8)
-            .map(|i| {
-                (0..EPISODE_DIM)
-                    .map(|j| ((i + j) as f32 * 0.001).sin())
-                    .collect()
-            })
-            .collect();
-        let ep_ctx = area.forward(&acts, Some(&past), &device);
-        let ep_no_ctx = area.forward(&acts, None, &device);
+        let ep_vec: Vec<f32> = (0..EPISODE_DIM).map(|j| (j as f32 * 0.001).sin()).collect();
+        // With a new episode: GRU runs one step and produces a context token (seq_k=10).
+        let ep_ctx = area.forward(&acts, Some(&ep_vec), &device);
+        // Without a new episode: no GRU context (seq_k=5).
+        let mut area2 = make_area();
+        let ep_no_ctx = area2.forward(&acts, None, &device);
         assert_eq!(ep_ctx.0.len(), EPISODE_DIM);
         assert!(
             ep_ctx.0.iter().all(|v| v.is_finite()),
@@ -282,7 +288,7 @@ mod tests {
     #[test]
     fn different_head_slices_produce_different_outputs() {
         let device = NdArrayDevice::Cpu;
-        let area = make_area();
+        let mut area = make_area();
 
         // Build two activations that differ only in which D_HEAD feature block is active.
         let mut low_block = SparseActivation {
@@ -316,7 +322,7 @@ mod tests {
     #[test]
     fn output_differs_with_different_inputs() {
         let device = NdArrayDevice::Cpu;
-        let area = make_area();
+        let mut area = make_area();
         let zero = zero_act(RegionId::Visual);
         let active = dummy_act(RegionId::Visual);
 

@@ -1386,6 +1386,7 @@ async fn main() -> Result<()> {
                             None
                         };
                         let min_salience_wake = if salience_n > 0 { Some(salience_min) } else { None };
+                        let perf_breakdown = perception.take_perf_breakdown();
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs_f64())
@@ -1451,6 +1452,10 @@ async fn main() -> Result<()> {
                             "video_encode_total_ms":      video_encode_total_ms,
                             "gain_update_total_ms":       gain_update_total_ms,
                             "perception_total_ms":        perception_total_ms,
+                            "perc_kwta_us":   perf_breakdown.kwta_us,
+                            "perc_symbolic_us": perf_breakdown.symbolic_us,
+                            "perc_bind_us":   perf_breakdown.bind_us,
+                            "perc_prior_us":  perf_breakdown.prior_us,
                         })
                         .to_string();
                         use std::io::Write as _;

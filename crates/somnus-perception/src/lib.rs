@@ -20,7 +20,7 @@ use burn::{
     record::{BinFileRecorder, FullPrecisionSettings},
     tensor::{Distribution, Tensor, TensorData},
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Instant};
 
 pub type TrainB = Autodiff<NdArray>;
 type PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>;
@@ -181,6 +181,20 @@ impl PerceptionModel<TrainB> {
 }
 
 /// Owns the full cognitive-layer forward pass and sleep-time training.
+/// Per-cycle timing breakdown for the wake ingest path (microseconds).
+/// Reset and returned by `take_perf_breakdown`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IngestPerfBreakdown {
+    /// k-WTA forward + SAE decoder for the triggering region.
+    pub kwta_us: u64,
+    /// `compute_symbolic_cross_modal` + `refresh_language_cache`.
+    pub symbolic_us: u64,
+    /// `try_bind` (GRU over WM window + cross-attention).
+    pub bind_us: u64,
+    /// `maybe_settle_and_update` (settle loop + prior update).
+    pub prior_us: u64,
+}
+
 pub struct PerceptionProcessor {
     model: Option<PerceptionModel<TrainB>>,
     optimizer: PercOptim,
@@ -202,6 +216,12 @@ pub struct PerceptionProcessor {
     last_language_input: Option<Vec<f32>>,
     working_memory: VecDeque<Vec<f32>>,
     wm_size: usize,
+
+    /// Cumulative ingest timing accumulators (μs). Reset by `take_perf_breakdown`.
+    perf_kwta_us: u64,
+    perf_symbolic_us: u64,
+    perf_bind_us: u64,
+    perf_prior_us: u64,
 }
 
 impl PerceptionProcessor {
@@ -225,7 +245,26 @@ impl PerceptionProcessor {
             last_language_input: None,
             working_memory: VecDeque::new(),
             wm_size: 0,
+            perf_kwta_us: 0,
+            perf_symbolic_us: 0,
+            perf_bind_us: 0,
+            perf_prior_us: 0,
         }
+    }
+
+    /// Return and reset the cumulative ingest timing accumulators.
+    pub fn take_perf_breakdown(&mut self) -> IngestPerfBreakdown {
+        let b = IngestPerfBreakdown {
+            kwta_us: self.perf_kwta_us,
+            symbolic_us: self.perf_symbolic_us,
+            bind_us: self.perf_bind_us,
+            prior_us: self.perf_prior_us,
+        };
+        self.perf_kwta_us = 0;
+        self.perf_symbolic_us = 0;
+        self.perf_bind_us = 0;
+        self.perf_prior_us = 0;
+        b
     }
 
     // ── Ingest ──────────────────────────────────────────────────────────────
@@ -240,6 +279,7 @@ impl PerceptionProcessor {
             tracing::info!(region = "speech", prior_cosine = c, "top-down prior");
         }
 
+        let t0 = Instant::now();
         let speech_act = self
             .model
             .as_mut()
@@ -252,15 +292,25 @@ impl PerceptionProcessor {
             .unwrap()
             .speech_decoder
             .reconstruction_error(values, &speech_act, &device);
+        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
 
         self.latest[RegionId::AudioSpeech.as_index()] = Some(speech_act);
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
 
+        let t1 = Instant::now();
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
-        let wm = self.wm_seq();
-        let (episode, regional_inputs) = self.try_bind(Some(&wm));
+        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+
+        let t2 = Instant::now();
+        let latest_ep = self.working_memory.back().cloned();
+        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
+        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+
+        let t3 = Instant::now();
         let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, speech_cos);
+        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -288,6 +338,7 @@ impl PerceptionProcessor {
             tracing::info!(region = "env", prior_cosine = c, "top-down prior");
         }
 
+        let t0 = Instant::now();
         let act = self
             .model
             .as_mut()
@@ -300,14 +351,25 @@ impl PerceptionProcessor {
             .unwrap()
             .env_decoder
             .reconstruction_error(values, &act, &device);
+        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
+
         self.latest[RegionId::AudioEnv.as_index()] = Some(act);
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
+        let t1 = Instant::now();
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
-        let wm = self.wm_seq();
-        let (episode, regional_inputs) = self.try_bind(Some(&wm));
+        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+
+        let t2 = Instant::now();
+        let latest_ep = self.working_memory.back().cloned();
+        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
+        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+
+        let t3 = Instant::now();
         let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
+        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -335,6 +397,7 @@ impl PerceptionProcessor {
             tracing::info!(region = "visual", prior_cosine = c, "top-down prior");
         }
 
+        let t0 = Instant::now();
         let act = self
             .model
             .as_mut()
@@ -347,14 +410,25 @@ impl PerceptionProcessor {
             .unwrap()
             .visual_decoder
             .reconstruction_error(values, &act, &device);
+        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
+
         self.latest[RegionId::Visual.as_index()] = Some(act);
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
+        let t1 = Instant::now();
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
         self.refresh_language_cache();
-        let wm = self.wm_seq();
-        let (episode, regional_inputs) = self.try_bind(Some(&wm));
+        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+
+        let t2 = Instant::now();
+        let latest_ep = self.working_memory.back().cloned();
+        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
+        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+
+        let t3 = Instant::now();
         let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
+        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -380,6 +454,7 @@ impl PerceptionProcessor {
             tracing::info!(region = "language", prior_cosine = c, "top-down prior");
         }
 
+        let t0 = Instant::now();
         let act = self
             .model
             .as_mut()
@@ -392,13 +467,24 @@ impl PerceptionProcessor {
             .unwrap()
             .language_decoder
             .reconstruction_error(values, &act, &device);
+        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
+
         self.latest[RegionId::Language.as_index()] = Some(act);
         self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
 
+        let t1 = Instant::now();
         let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
-        let wm = self.wm_seq();
-        let (episode, regional_inputs) = self.try_bind(Some(&wm));
+        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+
+        let t2 = Instant::now();
+        let latest_ep = self.working_memory.back().cloned();
+        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
+        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+
+        let t3 = Instant::now();
         let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
+        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
@@ -516,15 +602,10 @@ impl PerceptionProcessor {
         }
     }
 
-    /// Returns the working memory as an ordered episode sequence (oldest first).
-    fn wm_seq(&self) -> Vec<Vec<f32>> {
-        self.working_memory.iter().cloned().collect()
-    }
-
     #[allow(clippy::type_complexity)]
     fn try_bind(
-        &self,
-        episode_sequence: Option<&[Vec<f32>]>,
+        &mut self,
+        latest_episode: Option<&Vec<f32>>,
     ) -> (Option<EpisodeVector>, Option<[Vec<f32>; 5]>) {
         match (
             self.latest[0].as_ref(),
@@ -541,9 +622,9 @@ impl PerceptionProcessor {
                     n_units: N_UNITS,
                 };
                 let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
-                let ep = self.model.as_ref().unwrap().binding.forward(
+                let ep = self.model.as_mut().unwrap().binding.forward(
                     &[sp, en, vi, sy, lang],
-                    episode_sequence,
+                    latest_episode,
                     &device,
                 );
                 let regional = [
@@ -1077,7 +1158,7 @@ impl PerceptionProcessor {
     /// Blend two sets of regional encoder inputs and produce a synthetic episode.
     /// No DC update — inference only.
     pub fn synthesize_episode(
-        &self,
+        &mut self,
         regional_a: &[Vec<f32>; 5],
         regional_b: &[Vec<f32>; 5],
         alpha: f32,
@@ -1089,7 +1170,6 @@ impl PerceptionProcessor {
             values: vec![],
             n_units: N_UNITS,
         };
-        let model = self.model.as_ref().unwrap();
         let mut acts: [Option<SparseActivation>; 5] = [None, None, None, None, None];
         for i in 0..5 {
             let a = &regional_a[i];
@@ -1102,6 +1182,7 @@ impl PerceptionProcessor {
                 .zip(b.iter())
                 .map(|(&x, &y)| alpha * x + (1.0 - alpha) * y)
                 .collect();
+            let model = self.model.as_ref().unwrap();
             acts[i] = Some(match i {
                 0 => model.speech_layer.forward_no_dc(&blended, &device),
                 1 => model.env_layer.forward_no_dc(&blended, &device),
@@ -1116,7 +1197,7 @@ impl PerceptionProcessor {
             _ => return Err(PerceptionError::BindingIncomplete),
         };
         let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-        let episode = model.binding.forward(&[a0, a1, a2, a3, a4], None, &device);
+        let episode = self.model.as_mut().unwrap().binding.forward(&[a0, a1, a2, a3, a4], None, &device);
         Ok(episode.0)
     }
 
@@ -1484,9 +1565,9 @@ impl PerceptionProcessor {
     /// Returns `(refined_episode, iters_run, final_delta)`.
     /// `final_delta` is the L2 distance between the last two episode estimates (0.0 if the
     /// activation guard broke before any delta was computed).
-    fn settle_episode(&self, ep: &EpisodeVector) -> (EpisodeVector, usize, f32) {
+    fn settle_episode(&mut self, ep: &EpisodeVector) -> (EpisodeVector, usize, f32) {
         let device = self.device;
-        let model = self.model.as_ref().unwrap();
+        let model = self.model.as_mut().unwrap();
         let mut current = ep.clone();
         let mut last_delta = 0.0f32;
 
