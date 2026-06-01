@@ -1551,6 +1551,9 @@ async fn main() -> Result<()> {
                                                 Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                             }
                                         }
+                                        // Refresh autodiff graph every N episodes to prevent
+                                        // node accumulation from forward passes slowing into_data().
+                                        perception.refresh_autodiff_state();
                                     }
                                     wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
@@ -1611,6 +1614,9 @@ async fn main() -> Result<()> {
                                                 Err(e) => tracing::warn!(?e, "wake reconstruct error"),
                                             }
                                         }
+                                        // Refresh autodiff graph every N episodes to prevent
+                                        // node accumulation from forward passes slowing into_data().
+                                        perception.refresh_autodiff_state();
                                     }
                                     wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
@@ -1861,7 +1867,7 @@ fn ingest_language_line(
                 *wake_reconstruct_counter += 1;
                 if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval) {
                     throttle_passed = true;
-                    if ep_stats.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
+                    let mse = if ep_stats.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
                         match perception.wake_reconstruct_step(&ep.0, regional) {
                             Ok(mse) => {
                                 tracing::info!(output_mse = mse, "wake reconstruction");
@@ -1874,7 +1880,9 @@ fn ingest_language_line(
                         }
                     } else {
                         None
-                    }
+                    };
+                    perception.refresh_autodiff_state();
+                    mse
                 } else {
                     None
                 }
