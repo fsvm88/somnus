@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-01
-> **Last commit on main:** 9ed5d18 — Refresh autodiff graph every N wake episodes
+> **Last commit on main:** a280e1d — FP16 CLAP encoder
 > **Branch:** `main` (pushed to Codeberg)
 
-## Status: All perf fixes landed. 1.5h campaign (9 cycles) completed cleanly. 26K warm records. loss 0.47→0.13.
+## Status: Perf sprint complete. All fixes committed and pushed. No campaign running. Ready to resume with a long campaign against memory/campaign_20260601_2223.
 
 ---
 
@@ -33,6 +33,8 @@
 | GRU cache (Perf F) | f9b7e60 | BindingArea carries gru_hidden across calls; 1 GRU step/ingest vs 8; bind 121→5.6ms/ep; **8.8× perception speedup** |
 | EMA flat matmul (Perf G) | 536b3f1 | EMA predict via flat Vec<f32> matmul (no burn tensor alloc); bottleneck is memory bandwidth, not dispatch — within noise |
 | Autodiff refresh (Perf H) | 9ed5d18 | refresh_autodiff_state() every N wake episodes (at wake_reconstruct tick); bind was growing 16→47ms/ep per cycle, now flat at 2ms/ep |
+| FP16 CLAP (Perf I) | a280e1d | CLAP env encoder FP16: 9.9→5.5ms/ep (1.8×); DINOv2+Whisper FP16 tested but reverted (Cast op overhead > compute savings with keep_io_types); _fp16.onnx files on disk |
+| entropy fix | 307028f | cross_modal_gist_entropy was reporting -0.0 for pure-modality clusters; clamped to 0.0 |
 
 ---
 
@@ -71,13 +73,26 @@ When NREM exits via salience gate, the episodic buffer is not spilled and REM is
 
 ## Next
 
-**Longer campaign** — run more sessions to keep accumulating warm records:
+**Option A — Continue existing campaign** (26K warm records already accumulated):
+```bash
+SESSIONS=10 CYCLES=3 CAPACITY=4096 \
+MEMORY_DIR=memory/campaign_20260601_2223 \
+SESSION_START=4 \
+EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --max-warm-records 200000" \
+scripts/train_campaign.sh
+```
+
+**Option B — Fresh campaign** (clean start):
 ```bash
 SESSIONS=10 CYCLES=3 CAPACITY=4096 \
 MEMORY_DIR=memory/campaign_$(date +%Y%m%d_%H%M) \
 EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --max-warm-records 200000" \
 scripts/train_campaign.sh
 ```
+
+**Future architectural work (ADR candidate):**
+- GPU unification via ONNX-export of perception inference path → ORT/MIGraphX handles everything; burn stays on CPU for training only; weights sync at sleep boundaries. Non-trivial but cleanest long-term path.
+- DINOv2 FP16 without keep_io_types: requires passing FP16 inputs from Rust (`half` crate); could give 1.5–2× video encode speedup.
 
 ---
 
