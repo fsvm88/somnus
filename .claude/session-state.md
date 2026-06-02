@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-02
-> **Last commit on main:** ca4ab59 — GPU unification Phase 0 complete
+> **Last commit on main:** 56008a0 — GPU unification Phase 1 complete
 > **Branch:** `main` (not yet pushed to Codeberg)
 
-## Status: GPU unification Phase 0 COMPLETE. burn↔ONNX gate closed. Ready for Phase 1 (ORT inference in wake path).
+## Status: GPU unification Phase 1 COMPLETE. ORT binding session live on MIGraphX. Ready for campaign comparison.
 
 ---
 
@@ -21,40 +21,35 @@
 
 ---
 
-## GPU unification status: Phase 0 COMPLETE
+## GPU unification status: Phase 1 COMPLETE
 
-**All burn↔ONNX checks pass (CPU EP and MIGraphX EP):**
-- Encoder z vectors: exact match (<1.5e-06 on MIGraphX)
-- Sparse_z sets: same top-K selected
-- Episode (call 1, attention path): 5.59e-09 / 1.58e-08
-- Episode (call 2, GRU with non-zero input): 3.73e-09 / 1.68e-08
-- GRU hidden state: 6.52e-09 / 2.24e-08
+**Phase 0 (burn↔ONNX gate):** All checks pass on CPU EP and MIGraphX EP at <2e-08.
 
-Bug found and fixed: `cross_modal_proj` has `bias=true` — the bias wasn't being exported. Added `W_cross_bias` export and `Add` node in encoder ONNX graph.
+**Phase 1 (ORT binding session live):**
+- `--onnx-models-dir <dir>` flag enables ORT binding inference
+- Session built at startup, rebuilt at each sleep→wake boundary
+- Uses MIGraphX EP by default; `--no-onnx-migraphx` falls back to CPU EP
+- 401 live wake episodes confirmed via ORT/MIGraphX in 1-cycle test
+- Fallback to burn on ORT error (logged as WARN)
 
-**Validation toolchain:**
-- `cargo run --release -p somnus-perception --bin onnx_validate_prepare -- <dir>` — exports weights + reference data
-- `python3 experiments/onnx-validate/validate.py --data-dir <dir> --migraphx` — validates
+**What Phase 1 does NOT change:**
+- Burn k-WTA (encoder matmuls) still run for duty-cycle tracking
+- Only binding area (GRU + cross-attention) is on GPU via ORT
+- EMA heads still on CPU (burn flat matmul)
 
-**Phase 1: replace burn wake inference with ORT**
+**Campaign usage with ORT:**
+```bash
+SESSIONS=3 CYCLES=3 CAPACITY=4096 \
+MEMORY_DIR=memory/campaign_$(date +%Y%m%d_%H%M) \
+EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --max-warm-records 200000 \
+  --onnx-models-dir memory/onnx_models --onnx-script scripts/export_perception_graph.py" \
+scripts/train_campaign.sh
+```
 
-Concrete changes needed:
-1. Add `OnnxPerceptionSession` struct in `crates/somnus-perception/src/onnx_session.rs`:
-   - Holds two ORT sessions (encoder + binding)
-   - `run(&mut self, feeds) -> (episode, gru_h_out)` method
-   - `rebuild(weights_dir, onnx_dir)` — calls Python script + creates sessions
-2. Add to `PerceptionProcessor`:
-   - Optional `ort_session: Option<OnnxPerceptionSession>`
-   - `enable_ort_inference(weights_dir, onnx_dir)` — exports weights, builds graphs, loads sessions
-   - Modified `ingest_*` functions: if ort_session is Some, use ORT path; else burn path
-3. In `crates/somnus/src/main.rs`:
-   - `--onnx-models-dir` flag for where to store the ONNX files
-   - On startup (if flag set): call `enable_ort_inference`
-   - At sleep→wake boundary: rebuild ORT session if model changed
-
-The ORT session needs:
-- `ort` crate dependency in `somnus-perception`
-- `migraphx_session` helper (currently in `somnus/src/main.rs`) needs to move or be duplicated
+**Next steps:**
+- Phase 1.5: add encoder ORT session (replace burn k-WTA matmuls) 
+- Measure bind_ms improvement in campaign (expect ~7ms → <1ms for binding)
+- Phase 2: micro-batching (--micro-batch-size)
 
 ---
 
