@@ -1563,6 +1563,118 @@ impl PerceptionProcessor {
         }
     }
 
+    /// Export all inference-path weights to a directory for ONNX graph construction.
+    ///
+    /// Writes one raw float32 `.f32` file per weight tensor plus a JSON manifest
+    /// (`weights_manifest.json`) so `scripts/export_perception_graph.py` can load them
+    /// and build the two ONNX inference graphs.
+    ///
+    /// Weight naming convention (must match Python script):
+    ///   W_enc_{i}              – KWtaLayer linear, shape [n_in, n_units]  (i = 0..4)
+    ///   W_cross                – cross_modal_proj, shape [CROSS_MODAL_DIM, 384]
+    ///   W_region_{i}           – BindingArea region projection, shape [N_UNITS, D_PROJ]
+    ///   W_q / W_k / W_v        – Attention QKV, shape [D_PROJ, D_PROJ]
+    ///   gru_{gate}_input_W     – GRU input weight, shape [GRU_INPUT, GRU_HIDDEN]  (gate=update/reset/new)
+    ///   gru_{gate}_hidden_W    – GRU hidden weight, shape [GRU_HIDDEN, GRU_HIDDEN]
+    ///   W_temporal_proj        – GRU hidden → EPISODE_DIM, shape [GRU_HIDDEN, EPISODE_DIM]
+    pub fn export_weights_for_onnx(&self, dir: &std::path::Path) -> PerceptionResult<()> {
+        std::fs::create_dir_all(dir).map_err(|e| PerceptionError::Burn(e.to_string()))?;
+        let m = self.model.as_ref().unwrap();
+
+        let mut manifest: Vec<serde_json::Value> = Vec::new();
+
+        let mut write = |name: &str, data: Vec<f32>, shape: Vec<usize>| -> PerceptionResult<()> {
+            let fname = format!("{}.f32", name);
+            let path  = dir.join(&fname);
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            std::fs::write(&path, &bytes).map_err(|e| PerceptionError::Burn(e.to_string()))?;
+            manifest.push(serde_json::json!({
+                "name":  name,
+                "shape": shape,
+                "file":  fname,
+            }));
+            Ok(())
+        };
+
+        // ── KWtaLayer encoder weights [n_in, n_units] ────────────────────────
+        let enc_layers = [
+            (&m.speech_layer.linear,   384usize),
+            (&m.env_layer.linear,      512usize),
+            (&m.visual_layer.linear,   384usize),
+            (&m.symbolic_layer.linear, 384usize),
+            (&m.language_layer.linear, 896usize),
+        ];
+        for (i, (layer, n_in)) in enc_layers.iter().enumerate() {
+            let n_units = layer.weight.val().dims()[1];
+            let w: Vec<f32> = layer.weight.val().into_data().convert::<f32>().to_vec().unwrap();
+            write(&format!("W_enc_{i}"), w, vec![*n_in, n_units])?;
+        }
+
+        // ── Cross-modal projection [CROSS_MODAL_DIM, 384] ────────────────────
+        {
+            let dims = m.cross_modal_proj.weight.val().dims();
+            let w: Vec<f32> = m.cross_modal_proj.weight.val().into_data().convert::<f32>().to_vec().unwrap();
+            write("W_cross", w, vec![dims[0], dims[1]])?;
+        }
+
+        // ── BindingArea region projections [N_UNITS, D_PROJ] ─────────────────
+        let region_projs = [
+            &m.binding.region_0,
+            &m.binding.region_1,
+            &m.binding.region_2,
+            &m.binding.region_3,
+            &m.binding.region_4,
+        ];
+        for (i, proj) in region_projs.iter().enumerate() {
+            let dims = proj.weight.val().dims();
+            let w: Vec<f32> = proj.weight.val().into_data().convert::<f32>().to_vec().unwrap();
+            write(&format!("W_region_{i}"), w, vec![dims[0], dims[1]])?;
+        }
+
+        // ── Attention QKV [D_PROJ, D_PROJ] ───────────────────────────────────
+        for (name, param) in [
+            ("W_q", &m.binding.w_q),
+            ("W_k", &m.binding.w_k),
+            ("W_v", &m.binding.w_v),
+        ] {
+            let dims = param.weight.val().dims();
+            let w: Vec<f32> = param.weight.val().into_data().convert::<f32>().to_vec().unwrap();
+            write(name, w, vec![dims[0], dims[1]])?;
+        }
+
+        // ── GRU weights [in, out] (burn convention; Python script transposes) ─
+        let gru = &m.binding.temporal_gru;
+        for (gate_name, gate) in [
+            ("update", &gru.update_gate),
+            ("reset",  &gru.reset_gate),
+            ("new",    &gru.new_gate),
+        ] {
+            let wi_dims = gate.input_transform.weight.val().dims();
+            let wi: Vec<f32> = gate.input_transform.weight.val().into_data().convert::<f32>().to_vec().unwrap();
+            write(&format!("gru_{gate_name}_input_W"), wi, vec![wi_dims[0], wi_dims[1]])?;
+
+            let wh_dims = gate.hidden_transform.weight.val().dims();
+            let wh: Vec<f32> = gate.hidden_transform.weight.val().into_data().convert::<f32>().to_vec().unwrap();
+            write(&format!("gru_{gate_name}_hidden_W"), wh, vec![wh_dims[0], wh_dims[1]])?;
+        }
+
+        // ── temporal_proj [GRU_HIDDEN, EPISODE_DIM] ──────────────────────────
+        {
+            let dims = m.binding.temporal_proj.weight.val().dims();
+            let w: Vec<f32> = m.binding.temporal_proj.weight.val().into_data().convert::<f32>().to_vec().unwrap();
+            write("W_temporal_proj", w, vec![dims[0], dims[1]])?;
+        }
+
+        // ── Write manifest ────────────────────────────────────────────────────
+        let manifest_json = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| PerceptionError::Burn(e.to_string()))?;
+        std::fs::write(dir.join("weights_manifest.json"), manifest_json)
+            .map_err(|e| PerceptionError::Burn(e.to_string()))?;
+
+        tracing::info!(n_tensors = manifest.len(), "perception weights exported for ONNX");
+        Ok(())
+    }
+
     /// Pre-grow regions to `sizes`, then load weights.
     pub fn load_weights_with_sizes(
         &mut self,

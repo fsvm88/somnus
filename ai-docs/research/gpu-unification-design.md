@@ -105,83 +105,91 @@ Currently settle_steps=1 in the campaign (effectively disabled). When enabled, t
 
 ---
 
-## 4. ONNX graph design
+## 4. ONNX graph design (two-graph split)
 
-### Single fused graph per wake period
+### Why two graphs, not one
 
-Rather than one graph per encoder type (as encoders currently work), the perception graph takes **all available encoder inputs simultaneously** with zero-padding for missing modalities. This matches the actual data flow — cross_modal_proj already consumes all four inputs at once, and symbolic must be recomputed whenever any modality updates. The per-encoder `ingest_*` call structure is an artifact of sequential Rust code, not a semantic requirement.
+A single fused graph was designed first and validated against numpy (7.93e-09 diff on CPU EP). MIGraphX crashed it with "invalid input for conversion to integer" (migraphx_execution_provider_utils.h:351, `ToInteger`). Binary search located the trigger: **≥4 ScatterElements nodes whose outputs are exposed as graph outputs** cause MIGraphX to fail at runtime on RDNA4/gfx1201. This is a MIGraphX bug (not an ONNX spec issue — the same ops pass in isolation and in graphs with ≤3 such outputs).
+
+The two-graph split eliminates all ScatterElements from both graphs. Topk and masking live on CPU between the two calls. Neither graph hits the bug.
+
+**Host↔device cost**: 5×[1, 1024] read + 5×[1, 1024] write = ~40 KB per episode. Negligible vs. the weight-read cost at any scale.
+
+### Graph 1: Encoder (`perception_encoder.onnx`)
 
 ```
 Inputs:
-  speech_enc:      f32[B, 384]     -- zero-padded if no speech this tick
-  env_enc:         f32[B, 512]
-  visual_enc:      f32[B, 384]
-  language_enc:    f32[B, 896]
-  dc_speech:       f32[N_UNITS]    -- duty cycles, passed as state inputs
-  dc_env:          f32[N_UNITS]
-  dc_visual:       f32[N_UNITS]
-  dc_symbolic:     f32[N_UNITS]
-  dc_language:     f32[N_UNITS]
-  gru_hidden:      f32[1, GRU_HIDDEN]  -- temporal context state
-  prev_episode:    f32[B, EPISODE_DIM] -- previous episode for GRU step
+  speech_enc   f32[1, 384]
+  env_enc      f32[1, 512]
+  visual_enc   f32[1, 384]
+  language_enc f32[1, 896]
 
 Internal:
-  z_speech = speech_enc @ W_speech                                  -- [B, N_UNITS]
-  boosted_speech = z_speech + BOOST * (TARGET_DC - dc_speech)      -- duty-cycle boost
-  topk_speech = TopK(boosted_speech, k=K_ACTIVE)                   -- indices + values
-  mask_speech = scatter(zeros[B,N_UNITS], topk_speech.indices, 1)  -- [B, N_UNITS]
-  sparse_speech = mask_speech * z_speech                            -- sparse activations
-  -- ... same for env, visual, language
-
-  symbolic_in = cross_modal_proj([speech_enc | env_enc | visual_enc | lang_enc])
-  -- symbolic kwta same as above
-
-  projected_i = sparse_region_i @ W_region_i  for i in 0..5       -- [B, D_PROJ]
-  x = cat(projected_0..4, dim=0)                                   -- [5, D_PROJ]
-  q = x @ W_q;  gru_step = GRU(prev_episode, gru_hidden)
-  ctx = gru_step.hidden @ W_temporal_proj                          -- [1, EPISODE_DIM]
-  ctx_tokens = reshape(ctx, [5, D_PROJ])
-  k = cat([x, ctx_tokens]) @ W_k
-  v = cat([x, ctx_tokens]) @ W_v
-  attn = softmax(q @ k^T / sqrt(D_HEAD), dim=-1)
-  episode = flatten(attn @ v)                                      -- [EPISODE_DIM]
-
-  ema_preds_i = episode @ W_ema_i  for i in 0..5                  -- prior predictions
-  recon_i = sparse_i @ W_sae_decoder_i                             -- reconstruction
-  recon_error_i = mse(enc_input_i, recon_i)
+  cross_cat    = concat(speech, env, visual, language)   [1, 2176]
+  symbolic_enc = cross_cat @ W_cross                     [1, 384]
+  z_i          = enc_i @ W_enc_i                         [1, N_UNITS]
 
 Outputs:
-  episode:           f32[B, EPISODE_DIM]
-  gru_hidden_out:    f32[1, GRU_HIDDEN]
-  z_speech:          f32[B, N_UNITS]    -- raw pre-topk activations for duty-cycle update
-  z_env, z_visual, z_symbolic, z_language: same
-  topk_indices_*:    i64[B, K_ACTIVE]   -- top-k indices for duty-cycle update on CPU
-  ema_preds:         5× f32[B, d_out]   -- prior predictions per region
-  recon_errors:      f32[5]             -- SAE MSE per region (telemetry)
+  z_0 .. z_4   f32[1, N_UNITS]   raw pre-topk activations
 ```
 
-### Dynamic axes
+Ops: Concat, MatMul only. No risk on MIGraphX.
 
-- `B` (batch dimension): dynamic in the ONNX graph. Set to 1 for real-time wake, N for micro-batching.
-- `N_UNITS`: **static** per export. Changes only when `grow_region` or `prune_region` is called during sleep — triggers a graph rebuild at the next sleep→wake boundary.
+### CPU step (between Graph 1 and Graph 2)
 
-### ONNX operator coverage on MIGraphX
+```
+for i in 0..5:
+    boosted = z[i] + BOOST * (target_dc - dc[i])
+    topk_idx = argpartition(boosted, -K_ACTIVE)[-K_ACTIVE:]
+    mask[topk_idx] = 1.0; sparse_z[i] = z[i] * mask
+    dc[i] *= (1 - ALPHA); dc[i][topk_idx] += ALPHA
+```
 
-All operators used are in ONNX opset 14, which MIGraphX supports via ORT:
+O(5 × N_UNITS) ≈ 0.1ms at N_UNITS=1024.
 
-| Op | Used for |
-|---|---|
-| Gemm / MatMul | All linear layers |
-| GRU | BindingArea.temporal_gru |
-| TopK | Top-k selection in k-WTA |
-| Gather / ScatterElements | Sparse mask construction |
-| Concat | Cross-modal concat, KV augmentation |
-| Softmax | Attention weights |
-| ReduceMean | SAE reconstruction error |
-| Reshape, Transpose | Attention head splitting |
-| Mul, Add, Sub | Duty-cycle boost, EMA blend |
+### Graph 2: Binding (`perception_binding.onnx`)
 
-MIGraphX does not support all dynamic-shape ops well. All shapes except the batch dimension should be static at export time.
+```
+Inputs:
+  sp_0 .. sp_4   f32[1, N_UNITS]    sparse activations (after CPU step)
+  prev_episode   f32[1, EPISODE_DIM]
+  gru_hidden     f32[1, 1, GRU_HIDDEN]
+
+Internal:
+  proj_i         = sp_i @ W_region_i    [1, D_PROJ]
+  x              = concat([proj_0..4])  [5, D_PROJ]
+  gru_hidden_out = GRU(prev_episode, W_gru, R_gru; init=gru_hidden)
+  ctx            = reshape(gru_hidden_out, [1, GH]) @ W_temporal_proj  [1, EPISODE_DIM]
+  ctx_tokens     = reshape(ctx, [5, D_PROJ])
+  x_ext          = concat([x, ctx_tokens])            [10, D_PROJ]
+  Q = x @ W_q,   K = x_ext @ W_k,   V = x_ext @ W_v
+  multi-head scaled-dot-product (4 heads, seq=5, kv_seq=10)
+  episode        = reshape(attn_out, [1, EPISODE_DIM])
+
+Outputs:
+  episode        f32[1, EPISODE_DIM]
+  gru_hidden_out f32[1, 1, GRU_HIDDEN]
+```
+
+Ops: MatMul, GRU, Concat, Reshape, Transpose, Softmax, Mul. All confirmed working on MIGraphX.
+
+### MIGraphX operator coverage (empirically verified)
+
+| Op | Status | How tested |
+|---|---|---|
+| MatMul | ✓ | Probes + full graph |
+| GRU (linear_before_reset=1) | ✓ 1.79e-07 diff | `probe.py` + full graph |
+| Softmax + MatMul (cross-attention) | ✓ 1.86e-08 diff | `probe.py` + full graph |
+| TopK | ✓ correct set, different order | `probe.py` |
+| ScatterElements → internal node | ✓ | `probe.py` |
+| ScatterElements → graph output ≥4 | ✗ MIGraphX bug | `probe.py` threshold test |
+| INT64 graph outputs (topk indices) | ✗ MIGraphX bug | `probe.py` |
+
+**Hard constraint**: keep all topk/masking/ScatterElements on CPU. Never expose them as ONNX graph outputs.
+
+### N_UNITS is static per export
+
+Shape changes from `grow_region` / `prune_region` invalidate both graphs. Rebuild at the next sleep→wake boundary.
 
 ---
 
@@ -235,14 +243,13 @@ for dc in duty_cycle:  dc *= (1 - DUTY_CYCLE_ALPHA)   -- ALPHA = 0.001
 for i in top_k_indices: duty_cycle[i] += DUTY_CYCLE_ALPHA
 ```
 
-This update is cheap (O(N_UNITS) on CPU, ~4 KB write at current scale) and has no autodiff dependency. It is **not** placed inside the ONNX graph — instead:
+This update is cheap (O(N_UNITS) on CPU, ~4 KB write at current scale) and has no autodiff dependency. It runs entirely on CPU in the split between Graph 1 and Graph 2:
 
-- The graph takes `dc_i` as an input tensor (read-only within the graph)
-- The graph outputs `topk_indices_i` (the K_ACTIVE winning indices)
-- CPU updates `dc_i` using `topk_indices_i` after each graph call
-- The updated `dc_i` is passed as input to the next call
+1. Graph 1 returns z[i] (raw FLOAT, no topk performed inside the graph)
+2. CPU selects top-K from boosted z, builds sparse mask, updates dc
+3. Graph 2 receives sparse_z as input
 
-At batch=8 micro-batching, the CPU applies 8 sequential duty-cycle updates (one per sample in order) using the returned indices before the next batch. This is O(8 × K_ACTIVE) = O(160) ops — negligible.
+This design avoids all MIGraphX issues (no INT64 outputs, no ScatterElements in graph outputs). The CPU step adds ~0.1ms at N_UNITS=1024 — negligible.
 
 ---
 
@@ -340,11 +347,13 @@ No gradient information flows through the ORT session. No burn tensor leaves the
 
 ### Phase 0 — validate graph equivalence (no behavior change)
 
-Export a reference ONNX inference graph. Run it in parallel with the existing burn path for one full campaign cycle. Assert that `episode` vectors match to within 1e-4 (accounting for FP32 precision differences between NdArray and MIGraphX). This is a pure validation step — no behavior change, no code removed.
+**Status: partially complete (2026-06-02).** Two-graph design validated numpy↔ONNX↔MIGraphX. MIGraphX bug isolated and worked around. Weight exporter implemented.
 
-**Deliverable:** `scripts/export_perception_skeleton.py`, `PerceptionProcessor::export_onnx_for_validation()`, test in `experiments/`.
+Remaining gate: **burn ↔ ONNX episode match on one live episode** (with non-uniform dc to exercise the boost path). The numpy↔ONNX check validated graph structure; burn↔ONNX closes the GRU gate-order and Linear transpose convention risks against real trained weights.
 
-**Kill criterion:** if MIGraphX produces non-matching outputs on any op (GRU, TopK) that cannot be resolved, fall back to CPU-ORT EP (CPU reference, no perf win but validates correctness).
+**Deliverables:** `scripts/export_perception_graph.py` (two-graph builder + numpy validator), `PerceptionProcessor::export_weights_for_onnx()`, `experiments/migraphx-op-probe/probe.py`.
+
+**Kill criterion:** if burn↔ONNX episode MSE > 1e-3 after correcting GRU conventions, fall back to CPU-ORT EP for the binding graph (no perf win, but validates rest of pipeline).
 
 ### Phase 1 — wake inference on GPU
 
