@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-02
-> **Last commit on main:** f4813c5 — GPU unification Phase 0
+> **Last commit on main:** ca4ab59 — GPU unification Phase 0 complete
 > **Branch:** `main` (not yet pushed to Codeberg)
 
-## Status: GPU unification Phase 0 partially complete. Two-graph ONNX design validated on MIGraphX. Burn↔ONNX numeric gate still to close.
+## Status: GPU unification Phase 0 COMPLETE. burn↔ONNX gate closed. Ready for Phase 1 (ORT inference in wake path).
 
 ---
 
@@ -21,30 +21,40 @@
 
 ---
 
-## GPU unification status
+## GPU unification status: Phase 0 COMPLETE
 
-**Phase 0 gate: burn ↔ ONNX numeric match on one live episode**
+**All burn↔ONNX checks pass (CPU EP and MIGraphX EP):**
+- Encoder z vectors: exact match (<1.5e-06 on MIGraphX)
+- Sparse_z sets: same top-K selected
+- Episode (call 1, attention path): 5.59e-09 / 1.58e-08
+- Episode (call 2, GRU with non-zero input): 3.73e-09 / 1.68e-08
+- GRU hidden state: 6.52e-09 / 2.24e-08
 
-What's done:
-- `experiments/migraphx-op-probe/probe.py` — all ops confirmed
-- `scripts/export_perception_graph.py` — builds `perception_encoder.onnx` + `perception_binding.onnx`
-- `PerceptionProcessor::export_weights_for_onnx()` — dumps weights to `.f32` bundle
-- numpy↔CPU EP↔MIGraphX validated at <5e-9 with non-uniform dc
+Bug found and fixed: `cross_modal_proj` has `bias=true` — the bias wasn't being exported. Added `W_cross_bias` export and `Add` node in encoder ONNX graph.
 
-What remains for Phase 0 completion:
-1. Export actual burn weights via `export_weights_for_onnx()`
-2. Build ONNX graphs from those weights via Python script
-3. Run one burn inference episode + same episode through ONNX
-4. Assert episode diff < 1e-4
+**Validation toolchain:**
+- `cargo run --release -p somnus-perception --bin onnx_validate_prepare -- <dir>` — exports weights + reference data
+- `python3 experiments/onnx-validate/validate.py --data-dir <dir> --migraphx` — validates
 
-Likely risks for burn↔ONNX match:
-- GRU gate-order (burn: update/reset/new = z/r/h — same as ONNX, but needs runtime confirmation)
-- Linear weight transpose (burn stores [in, out]; ONNX GRU W expects [H, I] per gate — Python script transposes)
-- Non-uniform dc: boost term is `z + BOOST*(TARGET_DC - dc)` — make sure ONNX argpartition matches burn's select_top_k with same boosted scores
+**Phase 1: replace burn wake inference with ORT**
 
-After Phase 0:
-- Phase 1: replace burn wake inference with ORT session calls in PerceptionProcessor
-- Phase 2: micro-batching (--micro-batch-size flag)
+Concrete changes needed:
+1. Add `OnnxPerceptionSession` struct in `crates/somnus-perception/src/onnx_session.rs`:
+   - Holds two ORT sessions (encoder + binding)
+   - `run(&mut self, feeds) -> (episode, gru_h_out)` method
+   - `rebuild(weights_dir, onnx_dir)` — calls Python script + creates sessions
+2. Add to `PerceptionProcessor`:
+   - Optional `ort_session: Option<OnnxPerceptionSession>`
+   - `enable_ort_inference(weights_dir, onnx_dir)` — exports weights, builds graphs, loads sessions
+   - Modified `ingest_*` functions: if ort_session is Some, use ORT path; else burn path
+3. In `crates/somnus/src/main.rs`:
+   - `--onnx-models-dir` flag for where to store the ONNX files
+   - On startup (if flag set): call `enable_ort_inference`
+   - At sleep→wake boundary: rebuild ORT session if model changed
+
+The ORT session needs:
+- `ort` crate dependency in `somnus-perception`
+- `migraphx_session` helper (currently in `somnus/src/main.rs`) needs to move or be duplicated
 
 ---
 
