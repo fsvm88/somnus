@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-02
-> **Last commit on main:** 56008a0 — GPU unification Phase 1 complete
-> **Branch:** `main` (not yet pushed to Codeberg)
+> **Last commit on main:** a8fb6d4 — session state (pushed to Codeberg)
+> **Branch:** `main` (pushed)
 
-## Status: GPU unification Phase 1 COMPLETE. ORT binding session live on MIGraphX. Ready for campaign comparison.
+## Status: GPU unification Phase 1 COMPLETE and benchmarked. ORT binding 2.4–2.8× faster than burn. Ready for Phase 1.5 (encoder ORT).
 
 ---
 
@@ -46,10 +46,15 @@ EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --max-warm-records 200000 \
 scripts/train_campaign.sh
 ```
 
+**Campaign benchmark (memory/campaign_20260602_2308):**
+- bind_ms: **0.78–0.98ms/ep** (was 2.1–2.5ms with burn) → **2.4–2.8× speedup**
+- Loss trajectory normal; synthetics=8/cycle; all nrem=traces_exhausted (one salience interrupt s3c2)
+- s3c3 bind_ms=1.38ms follows the salience interrupt — not a regression
+
 **Next steps:**
-- Phase 1.5: add encoder ORT session (replace burn k-WTA matmuls) 
-- Measure bind_ms improvement in campaign (expect ~7ms → <1ms for binding)
-- Phase 2: micro-batching (--micro-batch-size)
+- Phase 1.5: add encoder ORT session (replace burn k-WTA matmuls, ~2.1+3.1ms/ep)
+- Phase 2: micro-batching (--micro-batch-size) for compounding GPU benefit
+- Add --onnx-models-dir to train_campaign.sh defaults (currently must be passed via EXTRA_ARGS)
 
 ---
 
