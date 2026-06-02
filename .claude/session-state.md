@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-02
-> **Last commit on main:** a8fb6d4 — session state (pushed to Codeberg)
+> **Last commit on main:** 9153ea3 — session state (pushed to Codeberg)
 > **Branch:** `main` (pushed)
 
 ## Status: GPU unification Phase 1 COMPLETE and benchmarked. ORT binding 2.4–2.8× faster than burn. Ready for Phase 1.5 (encoder ORT).
