@@ -67,10 +67,12 @@ def build_encoder_graph(weights: dict) -> onnx.ModelProto:
     w = weights
     nodes = [
         # Cross-modal concat → symbolic encoder input (derived, not a graph input)
+        # cross_modal_proj has bias=true: symbolic_enc = cross_cat @ W_cross + W_cross_bias
         h.make_node("Concat",
                     ["speech_enc", "env_enc", "visual_enc", "language_enc"],
                     ["cross_cat"], axis=-1),
-        h.make_node("MatMul", ["cross_cat", "W_cross"], ["symbolic_enc"]),
+        h.make_node("MatMul", ["cross_cat", "W_cross"], ["cross_proj"]),
+        h.make_node("Add",    ["cross_proj", "W_cross_bias"], ["symbolic_enc"]),
         # Linear forwards for each region
         h.make_node("MatMul", ["speech_enc",   "W_enc_0"], ["z_0"]),
         h.make_node("MatMul", ["env_enc",       "W_enc_1"], ["z_1"]),
@@ -79,7 +81,8 @@ def build_encoder_graph(weights: dict) -> onnx.ModelProto:
         h.make_node("MatMul", ["language_enc",  "W_enc_4"], ["z_4"]),
     ]
     initializers = [
-        nph.from_array(w["W_cross"].astype(np.float32),  name="W_cross"),
+        nph.from_array(w["W_cross"].astype(np.float32),      name="W_cross"),
+        nph.from_array(w["W_cross_bias"].astype(np.float32), name="W_cross_bias"),
         nph.from_array(w["W_enc_0"].astype(np.float32),  name="W_enc_0"),
         nph.from_array(w["W_enc_1"].astype(np.float32),  name="W_enc_1"),
         nph.from_array(w["W_enc_2"].astype(np.float32),  name="W_enc_2"),
@@ -225,7 +228,7 @@ def numpy_encoder(feeds: dict, weights: dict):
     w = weights
     cross = np.concatenate([feeds["speech_enc"], feeds["env_enc"],
                             feeds["visual_enc"],  feeds["language_enc"]], axis=-1)
-    symbolic_enc = cross @ w["W_cross"]
+    symbolic_enc = cross @ w["W_cross"] + w["W_cross_bias"]
     encs = [feeds["speech_enc"], feeds["env_enc"], feeds["visual_enc"],
             symbolic_enc, feeds["language_enc"]]
     return [enc @ w[f"W_enc_{i}"] for i, enc in enumerate(encs)]

@@ -17,3 +17,7 @@ path = "src/bin/bench_nrem_batch.rs"
 [[bin]]
 name = "bench_wake_percep"
 path = "src/bin/bench_wake_percep.rs"
+
+[[bin]]
+name = "onnx_validate_prepare"
+path = "src/bin/onnx_validate_prepare.rs"

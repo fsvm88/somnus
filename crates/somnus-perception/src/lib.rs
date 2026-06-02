@@ -1610,11 +1610,16 @@ impl PerceptionProcessor {
             write(&format!("W_enc_{i}"), w, vec![*n_in, n_units])?;
         }
 
-        // ── Cross-modal projection [CROSS_MODAL_DIM, 384] ────────────────────
+        // ── Cross-modal projection [CROSS_MODAL_DIM, 384] + bias [384] ──────
         {
             let dims = m.cross_modal_proj.weight.val().dims();
             let w: Vec<f32> = m.cross_modal_proj.weight.val().into_data().convert::<f32>().to_vec().unwrap();
             write("W_cross", w, vec![dims[0], dims[1]])?;
+            // cross_modal_proj has bias=true; bias shape [384]
+            if let Some(bias) = m.cross_modal_proj.bias.as_ref() {
+                let b: Vec<f32> = bias.val().into_data().convert::<f32>().to_vec().unwrap();
+                write("W_cross_bias", b, vec![dims[1]])?;
+            }
         }
 
         // ── BindingArea region projections [N_UNITS, D_PROJ] ─────────────────
@@ -1673,6 +1678,110 @@ impl PerceptionProcessor {
 
         tracing::info!(n_tensors = manifest.len(), "perception weights exported for ONNX");
         Ok(())
+    }
+
+    // ── ONNX validation helpers ──────────────────────────────────────────────
+
+    /// Return per-region duty cycles (for ONNX validation: must pass same dc to Python topk).
+    pub fn duty_cycles(&self) -> [Vec<f32>; 5] {
+        let m = self.model.as_ref().unwrap();
+        [
+            m.speech_layer.duty_cycle.clone(),
+            m.env_layer.duty_cycle.clone(),
+            m.visual_layer.duty_cycle.clone(),
+            m.symbolic_layer.duty_cycle.clone(),
+            m.language_layer.duty_cycle.clone(),
+        ]
+    }
+
+    /// Run just the 5 encoder linear forwards + cross-modal projection, no topk, no side effects.
+    /// Returns raw pre-topk activations [z_speech, z_env, z_visual, z_symbolic, z_language].
+    /// Language input is zero-padded when not provided.
+    pub fn encoder_z_only(
+        &self,
+        speech: &[f32],
+        env: &[f32],
+        visual: &[f32],
+        language: Option<&[f32]>,
+    ) -> [Vec<f32>; 5] {
+        let device = self.device;
+        let m = self.model.as_ref().unwrap();
+
+        let lang_zeros: Vec<f32>;
+        let lang = match language {
+            Some(l) => l,
+            None => { lang_zeros = vec![0.0f32; REGION_DIMS[4]]; &lang_zeros }
+        };
+
+        // cross_modal_proj → symbolic encoder input
+        let mut concat = vec![0.0f32; CROSS_MODAL_DIM];
+        let offsets = [(0usize, 384usize), (384, 512), (896, 384), (1280, 896)];
+        let srcs: [&[f32]; 4] = [speech, env, visual, lang];
+        for (src, (off, dim)) in srcs.iter().zip(offsets.iter()) {
+            let len = src.len().min(*dim);
+            concat[*off..*off + len].copy_from_slice(&src[..len]);
+        }
+        let cross_t: Tensor<NdArray, 2> = Tensor::from_data(
+            TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device,
+        );
+        let symbolic_enc: Vec<f32> = m.cross_modal_proj
+            .forward(Tensor::<TrainB, 2>::from_inner(cross_t))
+            .inner()
+            .into_data().convert::<f32>().to_vec().unwrap();
+
+        let enc_inputs: [&[f32]; 5] = [speech, env, visual, &symbolic_enc, lang];
+        let layers = [
+            &m.speech_layer.linear,
+            &m.env_layer.linear,
+            &m.visual_layer.linear,
+            &m.symbolic_layer.linear,
+            &m.language_layer.linear,
+        ];
+
+        std::array::from_fn(|i| {
+            let t: Tensor<NdArray, 2> = Tensor::from_data(
+                TensorData::new(enc_inputs[i].to_vec(), [1, enc_inputs[i].len()]), &device,
+            );
+            layers[i].forward(Tensor::<TrainB, 2>::from_inner(t))
+                .inner()
+                .into_data().convert::<f32>().to_vec().unwrap()
+        })
+    }
+
+    /// Run just the binding area on pre-built sparse activations. No side effects.
+    /// sparse_z: 5 dense [N_UNITS] vectors (non-zero entries = active units)
+    /// Returns (episode [EPISODE_DIM], gru_hidden_out [GRU_HIDDEN]).
+    pub fn binding_only(
+        &mut self,
+        sparse_z: &[Vec<f32>; 5],
+        prev_ep: Option<&[f32]>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let device = self.device;
+        let acts: [SparseActivation; 5] = std::array::from_fn(|i| {
+            let dense = &sparse_z[i];
+            let mut indices = Vec::with_capacity(K_ACTIVE);
+            let mut values  = Vec::with_capacity(K_ACTIVE);
+            for (j, &v) in dense.iter().enumerate() {
+                if v != 0.0 {
+                    indices.push(j as u16);
+                    values.push(v);
+                }
+            }
+            SparseActivation {
+                region: [
+                    RegionId::AudioSpeech, RegionId::AudioEnv, RegionId::Visual,
+                    RegionId::Symbolic, RegionId::Language,
+                ][i],
+                indices, values,
+                n_units: N_UNITS,
+            }
+        });
+        let act_refs: [&SparseActivation; 5] = [&acts[0], &acts[1], &acts[2], &acts[3], &acts[4]];
+        let ep = self.model.as_mut().unwrap()
+            .binding.forward(&act_refs, prev_ep.map(|p| p.to_vec()).as_ref(), &device);
+        let gru_h = self.model.as_ref().unwrap()
+            .binding.gru_hidden.clone().unwrap_or_else(|| vec![0.0; 256]);
+        (ep.0, gru_h)
     }
 
     /// Pre-grow regions to `sizes`, then load weights.
