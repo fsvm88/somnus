@@ -1,9 +1,11 @@
 pub mod binding;
 pub mod error;
+pub mod onnx_session;
 pub mod region;
 pub mod sae;
 
 pub use binding::{BindingArea, EpisodeVector, EPISODE_DIM};
+pub use onnx_session::OnnxPerceptionSession;
 pub use error::{PerceptionError, PerceptionResult};
 pub use region::{KWtaLayer, RegionId, SparseActivation, K_ACTIVE, N_UNITS};
 pub use sae::SaeDecoder;
@@ -247,6 +249,9 @@ pub struct PerceptionProcessor {
     perf_symbolic_us: u64,
     perf_bind_us: u64,
     perf_prior_us: u64,
+
+    /// ORT binding session (Phase 1). When Some, binding area uses ORT instead of burn.
+    ort_session: Option<crate::onnx_session::OnnxPerceptionSession>,
 }
 
 impl PerceptionProcessor {
@@ -274,6 +279,7 @@ impl PerceptionProcessor {
             perf_symbolic_us: 0,
             perf_bind_us: 0,
             perf_prior_us: 0,
+            ort_session: None,
         }
     }
 
@@ -639,7 +645,6 @@ impl PerceptionProcessor {
             self.latest[3].as_ref(),
         ) {
             (Some(sp), Some(en), Some(vi), Some(sy)) => {
-                let device = self.device;
                 let lang_zero = SparseActivation {
                     region: RegionId::Language,
                     indices: vec![],
@@ -647,11 +652,38 @@ impl PerceptionProcessor {
                     n_units: N_UNITS,
                 };
                 let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
-                let ep = self.model.as_mut().unwrap().binding.forward(
-                    &[sp, en, vi, sy, lang],
-                    latest_episode,
-                    &device,
-                );
+
+                let ep = if let Some(ref mut ort) = self.ort_session {
+                    // ORT path: convert burn sparse activations to dense, run ORT binding
+                    let sparse_z: [Vec<f32>; 5] = [
+                        sp.to_dense_n(N_UNITS),
+                        en.to_dense_n(N_UNITS),
+                        vi.to_dense_n(N_UNITS),
+                        sy.to_dense_n(N_UNITS),
+                        lang.to_dense_n(N_UNITS),
+                    ];
+                    let prev_zeros = vec![0.0f32; EPISODE_DIM];
+                    let prev = latest_episode
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&prev_zeros);
+                    match ort.run_binding(&sparse_z, prev) {
+                        Ok(ep_vec) => EpisodeVector(ep_vec),
+                        Err(e) => {
+                            tracing::warn!(?e, "ORT binding failed; falling back to burn");
+                            let device = self.device;
+                            self.model.as_mut().unwrap().binding.forward(
+                                &[sp, en, vi, sy, lang], latest_episode, &device,
+                            )
+                        }
+                    }
+                } else {
+                    // Burn path (original)
+                    let device = self.device;
+                    self.model.as_mut().unwrap().binding.forward(
+                        &[sp, en, vi, sy, lang], latest_episode, &device,
+                    )
+                };
+
                 let regional = [
                     self.latest_inputs[0].clone().unwrap_or_default(),
                     self.latest_inputs[1].clone().unwrap_or_default(),
@@ -1415,6 +1447,69 @@ impl PerceptionProcessor {
         self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
         tracing::info!(region = ?region, old_n = current_n, new_n, n_pruned = n_prune, "region pruned");
         n_prune
+    }
+
+    // ── ORT inference session management ────────────────────────────────────
+
+    /// Load the binding ONNX graph and enable ORT inference for the binding area.
+    /// Call once at startup (and after each sleep cycle via `rebuild_ort_session`).
+    /// `use_migraphx`: use AMD MIGraphX GPU EP; false → CPU EP (for testing).
+    pub fn enable_ort_inference(
+        &mut self,
+        bind_path: &std::path::Path,
+        use_migraphx: bool,
+    ) -> anyhow::Result<()> {
+        let sess = crate::onnx_session::OnnxPerceptionSession::load(bind_path, use_migraphx)?;
+        self.ort_session = Some(sess);
+        tracing::info!(migraphx = use_migraphx, "ORT binding session loaded");
+        Ok(())
+    }
+
+    /// Export current burn weights to `weights_dir`, call the Python graph-builder script,
+    /// then reload the ORT sessions. Call at each sleep→wake boundary when the model
+    /// weights have changed (NREM training, growth, prune).
+    ///
+    /// `script_path`: path to `scripts/export_perception_graph.py`
+    /// `onnx_dir`:    where to write (and read from) `perception_binding.onnx`
+    /// `use_migraphx`: true for production GPU; false for CPU-only testing
+    pub fn rebuild_ort_session(
+        &mut self,
+        script_path: &std::path::Path,
+        onnx_dir: &std::path::Path,
+        use_migraphx: bool,
+    ) -> anyhow::Result<()> {
+        // Step 1: export burn weights
+        let weights_dir = onnx_dir.join("weights");
+        self.export_weights_for_onnx(&weights_dir)?;
+
+        // Step 2: run Python to build ONNX graphs
+        let status = std::process::Command::new("python3")
+            .arg(script_path)
+            .arg("--weights-dir")
+            .arg(&weights_dir)
+            .arg("--out-dir")
+            .arg(onnx_dir)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to spawn Python: {e}"))?;
+        if !status.success() {
+            anyhow::bail!("export_perception_graph.py exited with {status}");
+        }
+
+        // Step 3: reload ORT sessions with new weights
+        let bind_path = onnx_dir.join("perception_binding.onnx");
+        self.enable_ort_inference(&bind_path, use_migraphx)?;
+        tracing::info!("ORT binding session rebuilt after sleep cycle");
+        Ok(())
+    }
+
+    /// Disable ORT inference (fall back to burn for all inference).
+    pub fn disable_ort_inference(&mut self) {
+        self.ort_session = None;
+    }
+
+    /// True if ORT binding inference is active.
+    pub fn ort_active(&self) -> bool {
+        self.ort_session.is_some()
     }
 
     // ── State accessors ──────────────────────────────────────────────────────

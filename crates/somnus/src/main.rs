@@ -327,6 +327,24 @@ struct Args {
     /// rocprof instead; see scripts/profile.sh.
     #[arg(long)]
     ort_profile_dir: Option<PathBuf>,
+
+    /// Enable ORT binding inference (Phase 1 GPU unification).
+    /// Directory where ONNX files are written and loaded from.
+    /// On startup and after each sleep cycle, burn weights are exported and
+    /// the ONNX graphs are rebuilt via scripts/export_perception_graph.py.
+    /// Requires Python3 with onnx + onnxruntime installed.
+    #[arg(long)]
+    onnx_models_dir: Option<PathBuf>,
+
+    /// Path to scripts/export_perception_graph.py (default: auto-detected relative
+    /// to the binary location). Only needed when --onnx-models-dir is set.
+    #[arg(long)]
+    onnx_script: Option<PathBuf>,
+
+    /// Use MIGraphX GPU EP for ORT binding session (requires AMD GPU + MIGraphX).
+    /// When false and --onnx-models-dir is set, uses CPU EP (for testing / validation).
+    #[arg(long, default_value = "true")]
+    onnx_migraphx: bool,
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -642,6 +660,26 @@ async fn main() -> Result<()> {
         working_memory_size = args.working_memory_size,
         "perception processor initialised (n=1024, k=20, cpu)"
     );
+
+    // ── ORT binding session (Phase 1 GPU unification) ─────────────────────────
+    let onnx_script_path: Option<PathBuf> = args.onnx_models_dir.as_ref().map(|_| {
+        args.onnx_script.clone().unwrap_or_else(|| {
+            // Default: find script relative to the binary
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("../../scripts/export_perception_graph.py")
+        })
+    });
+    if let (Some(ref onnx_dir), Some(ref script)) = (&args.onnx_models_dir, &onnx_script_path) {
+        std::fs::create_dir_all(onnx_dir)?;
+        info!(onnx_dir = %onnx_dir.display(), migraphx = args.onnx_migraphx, "building ORT binding session");
+        match perception.rebuild_ort_session(script, onnx_dir, args.onnx_migraphx) {
+            Ok(()) => info!("ORT binding session active"),
+            Err(e) => tracing::warn!(?e, "ORT session init failed — running with burn inference"),
+        }
+    }
 
     // ── memory hierarchy ──────────────────────────────────────────────────────
     std::fs::create_dir_all(&args.memory_dir)?;
@@ -1501,6 +1539,14 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::warn!(?e, "sleep cycle error"),
             }
             wake_start = std::time::Instant::now();
+
+            // Rebuild ORT binding session with updated weights after sleep training.
+            if let (Some(ref onnx_dir), Some(ref script)) = (&args.onnx_models_dir, &onnx_script_path) {
+                match perception.rebuild_ort_session(script, onnx_dir, args.onnx_migraphx) {
+                    Ok(()) => tracing::debug!("ORT binding session rebuilt"),
+                    Err(e) => tracing::warn!(?e, "ORT session rebuild failed — continuing with existing session"),
+                }
+            }
 
             // Exit after N sleep cycles if requested.
             if args.max_sleep_cycles > 0 && sleep_cycle_count >= args.max_sleep_cycles {

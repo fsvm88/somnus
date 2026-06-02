@@ -2374,8 +2374,11 @@ dependencies = [
 name = "somnus-perception"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "burn",
  "burn-ndarray",
+ "ndarray 0.17.2",
+ "ort",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
