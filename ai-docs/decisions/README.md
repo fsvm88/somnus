@@ -74,3 +74,4 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0020](0020-systematic-forgetting-cold-truncation.md) | Systematic forgetting: bounded cold archive | accepted |
 | [0021](0021-cross-modal-gist-entropy.md) | Cross-modal gist entropy: ingest_source and concept probe | accepted |
 | [0022](0022-instrumentation-metrics-expansion.md) | Instrumentation and metrics expansion: salience, blend, modality, NREM coverage | accepted |
+| [0023](0023-gpu-unification.md) | GPU unification: ORT/MIGraphX for perception inference | proposed |
