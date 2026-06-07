@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-07
-> **Last commit on main:** 590f7e6 — GPU unification Phase 1.5 + train_campaign.sh ONNX defaults
+> **Last commit on main:** 321cb8e — GainWorker: offload Qwen gain ORT call to dedicated background thread
 > **Branch:** `main` (not yet pushed)
 
-## Status: Phase 1.5 COMPLETE (encoder ORT live). Needs benchmark validation. Phase 2 (micro-batching) has a fundamental issue — see below.
+## Status: GainWorker COMPLETE. Phase 1.5 encoder ORT live (unvalidated). Next: benchmark + duty-cycle validation.
 
 ---
 
@@ -12,8 +12,22 @@
 
 | Item | Commit | What changed |
 |------|--------|--------------|
-| Phase 1.5: encoder ORT | 590f7e6 | All 5 encoder matmuls + cross-modal proj move to GPU; topk+dc stays in Rust |
 | train_campaign.sh ONNX defaults | 590f7e6 | ONNX_MODELS_DIR / ONNX_SCRIPT env vars; no more EXTRA_ARGS required |
+| Phase 1.5: encoder ORT | 590f7e6 | All 5 encoder matmuls + cross-modal proj move to GPU; topk+dc stays in Rust |
+| GainWorker (Phase 2 redirect) | 321cb8e | Qwen gain ORT call moved to dedicated OS thread; ~54ms stall eliminated from tokio loop |
+
+---
+
+## GainWorker design (321cb8e)
+
+- `ActionDecoder.gain_session` is `Option<Session>`; `create_gain_worker()` takes it via `Option::take()`.
+- `GainWorker` holds one `std::sync::mpsc::SyncSender<GainMsg>` (cap=2) + `Receiver<[f32; 5]>` (cap=2).
+- Audio/video arms: `gw.request_gain(ep.clone())` — fire-and-forget, drops if channel full.
+- Language arm: same, via `LangIngestResult.last_episode` field.
+- Main loop top: `gw.try_recv_gain()` → `perception.set_region_gain(g)` — non-blocking poll.
+- After NREM save_weights: `gw.update_weights(dec.proj_weights_flat())` — keeps worker's projection current.
+- `gain_interval` default raised to 20 (from 10); `gain_update_total_ms` removed from metrics (field kept as literal 0).
+- `update_gain` and `gain` field kept on `ActionDecoder` as `#[allow(dead_code)]` fallback.
 
 ---
 
@@ -23,7 +37,7 @@
 
 **Phase 1 (ORT binding session live):** 2.4–2.8× speedup confirmed (campaign_20260602_2308).
 
-**Phase 1.5 (ORT encoder session live — Phase 1.5 commit 590f7e6):**
+**Phase 1.5 (ORT encoder session live — commit 590f7e6):**
 - `enable_ort_inference` now auto-attaches `perception_encoder.onnx` if it exists in
   the same directory as `perception_binding.onnx`.
 - In `try_bind`: when encoder ORT is active, runs all 5 linears + cross-modal proj on GPU
@@ -54,20 +68,15 @@ total bind_ms should drop further from the 0.78–0.98ms/ep Phase 1 baseline.
 
 ---
 
-## Phase 2 (micro-batching) — BLOCKED on design issue
+## Next steps (priority order)
 
-**Problem:** The GRU binding is sequential (episode n feeds its hidden state into episode n+1).
-Batching the binding across episodes is not possible in the wake path. Only the encoder can be
-batched (B independent matmuls → B z vectors), but the encoder is now cheap (GPU).
-
-**Conclusion:** "Phase 2 micro-batching for compounding GPU benefit" is mostly false — the
-binding (the actual bottleneck) cannot be batched. Building a wake-path buffering refactor
-to batch only the encoder is low ROI.
-
-**Options for what Phase 2 becomes:**
-- Redirect to next real bottleneck (Qwen embeddings, NREM replay, something measured)
-- Defer / shelve — focus on validation + next research step
-- User decides
+1. **Benchmark Phase 1.5 + GainWorker**: run a campaign with ORT enabled, compare bind_ms and
+   wall-time per episode vs. the Phase 1 baseline (0.78–0.98ms/ep). Confirm GainWorker keeps
+   the tokio loop event latency flat even during gain updates.
+2. **Duty-cycle validation**: run burn-only vs. ORT encoder campaign (same seed+clip), compare
+   loss trajectory and per-region dc distributions. Gate any weight-sharing on this passing.
+3. **Identify next bottleneck** after GainWorker: check `perc_prior_us` and `perc_bind_us`
+   from the metrics — if those dominate, the GRU binding (0.78ms sequential) is the wall.
 
 ---
 
