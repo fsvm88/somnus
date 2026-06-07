@@ -44,12 +44,14 @@ pub struct ActionDecoder {
     optimizer: ProjOptim,
     /// Frozen embedding table: flat [vocab_size * LM_HIDDEN], row-major f32.
     embed_table: Vec<f32>,
-    /// Transformer-only (no LM head), static [1,5,896] — used by update_gain().
-    gain_session: Session,
+    /// Transformer-only (no LM head), static [1,5,896].
+    /// Moved to GainWorker via `create_gain_worker`; None afterwards.
+    gain_session: Option<Session>,
     /// Full model with LM head, dynamic seq_len — used by generate().
     lm_session: Session,
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
+    #[allow(dead_code)]
     pub gain: [f32; 5],
     device: NdArrayDevice,
     /// Cross-cycle LM hidden-state cache. Clips loop so token sequences repeat; after the first
@@ -78,7 +80,7 @@ impl ActionDecoder {
             }
         }
 
-        let gain_session = crate::migraphx_session(&gain_path)?;
+        let gain_session = Some(crate::migraphx_session(&gain_path)?);
         let lm_profile_prefix = ort_profile_dir.map(|d| d.join("qwen25_lm"));
         let lm_session = crate::cpu_session(&lm_path, lm_profile_prefix.as_deref())?;
 
@@ -121,28 +123,37 @@ impl ActionDecoder {
 
     /// Project episode vector → 4 region tokens → LM forward →
     /// update `self.gain` from hidden-state L2 norms (ADR 0012).
+    ///
+    /// No-ops if gain_session was moved to GainWorker via `create_gain_worker`.
+    #[allow(dead_code)]
     pub fn update_gain(&mut self, episode: &[f32]) -> Result<()> {
-        let proj_flat = self.project_flat(episode)?; // [N_REGIONS * LM_HIDDEN]
+        if self.gain_session.is_none() {
+            return Ok(());
+        }
+        // Compute projection before borrowing gain_session to avoid self re-borrow conflict.
+        let proj_flat = self.project_flat(episode)?;
 
+        let sess = self.gain_session.as_mut().unwrap();
         let inputs = Array3::from_shape_vec((1, N_REGIONS, LM_HIDDEN), proj_flat)
             .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
         let tensor = TensorRef::from_array_view(&inputs)?;
-        let outputs = self
-            .gain_session
-            .run(ort::inputs!["inputs_embeds" => tensor])?;
-        let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
-        if shape.len() < 3 || shape[1] != N_REGIONS as i64 {
-            bail!("unexpected last_hidden_state shape: {:?}", shape);
-        }
-        let hidden = data.to_vec();
+        // Extract hidden data inside a block so outputs (and its borrow of sess) drops
+        // before we write to self.gain.
+        let norms: [f32; 5] = {
+            let outputs = sess.run(ort::inputs!["inputs_embeds" => tensor])?;
+            let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+            if shape.len() < 3 || shape[1] != N_REGIONS as i64 {
+                bail!("unexpected last_hidden_state shape: {:?}", shape);
+            }
+            let h = data.to_vec();
+            std::array::from_fn(|i| {
+                let row = &h[i * LM_HIDDEN..(i + 1) * LM_HIDDEN];
+                row.iter().map(|x| x * x).sum::<f32>().sqrt()
+            })
+        };
 
-        // L2 norm of each region position's hidden vector → softmax → clipped gain
-        let norms: [f32; 5] = std::array::from_fn(|i| {
-            let row = &hidden[i * LM_HIDDEN..(i + 1) * LM_HIDDEN];
-            row.iter().map(|x| x * x).sum::<f32>().sqrt()
-        });
         let max_n = norms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp: [f32; 5] = norms.map(|n| ((n - max_n) / 10.0).exp()); // temperature = 10
+        let exp: [f32; 5] = norms.map(|n| ((n - max_n) / 10.0).exp());
         let sum_e: f32 = exp.iter().sum();
         let attn = exp.map(|e| e / sum_e);
         self.gain = attn.map(|a| (a * 5.0).clamp(0.5, 2.0));
@@ -450,6 +461,33 @@ impl ActionDecoder {
         Ok(flat.iter().map(|x| x * x).sum::<f32>().sqrt())
     }
 
+    /// Move the gain ORT session to a background `GainWorker` thread.
+    ///
+    /// Call once at startup (after weights are loaded). The session is not duplicated —
+    /// it moves entirely to the worker thread (no second GPU allocation).
+    /// Returns None if the gain session was already moved or was never loaded.
+    pub fn create_gain_worker(&mut self) -> Option<GainWorker> {
+        let sess = self.gain_session.take()?;
+        let proj_w = self.proj_weights_flat();
+        Some(GainWorker::spawn(sess, proj_w))
+    }
+
+    /// Snapshot the projection linear weights as a flat Vec<f32> (shape [n_in, n_out]).
+    /// Used to initialize or refresh the GainWorker after NREM training.
+    pub fn proj_weights_flat(&self) -> Vec<f32> {
+        self.model
+            .as_ref()
+            .unwrap()
+            .projection
+            .weight
+            .val()
+            .detach()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap()
+    }
+
     /// Save projection weights to a burn binary file.
     pub fn save_weights(&self, path: &std::path::Path) -> Result<()> {
         let model_clone = self.model.as_ref().unwrap().clone();
@@ -512,6 +550,103 @@ impl ActionDecoder {
         }
         Ok(out)
     }
+}
+
+// ── GainWorker ────────────────────────────────────────────────────────────────
+
+enum GainMsg {
+    Compute(Vec<f32>),
+    UpdateWeights(Vec<f32>),
+}
+
+/// Offloads per-episode Qwen gain updates from the tokio event loop to a dedicated OS thread.
+///
+/// The main loop sends episode vectors non-blocking and polls for results non-blocking.
+/// Projection weights are refreshed after each NREM cycle via `update_weights`.
+pub struct GainWorker {
+    tx: std::sync::mpsc::SyncSender<GainMsg>,
+    rx: std::sync::mpsc::Receiver<[f32; 5]>,
+}
+
+impl GainWorker {
+    /// Spawn the worker thread. Takes ownership of the gain ORT session (no duplicate load).
+    pub fn spawn(session: Session, proj_weights: Vec<f32>) -> Self {
+        let (tx, req_rx) = std::sync::mpsc::sync_channel::<GainMsg>(2);
+        let (resp_tx, rx) = std::sync::mpsc::sync_channel::<[f32; 5]>(2);
+
+        std::thread::Builder::new()
+            .name("gain-worker".into())
+            .spawn(move || {
+                let mut proj = proj_weights;
+                let mut session = session;
+                while let Ok(msg) = req_rx.recv() {
+                    match msg {
+                        GainMsg::UpdateWeights(w) => proj = w,
+                        GainMsg::Compute(ep) => {
+                            let gain = gain_from_episode(&mut session, &proj, &ep).unwrap_or_else(
+                                |e| {
+                                    tracing::warn!(?e, "gain computation failed");
+                                    [1.0f32; 5]
+                                },
+                            );
+                            let _ = resp_tx.send(gain);
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn gain-worker thread");
+
+        Self { tx, rx }
+    }
+
+    /// Non-blocking: queue an episode for gain computation.
+    /// Returns false and drops the request if the worker is busy (channel full).
+    pub fn request_gain(&self, episode: Vec<f32>) -> bool {
+        self.tx.try_send(GainMsg::Compute(episode)).is_ok()
+    }
+
+    /// Non-blocking: return the latest computed gain if ready.
+    pub fn try_recv_gain(&self) -> Option<[f32; 5]> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Refresh projection weights after NREM training. Non-blocking; drops if channel full.
+    pub fn update_weights(&self, weights: Vec<f32>) {
+        let _ = self.tx.try_send(GainMsg::UpdateWeights(weights));
+    }
+}
+
+/// Raw gain computation: project episode → region tokens → ORT forward → norms → gain.
+fn gain_from_episode(session: &mut Session, proj_w: &[f32], episode: &[f32]) -> Result<[f32; 5]> {
+    // project_flat: episode [EPISODE_DIM] @ proj_w [EPISODE_DIM, N_REGIONS * LM_HIDDEN]
+    // Burn stores Linear weights as [n_in, n_out] (no transpose needed for y = x @ W).
+    let n_out = N_REGIONS * LM_HIDDEN;
+    let mut proj_flat = vec![0.0f32; n_out];
+    for (i, &xi) in episode.iter().enumerate() {
+        let row = &proj_w[i * n_out..(i + 1) * n_out];
+        for (j, &wij) in row.iter().enumerate() {
+            proj_flat[j] += xi * wij;
+        }
+    }
+
+    let inputs = Array3::from_shape_vec((1, N_REGIONS, LM_HIDDEN), proj_flat)
+        .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
+    let tensor = TensorRef::from_array_view(&inputs)?;
+    let outputs = session.run(ort::inputs!["inputs_embeds" => tensor])?;
+    let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+    if shape.len() < 3 || shape[1] != N_REGIONS as i64 {
+        bail!("unexpected last_hidden_state shape: {:?}", shape);
+    }
+    let hidden = data.to_vec();
+    let norms: [f32; 5] = std::array::from_fn(|i| {
+        let row = &hidden[i * LM_HIDDEN..(i + 1) * LM_HIDDEN];
+        row.iter().map(|x| x * x).sum::<f32>().sqrt()
+    });
+    let max_n = norms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp: [f32; 5] = norms.map(|n| ((n - max_n) / 10.0).exp());
+    let sum_e: f32 = exp.iter().sum();
+    let attn = exp.map(|e| e / sum_e);
+    Ok(attn.map(|a| (a * 5.0).clamp(0.5, 2.0)))
 }
 
 fn argmax(logits: &[f32]) -> u32 {

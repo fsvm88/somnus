@@ -73,7 +73,7 @@ fn onnx_thread_budget() -> (usize, usize) {
     (intra, inter)
 }
 
-use action::ActionDecoder;
+use action::{ActionDecoder, GainWorker};
 use whisper_asr::WhisperDecoder;
 
 use anyhow::Result;
@@ -195,8 +195,8 @@ struct Args {
     action_gain: bool,
 
     /// Run the gain update every N episodes instead of every episode.
-    /// Gain changes slowly; N=10 cuts Qwen ORT cost by ~10× with negligible quality loss.
-    #[arg(long, default_value = "10")]
+    /// Gain changes slowly; N=20 is sufficient while keeping the background worker busy < 50%.
+    #[arg(long, default_value = "20")]
     gain_interval: usize,
 
     /// Run wake_reconstruct_step every N episodes. Higher values reduce CPU overhead at
@@ -772,6 +772,17 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Move the gain ORT session to a background thread so ~54ms Qwen calls don't
+    // block the tokio event loop. Only created when both --action and --action-gain are set.
+    let gain_worker: Option<GainWorker> = if args.action_gain {
+        decoder.as_mut().and_then(|d| d.create_gain_worker())
+    } else {
+        None
+    };
+    if gain_worker.is_some() {
+        info!("gain worker spawned — Qwen gain updates running in background");
+    }
+
     // ── language embedder ─────────────────────────────────────────────────────
     let lang_embedder: Option<LangEmbedder> = if args.language {
         match LangEmbedder::new(&args.models_dir) {
@@ -842,7 +853,6 @@ async fn main() -> Result<()> {
     let mut speech_encode_total_ms: u64 = 0;
     let mut env_encode_total_ms: u64 = 0;
     let mut video_encode_total_ms: u64 = 0;
-    let mut gain_update_total_ms: u64 = 0;
     let mut perception_total_ms: u64 = 0;
     // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
     // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
@@ -1275,6 +1285,13 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── poll gain worker result (non-blocking) ────────────────────────────
+        if let Some(ref gw) = gain_worker {
+            if let Some(g) = gw.try_recv_gain() {
+                perception.set_region_gain(g);
+            }
+        }
+
         // ── drain pending language lines before potentially sleeping ──────────
         while !lang_closed {
             match lang_rx.try_recv() {
@@ -1287,7 +1304,6 @@ async fn main() -> Result<()> {
                         &mut episodic,
                         args.top_k,
                         &recall,
-                        args.action_gain,
                         &mut decoder,
                         &mut wake_reconstruct_counter,
                         args.wake_reconstruct_interval,
@@ -1398,6 +1414,10 @@ async fn main() -> Result<()> {
                         if let Err(e) = dec.save_weights(&dec_w) {
                             tracing::warn!(?e, "decoder weights snapshot failed");
                         }
+                        // Push updated projection weights to gain worker (non-blocking).
+                        if let Some(ref gw) = gain_worker {
+                            gw.update_weights(dec.proj_weights_flat());
+                        }
                     }
                     // Write metrics NDJSON line.
                     if let Some(ref mut mf) = metrics_sink {
@@ -1488,7 +1508,7 @@ async fn main() -> Result<()> {
                             "speech_encode_total_ms":     speech_encode_total_ms,
                             "env_encode_total_ms":        env_encode_total_ms,
                             "video_encode_total_ms":      video_encode_total_ms,
-                            "gain_update_total_ms":       gain_update_total_ms,
+                            "gain_update_total_ms":       0u64,
                             "perception_total_ms":        perception_total_ms,
                             "perc_kwta_us":   perf_breakdown.kwta_us,
                             "perc_symbolic_us": perf_breakdown.symbolic_us,
@@ -1528,7 +1548,6 @@ async fn main() -> Result<()> {
                     speech_encode_total_ms = 0;
                     env_encode_total_ms = 0;
                     video_encode_total_ms = 0;
-                    gain_update_total_ms = 0;
                     perception_total_ms = 0;
                     cosine_ewma = None;
                     cosine_baseline = None;
@@ -1609,18 +1628,11 @@ async fn main() -> Result<()> {
                                 if !startup_query_fired && out.episode.is_some() {
                                     startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
-                                if args.action_gain && out.episode.is_some() {
-                                    gain_episode_counter += 1;
-                                    if gain_episode_counter.is_multiple_of(args.gain_interval) {
-                                        if let Some(ep) = &out.episode {
-                                            if let Some(ref mut dec) = decoder {
-                                                let t_gain = std::time::Instant::now();
-                                                match dec.update_gain(&ep.0) {
-                                                    Ok(()) => perception.set_region_gain(dec.gain),
-                                                    Err(e) => tracing::warn!(?e, "gain update failed"),
-                                                }
-                                                gain_update_total_ms += t_gain.elapsed().as_millis() as u64;
-                                            }
+                                if let Some(ref gw) = gain_worker {
+                                    if let Some(ep) = &out.episode {
+                                        gain_episode_counter += 1;
+                                        if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                            gw.request_gain(ep.0.clone());
                                         }
                                     }
                                 }
@@ -1672,18 +1684,11 @@ async fn main() -> Result<()> {
                                 if !startup_query_fired && out.episode.is_some() {
                                     startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
-                                if args.action_gain && out.episode.is_some() {
-                                    gain_episode_counter += 1;
-                                    if gain_episode_counter.is_multiple_of(args.gain_interval) {
-                                        if let Some(ep) = &out.episode {
-                                            if let Some(ref mut dec) = decoder {
-                                                let t_gain = std::time::Instant::now();
-                                                match dec.update_gain(&ep.0) {
-                                                    Ok(()) => perception.set_region_gain(dec.gain),
-                                                    Err(e) => tracing::warn!(?e, "gain update failed"),
-                                                }
-                                                gain_update_total_ms += t_gain.elapsed().as_millis() as u64;
-                                            }
+                                if let Some(ref gw) = gain_worker {
+                                    if let Some(ep) = &out.episode {
+                                        gain_episode_counter += 1;
+                                        if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                            gw.request_gain(ep.0.clone());
                                         }
                                     }
                                 }
@@ -1706,7 +1711,6 @@ async fn main() -> Result<()> {
                             &mut episodic,
                             args.top_k,
                             &recall,
-                            args.action_gain,
                             &mut decoder,
                             &mut wake_reconstruct_counter,
                             args.wake_reconstruct_interval,
@@ -1717,6 +1721,14 @@ async fn main() -> Result<()> {
                                 wake_episodes += 1;
                                 if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
                                     update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
+                                }
+                                if let Some(ref gw) = gain_worker {
+                                    if let Some(ref ep) = r.last_episode {
+                                        gain_episode_counter += 1;
+                                        if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                            gw.request_gain(ep.clone());
+                                        }
+                                    }
                                 }
                             }
                             if let Some(m) = r.reconstruct_mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
@@ -1859,6 +1871,8 @@ const WAKE_RECONSTRUCT_SALIENCE_THRESHOLD: f32 = 0.8;
 /// Result returned by `ingest_language_line` (ADR 0022).
 struct LangIngestResult {
     episode_produced: bool,
+    /// Raw episode vector when an episode was produced; used by gain worker.
+    last_episode: Option<Vec<f32>>,
     reconstruct_mse: Option<f32>,
     prior_cosines: [Option<f32>; 5],
     /// Per-episode stats for cycle-level accumulation; None when no episode was produced.
@@ -1884,7 +1898,6 @@ fn ingest_language_line(
     episodic: &mut EpisodicBuffer,
     top_k: usize,
     recall: &RecollectionLayer,
-    action_gain: bool,
     decoder: &mut Option<ActionDecoder>,
     wake_reconstruct_counter: &mut usize,
     wake_reconstruct_interval: usize,
@@ -1948,17 +1961,8 @@ fn ingest_language_line(
                     }
                 }
             }
-            if action_gain {
-                if let Some(ep) = &out.episode {
-                    if let Some(dec) = decoder.as_mut() {
-                        match dec.update_gain(&ep.0) {
-                            Ok(()) => perception.set_region_gain(dec.gain),
-                            Err(e) => tracing::warn!(?e, "gain update failed"),
-                        }
-                    }
-                }
-            }
-            Some(LangIngestResult { episode_produced, reconstruct_mse, prior_cosines, ep_stats, throttle_passed, settle_iters, settle_delta, perception_ms })
+            let last_episode = out.episode.as_ref().map(|ep| ep.0.clone());
+            Some(LangIngestResult { episode_produced, last_episode, reconstruct_mse, prior_cosines, ep_stats, throttle_passed, settle_iters, settle_delta, perception_ms })
         }
         Err(e) => {
             tracing::error!(?e, "perception error (language)");
