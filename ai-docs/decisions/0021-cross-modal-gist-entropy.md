@@ -3,6 +3,9 @@
 **Status:** accepted
 **Date:** 2026-05-30
 
+> **Decision:** Add IngestSource enum on EpisodeRecord to track modality; add cross_modal_gist_entropy metric (Shannon entropy over ingest_source distribution per cycle).  
+> **Keywords:** IngestSource, gist entropy, cross_modal_gist_entropy, concept probe, modality balance, SMNHOT02, asr_count, blend_count
+
 ## Context
 
 The existing gist probe (ADR 0007) measures episodic clustering quality: does the system

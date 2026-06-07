@@ -3,6 +3,9 @@
 **Date:** 2026-05-10  
 **Status:** Accepted
 
+> **Decision:** 4-head scaled dot-product cross-attention over 5 region tokens + GRU temporal context (GRU_HIDDEN=256) → EPISODE_DIM=640 episode vector; working memory appended to K/V.  
+> **Keywords:** BindingArea, cross-attention, GRU, GRU_HIDDEN=256, EPISODE_DIM=640, D_PROJ=128, working memory, region tokens, temporal context, try_bind
+
 ## Context
 
 Phase 3 introduced a binding area that concatenated four N_UNITS-dimensional dense region activations and projected the result to EPISODE_DIM=512 via a single `linear_no_bias(4096, 512)` layer. This had two problems:

@@ -1,5 +1,8 @@
 # Vector retrieval
 
+> **Contents:** ANN options for the recollection layer — flat search, HNSW (✓ committed, hnsw_rs), IVF-PQ, modern Hopfield networks. Memory/query latency by scale; persistence (dump/load, SMNWARM magic); warm==cold union property.  
+> **When to read:** Scaling the warm HNSW index; debugging slow restart times; considering a cold-tier ANN index.
+
 Research note for somnus. Covers the recollection layer's retrieval mechanism: approximate nearest-neighbor (ANN) indexes, exact search, and associative-memory (Hopfield) approaches. All numbers are **engineering estimates**.
 
 See `architecture.md` "Memory hierarchy" for the recollection layer design. The recollection layer is the cross-tier index: given a partial cue (from current perception or during sleep), it identifies relevant memories anywhere in the warm or cold tiers and materializes them into warmer tiers.

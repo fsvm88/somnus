@@ -3,6 +3,9 @@
 - **Status:** accepted
 - **Date:** 2026-04-28
 
+> **Decision:** EncoderOutput struct + ORT session types for the encoding pipeline; ort 2.0 against system ORT 1.24.4; parity-tested against HuggingFace Python reference (≤1e-4).  
+> **Keywords:** EncoderOutput, ORT session, ort crate, encoding pipeline, speech_enc, env_enc, visual_enc, ONNX, parity test
+
 ## Context
 
 ADR 0003 selected and pinned the three frozen encoders (Whisper-tiny for speech,

@@ -3,6 +3,9 @@
 **Status:** accepted
 **Date:** 2026-05-30
 
+> **Decision:** Add --max-cold-records N; during sleep spill, truncate cold archive to most recent N records (FIFO) to prevent unbounded growth.  
+> **Keywords:** cold archive, max-cold-records, truncation, systematic forgetting, SMNCOLD2, bounded archive, FIFO
+
 ## Context
 
 The cold archive (`episodes.cold`) is append-only. Without a bound, it grows indefinitely:

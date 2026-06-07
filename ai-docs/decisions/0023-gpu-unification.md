@@ -1,7 +1,10 @@
 # 0023. GPU unification via ORT/MIGraphX for perception inference
 
-- **Status:** proposed
+- **Status:** accepted; Phase 0 + Phase 1 implemented (2026-06-07)
 - **Date:** 2026-06-02
+
+> **Decision:** Export perception inference (k-WTA, cross_modal_proj, BindingArea GRU) as two ONNX graphs (perception_encoder.onnx + perception_binding.onnx) run via ORT+MIGraphX; burn stays on CPU for training only. Duty-cycle topk/masking on CPU between graphs to avoid MIGraphX ScatterElements/INT64 bug on gfx1201.  
+> **Keywords:** ORT, MIGraphX, GPU, perception_encoder.onnx, perception_binding.onnx, two-graph split, burn, kwta_us, sym_us, ScatterElements bug, INT64 output, gfx1201, RDNA4, sync_ort_weights, enable_ort_inference
 
 ## Context
 

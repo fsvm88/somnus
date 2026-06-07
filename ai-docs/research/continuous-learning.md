@@ -1,5 +1,8 @@
 # Continuous learning
 
+> **Contents:** CL families (replay/rehearsal, regularization, parameter isolation, growth), CLS dual-memory theory, where somnus's approach sits, hardware budget tradeoffs, and open failure modes.  
+> **When to read:** Designing the sleep-cycle learning update; evaluating catastrophic forgetting risk; understanding why CLS+replay+growth was chosen.
+
 Literature behind somnus's continuous-learning design. The commitments live in `vision.md` (commitments 1, 5); the operationalization is in `architecture.md`. This note records what the literature actually says, what it doesn't say, and where somnus diverges.
 
 ## Summary of somnus's approach

@@ -1,5 +1,8 @@
 # Replay strategies
 
+> **Contents:** Replay sampling options — uniform, recency-weighted, prioritized experience replay (PER), reservoir, generative. Covers compute overhead, episodic buffer sizing recommendations, and why uniform+synthetic was chosen for somnus.  
+> **When to read:** Tuning the NREM replay loop; implementing PER or recency weighting; understanding synthetic replay (ADR 0019).
+
 Research note for somnus. Covers how episodic memory content is selected and replayed into semantic memory during NREM-like sleep. All numbers are **engineering estimates**.
 
 See `architecture.md` "Sleep stages" (NREM-like: "Replay") and `sleep-and-consolidation.md`. The replay mechanism is the primary consolidation channel from hot (episodic) to warm (semantic) memory.

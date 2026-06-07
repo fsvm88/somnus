@@ -3,6 +3,9 @@
 **Status:** accepted  
 **Date:** 2026-05-31
 
+> **Decision:** Expand per-cycle NDJSON metrics to include ep_salience accumulation, wake_reconstruct throttle counters, blend_count, modality balance, NREM coverage, and per-region prior_cosine means.  
+> **Keywords:** ep_salience, wake_reconstruct_counter, blend_count, asr_count, modality_balance, NREM coverage, prior_cosine_mean, metrics.jsonl, NDJSON
+
 ## Context
 
 The per-cycle NDJSON metrics (ADR 0016) provided good visibility into NREM/REM

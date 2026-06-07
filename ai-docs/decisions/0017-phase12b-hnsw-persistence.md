@@ -3,6 +3,9 @@
 **Status:** accepted  
 **Date:** 2026-05-18
 
+> **Decision:** Dump warm HNSW index to disk after each sleep (hnsw.file_dump + records.bin sidecar + warm/version tag); load on restart to avoid cold-rebuild (~3min → <5s).  
+> **Keywords:** HNSW persistence, warm index, dump, load, Box::leak, warm/version, SMNWARM, restart time, SemanticStore
+
 ## Context
 
 On every restart, `load_snapshot` rebuilds the warm HNSW index by iterating the entire

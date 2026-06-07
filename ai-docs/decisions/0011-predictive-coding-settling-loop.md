@@ -3,6 +3,9 @@
 **Date:** 2026-05-11  
 **Status:** Accepted
 
+> **Decision:** After try_bind, run a fixed-budget settling loop; each iteration re-runs encoder+binding with prior-blended inputs until prior_cosine converges or budget exhausted. ORT enc+bind used when sessions active.  
+> **Keywords:** settle, settling loop, settle_episode, prior_cosine, SETTLE_EPS, SETTLE_COSINE_GATE, settle_steps, ORT settle, Path A/B/C
+
 ## Context
 
 ADR 0010 introduced top-down priors that bias the *next* episode's encoder inputs with predictions derived from the *current* episode. This is a one-step, inter-episode feedback path. It does not allow the system to iteratively refine the *current* episode by cycling feedback through the k-WTA layers multiple times before committing to a representation.

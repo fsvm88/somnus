@@ -1,5 +1,8 @@
 # ML Runtimes
 
+> **Contents:** Framework comparison — ort (inference, ✓ committed), burn (training, ✓ committed/NdArray backend), candle (not adopted), tch-rs (not adopted). Latency estimates, memory models, recommended split. Note: candle recommendation in this file was superseded; see updated "Recommended runtime architecture" section.  
+> **When to read:** Evaluating a new ML framework; understanding why burn was chosen over candle; checking ORT latency estimates.
+
 Research note for somnus. Covers the tensor + inference + training runtime layer in Rust: `ort`, `candle`, `burn`, and `tch-rs`. All numbers are **engineering estimates**; exact figures depend on GPU, driver, and model topology.
 
 See `tech-stack.md` for the current candidate list. The choice here drives how all frozen encoder inference and all cognitive-layer training is implemented.
@@ -140,21 +143,23 @@ Rust bindings to PyTorch's C++ libtorch library.
 
 ## Recommended runtime architecture
 
+> **Actual choice (supersedes the recommendation below):** `burn` (NdArray/CPU) was adopted for cognitive-layer training, not `candle`. The wake inference path was later migrated to `ort` + MIGraphX (ADR 0023). The current split is: `ort` for all inference (encoders + perception), `burn` for all training (NREM/wake_reconstruct/AdamW).
+
 ```
 Frozen encoder inference (Whisper, CLAP, DINOv2)
     → ort  (lowest latency, ONNX quantization)
 
-Cognitive-layer forward pass during wake
-    → candle  (lightweight, no training needed in wake mode)
+Perception inference during wake (k-WTA, binding, cross_modal_proj)
+    → ort + MIGraphX  (GPU, two-graph split; ADR 0023)
 
 Sleep-cycle training (replay updates, growth, homeostatic downscaling)
-    → candle  (primary) or burn (if training loop complexity demands it)
+    → burn  (NdArray backend, CPU; full autograd + AdamW)
 
 Compression / quantization of semantic memory
-    → ort quantization tools (at ONNX export)  or  candle FP16 casts
+    → ort quantization tools (at ONNX export)
 ```
 
-This split keeps the hot path (encoders during wake) on the fastest inference runtime, while giving the sleep cycle access to full autograd.
+This split keeps the hot path (encoders + perception during wake) on the fastest inference runtime, while giving the sleep cycle access to full autograd.
 
 ---
 

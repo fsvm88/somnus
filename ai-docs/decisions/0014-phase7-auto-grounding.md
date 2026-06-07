@@ -3,6 +3,9 @@
 **Status:** Implemented
 **Date:** 2026-05-17
 
+> **Decision:** Whenever ASR or stdin produces an episode, store that text as text_target on the episode for use as LM distillation target during NREM projection training.  
+> **Keywords:** auto-grounding, text_target, ASR, Whisper, grounding, LM training target, NREM projection, ingest_language
+
 ---
 
 ## Context

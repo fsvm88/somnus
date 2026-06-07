@@ -3,6 +3,9 @@
 **Status:** accepted  
 **Date:** 2026-05-10
 
+> **Decision:** EpisodicBuffer (bounded ring, hot) + SemanticStore (hnsw_rs HNSW L2, warm) + ColdArchive (INT8 memmap2, cold) + RecollectionLayer; warm==cold union maintained at all times.  
+> **Keywords:** EpisodicBuffer, SemanticStore, ColdArchive, RecollectionLayer, hnsw_rs, HNSW, hot, warm, cold, memmap2, somnus-memory
+
 ## Context
 
 Phase 3 produced 512-dim episode vectors from the binding area. Phase 4 makes those vectors retrievable: given a cue, the system should return the most similar past episodes. This is the first half of the recollection mechanism described in `architecture.md`.

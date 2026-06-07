@@ -1,5 +1,8 @@
 # Vision
 
+> **Contents:** The six defining commitments of somnus (continuous learning, sleep/wake, multimodal input, brain-inspired architecture, bottom-up growth, grounded concepts) plus what we are not building and why Rust.  
+> **When to read:** Evaluating whether a proposed feature fits the project; checking biological vs. engineering justification rules.
+
 **somnus** is a research project toward an AI system that resembles, in its information-processing structure, a human brain.
 
 ## Defining commitments

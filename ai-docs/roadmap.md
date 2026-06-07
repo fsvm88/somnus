@@ -1,5 +1,8 @@
 # Roadmap
 
+> **Contents:** Phase-by-phase record of what was built and when, with exit criteria. Phases 0–13 complete. Phase 9b (live mic/webcam) and Phase 14+ (GPU unification scaling) are open.  
+> **When to read:** Orienting in the project's history; finding which ADR covers a phase; identifying what's next.
+>
 > **Status:** coarse phasing. Use as orientation, not a commitment. Update when reality diverges.
 
 The phases below are approximate and overlap. We do not need to finish a phase before touching the next; the listing imposes priority, not strict order. Each phase has a single concrete *exit criterion* — when we can answer that question, we have made meaningful progress.

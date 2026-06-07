@@ -3,6 +3,9 @@
 - **Status:** accepted
 - **Date:** 2026-04-28
 
+> **Decision:** Whisper-tiny (speech, 384-dim) + CLAP-HTSAT-unfused (env, 512-dim) + DINOv2-S/14 (visual, 384-dim) as frozen pretrained encoders, all run via ORT.  
+> **Keywords:** Whisper, CLAP, DINOv2, frozen encoder, 384-dim, 512-dim, ORT, speech, environment, visual
+
 ## Context
 
 Phase 2 wires frozen pretrained encoders between the sensory pipeline (`somnus-sensory`)

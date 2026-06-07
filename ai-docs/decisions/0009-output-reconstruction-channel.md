@@ -3,6 +3,9 @@
 **Date:** 2026-05-11  
 **Status:** Accepted
 
+> **Decision:** Five EmaOutputHeads (EPISODE_DIM → region_dim per region) trained with MSE during wake; EMA weights synced from burn after each update cycle.  
+> **Keywords:** EmaOutputHeads, output heads, reconstruction, wake_reconstruct, MSE, linear_no_bias, EPISODE_DIM, region_dim, EMA
+
 ## Context
 
 The system currently has no generative or predictive path. The binding area produces a 640-dim episode vector during wake, but nothing uses that vector to reconstruct the sensory inputs that produced it. Adding output heads achieves two things:

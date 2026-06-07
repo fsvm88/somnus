@@ -3,6 +3,9 @@
 **Status:** accepted  
 **Date:** 2026-05-18
 
+> **Decision:** Prune grown units (index ≥ N_UNITS=1024) by L1 norm of encoder weight row when gist_recall_rate ≥ 0.8; default prune_fraction=0.5, prune_min_grown=64.  
+> **Keywords:** pruning, grow_region, prune_region, L1 norm, gist_recall_rate, prune_fraction, prune_min_grown, region_sizes
+
 ## Context
 
 `grow_region` adds units to a region's k-WTA encoder and SAE decoder when gist-level

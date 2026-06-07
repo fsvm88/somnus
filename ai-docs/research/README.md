@@ -1,5 +1,8 @@
 # research/
 
+> **Contents:** Topic-organized research notes — theory (continuous learning, sleep, predictive coding), component engineering (encoders, ML runtimes, vector retrieval, sparse coding, memory compression), and algorithms (growth, replay, binding). Each file cites primary sources and distinguishes findings from somnus-specific implications.  
+> **When to read:** Looking for the evidence behind a design choice; finding alternatives that were considered.
+
 Topic-organized research notes that inform design decisions.
 
 ## Conventions

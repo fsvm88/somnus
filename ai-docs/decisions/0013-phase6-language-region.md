@@ -3,6 +3,9 @@
 **Status:** Implemented (Stage A and Stage B complete)
 **Date:** 2026-05-17
 
+> **Decision:** Language as 5th cognitive region (index 4, 896-dim Qwen2.5 embed table mean-pooled); EPISODE_DIM 512→640; fed from stdin text and Whisper ASR transcripts.  
+> **Keywords:** language region, Qwen2.5, 896-dim, EPISODE_DIM=640, ASR, ingest_language, 5th region, mean-pool, text bypass
+
 ---
 
 ## Context

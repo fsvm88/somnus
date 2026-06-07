@@ -3,6 +3,9 @@
 **Status:** accepted  
 **Date:** 2026-05-10
 
+> **Decision:** NREM replay (AdamW + cosine LR, homeostatic decay) + REM gist probe (k-means, growth when gist_recall_rate < 0.5) + snapshot (weights + episodic + region_sizes); sleep triggered by high-water mark, schedule, or perf-degradation.  
+> **Keywords:** NREM, REM, sleep, replay, consolidation, growth, snapshot, AdamW, cosine LR, homeostatic, gist_recall_rate, sleep_trigger, high_water, schedule, perf_degradation
+
 ## Context
 
 Phase 4 left the system in eager-insert mode: every episode vector lands in both the hot (EpisodicBuffer) and warm (SemanticStore) tiers immediately, without any consolidation, weight updates, or compression. The k-WTA and SAE weights from Phase 3 are still random. Phase 5 adds the sleep machinery that makes the hot→warm→cold pipeline meaningful and starts training the perception weights via experience replay.

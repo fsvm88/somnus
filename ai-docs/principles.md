@@ -1,5 +1,8 @@
 # Principles
 
+> **Contents:** Working heuristics: research-first, brain-inspired-not-brain-faithful, modular-by-function, continuous-over-batch, cheap-to-throw-away, honesty-about-state, reproducibility, time-honest evaluation.  
+> **When to read:** Deciding how to implement something; resolving a tradeoff where no ADR exists.
+
 How we approach the work. These are heuristics, not laws — but a violation should be deliberate and noted.
 
 ## Research-first

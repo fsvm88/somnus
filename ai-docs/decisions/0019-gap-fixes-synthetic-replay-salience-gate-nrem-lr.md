@@ -3,6 +3,9 @@
 **Date:** 2026-05-30  
 **Status:** Accepted
 
+> **Decision:** Three gradient-quality improvements: (1) synthetic NREM replay (REM recombinations pushed into hot buffer), (2) salience-gated wake reconstruct (WAKE_RECONSTRUCT_SALIENCE=0.8 threshold), (3) salience-scaled NREM LR (LR_SALIENCE_CAP=2.0).  
+> **Keywords:** synthetic replay, salience gate, NREM LR, WAKE_RECONSTRUCT_SALIENCE, LR_SALIENCE_CAP, LR_SALIENCE_MAX_SCALE, prior_beta, ep_salience
+
 ## Context
 
 Three low-effort improvements identified after the architectural roundup (A–G commits). All target gradient signal quality without changing the model architecture.

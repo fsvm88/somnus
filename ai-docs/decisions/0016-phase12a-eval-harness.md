@@ -3,6 +3,9 @@
 **Status:** accepted  
 **Date:** 2026-05-18
 
+> **Decision:** eval_metrics.py reads metrics.jsonl and emits 4 charts (language trajectory, growth timeline, per-region MSE, sleep triggers); train_campaign.sh runs it automatically.  
+> **Keywords:** eval_metrics.py, metrics.jsonl, charts, language_trajectory, growth_timeline, per_region_mse, sleep_triggers, train_campaign.sh, session labels
+
 ## Context
 
 Every sleep cycle writes a line of JSON to `memory/metrics_*.jsonl` containing

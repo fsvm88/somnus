@@ -1,5 +1,8 @@
 # Glossary
 
+> **Contents:** Definitions for core operating modes (wake/sleep), learning terms (replay, consolidation, catastrophic forgetting), memory subsystems, perception, and architecture vocabulary.  
+> **When to read:** Encountering an unfamiliar term in any doc or in the code.
+
 Single source of truth for terminology. Define terms here; link from elsewhere.
 
 When you introduce a new term in a doc or in code, add it here first — even if just one line.

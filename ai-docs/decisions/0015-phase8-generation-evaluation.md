@@ -3,6 +3,9 @@
 **Status:** accepted  
 **Date:** 2026-05-17
 
+> **Decision:** Replace MSE projection loss with cosine alignment loss (prevents gradient explosion across sessions); add repetition penalty 1.3 for generation; add per-session eval diagnostics.  
+> **Keywords:** cosine alignment loss, MSE replacement, repetition penalty, generation, evaluation, projection training, gradient explosion
+
 ## Context
 
 Phase 7 delivered auto-grounding (ADR 0014): ASR transcriptions are now automatically set as

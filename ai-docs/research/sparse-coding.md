@@ -1,5 +1,8 @@
 # Sparse coding
 
+> **Contents:** k-WTA (✓ committed, n=1024, k=20), top-k, SAE/L1-penalized autoencoders. Covers dead-unit problem, duty-cycle boosting solution (DUTY_CYCLE_ALPHA=0.001, BOOST_STRENGTH=1.0, TARGET_DC=20/1024), compute overhead, interaction with growth.  
+> **When to read:** Tuning k-WTA hyperparameters; debugging dead units; understanding why duty-cycle boosting was added.
+
 Research note for somnus. Covers sparse representation schemes for the regional concept areas: k-winner-take-all (k-WTA), top-k activation, and sparse autoencoders (SAE/L1-penalized). All numbers are **engineering estimates**.
 
 See `architecture.md` "Regional concept areas" for the design commitment. Sparsity is a core mechanism for reducing interference between concepts and making growth local — new units can occupy different activation patterns without overwriting consolidated ones.

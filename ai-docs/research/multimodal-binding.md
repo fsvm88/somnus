@@ -1,5 +1,8 @@
 # Multimodal binding
 
+> **Contents:** Binding mechanism options (concatenation, gated fusion, cross-attention ✓ committed, contrastive, PoE), top-down prior feedback, latency constraints. Covers 4-head cross-attention + GRU temporal context rationale.  
+> **When to read:** Understanding the BindingArea design; adding a new region; evaluating alternatives to cross-attention.
+
 Research note for somnus. Covers how the integrative/binding area composes concurrent regional embeddings into a single unified episode, and how the bidirectional top-down prior paths work. All numbers are **engineering estimates**.
 
 See `architecture.md` "Integrative / binding area" for the design commitment. The binding area is the gateway from the regional layer to episodic memory, and provides the cross-modal disambiguation (McGurk-style) through its top-down feedback to regions.

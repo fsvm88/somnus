@@ -1,7 +1,10 @@
 # GPU Unification Design
 
-> **Status:** design complete, not yet implemented
-> **Date:** 2026-06-02
+> **Contents:** Full design for moving perception inference (k-WTA, cross_modal_proj, BindingArea GRU) from burn/CPU to ORT+MIGraphX/GPU. Covers scaling analysis, two-graph ONNX split (encoder + binding), duty-cycle management, weight sync protocol, MIGraphX operator constraints, and phased implementation. Phase 0+1 complete; Phases 2–4 prospective.  
+> **When to read:** Understanding the ORT two-graph architecture; debugging MIGraphX issues (ScatterElements/INT64 constraint); planning micro-batching or Rust ONNX builder.
+>
+> **Status:** Phase 0 (gate validation) and Phase 1 (wake inference on GPU) implemented as of 2026-06-07. Phases 2–4 (micro-batching, EMA in graph, Rust ONNX builder) remain prospective.
+> **Date:** 2026-06-02 (design); 2026-06-07 (Phase 1 complete)
 > **Companion ADR:** decisions/0023-gpu-unification.md
 
 ---
@@ -347,19 +350,15 @@ No gradient information flows through the ORT session. No burn tensor leaves the
 
 ### Phase 0 — validate graph equivalence (no behavior change)
 
-**Status: partially complete (2026-06-02).** Two-graph design validated numpy↔ONNX↔MIGraphX. MIGraphX bug isolated and worked around. Weight exporter implemented.
-
-Remaining gate: **burn ↔ ONNX episode match on one live episode** (with non-uniform dc to exercise the boost path). The numpy↔ONNX check validated graph structure; burn↔ONNX closes the GRU gate-order and Linear transpose convention risks against real trained weights.
+**Status: complete (2026-06-07).** Two-graph design validated numpy↔ONNX↔MIGraphX. MIGraphX bug (ScatterElements/INT64 graph outputs) isolated and worked around. Weight exporter implemented. burn↔ONNX episode MSE < 2e-8 on live episodes.
 
 **Deliverables:** `scripts/export_perception_graph.py` (two-graph builder + numpy validator), `PerceptionProcessor::export_weights_for_onnx()`, `experiments/migraphx-op-probe/probe.py`.
 
-**Kill criterion:** if burn↔ONNX episode MSE > 1e-3 after correcting GRU conventions, fall back to CPU-ORT EP for the binding graph (no perf win, but validates rest of pipeline).
-
 ### Phase 1 — wake inference on GPU
 
-Replace burn inference in the wake path with the ORT graph. Keep burn inference for settle (settle_steps=1, rarely fires) and all sleep-time passes. Add weight sync at sleep→wake boundary.
+**Status: complete (2026-06-07).** burn inference in the wake path replaced with ORT graph. settle_episode also uses ORT encoder + ORT binding (no burn kwta during settle). All 5 ingest paths skip burn forward when ORT encoder is active; cross_modal_proj uses flat Vec matmul. Weight sync at every sleep→wake boundary via `rebuild_ort_session`.
 
-**Deliverable:** modified `PerceptionProcessor` with `OrtInferenceSession` field; `sync_ort_weights()` method; updated `ingest_*` functions.
+**Benchmark (campaign_20260607_185345):** kwta=0.000ms/ep, sym=0.30ms/ep, bind=1.6–2.6ms/ep. Total perception ~17–19ms/ep vs 18ms burn-only baseline.
 
 ### Phase 2 — micro-batching
 

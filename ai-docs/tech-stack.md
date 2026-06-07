@@ -1,5 +1,8 @@
 # Tech stack
 
+> **Contents:** Committed and candidate crates for ML (ort + burn), audio (cpal, ffmpeg-next), video (nokhwa), vector retrieval (hnsw_rs), storage, concurrency (tokio, crossbeam), and observability (tracing).  
+> **When to read:** Adding a dependency; checking what's already committed; understanding why candle was not adopted (burn was).
+>
 > **Status:** candidates are noted as such; committed choices are marked **[committed]** and backed by an ADR or research note.
 
 ## Language
@@ -17,13 +20,13 @@ Order of preference when the ecosystem has a gap:
 
 **Split runtime — [committed], see `research/ml-runtimes.md`:**
 
-- **`ort`** (ONNX Runtime bindings) — **[committed]** for frozen pretrained encoder inference (Phase 2+). Best inference latency; no training support.
-- **`candle`** (HuggingFace) — **[committed]** for cognitive-layer training (Phase 3+). GPU via cuBLAS/cuDNN; actively maintained.
+- **`ort`** (ONNX Runtime bindings) — **[committed]** for frozen pretrained encoder inference (Phase 2+) and perception inference during wake (ADR 0023, GPU unification). Best inference latency; MIGraphX EP for AMD RDNA4/gfx1201.
+- **`burn`** (NdArray backend, CPU) — **[committed]** for cognitive-layer training (NREM replay, wake_reconstruct, AdamW optimizer). Wake inference path migrated to ORT (ADR 0023); burn is now training-only. Originally `candle` was planned; `burn` was chosen instead for better autograd ergonomics and backend agnosticism.
 
 Candidates not adopted:
 
-- `burn` — backend-agnostic; reconsider if `candle` CUDA support becomes a problem.
-- `tch-rs` — full libtorch; fallback if `candle` can't support a needed op.
+- `candle` — originally planned for cognitive-layer training; `burn` chosen instead.
+- `tch-rs` — full libtorch; fallback if `burn` can't support a needed op.
 - `dfdx` — pure-Rust autograd; slower-moving.
 
 Lower-level math (candidates, no commitment yet):
@@ -60,7 +63,7 @@ Three-tier hierarchy is architecturally committed (`architecture.md`); crate cho
 
 | Tier | Medium | Crate(s) |
 |------|--------|-----------|
-| Hot (episodic) | VRAM / candle tensors | `candle-core` |
+| Hot (episodic) | CPU RAM (Vec<f32> ring) | none — plain Rust Vec |
 | Warm (semantic) | RAM | `hnsw_rs` (HNSW) + plain `Vec` |
 | Cold (archive) | Disk | `memmap2` + custom binary format |
 

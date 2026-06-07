@@ -1,5 +1,8 @@
 # Encoders
 
+> **Contents:** Frozen pretrained encoder options and their VRAM/latency/dimension tradeoffs — speech (Whisper-tiny 384-dim ✓ committed), environment (CLAP-HTSAT 512-dim ✓ committed), visual (DINOv2-S/14 384-dim ✓ committed). Alternatives compared: HuBERT, SigLIP, MobileViT.  
+> **When to read:** Considering a replacement encoder; understanding why the committed trio was chosen; checking embedding dimensions for a new region.
+
 Research note for somnus. Covers the frozen pretrained encoder stack: audio (speech-focused + environment-focused) and visual. All numbers are **engineering estimates** from model architecture specs and published benchmarks; exact figures depend on driver/kernel versions. Refine to Option A (cited measurements) before making final encoder commitments.
 
 Hardware target: 14 GB VRAM (16 GB minus ~2 GB desktop overhead), 56 GB usable RAM.

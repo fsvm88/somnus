@@ -1,5 +1,8 @@
 # Memory compression
 
+> **Contents:** Warm→cold tier compression options — INT8 quantization (✓ implemented, 640 bytes/record), Product Quantization (✓ implemented, 27.5× reduction), structured pruning, distillation. Covers compression pipeline and quality tradeoffs.  
+> **When to read:** Tuning the cold archive format; adding a new compression stage; understanding the PQ codebook.
+
 Research note for somnus. Covers warm→cold tier compression: numeric quantization (FP16/INT8/INT4), structured pruning, and knowledge distillation. All numbers are **engineering estimates**.
 
 See `architecture.md` "Sleep stages" (NREM-like: "Compression") and "Memory hierarchy". Compression moves semantic memory content from warm (RAM) to cold (disk) during NREM-like sleep when the warm tier approaches capacity or when content has been sufficiently consolidated.

@@ -3,6 +3,9 @@
 - **Status:** accepted
 - **Date:** 2026-05-10
 
+> **Decision:** 5-region k-WTA (N_UNITS=1024, K_ACTIVE=20) with duty-cycle boosting + SAE decoder per region; 4-head cross-attention binding → 640-dim episode vector; somnus-perception crate.  
+> **Keywords:** k-WTA, N_UNITS, K_ACTIVE, SparseActivation, SAE, duty cycle, somnus-perception, EPISODE_DIM, cross-attention, binding area
+
 ## Context
 
 Phase 2 delivers three frozen-encoder embedding streams:

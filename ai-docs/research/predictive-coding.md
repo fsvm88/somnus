@@ -1,5 +1,8 @@
 # Predictive coding
 
+> **Contents:** Friston's FEP/PC framework, partial adoption rationale, what PC costs to implement fully vs. what somnus borrows (top-down priors, settling loop, reconstruction error as learning signal). Concludes with what is and isn't PC in somnus.  
+> **When to read:** Evaluating a PC-inspired feature; justifying or questioning the settling loop (ADR 0011); checking engineering vs. biology appeal.
+
 Research note for somnus. Covers Friston's free energy principle and predictive processing as a computational framework, and evaluates whether and how to adopt it. All numbers are **engineering estimates**.
 
 CLAUDE.md principle: "Every biological appeal in a design must also have an engineering justification; if the engineering doesn't stand on its own, the biology is decoration." This note applies that test to predictive coding.

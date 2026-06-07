@@ -1,5 +1,8 @@
 # Growth mechanisms
 
+> **Contents:** Cascade-Correlation, GNG, online cloning — mechanisms for adding units to a sparse region. Covers cost per unit added, growth trigger detection (gist recall rate < 0.5), and interaction with duty-cycle boosting.  
+> **When to read:** Implementing or tuning growth/pruning (grow_region, prune_region); understanding why cascade-correlation-style growth was chosen.
+
 Research note for somnus. Covers how the regional concept areas grow capacity when behavioral saturation is detected during REM-like sleep. All numbers are **engineering estimates**.
 
 See `architecture.md` "Sleep stages" (REM-like: "Growth") and `continuous-learning.md` (cascade-correlation). The growth mechanism operationalizes vision commitment 5 (bottom-up growth + behavioral saturation).

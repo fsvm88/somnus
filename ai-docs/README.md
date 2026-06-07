@@ -1,5 +1,8 @@
 # ai-docs
 
+> **Contents:** Index of all project documentation. Start here to find any doc.  
+> **When to read:** First stop in any new conversation; use as a map to deeper files.
+
 Project knowledge for **somnus**. Conversation context is ephemeral; this folder is the project's long-term memory.
 
 For *behavioral* expectations on the assistant, see `../CLAUDE.md`. This folder is for project content.

@@ -3,6 +3,9 @@
 **Date:** 2026-05-11  
 **Status:** Accepted
 
+> **Decision:** After each episode, output heads predict next encoder embeddings; on next ingest, blend raw input with stored prediction (RECALL_BLEND=0.5); prior_cosine logged per region.  
+> **Keywords:** top-down priors, prior blend, blend_with_prior, prior_cosine, RECALL_BLEND, predictive coding, bidirectional, region prior
+
 ## Context
 
 The architecture doc commits to a bidirectional binding area: the integrative layer both composes regional inputs into an episode (bottom-up) and sends top-down signals back to the regions to bias their interpretation of the next input. The canonical example is McGurk-style disambiguation: visual evidence of mouth motion should raise the prior on "speech" in the audio-speech region, surfacing a faint voice that bottom-up audio alone would suppress under noise.

@@ -1,5 +1,8 @@
 # Architecture
 
+> **Contents:** High-level system structure — encoders, 5 regional concept areas (audio-speech, audio-env, visual, symbolic, language), binding area (cross-attention + GRU), 3-tier memory (hot/warm/cold), sleep cycle (NREM+REM), action decoder (Qwen2.5). Implementation state as of 2026-06-07 included inline.  
+> **When to read:** Understanding how subsystems connect; checking which open architectural questions are resolved vs. open.
+>
 > **Status:** working sketch. Reflects decisions through the vision discussion (Q1/Q2/Q3 + sub-Q1). Subject to further change as research matures. Update this doc when subsystem boundaries shift; record the *why* in an ADR.
 >
 > **Implementation state (2026-05-30):** Phases 1–14 + architectural roundup + gap fixes implemented. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv2-S/14 (384-dim) via ORT. `crates/somnus-perception` runs five k-WTA layers (n=1024, k=20) — audio-speech, audio-env, visual, symbolic, language — plus 4-head cross-attention binding area with GRU temporal context (GRU_HIDDEN=256) → 640-dim episode vectors + SAE decoders for reconstruction error. `crates/somnus-memory` implements the three-tier memory hierarchy: `EpisodicBuffer` (bounded ring, hot), `SemanticStore` (hnsw_rs HNSW over episode vectors, warm), `ColdArchive` (INT8-quantised append-only binary, cold), `RecollectionLayer` (warm query + cold→warm promotion). The `somnus` binary wires all crates end-to-end with a full sleep cycle (NREM + REM), text bypass, auto-grounding, action decoder (Qwen2.5-0.5B projection + gain modulation), and eval harness.

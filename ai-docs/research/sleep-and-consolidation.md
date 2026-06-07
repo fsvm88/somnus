@@ -1,5 +1,8 @@
 # Sleep and consolidation
 
+> **Contents:** NREM/REM biology mapped to somnus's two-stage cycle (NREM=replay+homeostasis+compression, REM=generative replay+gist probe+growth). Covers sharp-wave ripples, synaptic homeostasis hypothesis, memory budget estimates for the hardware target.  
+> **When to read:** Understanding why two sleep stages; tuning sleep triggers (high-water, schedule, perf-degradation); checking biology-to-engineering mapping for a sleep-cycle change.
+
 Literature behind somnus's two-stage sleep cycle. The commitment lives in `vision.md` (commitment 2); the operationalization is in `architecture.md`'s "Sleep cycle and wake/sleep control" section. This note captures the biology and ML evidence that motivated the choices, and is honest about where somnus diverges.
 
 ## Summary of somnus's choice

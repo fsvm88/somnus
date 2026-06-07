@@ -3,6 +3,9 @@
 **Date:** 2026-05-12  
 **Status:** Accepted
 
+> **Decision:** ActionDecoder = linear projection (EPISODE_DIM=640 → 5×896) + frozen Qwen2.5-0.5B; attention weights drive per-region gain modulation each episode; GainWorker thread handles Qwen gain ORT; NREM trains projection via LM hidden-state distillation.  
+> **Keywords:** ActionDecoder, Qwen2.5, qwen25_gain, GainWorker, gain modulation, region_gain, projection, LM distillation, NREM projection, 640→5×896
+
 ## Context
 
 Through Phase 5 and its extensions the system has a complete wake→encode→perceive→bind→store→sleep→consolidate cycle, but it produces no external output. It is a perceptual sink. The open architectural question in `architecture.md` ("Action loop — does the system have one in early phases? Effector: internal state only, or external?") is answered here.

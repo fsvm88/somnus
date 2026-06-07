@@ -3,6 +3,9 @@
 - **Status:** accepted
 - **Date:** 2026-04-26
 
+> **Decision:** AudioFrame + VideoFrame types via cpal (mic) + nokhwa (webcam) + ffmpeg-next (files); crossbeam bounded channels with drop-oldest backpressure.  
+> **Keywords:** AudioFrame, VideoFrame, cpal, nokhwa, ffmpeg-next, crossbeam, backpressure, MediaFile, sensory pipeline
+
 ## Context
 
 ADR 0001 established the workspace layout. This ADR fixes the concrete Rust types

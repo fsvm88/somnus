@@ -3,6 +3,9 @@
 - **Status:** accepted
 - **Date:** 2026-04-26
 
+> **Decision:** Single Cargo workspace; crates split along real architectural boundaries only, not speculatively.  
+> **Keywords:** cargo, workspace, somnus-sensory, somnus-encoding, somnus-perception, somnus-memory, crate layout
+
 ## Context
 
 The project is starting from scratch in Rust. Before writing any code, the crate
