@@ -1,10 +1,10 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-02
-> **Last commit on main:** 9153ea3 — session state (pushed to Codeberg)
-> **Branch:** `main` (pushed)
+> **Last updated:** 2026-06-07
+> **Last commit on main:** 590f7e6 — GPU unification Phase 1.5 + train_campaign.sh ONNX defaults
+> **Branch:** `main` (not yet pushed)
 
-## Status: GPU unification Phase 1 COMPLETE and benchmarked. ORT binding 2.4–2.8× faster than burn. Ready for Phase 1.5 (encoder ORT).
+## Status: Phase 1.5 COMPLETE (encoder ORT live). Needs benchmark validation. Phase 2 (micro-batching) has a fundamental issue — see below.
 
 ---
 
@@ -12,49 +12,62 @@
 
 | Item | Commit | What changed |
 |------|--------|--------------|
-| Fresh campaign | campaign_20260602_1921 | 3 sessions × 3 cycles, 29K warm records, s3c3 loss=0.136, synthetics=8/cycle |
-| GPU unification spec | f0b7921 | ADR 0023 + ai-docs/research/gpu-unification-design.md |
-| MIGraphX op probes | f4813c5 | GRU/TopK/cross-attention all confirmed on RDNA4/gfx1201 |
-| MIGraphX bug isolation | f4813c5 | ScatterElements→graph-output ≥4 crashes MIGraphX (ToInteger bug) |
-| Two-graph ONNX design | f4813c5 | encoder graph + binding graph, both validated numpy↔ONNX↔MIGraphX |
-| Weight exporter (Rust) | f4813c5 | PerceptionProcessor::export_weights_for_onnx() |
+| Phase 1.5: encoder ORT | 590f7e6 | All 5 encoder matmuls + cross-modal proj move to GPU; topk+dc stays in Rust |
+| train_campaign.sh ONNX defaults | 590f7e6 | ONNX_MODELS_DIR / ONNX_SCRIPT env vars; no more EXTRA_ARGS required |
 
 ---
 
-## GPU unification status: Phase 1 COMPLETE
+## GPU unification status: Phase 1.5 COMPLETE (unvalidated)
 
-**Phase 0 (burn↔ONNX gate):** All checks pass on CPU EP and MIGraphX EP at <2e-08.
+**Phase 0 (burn↔ONNX gate):** All checks pass at <2e-08.
 
-**Phase 1 (ORT binding session live):**
-- `--onnx-models-dir <dir>` flag enables ORT binding inference
-- Session built at startup, rebuilt at each sleep→wake boundary
-- Uses MIGraphX EP by default; `--no-onnx-migraphx` falls back to CPU EP
-- 401 live wake episodes confirmed via ORT/MIGraphX in 1-cycle test
-- Fallback to burn on ORT error (logged as WARN)
+**Phase 1 (ORT binding session live):** 2.4–2.8× speedup confirmed (campaign_20260602_2308).
 
-**What Phase 1 does NOT change:**
-- Burn k-WTA (encoder matmuls) still run for duty-cycle tracking
-- Only binding area (GRU + cross-attention) is on GPU via ORT
-- EMA heads still on CPU (burn flat matmul)
+**Phase 1.5 (ORT encoder session live — Phase 1.5 commit 590f7e6):**
+- `enable_ort_inference` now auto-attaches `perception_encoder.onnx` if it exists in
+  the same directory as `perception_binding.onnx`.
+- In `try_bind`: when encoder ORT is active, runs all 5 linears + cross-modal proj on GPU
+  → 5 z vectors → Rust topk+dc-update via `KWtaLayer::topk_from_z` → ORT binding.
+- `compute_symbolic_cross_modal` uses `forward_no_dc` (no burn dc update) when encoder ORT
+  active — duty-cycle update happens once in try_bind via topk_from_z.
+- `refresh_language_cache` skipped when encoder ORT active (language z from ORT in try_bind).
+- Fallback to burn activations on ORT encoder error (WARN logged).
 
-**Campaign usage with ORT:**
+**Duty-cycle cadence change (validate before relying on ORT-trained weights):**
+- Burn path: each region's dc updates when its ingest_* fires (~2 updates/binding: triggering + symbolic).
+- ORT encoder path: all 5 regions dc-update once per binding event.
+- Behavioral effect unknown — run burn-only vs. ORT campaign, same seed+clip, compare
+  loss trajectory and per-region dc distributions.
+
+**Campaign usage with ORT (Phase 1.5):**
 ```bash
 SESSIONS=3 CYCLES=3 CAPACITY=4096 \
 MEMORY_DIR=memory/campaign_$(date +%Y%m%d_%H%M) \
-EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --max-warm-records 200000 \
-  --onnx-models-dir memory/onnx_models --onnx-script scripts/export_perception_graph.py" \
+ONNX_MODELS_DIR=memory/onnx_models \
+ONNX_SCRIPT=scripts/export_perception_graph.py \
+EXTRA_ARGS="--lang-oversample 9 --asr-min-chars 5 --max-warm-records 200000" \
 scripts/train_campaign.sh
 ```
 
-**Campaign benchmark (memory/campaign_20260602_2308):**
-- bind_ms: **0.78–0.98ms/ep** (was 2.1–2.5ms with burn) → **2.4–2.8× speedup**
-- Loss trajectory normal; synthetics=8/cycle; all nrem=traces_exhausted (one salience interrupt s3c2)
-- s3c3 bind_ms=1.38ms follows the salience interrupt — not a regression
+**Phase 1.5 not yet benchmarked.** Expected: encoder matmuls (~2.1+3.1ms/ep) move to GPU;
+total bind_ms should drop further from the 0.78–0.98ms/ep Phase 1 baseline.
 
-**Next steps:**
-- Phase 1.5: add encoder ORT session (replace burn k-WTA matmuls, ~2.1+3.1ms/ep)
-- Phase 2: micro-batching (--micro-batch-size) for compounding GPU benefit
-- Add --onnx-models-dir to train_campaign.sh defaults (currently must be passed via EXTRA_ARGS)
+---
+
+## Phase 2 (micro-batching) — BLOCKED on design issue
+
+**Problem:** The GRU binding is sequential (episode n feeds its hidden state into episode n+1).
+Batching the binding across episodes is not possible in the wake path. Only the encoder can be
+batched (B independent matmuls → B z vectors), but the encoder is now cheap (GPU).
+
+**Conclusion:** "Phase 2 micro-batching for compounding GPU benefit" is mostly false — the
+binding (the actual bottleneck) cannot be batched. Building a wake-path buffering refactor
+to batch only the encoder is low ROI.
+
+**Options for what Phase 2 becomes:**
+- Redirect to next real bottleneck (Qwen embeddings, NREM replay, something measured)
+- Defer / shelve — focus on validation + next research step
+- User decides
 
 ---
 
@@ -70,8 +83,8 @@ Also: **INT64 graph outputs trigger the same bug**. Keep topk indices off the ou
 
 3 sessions × 3 cycles, 29K warm records:
 - s3c3 loss: 0.136 (healthy)
-- synthetics_produced=8 every cycle (no NREM salience interrupts)
-- bind_ms flat 2.1-2.5ms/ep (autodiff refresh holding)
+- synthetics_produced=8 every cycle
+- bind_ms flat 2.1-2.5ms/ep (burn, no ORT)
 - All nrem_exit_reason=traces_exhausted (clean run)
 
 ---
