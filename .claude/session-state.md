@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-07
-> **Last commit on main:** 8419d1f — sym_us: replace burn cross_modal_proj with allocation-free Vec matmul
+> **Last commit on main:** 5af7907 — Update session state: sym_us + kwta_us optimization complete
 > **Branch:** `main` (not yet pushed)
 
-## Status: sym_us + kwta_us optimization complete. Both burn costs eliminated.
+## Status: sym_us + kwta_us optimization complete. Benchmark confirmed.
 
 ---
 
@@ -31,8 +31,22 @@
 | Burn-only (control) | 18.08 ms/ep | — |
 | Phase 1.5 (ORT enc+bind) | 16.83 ms/ep | −1.25 |
 | + ORT binding in settle | 14.59 ms/ep | −2.24 |
-| + ORT encoder in settle | **14.10 ms/ep** | −0.49 |
-| **vs burn-only** | | **−3.98 ms/ep (−22%)** |
+| + ORT encoder in settle | 14.10 ms/ep | −0.49 |
+| + skip burn kwta+sym in ingest | **~17 ms/ep** | (load varies; kwta=0, sym=0.30ms) |
+
+### Confirmed benchmark (campaign_20260607_185345, 2s×3c, CAPACITY=2048, ONNX active)
+
+| s | c | perc ms/ep | kwta | sym | bind | settle | prior_upd |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 18.45 | 0.000 | 0.304 | 2.646 | 3.085 | 0.436 |
+| 1 | 2 | 17.67 | 0.000 | 0.326 | 1.883 | 2.088 | 0.413 |
+| 1 | 3 |  4.93 | 0.000 | 0.329 | 1.762 | 2.161 | 0.495 |
+| 2 | 1 | 18.10 | 0.000 | 0.331 | 2.163 | 3.546 | 0.427 |
+| 2 | 2 | 16.38 | 0.000 | 0.260 | 1.699 | 1.879 | 0.338 |
+| 2 | 3 |  4.63 | 0.000 | 0.341 | 1.649 | 2.016 | 0.445 |
+
+kwta = 0.000 ms/ep (eliminated). sym = 0.26–0.34 ms/ep (down from ~9ms peak, ~3ms prior run).
+Remaining costs: bind (ORT enc+bind) and settle (varies with trigger rate).
 
 ### Settle bottleneck: CLOSED
 
@@ -47,17 +61,17 @@ Cannot go lower without reducing settle rate. prior_update_us is now the floor (
 
 ---
 
-## Current bottleneck breakdown (campaign_20260607_184504, CAPACITY=2048, ONNX active)
+## Current bottleneck breakdown (campaign_20260607_185345, CAPACITY=2048, ONNX active)
 
 | Component | ms/ep | Notes |
 |---|---|---|
-| prior_us | ~2.1 | settle (1.73) + prior_update (0.35) |
-| sym_us | ~3.0–3.6 | flat Vec matmul done; residual is OS scheduling jitter |
-| bind_us | ~1.6 | ORT encoder + ORT binding |
+| settle_us | ~2–3.5 | dominates; varies with settle trigger rate |
+| bind_us | ~1.6–2.6 | ORT encoder + ORT binding |
+| prior_us | ~0.34–0.50 | prior_update (NREM side) |
+| sym_us | **~0.30** | flat Vec matmul; effectively free |
 | kwta_us | **0.000** | eliminated — ORT encoder handles all 5 regions |
-| perc_total | ~19ms | (vs 18ms burn-only baseline at CAPACITY=4096; load varies) |
 
-kwta_us and sym_us targets: CLOSED. Residual sym_us is irreducible thread jitter.
+kwta_us and sym_us: CLOSED. Next bottleneck: settle_us (bind ORT ~0.85ms + enc ORT ~0.7ms per trigger).
 
 ---
 
