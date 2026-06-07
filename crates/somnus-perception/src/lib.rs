@@ -1988,55 +1988,117 @@ impl PerceptionProcessor {
     /// Returns `(refined_episode, iters_run, final_delta)`.
     /// `final_delta` is the L2 distance between the last two episode estimates (0.0 if the
     /// activation guard broke before any delta was computed).
+    ///
+    /// When ORT binding is active the binding step uses the ORT session instead of burn.
+    /// The live GRU hidden state is saved before the loop and restored after each ORT call
+    /// so settle iterations don't advance the cross-episode temporal state.
     fn settle_episode(&mut self, ep: &EpisodeVector) -> (EpisodeVector, usize, f32) {
         let device = self.device;
-        let model = self.model.as_mut().unwrap();
+        let use_ort = self.ort_session.is_some();
+        // Snapshot hidden state: settle must not advance the live GRU across iterations.
+        let saved_hidden = if use_ort {
+            self.ort_session.as_ref().map(|s| s.gru_hidden.clone())
+        } else {
+            None
+        };
         let mut current = ep.clone();
         let mut last_delta = 0.0f32;
 
         for iter in 0..self.settle_steps {
-            // Use EMA heads for inference — no autodiff overhead, stable priors.
+            // EMA predictions (no model borrow needed).
             let mut preds: [Vec<f32>; 5] = Default::default();
             for (i, pred) in preds.iter_mut().enumerate() {
                 *pred = self.ema_heads.predict(&current.0, i);
             }
 
+            // Blend raw inputs with EMA preds, then run kwta (burn path for all cases).
             let mut acts: [Option<SparseActivation>; 5] = Default::default();
-            for i in 0..5 {
-                if let Some(raw) = &self.latest_inputs[i] {
-                    let raw_norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-                    let pred_norm = preds[i].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-                    let amp_scale = raw_norm / pred_norm;
-                    let blended: Vec<f32> = raw
-                        .iter()
-                        .zip(&preds[i])
-                        .map(|(&r, &p)| {
-                            (1.0 - self.settle_beta) * r + self.settle_beta * p * amp_scale
-                        })
-                        .collect();
-                    acts[i] = Some(match i {
-                        0 => model.speech_layer.forward_no_dc(&blended, &device),
-                        1 => model.env_layer.forward_no_dc(&blended, &device),
-                        2 => model.visual_layer.forward_no_dc(&blended, &device),
-                        3 => model.symbolic_layer.forward_no_dc(&blended, &device),
-                        4 => model.language_layer.forward_no_dc(&blended, &device),
-                        _ => unreachable!(),
-                    });
+            {
+                let model = self.model.as_mut().unwrap();
+                for i in 0..5 {
+                    if let Some(raw) = &self.latest_inputs[i] {
+                        let raw_norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                        let pred_norm =
+                            preds[i].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                        let amp_scale = raw_norm / pred_norm;
+                        let blended: Vec<f32> = raw
+                            .iter()
+                            .zip(&preds[i])
+                            .map(|(&r, &p)| {
+                                (1.0 - self.settle_beta) * r + self.settle_beta * p * amp_scale
+                            })
+                            .collect();
+                        acts[i] = Some(match i {
+                            0 => model.speech_layer.forward_no_dc(&blended, &device),
+                            1 => model.env_layer.forward_no_dc(&blended, &device),
+                            2 => model.visual_layer.forward_no_dc(&blended, &device),
+                            3 => model.symbolic_layer.forward_no_dc(&blended, &device),
+                            4 => model.language_layer.forward_no_dc(&blended, &device),
+                            _ => unreachable!(),
+                        });
+                    }
                 }
-            }
+            } // model borrow dropped here
 
-            let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
-                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-                _ => break,
+            // Binding step: ORT when available, burn otherwise.
+            let refined = if use_ort {
+                let sparse_z: [Vec<f32>; 5] = std::array::from_fn(|i| {
+                    acts[i]
+                        .as_ref()
+                        .map(|a| a.to_dense_n(N_UNITS))
+                        .unwrap_or_else(|| vec![0.0f32; N_UNITS])
+                });
+                let ort = self.ort_session.as_mut().unwrap();
+                match ort.run_binding(&sparse_z, &current.0) {
+                    Ok(ep_vec) => {
+                        // Restore hidden — settle must not advance the live GRU state.
+                        if let Some(ref h) = saved_hidden {
+                            ort.gru_hidden = h.clone();
+                        }
+                        EpisodeVector(ep_vec)
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "ORT binding in settle failed; falling back to burn");
+                        if let Some(ref h) = saved_hidden {
+                            ort.gru_hidden = h.clone();
+                        }
+                        // Burn fallback — re-borrow model after dropping ort ref.
+                        let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
+                            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                            _ => break,
+                        };
+                        let lang_zero = SparseActivation {
+                            region: RegionId::Language,
+                            indices: vec![],
+                            values: vec![],
+                            n_units: N_UNITS,
+                        };
+                        let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
+                        self.model.as_mut().unwrap().binding.forward(
+                            &[a0, a1, a2, a3, a4],
+                            None,
+                            &device,
+                        )
+                    }
+                }
+            } else {
+                let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
+                    (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                    _ => break,
+                };
+                let lang_zero = SparseActivation {
+                    region: RegionId::Language,
+                    indices: vec![],
+                    values: vec![],
+                    n_units: N_UNITS,
+                };
+                let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
+                self.model
+                    .as_mut()
+                    .unwrap()
+                    .binding
+                    .forward(&[a0, a1, a2, a3, a4], None, &device)
             };
-            let lang_zero = SparseActivation {
-                region: RegionId::Language,
-                indices: vec![],
-                values: vec![],
-                n_units: N_UNITS,
-            };
-            let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-            let refined = model.binding.forward(&[a0, a1, a2, a3, a4], None, &device);
 
             let delta: f32 = current
                 .0
