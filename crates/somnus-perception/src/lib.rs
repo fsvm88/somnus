@@ -220,6 +220,10 @@ pub struct IngestPerfBreakdown {
     pub bind_us: u64,
     /// `maybe_settle_and_update` (settle loop + prior update).
     pub prior_us: u64,
+    /// Time inside `settle_episode` only (subset of prior_us; zero when settle didn't fire).
+    pub settle_us: u64,
+    /// Time inside `update_prior_predictions` only (subset of prior_us; always fires with episode).
+    pub prior_update_us: u64,
 }
 
 pub struct PerceptionProcessor {
@@ -249,6 +253,8 @@ pub struct PerceptionProcessor {
     perf_symbolic_us: u64,
     perf_bind_us: u64,
     perf_prior_us: u64,
+    perf_settle_us: u64,
+    perf_prior_update_us: u64,
 
     /// ORT binding session (Phase 1). When Some, binding area uses ORT instead of burn.
     ort_session: Option<crate::onnx_session::OnnxPerceptionSession>,
@@ -279,6 +285,8 @@ impl PerceptionProcessor {
             perf_symbolic_us: 0,
             perf_bind_us: 0,
             perf_prior_us: 0,
+            perf_settle_us: 0,
+            perf_prior_update_us: 0,
             ort_session: None,
         }
     }
@@ -290,11 +298,15 @@ impl PerceptionProcessor {
             symbolic_us: self.perf_symbolic_us,
             bind_us: self.perf_bind_us,
             prior_us: self.perf_prior_us,
+            settle_us: self.perf_settle_us,
+            prior_update_us: self.perf_prior_update_us,
         };
         self.perf_kwta_us = 0;
         self.perf_symbolic_us = 0;
         self.perf_bind_us = 0;
         self.perf_prior_us = 0;
+        self.perf_settle_us = 0;
+        self.perf_prior_update_us = 0;
         b
     }
 
@@ -545,12 +557,16 @@ impl PerceptionProcessor {
         if let Some(ep) = episode {
             let should_settle =
                 self.settle_steps > 0 && cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
+            let t_settle = Instant::now();
             let (refined, iters, delta) = if should_settle {
                 self.settle_episode(&ep)
             } else {
                 (ep, 0, 0.0)
             };
+            self.perf_settle_us += t_settle.elapsed().as_micros() as u64;
+            let t_prior_update = Instant::now();
             self.update_prior_predictions(&refined.0);
+            self.perf_prior_update_us += t_prior_update.elapsed().as_micros() as u64;
             (Some(refined), iters, delta)
         } else {
             (None, 0, 0.0)

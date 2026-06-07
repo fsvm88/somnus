@@ -1510,10 +1510,12 @@ async fn main() -> Result<()> {
                             "video_encode_total_ms":      video_encode_total_ms,
                             "gain_update_total_ms":       0u64,
                             "perception_total_ms":        perception_total_ms,
-                            "perc_kwta_us":   perf_breakdown.kwta_us,
-                            "perc_symbolic_us": perf_breakdown.symbolic_us,
-                            "perc_bind_us":   perf_breakdown.bind_us,
-                            "perc_prior_us":  perf_breakdown.prior_us,
+                            "perc_kwta_us":         perf_breakdown.kwta_us,
+                            "perc_symbolic_us":     perf_breakdown.symbolic_us,
+                            "perc_bind_us":         perf_breakdown.bind_us,
+                            "perc_prior_us":        perf_breakdown.prior_us,
+                            "perc_settle_us":       perf_breakdown.settle_us,
+                            "perc_prior_update_us": perf_breakdown.prior_update_us,
                         })
                         .to_string();
                         use std::io::Write as _;
