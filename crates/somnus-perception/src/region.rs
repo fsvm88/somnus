@@ -127,6 +127,13 @@ impl<B: Backend> KWtaLayer<B> {
         self.select_top_k(z_vec)
     }
 
+    /// topk selection from a pre-computed z vector, without duty-cycle update.
+    /// Used by the settle loop: settle is a refinement pass, not a real ingest,
+    /// so dc should not be advanced.
+    pub fn topk_from_z_no_dc(&self, z_vec: Vec<f32>) -> SparseActivation {
+        self.select_top_k_no_dc(z_vec)
+    }
+
     fn select_top_k(&mut self, z_vec: Vec<f32>) -> SparseActivation {
         let n = self.n_units;
         let target_dc = K_ACTIVE as f32 / n as f32;

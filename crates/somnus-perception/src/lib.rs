@@ -1986,118 +1986,184 @@ impl PerceptionProcessor {
     // ── Private helpers ──────────────────────────────────────────────────────
 
     /// Returns `(refined_episode, iters_run, final_delta)`.
-    /// `final_delta` is the L2 distance between the last two episode estimates (0.0 if the
-    /// activation guard broke before any delta was computed).
     ///
-    /// When ORT binding is active the binding step uses the ORT session instead of burn.
-    /// The live GRU hidden state is saved before the loop and restored after each ORT call
-    /// so settle iterations don't advance the cross-episode temporal state.
+    /// Three execution paths, selected at runtime:
+    ///   A. ORT encoder + topk_no_dc + ORT binding  (encoder + binding sessions active)
+    ///   B. burn kwta   + ORT binding               (binding session only)
+    ///   C. burn kwta   + burn binding               (no ORT)
+    ///
+    /// In all ORT paths the live GRU hidden state is saved before the loop and restored
+    /// after each binding call so settle iterations don't advance cross-episode state.
     fn settle_episode(&mut self, ep: &EpisodeVector) -> (EpisodeVector, usize, f32) {
         let device = self.device;
         let use_ort = self.ort_session.is_some();
-        // Snapshot hidden state: settle must not advance the live GRU across iterations.
+        let use_encoder = use_ort && self.ort_session.as_ref().is_some_and(|s| s.has_encoder());
         let saved_hidden = if use_ort {
             self.ort_session.as_ref().map(|s| s.gru_hidden.clone())
         } else {
             None
         };
+
         let mut current = ep.clone();
         let mut last_delta = 0.0f32;
 
         for iter in 0..self.settle_steps {
-            // EMA predictions (no model borrow needed).
+            // EMA predictions — pure Rust matmul, no borrow of model or ort.
             let mut preds: [Vec<f32>; 5] = Default::default();
             for (i, pred) in preds.iter_mut().enumerate() {
                 *pred = self.ema_heads.predict(&current.0, i);
             }
 
-            // Blend raw inputs with EMA preds, then run kwta (burn path for all cases).
-            let mut acts: [Option<SparseActivation>; 5] = Default::default();
-            {
-                let model = self.model.as_mut().unwrap();
-                for i in 0..5 {
-                    if let Some(raw) = &self.latest_inputs[i] {
-                        let raw_norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-                        let pred_norm =
-                            preds[i].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
-                        let amp_scale = raw_norm / pred_norm;
-                        let blended: Vec<f32> = raw
-                            .iter()
-                            .zip(&preds[i])
-                            .map(|(&r, &p)| {
-                                (1.0 - self.settle_beta) * r + self.settle_beta * p * amp_scale
-                            })
-                            .collect();
-                        acts[i] = Some(match i {
-                            0 => model.speech_layer.forward_no_dc(&blended, &device),
-                            1 => model.env_layer.forward_no_dc(&blended, &device),
-                            2 => model.visual_layer.forward_no_dc(&blended, &device),
-                            3 => model.symbolic_layer.forward_no_dc(&blended, &device),
-                            4 => model.language_layer.forward_no_dc(&blended, &device),
-                            _ => unreachable!(),
-                        });
-                    }
-                }
-            } // model borrow dropped here
-
-            // Binding step: ORT when available, burn otherwise.
-            let refined = if use_ort {
-                let sparse_z: [Vec<f32>; 5] = std::array::from_fn(|i| {
-                    acts[i]
-                        .as_ref()
-                        .map(|a| a.to_dense_n(N_UNITS))
-                        .unwrap_or_else(|| vec![0.0f32; N_UNITS])
-                });
-                let ort = self.ort_session.as_mut().unwrap();
-                match ort.run_binding(&sparse_z, &current.0) {
-                    Ok(ep_vec) => {
-                        // Restore hidden — settle must not advance the live GRU state.
-                        if let Some(ref h) = saved_hidden {
-                            ort.gru_hidden = h.clone();
+            let refined = if use_encoder {
+                // ── Path A: ORT encoder → topk_no_dc → ORT binding ──────────────
+                // Encoder takes 4 raw modality inputs (speech/env/visual/lang);
+                // symbolic is produced by the encoder's internal cross-modal projection.
+                const ENC_REGIONS: [(usize, usize); 4] = [(0, 384), (1, 512), (2, 384), (4, 896)];
+                let mut blended_enc: [Vec<f32>; 4] = Default::default();
+                for (slot, &(ri, default_dim)) in ENC_REGIONS.iter().enumerate() {
+                    blended_enc[slot] = match self.latest_inputs[ri].as_deref() {
+                        Some(raw) => {
+                            let rn = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                            let pn = preds[ri].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                            let amp = rn / pn;
+                            raw.iter()
+                                .zip(&preds[ri])
+                                .map(|(&r, &p)| (1.0 - self.settle_beta) * r + self.settle_beta * p * amp)
+                                .collect()
                         }
-                        EpisodeVector(ep_vec)
+                        None => vec![0.0f32; default_dim],
+                    };
+                }
+
+                // ORT encoder — borrow ends when enc_result is returned.
+                let enc_result = self.ort_session.as_mut().unwrap().run_encoder(
+                    &blended_enc[0],
+                    &blended_enc[1],
+                    &blended_enc[2],
+                    &blended_enc[3],
+                );
+
+                match enc_result {
+                    Ok([z0, z1, z2, z3, z4]) => {
+                        // topk_no_dc: immutable model borrow, dropped before binding.
+                        let sparse_z: [Vec<f32>; 5] = {
+                            let m = self.model.as_ref().unwrap();
+                            [
+                                m.speech_layer.topk_from_z_no_dc(z0).to_dense_n(N_UNITS),
+                                m.env_layer.topk_from_z_no_dc(z1).to_dense_n(N_UNITS),
+                                m.visual_layer.topk_from_z_no_dc(z2).to_dense_n(N_UNITS),
+                                m.symbolic_layer.topk_from_z_no_dc(z3).to_dense_n(N_UNITS),
+                                m.language_layer.topk_from_z_no_dc(z4).to_dense_n(N_UNITS),
+                            ]
+                        };
+                        // ORT binding — restore hidden so settle doesn't advance live GRU.
+                        let ort = self.ort_session.as_mut().unwrap();
+                        match ort.run_binding(&sparse_z, &current.0) {
+                            Ok(ep_vec) => {
+                                if let Some(ref h) = saved_hidden {
+                                    ort.gru_hidden = h.clone();
+                                }
+                                EpisodeVector(ep_vec)
+                            }
+                            Err(e) => {
+                                tracing::warn!(?e, "ORT binding in settle (encoder path) failed");
+                                if let Some(ref h) = saved_hidden {
+                                    ort.gru_hidden = h.clone();
+                                }
+                                break;
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!(?e, "ORT binding in settle failed; falling back to burn");
-                        if let Some(ref h) = saved_hidden {
-                            ort.gru_hidden = h.clone();
-                        }
-                        // Burn fallback — re-borrow model after dropping ort ref.
-                        let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
-                            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-                            _ => break,
-                        };
-                        let lang_zero = SparseActivation {
-                            region: RegionId::Language,
-                            indices: vec![],
-                            values: vec![],
-                            n_units: N_UNITS,
-                        };
-                        let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-                        self.model.as_mut().unwrap().binding.forward(
-                            &[a0, a1, a2, a3, a4],
-                            None,
-                            &device,
-                        )
+                        tracing::warn!(?e, "ORT encoder in settle failed; aborting settle");
+                        break;
                     }
                 }
             } else {
-                let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
-                    (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-                    _ => break,
-                };
-                let lang_zero = SparseActivation {
-                    region: RegionId::Language,
-                    indices: vec![],
-                    values: vec![],
-                    n_units: N_UNITS,
-                };
-                let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-                self.model
-                    .as_mut()
-                    .unwrap()
-                    .binding
-                    .forward(&[a0, a1, a2, a3, a4], None, &device)
+                // ── Paths B & C: burn kwta (both), then ORT or burn binding ─────
+                let mut acts: [Option<SparseActivation>; 5] = Default::default();
+                {
+                    let model = self.model.as_mut().unwrap();
+                    for i in 0..5 {
+                        if let Some(raw) = &self.latest_inputs[i] {
+                            let rn = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                            let pn = preds[i].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                            let amp = rn / pn;
+                            let blended: Vec<f32> = raw
+                                .iter()
+                                .zip(&preds[i])
+                                .map(|(&r, &p)| (1.0 - self.settle_beta) * r + self.settle_beta * p * amp)
+                                .collect();
+                            acts[i] = Some(match i {
+                                0 => model.speech_layer.forward_no_dc(&blended, &device),
+                                1 => model.env_layer.forward_no_dc(&blended, &device),
+                                2 => model.visual_layer.forward_no_dc(&blended, &device),
+                                3 => model.symbolic_layer.forward_no_dc(&blended, &device),
+                                4 => model.language_layer.forward_no_dc(&blended, &device),
+                                _ => unreachable!(),
+                            });
+                        }
+                    }
+                } // model borrow dropped
+
+                if use_ort {
+                    // ── Path B: ORT binding ──────────────────────────────────────
+                    let sparse_z: [Vec<f32>; 5] = std::array::from_fn(|i| {
+                        acts[i]
+                            .as_ref()
+                            .map(|a| a.to_dense_n(N_UNITS))
+                            .unwrap_or_else(|| vec![0.0f32; N_UNITS])
+                    });
+                    let ort = self.ort_session.as_mut().unwrap();
+                    match ort.run_binding(&sparse_z, &current.0) {
+                        Ok(ep_vec) => {
+                            if let Some(ref h) = saved_hidden {
+                                ort.gru_hidden = h.clone();
+                            }
+                            EpisodeVector(ep_vec)
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, "ORT binding in settle failed; falling back to burn");
+                            if let Some(ref h) = saved_hidden {
+                                ort.gru_hidden = h.clone();
+                            }
+                            let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
+                                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                                _ => break,
+                            };
+                            let lang_zero = SparseActivation {
+                                region: RegionId::Language,
+                                indices: vec![],
+                                values: vec![],
+                                n_units: N_UNITS,
+                            };
+                            let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
+                            self.model.as_mut().unwrap().binding.forward(
+                                &[a0, a1, a2, a3, a4],
+                                None,
+                                &device,
+                            )
+                        }
+                    }
+                } else {
+                    // ── Path C: burn binding ─────────────────────────────────────
+                    let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
+                        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                        _ => break,
+                    };
+                    let lang_zero = SparseActivation {
+                        region: RegionId::Language,
+                        indices: vec![],
+                        values: vec![],
+                        n_units: N_UNITS,
+                    };
+                    let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
+                    self.model.as_mut().unwrap().binding.forward(
+                        &[a0, a1, a2, a3, a4],
+                        None,
+                        &device,
+                    )
+                }
             };
 
             let delta: f32 = current
@@ -2109,9 +2175,8 @@ impl PerceptionProcessor {
                 .sqrt();
             last_delta = delta;
             tracing::debug!(iter, delta, "settle delta");
-            let converged = delta < SETTLE_EPS;
             current = refined;
-            if converged {
+            if delta < SETTLE_EPS {
                 return (current, iter + 1, last_delta);
             }
         }
