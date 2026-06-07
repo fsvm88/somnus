@@ -258,6 +258,10 @@ pub struct PerceptionProcessor {
 
     /// ORT binding session (Phase 1). When Some, binding area uses ORT instead of burn.
     ort_session: Option<crate::onnx_session::OnnxPerceptionSession>,
+
+    /// Flat [n_in × d_out] copy of cross_modal_proj weights for allocation-free inference.
+    /// Row-major: flat[i * d_out + j] = weight[i][j].  Synced after each NREM weight update.
+    cross_modal_proj_flat: Option<Vec<f32>>,
 }
 
 impl PerceptionProcessor {
@@ -288,7 +292,24 @@ impl PerceptionProcessor {
             perf_settle_us: 0,
             perf_prior_update_us: 0,
             ort_session: None,
+            cross_modal_proj_flat: None,
         }
+    }
+
+    /// Sync the flat cross_modal_proj weight copy after model weights update (NREM).
+    /// Called whenever ORT sessions are rebuilt so the inference copy stays in sync.
+    pub fn sync_cross_modal_flat(&mut self) {
+        let model = self.model.as_ref().unwrap();
+        let w: Vec<f32> = model
+            .cross_modal_proj
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        // burn stores Linear weight as [n_in, n_out] — already row-major [i][j].
+        self.cross_modal_proj_flat = Some(w);
     }
 
     /// Return and reset the cumulative ingest timing accumulators.
@@ -603,19 +624,35 @@ impl PerceptionProcessor {
             }
         }
 
-        // Project to 384-dim
-        let concat_t: Tensor<TrainB, 2> =
-            Tensor::from_data(TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device);
-        let projected: Vec<f32> = self
-            .model
-            .as_ref()
-            .unwrap()
-            .cross_modal_proj
-            .forward(concat_t)
-            .into_data()
-            .convert::<f32>()
-            .to_vec()
-            .unwrap();
+        // Project to 384-dim.
+        // When ORT encoder is active, use the flat weight copy for allocation-free inference
+        // instead of going through the Autodiff<NdArray> tensor machinery.
+        let projected: Vec<f32> = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            if let Some(flat) = &self.cross_modal_proj_flat {
+                // Raw matmul: concat[2176] × flat[2176 × 384] → out[384]
+                let d_out = 384usize;
+                let mut out = vec![0.0f32; d_out];
+                for (i, &c) in concat.iter().enumerate() {
+                    if c == 0.0 { continue; }
+                    let base = i * d_out;
+                    for j in 0..d_out {
+                        out[j] += c * flat[base + j];
+                    }
+                }
+                out
+            } else {
+                // Flat weights not yet synced (first call before first NREM); use burn path.
+                let concat_t: Tensor<TrainB, 2> =
+                    Tensor::from_data(TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device);
+                self.model.as_ref().unwrap().cross_modal_proj.forward(concat_t)
+                    .into_data().convert::<f32>().to_vec().unwrap()
+            }
+        } else {
+            let concat_t: Tensor<TrainB, 2> =
+                Tensor::from_data(TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device);
+            self.model.as_ref().unwrap().cross_modal_proj.forward(concat_t)
+                .into_data().convert::<f32>().to_vec().unwrap()
+        };
 
         // Store projected embedding: NREM synthesize_episode uses latest_inputs[3] as
         // input to the symbolic layer for dream synthesis, so this must always be set.
@@ -1554,6 +1591,7 @@ impl PerceptionProcessor {
             tracing::info!(migraphx = use_migraphx, "ORT binding session loaded (no encoder)");
         }
         self.ort_session = Some(sess);
+        self.sync_cross_modal_flat();
         Ok(())
     }
 
@@ -1590,6 +1628,7 @@ impl PerceptionProcessor {
         // Step 3: reload ORT sessions with new weights
         let bind_path = onnx_dir.join("perception_binding.onnx");
         self.enable_ort_inference(&bind_path, use_migraphx)?;
+        self.sync_cross_modal_flat();
         tracing::info!("ORT sessions rebuilt after sleep cycle");
         Ok(())
     }
