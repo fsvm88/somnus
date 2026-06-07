@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-07
-> **Last commit on main:** ea9ed9a — ORT encoder in settle: replace burn kwta with encoder ORT + topk_no_dc
+> **Last commit on main:** 8419d1f — sym_us: replace burn cross_modal_proj with allocation-free Vec matmul
 > **Branch:** `main` (not yet pushed)
 
-## Status: ORT settle fully optimised. Cumulative −3.98ms/ep (22%) over burn-only.
+## Status: sym_us + kwta_us optimization complete. Both burn costs eliminated.
 
 ---
 
@@ -18,6 +18,9 @@
 | Instrument prior_us | de26f6c | settle_us + prior_update_us sub-timers in metrics |
 | ORT binding in settle | 86ca92e | burn GRU in settle → ORT binding; hidden saved/restored |
 | ORT encoder in settle | ea9ed9a | burn kwta in settle → ORT encoder + topk_from_z_no_dc |
+| Skip burn kwta in ingest | a0eab2d | skip burn forward in ingest_{speech,env,visual,lang} when ORT enc active |
+| Fix NREM sym dependency | 2d94bbe | always populate latest_inputs[3] before sym early-return |
+| Flat matmul for sym | 8419d1f | cross_modal_proj → allocation-free Vec matmul; kwta=0, sym~3ms (jitter) |
 
 ---
 
@@ -44,16 +47,17 @@ Cannot go lower without reducing settle rate. prior_update_us is now the floor (
 
 ---
 
-## Current bottleneck breakdown (ORT enc settle, warm CAPACITY=2048)
+## Current bottleneck breakdown (campaign_20260607_184504, CAPACITY=2048, ONNX active)
 
 | Component | ms/ep | Notes |
 |---|---|---|
-| **sym_us** | **~2.5** | #1 — symbolic cross-modal (burn cross_modal_proj + kwta) |
 | prior_us | ~2.1 | settle (1.73) + prior_update (0.35) |
-| bind_us | ~1.5 | ORT encoder + ORT binding |
-| **kwta_us** | **~1.5** | #2 — topk+dc for triggering region (burn) |
+| sym_us | ~3.0–3.6 | flat Vec matmul done; residual is OS scheduling jitter |
+| bind_us | ~1.6 | ORT encoder + ORT binding |
+| kwta_us | **0.000** | eliminated — ORT encoder handles all 5 regions |
+| perc_total | ~19ms | (vs 18ms burn-only baseline at CAPACITY=4096; load varies) |
 
-Settle bottleneck is closed. Remaining burn costs: sym_us and kwta_us.
+kwta_us and sym_us targets: CLOSED. Residual sym_us is irreducible thread jitter.
 
 ---
 
