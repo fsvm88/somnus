@@ -590,22 +590,6 @@ impl PerceptionProcessor {
     ///
     /// Returns (symbolic_prior_cosine, symbolic_reconstruction_err).
     fn compute_symbolic_cross_modal(&mut self) -> (Option<f32>, f32) {
-        // When ORT encoder is active, symbolic z is computed by run_encoder inside try_bind.
-        // Skip the entire burn cross-modal computation (~2.5ms/ep saved).
-        // Bootstrap latest[3] with a placeholder the first time so the try_bind gate can fire;
-        // try_bind will immediately overwrite it with the real ORT z3 activation.
-        if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-            if self.latest[RegionId::Symbolic.as_index()].is_none() {
-                self.latest[RegionId::Symbolic.as_index()] = Some(SparseActivation {
-                    region: RegionId::Symbolic,
-                    indices: (0..K_ACTIVE as u16).collect(),
-                    values: vec![1.0f32; K_ACTIVE],
-                    n_units: N_UNITS,
-                });
-            }
-            return (None, 0.0);
-        }
-
         let device = self.device;
 
         // Build 2176-dim concat: [speech(384) | env(512) | visual(384) | language(896)]
@@ -633,29 +617,33 @@ impl PerceptionProcessor {
             .to_vec()
             .unwrap();
 
+        // Store projected embedding: NREM synthesize_episode uses latest_inputs[3] as
+        // input to the symbolic layer for dream synthesis, so this must always be set.
+        self.latest_inputs[RegionId::Symbolic.as_index()] = Some(projected.clone());
+
+        // When ORT encoder is active: symbolic z (and dc update) come from run_encoder +
+        // topk_from_z inside try_bind.  Skip the burn kwta and reconstruction_error.
+        // Bootstrap latest[3] with a placeholder on first call so the try_bind gate
+        // can fire; try_bind overwrites it immediately with the real ORT z3 activation.
+        if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            if self.latest[RegionId::Symbolic.as_index()].is_none() {
+                self.latest[RegionId::Symbolic.as_index()] = Some(SparseActivation {
+                    region: RegionId::Symbolic,
+                    indices: (0..K_ACTIVE as u16).collect(),
+                    values: vec![1.0f32; K_ACTIVE],
+                    n_units: N_UNITS,
+                });
+            }
+            return (None, 0.0);
+        }
+
         // Blend with prior and encode through symbolic k-WTA.
-        // Phase 1.5: when encoder ORT is active, use forward_no_dc so the duty-cycle
-        // update happens exactly once per binding event (via topk_from_z in try_bind).
-        // The resulting activation is a placeholder — try_bind overwrites it with ORT z_3.
         let gained = apply_gain(&projected, self.region_gain[3]);
         let (symbolic_input, symbolic_cos) = self.blend_with_prior(&gained, 3);
         if let Some(c) = symbolic_cos {
             tracing::info!(region = "symbolic", prior_cosine = c, "top-down prior");
         }
-        let ort_enc = self.ort_session.as_ref().is_some_and(|s| s.has_encoder());
-        let symbolic_act = if ort_enc {
-            self.model
-                .as_ref()
-                .unwrap()
-                .symbolic_layer
-                .forward_no_dc(&symbolic_input, &device)
-        } else {
-            self.model
-                .as_mut()
-                .unwrap()
-                .symbolic_layer
-                .forward(&symbolic_input, &device)
-        };
+        let symbolic_act = self.model.as_mut().unwrap().symbolic_layer.forward(&symbolic_input, &device);
         let symbolic_err = self
             .model
             .as_ref()
@@ -664,8 +652,6 @@ impl PerceptionProcessor {
             .reconstruction_error(&projected, &symbolic_act, &device);
 
         self.latest[RegionId::Symbolic.as_index()] = Some(symbolic_act);
-        // Store the projected embedding as symbolic's input for NREM replay and settling.
-        self.latest_inputs[RegionId::Symbolic.as_index()] = Some(projected);
 
         (symbolic_cos, symbolic_err)
     }
