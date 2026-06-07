@@ -323,21 +323,26 @@ impl PerceptionProcessor {
         }
 
         let t0 = Instant::now();
-        let speech_act = self
-            .model
-            .as_mut()
-            .unwrap()
-            .speech_layer
-            .forward(&speech_input, &device);
-        let speech_err = self
-            .model
-            .as_ref()
-            .unwrap()
-            .speech_decoder
-            .reconstruction_error(values, &speech_act, &device);
+        let speech_err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            // ORT encoder recomputes all 5 regions in try_bind; skip burn forward.
+            // Bootstrap latest[0] if needed so try_bind gate can fire.
+            if self.latest[RegionId::AudioSpeech.as_index()].is_none() {
+                self.latest[RegionId::AudioSpeech.as_index()] = Some(SparseActivation {
+                    region: RegionId::AudioSpeech,
+                    indices: (0..K_ACTIVE as u16).collect(),
+                    values: vec![1.0f32; K_ACTIVE],
+                    n_units: N_UNITS,
+                });
+            }
+            0.0
+        } else {
+            let act = self.model.as_mut().unwrap().speech_layer.forward(&speech_input, &device);
+            let err = self.model.as_ref().unwrap().speech_decoder
+                .reconstruction_error(values, &act, &device);
+            self.latest[RegionId::AudioSpeech.as_index()] = Some(act);
+            err
+        };
         self.perf_kwta_us += t0.elapsed().as_micros() as u64;
-
-        self.latest[RegionId::AudioSpeech.as_index()] = Some(speech_act);
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
 
         let t1 = Instant::now();
@@ -382,21 +387,24 @@ impl PerceptionProcessor {
         }
 
         let t0 = Instant::now();
-        let act = self
-            .model
-            .as_mut()
-            .unwrap()
-            .env_layer
-            .forward(&input, &device);
-        let err = self
-            .model
-            .as_ref()
-            .unwrap()
-            .env_decoder
-            .reconstruction_error(values, &act, &device);
+        let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            if self.latest[RegionId::AudioEnv.as_index()].is_none() {
+                self.latest[RegionId::AudioEnv.as_index()] = Some(SparseActivation {
+                    region: RegionId::AudioEnv,
+                    indices: (0..K_ACTIVE as u16).collect(),
+                    values: vec![1.0f32; K_ACTIVE],
+                    n_units: N_UNITS,
+                });
+            }
+            0.0
+        } else {
+            let act = self.model.as_mut().unwrap().env_layer.forward(&input, &device);
+            let e = self.model.as_ref().unwrap().env_decoder
+                .reconstruction_error(values, &act, &device);
+            self.latest[RegionId::AudioEnv.as_index()] = Some(act);
+            e
+        };
         self.perf_kwta_us += t0.elapsed().as_micros() as u64;
-
-        self.latest[RegionId::AudioEnv.as_index()] = Some(act);
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
         let t1 = Instant::now();
@@ -441,21 +449,24 @@ impl PerceptionProcessor {
         }
 
         let t0 = Instant::now();
-        let act = self
-            .model
-            .as_mut()
-            .unwrap()
-            .visual_layer
-            .forward(&input, &device);
-        let err = self
-            .model
-            .as_ref()
-            .unwrap()
-            .visual_decoder
-            .reconstruction_error(values, &act, &device);
+        let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            if self.latest[RegionId::Visual.as_index()].is_none() {
+                self.latest[RegionId::Visual.as_index()] = Some(SparseActivation {
+                    region: RegionId::Visual,
+                    indices: (0..K_ACTIVE as u16).collect(),
+                    values: vec![1.0f32; K_ACTIVE],
+                    n_units: N_UNITS,
+                });
+            }
+            0.0
+        } else {
+            let act = self.model.as_mut().unwrap().visual_layer.forward(&input, &device);
+            let e = self.model.as_ref().unwrap().visual_decoder
+                .reconstruction_error(values, &act, &device);
+            self.latest[RegionId::Visual.as_index()] = Some(act);
+            e
+        };
         self.perf_kwta_us += t0.elapsed().as_micros() as u64;
-
-        self.latest[RegionId::Visual.as_index()] = Some(act);
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
         let t1 = Instant::now();
@@ -498,21 +509,18 @@ impl PerceptionProcessor {
         }
 
         let t0 = Instant::now();
-        let act = self
-            .model
-            .as_mut()
-            .unwrap()
-            .language_layer
-            .forward(&input, &device);
-        let err = self
-            .model
-            .as_ref()
-            .unwrap()
-            .language_decoder
-            .reconstruction_error(values, &act, &device);
+        let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            // Language is not checked in the try_bind gate (indices 0-3 only),
+            // so no bootstrap needed; try_bind updates latest[4] via topk_from_z.
+            0.0
+        } else {
+            let act = self.model.as_mut().unwrap().language_layer.forward(&input, &device);
+            let e = self.model.as_ref().unwrap().language_decoder
+                .reconstruction_error(values, &act, &device);
+            self.latest[RegionId::Language.as_index()] = Some(act);
+            e
+        };
         self.perf_kwta_us += t0.elapsed().as_micros() as u64;
-
-        self.latest[RegionId::Language.as_index()] = Some(act);
         self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
 
         let t1 = Instant::now();
@@ -582,6 +590,22 @@ impl PerceptionProcessor {
     ///
     /// Returns (symbolic_prior_cosine, symbolic_reconstruction_err).
     fn compute_symbolic_cross_modal(&mut self) -> (Option<f32>, f32) {
+        // When ORT encoder is active, symbolic z is computed by run_encoder inside try_bind.
+        // Skip the entire burn cross-modal computation (~2.5ms/ep saved).
+        // Bootstrap latest[3] with a placeholder the first time so the try_bind gate can fire;
+        // try_bind will immediately overwrite it with the real ORT z3 activation.
+        if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            if self.latest[RegionId::Symbolic.as_index()].is_none() {
+                self.latest[RegionId::Symbolic.as_index()] = Some(SparseActivation {
+                    region: RegionId::Symbolic,
+                    indices: (0..K_ACTIVE as u16).collect(),
+                    values: vec![1.0f32; K_ACTIVE],
+                    n_units: N_UNITS,
+                });
+            }
+            return (None, 0.0);
+        }
+
         let device = self.device;
 
         // Build 2176-dim concat: [speech(384) | env(512) | visual(384) | language(896)]
