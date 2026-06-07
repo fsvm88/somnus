@@ -593,18 +593,29 @@ impl PerceptionProcessor {
             .to_vec()
             .unwrap();
 
-        // Blend with prior and encode through symbolic k-WTA
+        // Blend with prior and encode through symbolic k-WTA.
+        // Phase 1.5: when encoder ORT is active, use forward_no_dc so the duty-cycle
+        // update happens exactly once per binding event (via topk_from_z in try_bind).
+        // The resulting activation is a placeholder — try_bind overwrites it with ORT z_3.
         let gained = apply_gain(&projected, self.region_gain[3]);
         let (symbolic_input, symbolic_cos) = self.blend_with_prior(&gained, 3);
         if let Some(c) = symbolic_cos {
             tracing::info!(region = "symbolic", prior_cosine = c, "top-down prior");
         }
-        let symbolic_act = self
-            .model
-            .as_mut()
-            .unwrap()
-            .symbolic_layer
-            .forward(&symbolic_input, &device);
+        let ort_enc = self.ort_session.as_ref().is_some_and(|s| s.has_encoder());
+        let symbolic_act = if ort_enc {
+            self.model
+                .as_ref()
+                .unwrap()
+                .symbolic_layer
+                .forward_no_dc(&symbolic_input, &device)
+        } else {
+            self.model
+                .as_mut()
+                .unwrap()
+                .symbolic_layer
+                .forward(&symbolic_input, &device)
+        };
         let symbolic_err = self
             .model
             .as_ref()
@@ -620,6 +631,11 @@ impl PerceptionProcessor {
     }
 
     fn refresh_language_cache(&mut self) {
+        // Phase 1.5: when encoder ORT is active, skip — the language z comes from
+        // run_encoder in try_bind, which uses latest_inputs[Language] directly.
+        if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            return;
+        }
         let device = self.device;
         if let Some(emb) = self.last_language_input.clone() {
             let act = self
@@ -638,63 +654,101 @@ impl PerceptionProcessor {
         &mut self,
         latest_episode: Option<&Vec<f32>>,
     ) -> (Option<EpisodeVector>, Option<[Vec<f32>; 5]>) {
-        match (
-            self.latest[0].as_ref(),
-            self.latest[1].as_ref(),
-            self.latest[2].as_ref(),
-            self.latest[3].as_ref(),
-        ) {
-            (Some(sp), Some(en), Some(vi), Some(sy)) => {
-                let lang_zero = SparseActivation {
-                    region: RegionId::Language,
-                    indices: vec![],
-                    values: vec![],
-                    n_units: N_UNITS,
-                };
-                let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
+        // Require all 4 primary regions to have activations before binding fires.
+        if self.latest[0].is_none()
+            || self.latest[1].is_none()
+            || self.latest[2].is_none()
+            || self.latest[3].is_none()
+        {
+            return (None, None);
+        }
 
-                let ep = if let Some(ref mut ort) = self.ort_session {
-                    // ORT path: convert burn sparse activations to dense, run ORT binding
-                    let sparse_z: [Vec<f32>; 5] = [
-                        sp.to_dense_n(N_UNITS),
-                        en.to_dense_n(N_UNITS),
-                        vi.to_dense_n(N_UNITS),
-                        sy.to_dense_n(N_UNITS),
-                        lang.to_dense_n(N_UNITS),
-                    ];
-                    let prev_zeros = vec![0.0f32; EPISODE_DIM];
-                    let prev = latest_episode
-                        .map(|v| v.as_slice())
-                        .unwrap_or(&prev_zeros);
-                    match ort.run_binding(&sparse_z, prev) {
-                        Ok(ep_vec) => EpisodeVector(ep_vec),
-                        Err(e) => {
-                            tracing::warn!(?e, "ORT binding failed; falling back to burn");
-                            let device = self.device;
-                            self.model.as_mut().unwrap().binding.forward(
-                                &[sp, en, vi, sy, lang], latest_episode, &device,
-                            )
-                        }
+        // Phase 1.5: encoder ORT path — replace all 5 burn activations with GPU encoder z+topk.
+        // Cadence note: duty-cycle updates happen here (once per binding) for all 5 regions,
+        // vs. the burn path which updates per-region per-ingest. Validate against burn-only runs.
+        if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+            // Collect inputs as owned Vecs (ends borrows of self.latest_inputs).
+            let enc_in = [
+                self.latest_inputs[0].clone().unwrap_or_else(|| vec![0.0f32; 384]),
+                self.latest_inputs[1].clone().unwrap_or_else(|| vec![0.0f32; 512]),
+                self.latest_inputs[2].clone().unwrap_or_else(|| vec![0.0f32; 384]),
+                self.latest_inputs[4].clone().unwrap_or_else(|| vec![0.0f32; 896]),
+            ];
+            let z_result = self
+                .ort_session
+                .as_mut()
+                .unwrap()
+                .run_encoder(&enc_in[0], &enc_in[1], &enc_in[2], &enc_in[3]);
+            match z_result {
+                Ok([z0, z1, z2, z3, z4]) => {
+                    let model = self.model.as_mut().unwrap();
+                    self.latest[0] = Some(model.speech_layer.topk_from_z(z0));
+                    self.latest[1] = Some(model.env_layer.topk_from_z(z1));
+                    self.latest[2] = Some(model.visual_layer.topk_from_z(z2));
+                    self.latest[3] = Some(model.symbolic_layer.topk_from_z(z3));
+                    // Only update language if we have a real language input; zeros → garbage z.
+                    if self.latest_inputs[4].is_some() {
+                        self.latest[4] = Some(model.language_layer.topk_from_z(z4));
                     }
-                } else {
-                    // Burn path (original)
+                }
+                Err(e) => tracing::warn!(?e, "ORT encoder failed; using burn activations"),
+            }
+        }
+
+        // At this point self.latest[0..3] are Some (checked above; may be ORT or burn).
+        let lang_zero = SparseActivation {
+            region: RegionId::Language,
+            indices: vec![],
+            values: vec![],
+            n_units: N_UNITS,
+        };
+        let sp   = self.latest[0].as_ref().unwrap();
+        let en   = self.latest[1].as_ref().unwrap();
+        let vi   = self.latest[2].as_ref().unwrap();
+        let sy   = self.latest[3].as_ref().unwrap();
+        let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
+
+        let ep = if let Some(ref mut ort) = self.ort_session {
+            // ORT binding path
+            let sparse_z: [Vec<f32>; 5] = [
+                sp.to_dense_n(N_UNITS),
+                en.to_dense_n(N_UNITS),
+                vi.to_dense_n(N_UNITS),
+                sy.to_dense_n(N_UNITS),
+                lang.to_dense_n(N_UNITS),
+            ];
+            let prev_zeros = vec![0.0f32; EPISODE_DIM];
+            let prev = latest_episode.map(|v| v.as_slice()).unwrap_or(&prev_zeros);
+            match ort.run_binding(&sparse_z, prev) {
+                Ok(ep_vec) => EpisodeVector(ep_vec),
+                Err(e) => {
+                    tracing::warn!(?e, "ORT binding failed; falling back to burn");
                     let device = self.device;
                     self.model.as_mut().unwrap().binding.forward(
-                        &[sp, en, vi, sy, lang], latest_episode, &device,
+                        &[sp, en, vi, sy, lang],
+                        latest_episode,
+                        &device,
                     )
-                };
-
-                let regional = [
-                    self.latest_inputs[0].clone().unwrap_or_default(),
-                    self.latest_inputs[1].clone().unwrap_or_default(),
-                    self.latest_inputs[2].clone().unwrap_or_default(),
-                    self.latest_inputs[3].clone().unwrap_or_default(),
-                    self.latest_inputs[4].clone().unwrap_or_default(),
-                ];
-                (Some(ep), Some(regional))
+                }
             }
-            _ => (None, None),
-        }
+        } else {
+            // Burn path (original)
+            let device = self.device;
+            self.model.as_mut().unwrap().binding.forward(
+                &[sp, en, vi, sy, lang],
+                latest_episode,
+                &device,
+            )
+        };
+
+        let regional = [
+            self.latest_inputs[0].clone().unwrap_or_default(),
+            self.latest_inputs[1].clone().unwrap_or_default(),
+            self.latest_inputs[2].clone().unwrap_or_default(),
+            self.latest_inputs[3].clone().unwrap_or_default(),
+            self.latest_inputs[4].clone().unwrap_or_default(),
+        ];
+        (Some(ep), Some(regional))
     }
 
     // ── Sleep-time training ──────────────────────────────────────────────────
@@ -1451,17 +1505,29 @@ impl PerceptionProcessor {
 
     // ── ORT inference session management ────────────────────────────────────
 
-    /// Load the binding ONNX graph and enable ORT inference for the binding area.
+    /// Load ORT inference sessions (binding + encoder if present).
     /// Call once at startup (and after each sleep cycle via `rebuild_ort_session`).
     /// `use_migraphx`: use AMD MIGraphX GPU EP; false → CPU EP (for testing).
+    /// Phase 1.5: also loads `perception_encoder.onnx` if it exists alongside `bind_path`.
     pub fn enable_ort_inference(
         &mut self,
         bind_path: &std::path::Path,
         use_migraphx: bool,
     ) -> anyhow::Result<()> {
-        let sess = crate::onnx_session::OnnxPerceptionSession::load(bind_path, use_migraphx)?;
+        let mut sess =
+            crate::onnx_session::OnnxPerceptionSession::load(bind_path, use_migraphx)?;
+        // Phase 1.5: attach encoder session if its ONNX file exists in the same directory.
+        let enc_path = bind_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("perception_encoder.onnx");
+        if enc_path.exists() {
+            sess = sess.with_encoder(&enc_path, use_migraphx)?;
+            tracing::info!(migraphx = use_migraphx, "ORT encoder+binding sessions loaded");
+        } else {
+            tracing::info!(migraphx = use_migraphx, "ORT binding session loaded (no encoder)");
+        }
         self.ort_session = Some(sess);
-        tracing::info!(migraphx = use_migraphx, "ORT binding session loaded");
         Ok(())
     }
 
@@ -1470,7 +1536,7 @@ impl PerceptionProcessor {
     /// weights have changed (NREM training, growth, prune).
     ///
     /// `script_path`: path to `scripts/export_perception_graph.py`
-    /// `onnx_dir`:    where to write (and read from) `perception_binding.onnx`
+    /// `onnx_dir`:    where to write (and read from) the ONNX graphs
     /// `use_migraphx`: true for production GPU; false for CPU-only testing
     pub fn rebuild_ort_session(
         &mut self,
@@ -1498,7 +1564,7 @@ impl PerceptionProcessor {
         // Step 3: reload ORT sessions with new weights
         let bind_path = onnx_dir.join("perception_binding.onnx");
         self.enable_ort_inference(&bind_path, use_migraphx)?;
-        tracing::info!("ORT binding session rebuilt after sleep cycle");
+        tracing::info!("ORT sessions rebuilt after sleep cycle");
         Ok(())
     }
 

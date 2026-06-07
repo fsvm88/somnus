@@ -117,6 +117,16 @@ impl<B: Backend> KWtaLayer<B> {
         self.select_top_k_no_dc(z_vec)
     }
 
+    /// Apply k-WTA topk + duty-cycle update to a pre-computed z vector.
+    ///
+    /// Use when the linear matmul runs externally (e.g. encoder ORT session in Phase 1.5).
+    /// Duty-cycle cadence note: when the encoder ORT is active, this is called once per
+    /// binding event for all 5 regions simultaneously, vs. the burn path which updates
+    /// per-region per-ingest. The rate differs; validate against burn-only runs.
+    pub fn topk_from_z(&mut self, z_vec: Vec<f32>) -> SparseActivation {
+        self.select_top_k(z_vec)
+    }
+
     fn select_top_k(&mut self, z_vec: Vec<f32>) -> SparseActivation {
         let n = self.n_units;
         let target_dc = K_ACTIVE as f32 / n as f32;

@@ -1,8 +1,8 @@
-/// ORT-backed binding inference session for the perception pipeline (Phase 1).
+/// ORT-backed binding + encoder inference sessions for the perception pipeline.
 ///
-/// Replaces burn's binding area (GRU + cross-attention) with an ORT call.
-/// Burn k-WTA layers still run for duty-cycle tracking; their dense sparse activations
-/// are passed into the ORT binding graph. Phase 1.5 adds the encoder session.
+/// Phase 1 (binding): replaces burn's GRU + cross-attention with an ORT call.
+/// Phase 1.5 (encoder): replaces burn's 5 encoder matmuls with a single ORT call.
+/// Topk selection and duty-cycle updates remain on CPU (Rust) between encoder and binding.
 use std::path::Path;
 
 use ndarray::{Array2, Array3};
@@ -11,14 +11,17 @@ use ort::{session::Session, value::TensorRef};
 use crate::{EPISODE_DIM, N_UNITS};
 
 const GRU_HIDDEN: usize = 256;
+// Encoder input dimensions per region: [speech, env, visual, language]
+const ENC_DIMS: [usize; 4] = [384, 512, 384, 896];
 
 pub struct OnnxPerceptionSession {
     sess_bind: Session,
+    sess_enc: Option<Session>, // Phase 1.5: encoder session
     pub gru_hidden: Vec<f32>,
 }
 
 impl OnnxPerceptionSession {
-    /// Load from an existing `perception_binding.onnx`.
+    /// Load binding session from `perception_binding.onnx`.
     /// `use_migraphx`: attach MIGraphX EP (AMD GPU).
     pub fn load(bind_path: &Path, use_migraphx: bool) -> anyhow::Result<Self> {
         let sess = if use_migraphx {
@@ -28,8 +31,74 @@ impl OnnxPerceptionSession {
         };
         Ok(Self {
             sess_bind: sess,
+            sess_enc: None,
             gru_hidden: vec![0.0f32; GRU_HIDDEN],
         })
+    }
+
+    /// Attach an encoder session from `perception_encoder.onnx` (Phase 1.5).
+    pub fn with_encoder(mut self, enc_path: &Path, use_migraphx: bool) -> anyhow::Result<Self> {
+        let sess = if use_migraphx {
+            migraphx_session(enc_path)?
+        } else {
+            cpu_session(enc_path)?
+        };
+        self.sess_enc = Some(sess);
+        Ok(self)
+    }
+
+    pub fn has_encoder(&self) -> bool {
+        self.sess_enc.is_some()
+    }
+
+    /// Run the encoder graph (Phase 1.5).
+    ///
+    /// Inputs: raw embeddings for each region (zero-padded to correct dim by caller).
+    /// Returns 5 pre-topk z vectors [N_UNITS] in region order [speech, env, visual, symbolic, lang].
+    pub fn run_encoder(
+        &mut self,
+        speech: &[f32],
+        env: &[f32],
+        visual: &[f32],
+        lang: &[f32],
+    ) -> anyhow::Result<[Vec<f32>; 5]> {
+        let sess = self.sess_enc.as_mut().ok_or_else(|| anyhow::anyhow!("encoder session not loaded"))?;
+
+        // Pad or truncate to expected dims
+        let speech_v = pad_to(speech, ENC_DIMS[0]);
+        let env_v    = pad_to(env,    ENC_DIMS[1]);
+        let visual_v = pad_to(visual, ENC_DIMS[2]);
+        let lang_v   = pad_to(lang,   ENC_DIMS[3]);
+
+        let sp_arr = Array2::from_shape_vec((1, ENC_DIMS[0]), speech_v)?;
+        let en_arr = Array2::from_shape_vec((1, ENC_DIMS[1]), env_v)?;
+        let vi_arr = Array2::from_shape_vec((1, ENC_DIMS[2]), visual_v)?;
+        let la_arr = Array2::from_shape_vec((1, ENC_DIMS[3]), lang_v)?;
+
+        let t_sp = TensorRef::from_array_view(sp_arr.view())?;
+        let t_en = TensorRef::from_array_view(en_arr.view())?;
+        let t_vi = TensorRef::from_array_view(vi_arr.view())?;
+        let t_la = TensorRef::from_array_view(la_arr.view())?;
+
+        let outputs = sess.run(ort::inputs![
+            "speech_enc"   => t_sp,
+            "env_enc"      => t_en,
+            "visual_enc"   => t_vi,
+            "language_enc" => t_la,
+        ])?;
+
+        let extract = |name: &str| -> anyhow::Result<Vec<f32>> {
+            let (_, data) = outputs[name].try_extract_tensor::<f32>()?;
+            Ok(data.to_vec())
+        };
+
+        Ok([
+            extract("z_0")?,
+            extract("z_1")?,
+            extract("z_2")?,
+            extract("z_3")?,
+            extract("z_4")?,
+        ])
     }
 
     /// Run the binding graph.
@@ -124,4 +193,12 @@ fn thread_budget() -> (usize, usize) {
         .map(|n| n.get())
         .unwrap_or(4);
     ((n / 2).max(1), (n / 4).max(1))
+}
+
+/// Truncate or zero-pad `src` to exactly `n` elements.
+fn pad_to(src: &[f32], n: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; n];
+    let copy = src.len().min(n);
+    v[..copy].copy_from_slice(&src[..copy]);
+    v
 }

@@ -8,18 +8,23 @@
 #   scripts/train_campaign.sh [OPTIONS]
 #
 # Options (environment variables):
-#   SESSIONS      Number of sessions to run  (default: 10)
-#   CYCLES        Sleep cycles per session   (default: 3)
-#   CAPACITY      Episodic buffer size; sleep triggers at 80% (default: 4096)
-#                 Set small for fast validation, e.g. CAPACITY=64 → ~51 episodes/cycle
-#   CLIPS         Space-separated clip paths (default: all four in clips/)
-#   CAMPAIGN_DIR  Directory for metrics/logs (default: memory/campaign_<timestamp>)
-#   MEMORY_DIR    Shared memory directory    (default: memory)
-#   EXTRA_ARGS    Extra args passed to somnus   (default: none)
+#   SESSIONS         Number of sessions to run  (default: 10)
+#   CYCLES           Sleep cycles per session   (default: 3)
+#   CAPACITY         Episodic buffer size; sleep triggers at 80% (default: 4096)
+#                    Set small for fast validation, e.g. CAPACITY=64 → ~51 episodes/cycle
+#   CLIPS            Space-separated clip paths (default: all four in clips/)
+#   CAMPAIGN_DIR     Directory for metrics/logs (default: memory/campaign_<timestamp>)
+#   MEMORY_DIR       Shared memory directory    (default: memory)
+#   ONNX_MODELS_DIR  Enable ORT encoder+binding via this dir (default: disabled)
+#                    Writes/reads perception_encoder.onnx + perception_binding.onnx here.
+#                    Do NOT also pass --onnx-models-dir in EXTRA_ARGS.
+#   ONNX_SCRIPT      Override path to export_perception_graph.py (optional)
+#   EXTRA_ARGS       Extra args passed to somnus   (default: none)
 #
 # Example:
 #   SESSIONS=20 CYCLES=3 scripts/train_campaign.sh
 #   SESSIONS=5 EXTRA_ARGS="--prune-fraction 0.5" scripts/train_campaign.sh
+#   SESSIONS=10 ONNX_MODELS_DIR=memory/onnx_models scripts/train_campaign.sh
 
 set -euo pipefail
 
@@ -39,6 +44,10 @@ CLIPS="${CLIPS:-clips/talking_head.mp4 clips/urban.mp4 clips/animation.mp4 clips
 TEXT_CORPUS="${TEXT_CORPUS:-}"
 TEXT_RATE="${TEXT_RATE:-5}"      # chunks per second fed to --language stdin
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+# When set, enables ORT encoder+binding sessions (Phase 1 + 1.5).
+# Maps to --onnx-models-dir; writes ONNX graphs relative to MEMORY_DIR by default.
+ONNX_MODELS_DIR="${ONNX_MODELS_DIR:-}"
+ONNX_SCRIPT="${ONNX_SCRIPT:-}"       # override path to export_perception_graph.py
 
 METRICS_FILE="${CAMPAIGN_DIR}/metrics.jsonl"
 LOG_DIR="${CAMPAIGN_DIR}/logs"
@@ -58,6 +67,8 @@ CYCLES=${CYCLES}
 CAPACITY=${CAPACITY}
 CLIPS=${CLIPS}
 MEMORY_DIR=${MEMORY_DIR}
+ONNX_MODELS_DIR=${ONNX_MODELS_DIR}
+ONNX_SCRIPT=${ONNX_SCRIPT}
 EXTRA_ARGS=${EXTRA_ARGS}
 started=$(date -Iseconds)
 EOF
@@ -73,6 +84,16 @@ FILE_FLAGS=""
 for clip in $CLIPS; do
     FILE_FLAGS="$FILE_FLAGS --file $clip"
 done
+
+# Build ORT flags from ONNX_MODELS_DIR / ONNX_SCRIPT.
+# Guard against duplicate flags if user also passes them in EXTRA_ARGS.
+ONNX_DIR_FLAG=""
+if [ -n "$ONNX_MODELS_DIR" ] && [[ "$EXTRA_ARGS" != *"--onnx-models-dir"* ]]; then
+    ONNX_DIR_FLAG="--onnx-models-dir ${ONNX_MODELS_DIR}"
+    if [ -n "$ONNX_SCRIPT" ] && [[ "$EXTRA_ARGS" != *"--onnx-script"* ]]; then
+        ONNX_DIR_FLAG="${ONNX_DIR_FLAG} --onnx-script ${ONNX_SCRIPT}"
+    fi
+fi
 
 # ── Session loop ──────────────────────────────────────────────────────────────
 for i in $(seq "$SESSION_START" "$SESSION_END"); do
@@ -107,6 +128,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
+            $ONNX_DIR_FLAG \
             $EXTRA_ARGS \
             2>>"$SESSION_LOG" || EXIT=$?
     else
@@ -127,6 +149,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
+            $ONNX_DIR_FLAG \
             $EXTRA_ARGS \
             2>>"$SESSION_LOG" || EXIT=$?
     fi
