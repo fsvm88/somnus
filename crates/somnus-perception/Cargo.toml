@@ -11,7 +11,8 @@ tracing      = { workspace = true }
 serde_json   = { workspace = true }
 ort          = { workspace = true }
 ndarray      = { workspace = true }
-anyhow       = { workspace = true }
+anyhow           = { workspace = true }
+matrixmultiply   = "0.3"
 
 [[bin]]
 name = "bench_nrem_batch"

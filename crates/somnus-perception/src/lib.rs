@@ -86,19 +86,22 @@ impl EmaOutputHeads {
     }
 
     /// Inference-only head forward: ep_data @ weight → Vec<f32>.
-    /// Plain Rust matmul — no tensor allocation overhead.
+    /// Uses sgemm for AVX2/FMA-accelerated GEMV.
     fn predict(&self, ep_data: &[f32], idx: usize) -> Vec<f32> {
         let w = &self.flat[idx];
+        let d_in = ep_data.len();
         let d_out = self.d_out[idx];
         let mut out = vec![0.0f32; d_out];
-        for (i, &x) in ep_data.iter().enumerate() {
-            if x == 0.0 {
-                continue;
-            }
-            let row = &w[i * d_out..(i + 1) * d_out];
-            for (o, &wij) in out.iter_mut().zip(row) {
-                *o += x * wij;
-            }
+        // A: [1, d_in] row-major   B: [d_in, d_out] row-major   C: [1, d_out]
+        unsafe {
+            matrixmultiply::sgemm(
+                1, d_in, d_out,
+                1.0,
+                ep_data.as_ptr(), d_in as isize, 1,
+                w.as_ptr(),       d_out as isize, 1,
+                0.0,
+                out.as_mut_ptr(), d_out as isize, 1,
+            );
         }
         out
     }
@@ -111,8 +114,8 @@ pub const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 896];
 /// speech(384) + env(512) + visual(384) + language(896). Missing modalities are zero-padded.
 pub const CROSS_MODAL_DIM: usize = 384 + 512 + 384 + 896;
 
-/// prior_cosine below this gate activates settling (ADR 0011).
-const SETTLE_COSINE_GATE: f32 = 0.85;
+/// Default prior_cosine gate for settling (ADR 0011). Exposed as --settle-gate at runtime.
+pub const SETTLE_COSINE_GATE_DEFAULT: f32 = 0.85;
 
 /// L2 delta below which settling is considered converged (ADR 0011).
 /// Calibration note (2026-05-31): smoke tests show settle_delta_mean ≈ 0.46 on unit-normalised
@@ -243,6 +246,9 @@ pub struct PerceptionProcessor {
     latest_inputs: [Option<Vec<f32>>; 5],
     settle_steps: usize,
     settle_beta: f32,
+    settle_gate: f32,
+    settle_every: usize,
+    settle_episode_count: usize,
     region_gain: [f32; 5],
     last_language_input: Option<Vec<f32>>,
     working_memory: VecDeque<Vec<f32>>,
@@ -281,6 +287,9 @@ impl PerceptionProcessor {
             latest_inputs: [None, None, None, None, None],
             settle_steps: 0,
             settle_beta: 0.5,
+            settle_gate: SETTLE_COSINE_GATE_DEFAULT,
+            settle_every: 1,
+            settle_episode_count: 0,
             region_gain: [1.0; 5],
             last_language_input: None,
             working_memory: VecDeque::new(),
@@ -584,8 +593,10 @@ impl PerceptionProcessor {
         cosine: Option<f32>,
     ) -> (Option<EpisodeVector>, usize, f32) {
         if let Some(ep) = episode {
-            let should_settle =
-                self.settle_steps > 0 && cosine.is_none_or(|c| c < SETTLE_COSINE_GATE);
+            self.settle_episode_count += 1;
+            let should_settle = self.settle_steps > 0
+                && cosine.is_none_or(|c| c < self.settle_gate)
+                && self.settle_episode_count.is_multiple_of(self.settle_every);
             let t_settle = Instant::now();
             let (refined, iters, delta) = if should_settle {
                 self.settle_episode(&ep)
@@ -1672,6 +1683,14 @@ impl PerceptionProcessor {
 
     pub fn set_settle_beta(&mut self, beta: f32) {
         self.settle_beta = beta;
+    }
+
+    pub fn set_settle_gate(&mut self, gate: f32) {
+        self.settle_gate = gate;
+    }
+
+    pub fn set_settle_every(&mut self, every: usize) {
+        self.settle_every = every.max(1);
     }
 
     /// Detach all model parameters from the accumulated autodiff graph and reset the optimizer.

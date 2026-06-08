@@ -164,6 +164,16 @@ struct Args {
     #[arg(long, default_value = "0.5")]
     settle_beta: f32,
 
+    /// Cosine similarity gate for settling: settle fires when prior_cosine < this
+    /// threshold. Raise toward 1.0 to reduce settle frequency. Default 0.85.
+    #[arg(long, default_value = "0.85")]
+    settle_gate: f32,
+
+    /// Run settling only every N episodes (1 = every episode). Subsamples settle
+    /// to reduce GPU cost. E.g. --settle-every 2 halves settle overhead.
+    #[arg(long, default_value = "1")]
+    settle_every: usize,
+
     /// Working-memory ring size: number of recent episode vectors to carry as
     /// cross-attention context in the binding area (ADR 0010/10d). 0 = disabled (default).
     /// Cleared at sleep entry (wake-local by design).
@@ -652,6 +662,8 @@ async fn main() -> Result<()> {
     perception.set_prior_beta(args.prior_beta);
     perception.set_settle_steps(args.settle_steps);
     perception.set_settle_beta(args.settle_beta);
+    perception.set_settle_gate(args.settle_gate);
+    perception.set_settle_every(args.settle_every);
     perception.set_wm_size(args.working_memory_size);
     info!(
         prior_beta = args.prior_beta,
@@ -1652,7 +1664,9 @@ async fn main() -> Result<()> {
                         sink_write(&mut sink, &video_emb_json(&emb));
                         video_encode_total_ms += emb.encode_ms;
                         let t_perc = std::time::Instant::now();
-                        match perception.ingest_visual(&emb.values) {
+                        let vis_result = perception.ingest_visual(&emb.values);
+                        perception_total_ms += t_perc.elapsed().as_millis() as u64;
+                        match vis_result {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                                 if out.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += out.settle_iters; settle_delta_sum += out.settle_delta as f64; }
@@ -1697,7 +1711,6 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => tracing::error!(?e, "perception error (video)"),
                         }
-                        perception_total_ms += t_perc.elapsed().as_millis() as u64;
                     }
                     None => { video_emb_closed = true; }
                 }

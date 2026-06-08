@@ -2377,6 +2377,7 @@ dependencies = [
  "anyhow",
  "burn",
  "burn-ndarray",
+ "matrixmultiply",
  "ndarray 0.17.2",
  "ort",
  "serde_json",
