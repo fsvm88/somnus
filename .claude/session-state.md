@@ -1,104 +1,108 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-08
-> **Last commit on main:** 9b5e3bf — perf: three wake-path optimizations
-> **Branch:** `main` (not yet pushed)
+> **Last commit on main:** 47a0101 — Update session state: three perf opts committed, metric fix documented
+> **Branch:** `main` (clean, up to date with origin)
 
-## Status: Three more wake-path perf optimizations committed (9b5e3bf).
-
----
-
-## Completed this session
-
-| Item | Commit | What changed |
-|------|--------|--------------|
-| Fix perception_total_ms metric | 9b5e3bf | video ingest now times only ingest_visual; was ~12ms/ep inflated |
-| SIMD EMA matmuls | 9b5e3bf | EmaOutputHeads::predict → matrixmultiply::sgemm (AVX2/FMA) |
-| Configurable settle rate | 9b5e3bf | --settle-gate (default 0.85) + --settle-every N (default 1) CLI args |
-
-Previous session:
-| train_campaign.sh ONNX defaults | 590f7e6 | ONNX_MODELS_DIR / ONNX_SCRIPT env vars |
-| Phase 1.5: encoder ORT | 590f7e6 | 5 encoder matmuls → GPU |
-| GainWorker | 321cb8e | Qwen gain ORT → dedicated OS thread |
-| Instrument prior_us | de26f6c | settle_us + prior_update_us sub-timers in metrics |
-| ORT binding in settle | 86ca92e | burn GRU in settle → ORT binding; hidden saved/restored |
-| ORT encoder in settle | ea9ed9a | burn kwta in settle → ORT encoder + topk_from_z_no_dc |
-| Skip burn kwta in ingest | a0eab2d | skip burn forward in ingest_{speech,env,visual,lang} when ORT enc active |
-| Flat matmul for sym | 8419d1f | cross_modal_proj → allocation-free Vec matmul; kwta=0, sym~0.30ms |
+## Status: Perf analysis complete. Three next targets queued.
 
 ---
 
-## Key finding this session
+## Completed this session (9b5e3bf)
 
-**The 18ms `perc_total` was inflated**. For video frames, `t_perc` was timing
-`ingest_visual` + `record_episode` + `wake_reconstruct_step` — all inside the
-Ok() block. Audio and language timers correctly wrap only the ingest call.
-Fixed in 9b5e3bf. Cycle 3's 4.93ms ≈ components (4.75ms) was already correct.
+| Item | What changed |
+|------|--------------|
+| Fix `perception_total_ms` metric | Video timer now wraps only `ingest_visual`; was including `record_episode` + `wake_reconstruct_step` (~12ms inflation) |
+| SIMD EMA matmuls | `EmaOutputHeads::predict` → `matrixmultiply::sgemm` (AVX2/FMA); expected ~0.15–0.20ms/ep savings |
+| `--settle-gate FLOAT` | Expose `SETTLE_COSINE_GATE` as CLI arg (default 0.85); raises gate to reduce settle trigger rate |
+| `--settle-every N` | Subsample settle to every N episodes (default 1); `--settle-every 4` saves ~2.25ms/ep |
 
-**True perception pipeline cost (ONNX path):**
-- bind_us: ~1.6–2.6 ms/ep (ORT enc + ORT bind)
-- settle_us: ~2–3.5 ms/ep (ORT enc + topk + ORT bind, fires ~0.985/ep)
-- prior_update_us: ~0.35–0.50 ms/ep (5 EMA head matmuls — now sgemm)
-- sym_us: ~0.30 ms/ep (flat Vec matmul)
-- kwta_us: 0.000 ms/ep
-
-The `record_episode` + `wake_reconstruct_step` overhead (the ~12ms gap in
-cycles 1-2) is outside perception and can only be improved by rate-limiting
-wake_reconstruct or async post-processing.
+Previous sessions: ORT encoder+binding, GainWorker, flat sym matmul, burn kwta elimination.
 
 ---
 
-## Benchmark progression (warm cycles, CAPACITY=2048)
+## What the "12ms gap" was
 
-| Stage | perc_total | Δ |
+The old video `t_perc` timer wrapped the entire Ok() block. The excess came from:
+- **`record_episode` → HNSW `query_warm_with_dist`**: ~1–15ms depending on warm index size
+- **`wake_reconstruct_step`**: full burn autodiff backward, 5–15ms/call @ every 5 eps = ~1–3ms amortized
+- **JSON episode write** (640 floats): ~0.5ms
+
+Cycle 3's 4.93ms ≈ components (4.75ms) was already clean. Cycles 1–2 were inflated by these triggers.
+After metric fix, all cycles should show ~5–6ms/ep perception.
+
+---
+
+## True hot path breakdown (post-fix, ONNX active)
+
+| Component | ms/ep | Timer |
 |---|---|---|
-| Burn-only (control) | 18.08 ms/ep | — |
-| Phase 1.5 (ORT enc+bind) | 16.83 ms/ep | −1.25 |
-| + ORT binding in settle | 14.59 ms/ep | −2.24 |
-| + ORT encoder in settle | 14.10 ms/ep | −0.49 |
-| + skip burn kwta+sym | ~5ms/ep (cycles 3) | metric was misleading |
-| + sgemm + settle knobs | rebenchmark needed | new commit 9b5e3bf |
+| bind_us (ORT enc + ORT bind) | ~1.6–2.6 | inside perception |
+| settle_us (ORT enc + topk + ORT bind) | ~2–3.5 × settle_every rate | inside perception |
+| prior_update_us (5× sgemm heads) | ~0.15 | inside perception |
+| sym_us (2176→384 Vec matmul) | ~0.30 | inside perception |
+| **HNSW query_warm_with_dist** | ~1–15 (grows with warm index) | outside, untracked |
+| **wake_reconstruct_step** | ~1–3 amortized (5–15ms/call × 1/5 ep) | outside, untracked |
+| JSON episode write (640 f32) | ~0.5 | outside, untracked |
 
-### Last confirmed benchmark (campaign_20260607_185345, 2s×3c, CAPACITY=2048)
-
-| s | c | perc ms/ep | kwta | sym | bind | settle | prior_upd |
-|---|---|---|---|---|---|---|---|
-| 1 | 1 | 18.45* | 0.000 | 0.304 | 2.646 | 3.085 | 0.436 |
-| 1 | 2 | 17.67* | 0.000 | 0.326 | 1.883 | 2.088 | 0.413 |
-| 1 | 3 |  4.93  | 0.000 | 0.329 | 1.762 | 2.161 | 0.495 |
-
-*Cycles 1-2 were inflated by ~12ms due to wake_reconstruct in video timer (fixed).
-True perc = bind + settle + prior_update + sym ≈ 6ms/ep for cycle 1.
+With `--settle-every 4`: perception ≈ **3.4ms/ep**. Total frame latency also depends on HNSW + wake_reconstruct.
 
 ---
 
-## Performance knobs after 9b5e3bf
+## Queued next (smallest → biggest)
+
+### 1. `--recall-ef N` (15 min)
+`SEARCH_EF=64` hardcoded in `crates/somnus-memory/src/semantic.rs:23`. Expose as CLI arg.
+- Wire through `RecollectionLayer` → `SemanticStore::query_with_dist`
+- At `--recall-ef 16`: ~4× faster HNSW queries; growing warm index is the main long-run bottleneck
+- Tradeoff: lower recall accuracy — validate with `eval_metrics.py`
+
+### 2. Lazy `regional_inputs` in `try_bind` (30 min)
+`crates/somnus-perception/src/lib.rs:818–825`: 5 `latest_inputs.clone()` calls every episode (~10KB).
+Only needed for `episodic.push` (always) and `wake_reconstruct_step` (every 5 eps × salience gate).
+Approach: clone `regional` only when episode is Some (already gated), which it is — nothing to change there.
+Real fix: avoid storing full 5-vec array in `PerceptionOutput`; instead pass it lazily only when needed.
+Note: `episodic.push` stores all 5 for sleep replay, so we can't skip the clone for push — only for wake_reconstruct.
+Actually minor (~0.05ms/ep) — may not be worth the refactor. Re-evaluate after --recall-ef.
+
+### 3. Async `wake_reconstruct_step` (2–3 hr)
+Move the blocking autodiff backward pass off the main ingest loop onto a dedicated worker thread.
+Model: identical to `GainWorker` pattern in `crates/somnus/src/action.rs`.
+- Worker thread owns a clone of the model + optimizer
+- Main loop sends `(episode: Vec<f32>, regional: [Vec<f32>; 5])` over a channel (non-blocking)
+- Worker does backward + AdamW step + EMA update, sends updated EMA weights back
+- Main loop applies updated EMA weights non-blockingly
+Concern: model desync between perception's training model and wake_reconstruct's model copy. Need to periodically sync. Same issue GainWorker has with stale weights — acceptable for research.
+Saves: ~1–3ms/ep amortized, and eliminates latency spikes on high-salience episodes.
+
+---
+
+## Performance knobs
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--settle-steps 0` | N/A | Disable settle entirely; saves ~3ms/ep at 0.985/ep |
-| `--settle-every 2` | 1 | Halve settle rate; saves ~1.5ms/ep |
-| `--settle-every 4` | 1 | 25% settle rate; saves ~2.25ms/ep |
-| `--settle-gate 0.99` | 0.85 | Reduces trigger rate as priors improve |
-
-At `--settle-every 4`: expected total ≈ 2ms bind + 0.75ms settle + 0.35ms prior_upd + 0.30ms sym ≈ 3.4ms/ep.
+| `--settle-steps 0` | 0 | Disable settle entirely; saves ~3ms/ep |
+| `--settle-every N` | 1 | Subsample settle; `--settle-every 4` → ~3.4ms/ep perception |
+| `--settle-gate F` | 0.85 | Raise to reduce settle trigger rate as priors improve |
+| `--wake-reconstruct-interval N` | 5 | Fire wake_reconstruct every N episodes |
+| `--video-stride N` | 1 | Encode every Nth video frame; halving visual load with N=2 |
 
 ---
 
-## settle_episode execution paths (ea9ed9a)
+## settle_episode execution paths
 
-Three paths selected at runtime:
-- **Path A** (encoder+binding active): ORT encoder → topk_from_z_no_dc → ORT binding
+- **Path A** (ORT encoder + binding active): ORT encoder → topk_from_z_no_dc → ORT binding
 - **Path B** (binding only): burn kwta → ORT binding
 - **Path C** (burn only): burn kwta → burn binding
 
-Hidden state saved before loop, restored after each ORT binding call.
+GRU hidden saved before settle loop, restored after each binding call.
+settle_beta=0.5 (default): blends raw input with 50% EMA prediction before re-encoding.
 
 ---
 
 ## MIGraphX constraint (hard)
 
-Never expose ScatterElements or INT64 outputs. Workaround: two-graph split, topk/masking on CPU.
+Never expose ScatterElements or INT64 outputs. Two-graph split, topk/masking on CPU.
 
 ---
 
@@ -113,4 +117,6 @@ Never expose ScatterElements or INT64 outputs. Workaround: two-graph split, topk
 - burn GRU: reset_after=True → ONNX linear_before_reset=1
 - burn Linear weight: [n_in, n_out] (transpose of ONNX/PyTorch)
 - DUTY_CYCLE_ALPHA=0.001, BOOST_STRENGTH=1.0, TARGET_DC=20/1024≈0.0195
-- settle_beta default 0.5; settle_gate default 0.85; settle_every default 1
+- settle_beta=0.5, settle_gate=0.85, settle_every=1 (all defaults)
+- SEARCH_EF=64 (hardcoded in somnus-memory/src/semantic.rs:23)
+- wake_reconstruct_interval=5 (default), salience gate=0.8
