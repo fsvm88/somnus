@@ -1,10 +1,10 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-07
-> **Last commit on main:** 5af7907 — Update session state: sym_us + kwta_us optimization complete
+> **Last updated:** 2026-06-08
+> **Last commit on main:** 9b5e3bf — perf: three wake-path optimizations
 > **Branch:** `main` (not yet pushed)
 
-## Status: sym_us + kwta_us optimization complete. Benchmark confirmed.
+## Status: Three more wake-path perf optimizations committed (9b5e3bf).
 
 ---
 
@@ -12,6 +12,11 @@
 
 | Item | Commit | What changed |
 |------|--------|--------------|
+| Fix perception_total_ms metric | 9b5e3bf | video ingest now times only ingest_visual; was ~12ms/ep inflated |
+| SIMD EMA matmuls | 9b5e3bf | EmaOutputHeads::predict → matrixmultiply::sgemm (AVX2/FMA) |
+| Configurable settle rate | 9b5e3bf | --settle-gate (default 0.85) + --settle-every N (default 1) CLI args |
+
+Previous session:
 | train_campaign.sh ONNX defaults | 590f7e6 | ONNX_MODELS_DIR / ONNX_SCRIPT env vars |
 | Phase 1.5: encoder ORT | 590f7e6 | 5 encoder matmuls → GPU |
 | GainWorker | 321cb8e | Qwen gain ORT → dedicated OS thread |
@@ -19,8 +24,27 @@
 | ORT binding in settle | 86ca92e | burn GRU in settle → ORT binding; hidden saved/restored |
 | ORT encoder in settle | ea9ed9a | burn kwta in settle → ORT encoder + topk_from_z_no_dc |
 | Skip burn kwta in ingest | a0eab2d | skip burn forward in ingest_{speech,env,visual,lang} when ORT enc active |
-| Fix NREM sym dependency | 2d94bbe | always populate latest_inputs[3] before sym early-return |
-| Flat matmul for sym | 8419d1f | cross_modal_proj → allocation-free Vec matmul; kwta=0, sym~3ms (jitter) |
+| Flat matmul for sym | 8419d1f | cross_modal_proj → allocation-free Vec matmul; kwta=0, sym~0.30ms |
+
+---
+
+## Key finding this session
+
+**The 18ms `perc_total` was inflated**. For video frames, `t_perc` was timing
+`ingest_visual` + `record_episode` + `wake_reconstruct_step` — all inside the
+Ok() block. Audio and language timers correctly wrap only the ingest call.
+Fixed in 9b5e3bf. Cycle 3's 4.93ms ≈ components (4.75ms) was already correct.
+
+**True perception pipeline cost (ONNX path):**
+- bind_us: ~1.6–2.6 ms/ep (ORT enc + ORT bind)
+- settle_us: ~2–3.5 ms/ep (ORT enc + topk + ORT bind, fires ~0.985/ep)
+- prior_update_us: ~0.35–0.50 ms/ep (5 EMA head matmuls — now sgemm)
+- sym_us: ~0.30 ms/ep (flat Vec matmul)
+- kwta_us: 0.000 ms/ep
+
+The `record_episode` + `wake_reconstruct_step` overhead (the ~12ms gap in
+cycles 1-2) is outside perception and can only be improved by rate-limiting
+wake_reconstruct or async post-processing.
 
 ---
 
@@ -32,46 +56,32 @@
 | Phase 1.5 (ORT enc+bind) | 16.83 ms/ep | −1.25 |
 | + ORT binding in settle | 14.59 ms/ep | −2.24 |
 | + ORT encoder in settle | 14.10 ms/ep | −0.49 |
-| + skip burn kwta+sym in ingest | **~17 ms/ep** | (load varies; kwta=0, sym=0.30ms) |
+| + skip burn kwta+sym | ~5ms/ep (cycles 3) | metric was misleading |
+| + sgemm + settle knobs | rebenchmark needed | new commit 9b5e3bf |
 
-### Confirmed benchmark (campaign_20260607_185345, 2s×3c, CAPACITY=2048, ONNX active)
+### Last confirmed benchmark (campaign_20260607_185345, 2s×3c, CAPACITY=2048)
 
 | s | c | perc ms/ep | kwta | sym | bind | settle | prior_upd |
 |---|---|---|---|---|---|---|---|
-| 1 | 1 | 18.45 | 0.000 | 0.304 | 2.646 | 3.085 | 0.436 |
-| 1 | 2 | 17.67 | 0.000 | 0.326 | 1.883 | 2.088 | 0.413 |
-| 1 | 3 |  4.93 | 0.000 | 0.329 | 1.762 | 2.161 | 0.495 |
-| 2 | 1 | 18.10 | 0.000 | 0.331 | 2.163 | 3.546 | 0.427 |
-| 2 | 2 | 16.38 | 0.000 | 0.260 | 1.699 | 1.879 | 0.338 |
-| 2 | 3 |  4.63 | 0.000 | 0.341 | 1.649 | 2.016 | 0.445 |
+| 1 | 1 | 18.45* | 0.000 | 0.304 | 2.646 | 3.085 | 0.436 |
+| 1 | 2 | 17.67* | 0.000 | 0.326 | 1.883 | 2.088 | 0.413 |
+| 1 | 3 |  4.93  | 0.000 | 0.329 | 1.762 | 2.161 | 0.495 |
 
-kwta = 0.000 ms/ep (eliminated). sym = 0.26–0.34 ms/ep (down from ~9ms peak, ~3ms prior run).
-Remaining costs: bind (ORT enc+bind) and settle (varies with trigger rate).
-
-### Settle bottleneck: CLOSED
-
-| | ms/trigger | settle/ep |
-|---|---|---|
-| Burn settle | ~5.9 ms | 0.84 |
-| ORT bind settle | 4.59 ms | 0.985 |
-| ORT enc settle | **1.75 ms** | 0.985 |
-
-Residual 1.75ms = encoder ORT (~0.7ms) + binding ORT (~0.85ms) + topk_no_dc (~0.2ms).
-Cannot go lower without reducing settle rate. prior_update_us is now the floor (~0.35ms).
+*Cycles 1-2 were inflated by ~12ms due to wake_reconstruct in video timer (fixed).
+True perc = bind + settle + prior_update + sym ≈ 6ms/ep for cycle 1.
 
 ---
 
-## Current bottleneck breakdown (campaign_20260607_185345, CAPACITY=2048, ONNX active)
+## Performance knobs after 9b5e3bf
 
-| Component | ms/ep | Notes |
+| Flag | Default | Effect |
 |---|---|---|
-| settle_us | ~2–3.5 | dominates; varies with settle trigger rate |
-| bind_us | ~1.6–2.6 | ORT encoder + ORT binding |
-| prior_us | ~0.34–0.50 | prior_update (NREM side) |
-| sym_us | **~0.30** | flat Vec matmul; effectively free |
-| kwta_us | **0.000** | eliminated — ORT encoder handles all 5 regions |
+| `--settle-steps 0` | N/A | Disable settle entirely; saves ~3ms/ep at 0.985/ep |
+| `--settle-every 2` | 1 | Halve settle rate; saves ~1.5ms/ep |
+| `--settle-every 4` | 1 | 25% settle rate; saves ~2.25ms/ep |
+| `--settle-gate 0.99` | 0.85 | Reduces trigger rate as priors improve |
 
-kwta_us and sym_us: CLOSED. Next bottleneck: settle_us (bind ORT ~0.85ms + enc ORT ~0.7ms per trigger).
+At `--settle-every 4`: expected total ≈ 2ms bind + 0.75ms settle + 0.35ms prior_upd + 0.30ms sym ≈ 3.4ms/ep.
 
 ---
 
@@ -82,25 +92,7 @@ Three paths selected at runtime:
 - **Path B** (binding only): burn kwta → ORT binding
 - **Path C** (burn only): burn kwta → burn binding
 
-Hidden state saved before loop, restored after each ORT binding call (settle must not
-advance cross-episode GRU state). topk_from_z_no_dc added to KWtaLayer (wraps
-private select_top_k_no_dc — no dc update during refinement passes).
-
----
-
-## Duty-cycle validation: DONE — duty-cycle cadence change is NOT the cause of higher
-settle rate vs Phase 1. Burn-only control had same settle rate (0.94/ep). Root cause:
-smaller CAPACITY (2048 vs 4096 in Phase 1) → fewer episodes per cycle → less warmup.
-
----
-
-## GPU unification status
-
-- Phase 0 (gate): passes <2e-08
-- Phase 1 (ORT binding): 2.4–2.8× speedup confirmed
-- Phase 1.5 (ORT encoder): validated, +1.25ms/ep over Phase 1
-- GainWorker: no stall impact confirmed
-- ORT settle (enc+bind): +2.73ms/ep over Phase 1.5
+Hidden state saved before loop, restored after each ORT binding call.
 
 ---
 
@@ -121,3 +113,4 @@ Never expose ScatterElements or INT64 outputs. Workaround: two-graph split, topk
 - burn GRU: reset_after=True → ONNX linear_before_reset=1
 - burn Linear weight: [n_in, n_out] (transpose of ONNX/PyTorch)
 - DUTY_CYCLE_ALPHA=0.001, BOOST_STRENGTH=1.0, TARGET_DC=20/1024≈0.0195
+- settle_beta default 0.5; settle_gate default 0.85; settle_every default 1
