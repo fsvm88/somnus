@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-12
-> **Last commit on main:** b7c4c8f — perf: async wake_reconstruct_step via WakeReconWorker
+> **Last commit on main:** 2e9d1f6 — fix: wake-recon worker heads were frozen (missing require_grad)
 > **Branch:** `main` (clean)
 
-## Status: Perf queue from 2026-06-08 cleared. Next: validate with a campaign run.
+## Status: Perf queue cleared AND validated via A/B campaign runs. Async wake-recon works after require_grad fix.
 
 ---
 
@@ -12,15 +12,29 @@
 
 | Item | Commit | What changed |
 |------|--------|--------------|
-| `--recall-ef N` | de4a49e | `SEARCH_EF` now a `SemanticStore` field, set via CLI (default 64). Propagates through `rebuild_from_recent`. `--recall-ef 16` ≈ 4× faster HNSW queries; validate recall with `eval_metrics.py` |
+| `--recall-ef N` | de4a49e | `SEARCH_EF` now a `SemanticStore` field, set via CLI (default 64). Propagates through `rebuild_from_recent` |
 | cargo fmt pass | 93daa34 | rustfmt normalization across 10 files, no code changes |
 | Async wake_reconstruct | b7c4c8f | `--wake-recon-async` (off by default): `WakeReconWorker` in `somnus-perception/src/wake_worker.rs` |
+| require_grad fix | 2e9d1f6 | **Critical**: `Param::initialized` inherits `require_grad` from the tensor; `from_data` tensors don't track gradients. Both `set_linear_weight` (worker) and `set_head_weights_flat` (sleep merge) produced silently frozen heads. Caught by A/B run. Also req channel 4→16, test now asserts weights move |
 
-**Item 2 from the old queue (lazy `regional_inputs`) was skipped** — re-evaluated as planned: ~0.05ms/ep for a `PerceptionOutput` refactor; not worth it. Drop unless profiling says otherwise.
+**Item 2 from the old queue (lazy `regional_inputs`) was skipped** — re-evaluated as planned: ~0.05ms/ep for a `PerceptionOutput` refactor; not worth it.
 
 ---
 
-## WakeReconWorker design (b7c4c8f)
+## A/B validation results (2026-06-12)
+
+Setup: 2 sessions × 3 cycles, capacity 2048, fresh memory dirs, ONNX active.
+A = baseline (`memory/ab_baseline/campaign/`), B2 = `--recall-ef 16 --wake-recon-async` after fix (`memory/ab_newflags/campaign/`).
+
+- **Async learning confirmed**: B2 `mean_output_mse_wake` 0.67→0.46, prior cosines climb to [0.55, 0.53, 0.52, –, 0.27]. First B run (frozen heads) had flat mse ~0.7 and cosines ~0.
+- **B2's sleep cycles split**: c1 sleep aborts before REM (pending embeddings interrupt — pre-existing dynamic, also seen in 2026-06-07 baseline c3), re-enters immediately as an empty "c2" that finishes REM+spill. So B2 effectively got 2 training cycles/session vs A's 3 — compare B2 c3 against A c2.
+- **At matched progress, B2 ≈ A**: mse 0.456–0.468 vs A c2's 0.467–0.487; warm_recall_l2 1.00–1.05 vs 0.93–1.05; gist_recall_rate 0.35–0.39 vs 0.32–0.53. No recall-ef-16 degradation visible at this index size (~10k records) — the real test needs a 100k+ warm index.
+- **Wake cycles faster**: B2 ~28–31s vs A ~31–46s (confounded with cycle splitting; directionally right).
+- **Open issue: drop rate 25–35%** (78–122/cycle) even with 16-deep queue — worker throughput (backward + AdamW + EMA + 6.5MB flat clone per step at ~13 req/s) can't absorb bursts. Worker still trains on ~200+ eps/cycle and converges fine. Options if it matters: batch drained requests in the worker, throttle EMA responses (every Nth step), or accept.
+
+---
+
+## WakeReconWorker design (b7c4c8f + 2e9d1f6)
 
 Key insight: `wake_reconstruct_step` trains **only the 5 output heads**, and wake inference reads **only `ema_heads.flat`** — so the worker needs just the heads, not the full model.
 
@@ -35,10 +49,10 @@ Key insight: `wake_reconstruct_step` trains **only the 5 output heads**, and wak
 
 ## Queued next
 
-1. **Validation campaign run** with the new flags:
-   - `--recall-ef 16` → check `warm_recall_l2` / `gist_recall_rate` don't degrade unacceptably
-   - `--wake-recon-async` → confirm `mean_output_mse_wake` stays comparable to sync baseline, `wake_recon_dropped` ≈ 0, and per-episode latency spikes are gone
-2. Pre-existing clippy `--tests` lints in `somnus-encoding/tests/mel_parity.rs` and `somnus-memory/src/pq.rs` (identity_op, assertions_on_constants) — not from this session; fix opportunistically. Note: project gate is `cargo clippy -- -D warnings` without `--tests`, which is clean.
+1. **recall-ef verdict at scale**: re-run the A/B on a grown warm index (100k+ records, e.g. long-clips campaign with `--max-warm-records 200000`) — at ~10k records HNSW is cheap either way, so the small run couldn't show the recall/speed tradeoff.
+2. **Worker drop rate** (25–35%): decide whether to batch drained Train requests in the worker, throttle EMA responses (every Nth step), or accept. Only matters if dropped high-salience episodes hurt head convergence — current evidence says no.
+3. **Sleep-split dynamic**: pending-embeddings interrupt aborts REM, causing an empty follow-up cycle (pre-existing, not async-specific; also in 2026-06-07 baseline). Costs one effective training cycle per session in file mode. Look at the interrupt condition in `run_sleep_cycle`.
+4. Pre-existing clippy `--tests` lints in `somnus-encoding/tests/mel_parity.rs` and `somnus-memory/src/pq.rs` (identity_op, assertions_on_constants). Project gate (`cargo clippy -- -D warnings`, no `--tests`) is clean.
 
 ---
 
