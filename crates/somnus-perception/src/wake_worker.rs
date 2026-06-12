@@ -52,8 +52,12 @@ fn set_linear_weight(
     device: &NdArrayDevice,
 ) {
     let id = linear.weight.id;
+    // require_grad is mandatory: Param::initialized inherits the tensor's flag,
+    // and from_data tensors don't track gradients — without it the head is
+    // silently frozen (no grads → AdamW no-op).
     let t: Tensor<TrainB, 2> =
-        Tensor::from_data(TensorData::new(flat.to_vec(), [EPISODE_DIM, d_out]), device);
+        Tensor::from_data(TensorData::new(flat.to_vec(), [EPISODE_DIM, d_out]), device)
+            .require_grad();
     linear.weight = Param::initialized(id, t);
 }
 
@@ -177,7 +181,9 @@ impl WakeReconWorker {
     /// Spawn with the current model head weights and a clone of the current
     /// EMA state (so EMA continuity is preserved across the handoff).
     pub(crate) fn spawn(weights: [Vec<f32>; 5], mut ema: EmaOutputHeads) -> Self {
-        let (tx, req_rx) = mpsc::sync_channel::<Msg>(4);
+        // 16-deep: episodes arrive in bursts in file mode; a 4-deep queue
+        // dropped ~10–15% of train requests in the 2026-06-12 A/B run.
+        let (tx, req_rx) = mpsc::sync_channel::<Msg>(16);
         let (resp_tx, rx) = mpsc::sync_channel::<Resp>(4);
 
         std::thread::Builder::new()
@@ -294,6 +300,7 @@ mod tests {
     #[test]
     fn round_trip_train_and_weight_sync() {
         let p = PerceptionProcessor::new(NdArrayDevice::Cpu);
+        let initial = p.head_weights_flat();
         let worker = p.create_wake_recon_worker();
 
         let episode = vec![0.1f32; EPISODE_DIM];
@@ -315,9 +322,27 @@ mod tests {
             assert_eq!(w.len(), EPISODE_DIM * d);
         }
 
-        worker.set_weights(weights);
-        // Worker must still be responsive after a weight push.
-        let again = worker.fetch_weights(|_, _| {});
-        assert!(again.is_some());
+        // The train step must actually move the weights. Guards against the
+        // require_grad regression: a from_data tensor without .require_grad()
+        // produces no gradients and AdamW silently no-ops.
+        let moved = initial
+            .iter()
+            .zip(weights.iter())
+            .any(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-9));
+        assert!(moved, "head weights unchanged after a train step");
+
+        worker.set_weights(weights.clone());
+        // Worker must still be responsive after a weight push, and a second
+        // train step must keep learning (weights pushed via SetWeights must
+        // still require grad).
+        let episode2 = vec![0.3f32; EPISODE_DIM];
+        let regional2: [Vec<f32>; 5] = std::array::from_fn(|i| vec![0.5f32; REGION_DIMS[i]]);
+        assert!(worker.request_train(episode2, regional2, 1e-3));
+        let weights2 = worker.fetch_weights(|_, _| {}).expect("worker alive");
+        let moved2 = weights2
+            .iter()
+            .zip(weights.iter())
+            .any(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-9));
+        assert!(moved2, "weights frozen after SetWeights push");
     }
 }

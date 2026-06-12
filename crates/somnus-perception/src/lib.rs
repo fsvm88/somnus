@@ -1434,8 +1434,12 @@ impl PerceptionProcessor {
         ];
         for (h, (flat, d_out)) in heads.into_iter().zip(weights.into_iter().zip(REGION_DIMS)) {
             let id = h.weight.id;
+            // require_grad is mandatory: Param::initialized inherits the tensor's
+            // flag, and from_data tensors don't track gradients — without it the
+            // merged heads would be silently frozen for NREM training.
             let t: Tensor<TrainB, 2> =
-                Tensor::from_data(TensorData::new(flat, [EPISODE_DIM, d_out]), &device);
+                Tensor::from_data(TensorData::new(flat, [EPISODE_DIM, d_out]), &device)
+                    .require_grad();
             h.weight = Param::initialized(id, t);
         }
     }
