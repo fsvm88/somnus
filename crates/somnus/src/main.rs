@@ -88,7 +88,7 @@ use somnus_memory::{
     load_region_sizes, load_snapshot, weights_path, ColdArchive, EpisodicBuffer, IngestSource,
     RecollectionLayer, SemanticStore,
 };
-use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
+use somnus_perception::{PerceptionProcessor, WakeReconWorker, EPISODE_DIM};
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, SensorMetrics, Timestamp, VideoCapture, VideoFrame,
 };
@@ -192,6 +192,14 @@ struct Args {
     /// with some recall loss — validate with eval_metrics.py warm_recall_l2.
     #[arg(long, default_value = "64")]
     recall_ef: usize,
+
+    /// Run wake_reconstruct_step on a background worker thread instead of
+    /// blocking the ingest loop (saves ~1–3ms/ep amortized, eliminates 5–15ms
+    /// latency spikes on high-salience episodes). Head weights merge back into
+    /// the main model at sleep entry; EMA prediction weights stream back
+    /// continuously with a few-episode lag.
+    #[arg(long, default_value = "false")]
+    wake_recon_async: bool,
 
     /// Cap on the number of records in the cold archive. When the archive exceeds
     /// this limit during sleep, the oldest records are dropped and the file is
@@ -760,7 +768,11 @@ async fn main() -> Result<()> {
 
     // ── action decoder ────────────────────────────────────────────────────────
     let mut decoder: Option<ActionDecoder> = if args.action {
-        match ActionDecoder::new(&args.models_dir, NdArrayDevice::Cpu, args.ort_profile_dir.as_deref()) {
+        match ActionDecoder::new(
+            &args.models_dir,
+            NdArrayDevice::Cpu,
+            args.ort_profile_dir.as_deref(),
+        ) {
             Ok(mut d) => {
                 let dec_w = args
                     .memory_dir
@@ -800,6 +812,15 @@ async fn main() -> Result<()> {
     if gain_worker.is_some() {
         info!("gain worker spawned — Qwen gain updates running in background");
     }
+
+    // ── wake-reconstruction worker (perception weights already restored above) ─
+    let wake_recon_worker: Option<WakeReconWorker> = if args.wake_recon_async {
+        info!("wake-recon worker spawned — wake_reconstruct_step running in background");
+        Some(perception.create_wake_recon_worker())
+    } else {
+        None
+    };
+    let mut wake_recon_dropped: u64 = 0;
 
     // ── language embedder ─────────────────────────────────────────────────────
     let lang_embedder: Option<LangEmbedder> = if args.language {
@@ -1312,6 +1333,16 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── poll wake-recon worker EMA updates (non-blocking) ─────────────────
+        if let Some(ref w) = wake_recon_worker {
+            while let Some((flat, loss)) = w.try_recv_ema() {
+                perception.apply_ema_flat(flat);
+                wake_output_mse_sum += loss as f64;
+                wake_output_mse_n += 1;
+                tracing::info!(output_mse = loss, "wake reconstruction (async)");
+            }
+        }
+
         // ── drain pending language lines before potentially sleeping ──────────
         while !lang_closed {
             match lang_rx.try_recv() {
@@ -1327,6 +1358,8 @@ async fn main() -> Result<()> {
                         &mut decoder,
                         &mut wake_reconstruct_counter,
                         args.wake_reconstruct_interval,
+                        wake_recon_worker.as_ref(),
+                        &mut wake_recon_dropped,
                     ) {
                         lang_ingest_count += 1;
                         if r.episode_produced {
@@ -1343,11 +1376,32 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
-                        if let Some(m) = r.reconstruct_mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
-                        if r.throttle_passed { wake_reconstruct_throttle_passed += 1; }
-                        if r.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += r.settle_iters; settle_delta_sum += r.settle_delta as f64; }
+                        if let Some(m) = r.reconstruct_mse {
+                            wake_output_mse_sum += m as f64;
+                            wake_output_mse_n += 1;
+                        }
+                        if r.throttle_passed {
+                            wake_reconstruct_throttle_passed += 1;
+                        }
+                        if r.settle_iters > 0 {
+                            settle_trigger_count += 1;
+                            settle_iters_sum += r.settle_iters;
+                            settle_delta_sum += r.settle_delta as f64;
+                        }
                         if let Some(ref es) = r.ep_stats {
-                            accumulate_salience(es, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                            accumulate_salience(
+                                es,
+                                &mut salience_sum,
+                                &mut salience_n,
+                                &mut salience_min,
+                                &mut high_salience_episodes,
+                                &mut blend_count,
+                                &mut episodes_speech,
+                                &mut episodes_env,
+                                &mut episodes_visual,
+                                &mut episodes_language,
+                                &mut episodes_mixed,
+                            );
                         }
                         accumulate_cosines(
                             &r.prior_cosines,
@@ -1388,6 +1442,25 @@ async fn main() -> Result<()> {
             pending_embs.store(0, Ordering::Relaxed);
             perception.reset_region_gain(); // stale gain must not carry across sleep boundary
             perception.clear_working_memory(); // working memory is wake-local
+                                               // Merge worker-trained head weights into the model so NREM training
+                                               // continues from them (drains the worker's queue; applies any
+                                               // in-flight EMA updates so they aren't lost).
+            if let Some(ref w) = wake_recon_worker {
+                let mut pending_ema: Option<[Vec<f32>; 5]> = None;
+                match w.fetch_weights(|flat, loss| {
+                    wake_output_mse_sum += loss as f64;
+                    wake_output_mse_n += 1;
+                    pending_ema = Some(flat);
+                }) {
+                    Some(weights) => {
+                        perception.set_head_weights_flat(weights);
+                        if let Some(flat) = pending_ema {
+                            perception.apply_ema_flat(flat);
+                        }
+                    }
+                    None => tracing::warn!("wake-recon worker died — heads not merged"),
+                }
+            }
             match sleep::run_sleep_cycle(
                 &mut perception,
                 &mut episodic,
@@ -1463,7 +1536,11 @@ async fn main() -> Result<()> {
                         } else {
                             None
                         };
-                        let min_salience_wake = if salience_n > 0 { Some(salience_min) } else { None };
+                        let min_salience_wake = if salience_n > 0 {
+                            Some(salience_min)
+                        } else {
+                            None
+                        };
                         let perf_breakdown = perception.take_perf_breakdown();
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -1505,6 +1582,7 @@ async fn main() -> Result<()> {
                             "wake_reconstruct_attempts":       wake_reconstruct_counter,
                             "wake_reconstruct_throttle_passed": wake_reconstruct_throttle_passed,
                             "wake_reconstruct_fired":          wake_output_mse_n,
+                            "wake_recon_dropped":              wake_recon_dropped,
                             "settle_trigger_count":  settle_trigger_count,
                             "settle_iters_sum":      settle_iters_sum,
                             "settle_delta_mean": if settle_trigger_count > 0 { Some(settle_delta_sum / settle_trigger_count as f64) } else { None },
@@ -1559,6 +1637,7 @@ async fn main() -> Result<()> {
                     high_salience_episodes = 0;
                     blend_count = 0;
                     wake_reconstruct_throttle_passed = 0;
+                    wake_recon_dropped = 0;
                     episodes_speech = 0;
                     episodes_env = 0;
                     episodes_visual = 0;
@@ -1579,13 +1658,23 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => tracing::warn!(?e, "sleep cycle error"),
             }
+            // Push NREM-trained head weights back to the worker for the next
+            // wake phase (also after a failed cycle — partial training counts).
+            if let Some(ref w) = wake_recon_worker {
+                w.set_weights(perception.head_weights_flat());
+            }
             wake_start = std::time::Instant::now();
 
             // Rebuild ORT binding session with updated weights after sleep training.
-            if let (Some(ref onnx_dir), Some(ref script)) = (&args.onnx_models_dir, &onnx_script_path) {
+            if let (Some(ref onnx_dir), Some(ref script)) =
+                (&args.onnx_models_dir, &onnx_script_path)
+            {
                 match perception.rebuild_ort_session(script, onnx_dir, args.onnx_migraphx) {
                     Ok(()) => tracing::debug!("ORT binding session rebuilt"),
-                    Err(e) => tracing::warn!(?e, "ORT session rebuild failed — continuing with existing session"),
+                    Err(e) => tracing::warn!(
+                        ?e,
+                        "ORT session rebuild failed — continuing with existing session"
+                    ),
                 }
             }
 
@@ -1629,13 +1718,19 @@ async fn main() -> Result<()> {
                                     if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
                                         wake_reconstruct_throttle_passed += 1;
                                         if rec.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
-                                            match perception.wake_reconstruct_step(&ep.0, regional) {
-                                                Ok(mse) => {
-                                                    wake_output_mse_sum += mse as f64;
-                                                    wake_output_mse_n += 1;
-                                                    tracing::info!(output_mse = mse, "wake reconstruction");
+                                            if let Some(ref w) = wake_recon_worker {
+                                                if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
+                                                    wake_recon_dropped += 1;
                                                 }
-                                                Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                                            } else {
+                                                match perception.wake_reconstruct_step(&ep.0, regional) {
+                                                    Ok(mse) => {
+                                                        wake_output_mse_sum += mse as f64;
+                                                        wake_output_mse_n += 1;
+                                                        tracing::info!(output_mse = mse, "wake reconstruction");
+                                                    }
+                                                    Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                                                }
                                             }
                                         }
                                         // Refresh autodiff graph every N episodes to prevent
@@ -1687,13 +1782,19 @@ async fn main() -> Result<()> {
                                     if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
                                         wake_reconstruct_throttle_passed += 1;
                                         if rec.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
-                                            match perception.wake_reconstruct_step(&ep.0, regional) {
-                                                Ok(mse) => {
-                                                    wake_output_mse_sum += mse as f64;
-                                                    wake_output_mse_n += 1;
-                                                    tracing::info!(output_mse = mse, "wake reconstruction");
+                                            if let Some(ref w) = wake_recon_worker {
+                                                if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
+                                                    wake_recon_dropped += 1;
                                                 }
-                                                Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                                            } else {
+                                                match perception.wake_reconstruct_step(&ep.0, regional) {
+                                                    Ok(mse) => {
+                                                        wake_output_mse_sum += mse as f64;
+                                                        wake_output_mse_n += 1;
+                                                        tracing::info!(output_mse = mse, "wake reconstruction");
+                                                    }
+                                                    Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                                                }
                                             }
                                         }
                                         // Refresh autodiff graph every N episodes to prevent
@@ -1737,6 +1838,8 @@ async fn main() -> Result<()> {
                             &mut decoder,
                             &mut wake_reconstruct_counter,
                             args.wake_reconstruct_interval,
+                            wake_recon_worker.as_ref(),
+                            &mut wake_recon_dropped,
                         ) {
                             lang_ingest_count += 1;
                             perception_total_ms += r.perception_ms;
@@ -1924,6 +2027,8 @@ fn ingest_language_line(
     decoder: &mut Option<ActionDecoder>,
     wake_reconstruct_counter: &mut usize,
     wake_reconstruct_interval: usize,
+    wake_recon_worker: Option<&WakeReconWorker>,
+    wake_recon_dropped: &mut u64,
 ) -> Option<LangIngestResult> {
     let Some(le) = lang_embedder else { return None };
     let emb = match le.embed(text) {
@@ -1945,32 +2050,48 @@ fn ingest_language_line(
             let settle_delta = out.settle_delta;
             let ep_stats = record_episode(&out, &ts, sink, episodic, top_k, recall);
             let mut throttle_passed = false;
-            let reconstruct_mse = if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                *wake_reconstruct_counter += 1;
-                if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval) {
-                    throttle_passed = true;
-                    let mse = if ep_stats.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
-                        match perception.wake_reconstruct_step(&ep.0, regional) {
-                            Ok(mse) => {
-                                tracing::info!(output_mse = mse, "wake reconstruction");
-                                Some(mse)
-                            }
-                            Err(e) => {
-                                tracing::warn!(?e, "wake reconstruct error");
+            let reconstruct_mse =
+                if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+                    *wake_reconstruct_counter += 1;
+                    if wake_reconstruct_counter.is_multiple_of(wake_reconstruct_interval) {
+                        throttle_passed = true;
+                        let mse = if ep_stats
+                            .as_ref()
+                            .is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD)
+                        {
+                            if let Some(w) = wake_recon_worker {
+                                // Async: loss arrives later via try_recv_ema at the poll site.
+                                if !w.request_train(
+                                    ep.0.clone(),
+                                    regional.clone(),
+                                    perception.learning_rate(),
+                                ) {
+                                    *wake_recon_dropped += 1;
+                                }
                                 None
+                            } else {
+                                match perception.wake_reconstruct_step(&ep.0, regional) {
+                                    Ok(mse) => {
+                                        tracing::info!(output_mse = mse, "wake reconstruction");
+                                        Some(mse)
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(?e, "wake reconstruct error");
+                                        None
+                                    }
+                                }
                             }
-                        }
+                        } else {
+                            None
+                        };
+                        perception.refresh_autodiff_state();
+                        mse
                     } else {
                         None
-                    };
-                    perception.refresh_autodiff_state();
-                    mse
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
             // Auto-grounding (ADR 0014): every language ingest (stdin or ASR) becomes
             // a text_target on the episode that was just pushed. This trains the
             // ActionDecoder projection during NREM without requiring manual queries.
@@ -1985,7 +2106,17 @@ fn ingest_language_line(
                 }
             }
             let last_episode = out.episode.as_ref().map(|ep| ep.0.clone());
-            Some(LangIngestResult { episode_produced, last_episode, reconstruct_mse, prior_cosines, ep_stats, throttle_passed, settle_iters, settle_delta, perception_ms })
+            Some(LangIngestResult {
+                episode_produced,
+                last_episode,
+                reconstruct_mse,
+                prior_cosines,
+                ep_stats,
+                throttle_passed,
+                settle_iters,
+                settle_delta,
+                perception_ms,
+            })
         }
         Err(e) => {
             tracing::error!(?e, "perception error (language)");
@@ -2116,7 +2247,13 @@ fn record_episode(
         _ if active.is_empty() => IngestSource::Unknown,
         _ => IngestSource::Mixed,
     };
-    let id = episodic.push(ts_secs, episode_vec.clone(), regional, salience, ingest_source);
+    let id = episodic.push(
+        ts_secs,
+        episode_vec.clone(),
+        regional,
+        salience,
+        ingest_source,
+    );
     tracing::info!(
         dim = episode_vec.len(),
         episode_id = id,
@@ -2133,7 +2270,11 @@ fn record_episode(
     })
     .to_string();
     sink_write(sink, &line);
-    Some(RecordedEpisode { salience, blended, source: ingest_source })
+    Some(RecordedEpisode {
+        salience,
+        blended,
+        source: ingest_source,
+    })
 }
 
 /// Accumulate per-episode salience and modality stats into cycle-level counters (ADR 0022).
@@ -2164,11 +2305,11 @@ fn accumulate_salience(
         *blend_count += 1;
     }
     match rec.source {
-        IngestSource::Speech   => *episodes_speech   += 1,
-        IngestSource::Env      => *episodes_env      += 1,
-        IngestSource::Visual   => *episodes_visual   += 1,
+        IngestSource::Speech => *episodes_speech += 1,
+        IngestSource::Env => *episodes_env += 1,
+        IngestSource::Visual => *episodes_visual += 1,
         IngestSource::Language => *episodes_language += 1,
-        _                      => *episodes_mixed    += 1,
+        _ => *episodes_mixed += 1,
     }
 }
 
