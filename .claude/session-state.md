@@ -49,6 +49,8 @@ Key insight: `wake_reconstruct_step` trains **only the 5 output heads**, and wak
 
 ## Queued next
 
+> Recommended order (discussed end of 2026-06-12 session): start with **#3 sleep-split fix** — it taxes every file-mode campaign one cycle/session, small scope. Then launch **#1 at-scale run** in the background. Caveat for #3: the interrupt exists so live input isn't starved during sleep; fix must not break live ingest.
+
 1. **recall-ef verdict at scale**: re-run the A/B on a grown warm index (100k+ records, e.g. long-clips campaign with `--max-warm-records 200000`) — at ~10k records HNSW is cheap either way, so the small run couldn't show the recall/speed tradeoff.
 2. **Worker drop rate** (25–35%): decide whether to batch drained Train requests in the worker, throttle EMA responses (every Nth step), or accept. Only matters if dropped high-salience episodes hurt head convergence — current evidence says no.
 3. **Sleep-split dynamic**: pending-embeddings interrupt aborts REM, causing an empty follow-up cycle (pre-existing, not async-specific; also in 2026-06-07 baseline). Costs one effective training cycle per session in file mode. Look at the interrupt condition in `run_sleep_cycle`.
