@@ -6,12 +6,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum IngestSource {
-    Speech   = 0,
-    Env      = 1,
-    Visual   = 2,
+    Speech = 0,
+    Env = 1,
+    Visual = 2,
     Language = 3,
-    Mixed    = 4,
-    Unknown  = 255,
+    Mixed = 4,
+    Unknown = 255,
 }
 
 impl IngestSource {

@@ -62,13 +62,16 @@ impl OnnxPerceptionSession {
         visual: &[f32],
         lang: &[f32],
     ) -> anyhow::Result<[Vec<f32>; 5]> {
-        let sess = self.sess_enc.as_mut().ok_or_else(|| anyhow::anyhow!("encoder session not loaded"))?;
+        let sess = self
+            .sess_enc
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("encoder session not loaded"))?;
 
         // Pad or truncate to expected dims
         let speech_v = pad_to(speech, ENC_DIMS[0]);
-        let env_v    = pad_to(env,    ENC_DIMS[1]);
+        let env_v = pad_to(env, ENC_DIMS[1]);
         let visual_v = pad_to(visual, ENC_DIMS[2]);
-        let lang_v   = pad_to(lang,   ENC_DIMS[3]);
+        let lang_v = pad_to(lang, ENC_DIMS[3]);
 
         let sp_arr = Array2::from_shape_vec((1, ENC_DIMS[0]), speech_v)?;
         let en_arr = Array2::from_shape_vec((1, ENC_DIMS[1]), env_v)?;
@@ -119,15 +122,15 @@ impl OnnxPerceptionSession {
         let sp3 = Array2::from_shape_vec((1, N_UNITS), sparse_z[3].clone())?;
         let sp4 = Array2::from_shape_vec((1, N_UNITS), sparse_z[4].clone())?;
         let prev_arr = Array2::from_shape_vec((1, EPISODE_DIM), prev_ep.to_vec())?;
-        let gru_arr  = Array3::from_shape_vec((1, 1, GRU_HIDDEN), self.gru_hidden.clone())?;
+        let gru_arr = Array3::from_shape_vec((1, 1, GRU_HIDDEN), self.gru_hidden.clone())?;
 
-        let t_sp0  = TensorRef::from_array_view(sp0.view())?;
-        let t_sp1  = TensorRef::from_array_view(sp1.view())?;
-        let t_sp2  = TensorRef::from_array_view(sp2.view())?;
-        let t_sp3  = TensorRef::from_array_view(sp3.view())?;
-        let t_sp4  = TensorRef::from_array_view(sp4.view())?;
+        let t_sp0 = TensorRef::from_array_view(sp0.view())?;
+        let t_sp1 = TensorRef::from_array_view(sp1.view())?;
+        let t_sp2 = TensorRef::from_array_view(sp2.view())?;
+        let t_sp3 = TensorRef::from_array_view(sp3.view())?;
+        let t_sp4 = TensorRef::from_array_view(sp4.view())?;
         let t_prev = TensorRef::from_array_view(prev_arr.view())?;
-        let t_gru  = TensorRef::from_array_view(gru_arr.view())?;
+        let t_gru = TensorRef::from_array_view(gru_arr.view())?;
 
         let outputs = self.sess_bind.run(ort::inputs![
             "sp_0"         => t_sp0,

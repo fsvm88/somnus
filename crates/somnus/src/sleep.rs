@@ -15,8 +15,7 @@ use std::{
 
 use anyhow::Result;
 use somnus_memory::{
-    save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, IngestSource,
-    RecollectionLayer,
+    save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, IngestSource, RecollectionLayer,
 };
 use somnus_perception::{PerceptionProcessor, RegionId, N_UNITS};
 
@@ -410,7 +409,10 @@ pub fn run_sleep_cycle(
     // replaces every ParamId, freeing accumulated entries on the next backward() call.
     let t_refresh = Instant::now();
     perception.refresh_autodiff_state();
-    tracing::info!(refresh_ms = t_refresh.elapsed().as_millis(), "NREM: autodiff state refreshed");
+    tracing::info!(
+        refresh_ms = t_refresh.elapsed().as_millis(),
+        "NREM: autodiff state refreshed"
+    );
 
     let t_nrem = Instant::now();
 
@@ -619,7 +621,13 @@ pub fn run_sleep_cycle(
     let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5], IngestSource)> = if !was_interrupted {
         episodic
             .iter_traces()
-            .map(|t| (t.record.values.clone(), t.regional.clone(), t.record.ingest_source))
+            .map(|t| {
+                (
+                    t.record.values.clone(),
+                    t.regional.clone(),
+                    t.record.ingest_source,
+                )
+            })
             .collect()
     } else {
         vec![]
@@ -665,12 +673,12 @@ pub fn run_sleep_cycle(
                     }
                     // Bin the source into the cluster histogram (Unknown → slot 5).
                     let slot = match src {
-                        IngestSource::Speech   => 0,
-                        IngestSource::Env      => 1,
-                        IngestSource::Visual   => 2,
+                        IngestSource::Speech => 0,
+                        IngestSource::Env => 1,
+                        IngestSource::Visual => 2,
                         IngestSource::Language => 3,
-                        IngestSource::Mixed    => 4,
-                        IngestSource::Unknown  => 5,
+                        IngestSource::Mixed => 4,
+                        IngestSource::Unknown => 5,
                     };
                     cluster_sources[probe_cluster][slot] += 1;
                 }

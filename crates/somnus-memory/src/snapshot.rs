@@ -373,10 +373,16 @@ mod tests {
         assert_eq!(traces[0].regional[0], vec![1.0f32; 384]);
         assert_eq!(traces[0].regional[1], vec![2.0f32; 512]);
         assert!(traces[0].regional[2].is_empty());
-        assert_eq!(traces[0].record.ingest_source, crate::episode::IngestSource::Unknown);
+        assert_eq!(
+            traces[0].record.ingest_source,
+            crate::episode::IngestSource::Unknown
+        );
         assert_eq!(traces[1].record.timestamp_secs, 2.0);
         assert_eq!(traces[1].regional[2], vec![3.0f32; 384]);
-        assert_eq!(traces[1].record.ingest_source, crate::episode::IngestSource::Visual);
+        assert_eq!(
+            traces[1].record.ingest_source,
+            crate::episode::IngestSource::Visual
+        );
     }
 
     #[test]

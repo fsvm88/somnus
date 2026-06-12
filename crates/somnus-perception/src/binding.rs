@@ -135,18 +135,22 @@ impl<B: Backend> BindingArea<B> {
         // K and V: current regions + optional GRU temporal context token.
         // One GRU step with cached hidden state — O(1) instead of O(wm_size).
         let (k, v) = if let Some(ep) = new_episode {
-            let seq_t: Tensor<B, 3> = Tensor::from_data(
-                TensorData::new(ep.clone(), [1, 1, EPISODE_DIM]),
-                device,
-            );
-            let init_hidden: Option<Tensor<B, 2>> = self.gru_hidden.as_ref().map(|h| {
-                Tensor::from_data(TensorData::new(h.clone(), [1, GRU_HIDDEN]), device)
-            });
+            let seq_t: Tensor<B, 3> =
+                Tensor::from_data(TensorData::new(ep.clone(), [1, 1, EPISODE_DIM]), device);
+            let init_hidden: Option<Tensor<B, 2>> = self
+                .gru_hidden
+                .as_ref()
+                .map(|h| Tensor::from_data(TensorData::new(h.clone(), [1, GRU_HIDDEN]), device));
             let gru_out: Tensor<B, 3> = self.temporal_gru.forward(seq_t, init_hidden);
             let hidden: Tensor<B, 2> = gru_out.narrow(1, 0, 1).squeeze_dim::<2>(1);
             // Cache hidden state for the next call.
             self.gru_hidden = Some(
-                hidden.clone().into_data().convert::<f32>().to_vec().unwrap(),
+                hidden
+                    .clone()
+                    .into_data()
+                    .convert::<f32>()
+                    .to_vec()
+                    .unwrap(),
             );
             // Project → [1, EPISODE_DIM] → reshape → [5, D_PROJ]
             let ctx: Tensor<B, 2> = self.temporal_proj.forward(hidden);
@@ -196,7 +200,6 @@ mod tests {
         let device = NdArrayDevice::Cpu;
         BindingArea::new(&device)
     }
-
 
     fn dummy_act(region: RegionId) -> SparseActivation {
         SparseActivation {

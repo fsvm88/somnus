@@ -180,7 +180,9 @@ mod tests {
     #[test]
     fn all_five_ingest_paths_return_finite_output() {
         let mut proc = make_proc();
-        let lang = (0..REGION_DIMS[4]).map(|j| (j as f32 * 0.005).cos()).collect::<Vec<_>>();
+        let lang = (0..REGION_DIMS[4])
+            .map(|j| (j as f32 * 0.005).cos())
+            .collect::<Vec<_>>();
         let out_lang = proc.ingest_language(&lang).unwrap();
         // prior_cosines may be None when no prior exists yet, but must not be NaN
         for c in out_lang.prior_cosines.iter().flatten() {
@@ -262,7 +264,9 @@ mod tests {
             proc.ingest_env(&env_input()).unwrap();
             proc.ingest_visual(&visual_input()).unwrap();
             // symbolic via speech region — same dims, different phase
-            let sym: Vec<f32> = (0..REGION_DIMS[0]).map(|j| (j as f32 * 0.07).cos()).collect();
+            let sym: Vec<f32> = (0..REGION_DIMS[0])
+                .map(|j| (j as f32 * 0.07).cos())
+                .collect();
             let out = proc.ingest_speech(&sym).unwrap();
             out.episode.map(|ep| ep.0).unwrap_or_default()
         };
@@ -273,7 +277,10 @@ mod tests {
         if !ep_u.is_empty() && !ep_s.is_empty() {
             assert_eq!(ep_u.len(), EPISODE_DIM);
             assert_eq!(ep_s.len(), EPISODE_DIM);
-            assert!(ep_s.iter().all(|v| v.is_finite()), "settled episode has NaN/inf");
+            assert!(
+                ep_s.iter().all(|v| v.is_finite()),
+                "settled episode has NaN/inf"
+            );
             assert_ne!(ep_u, ep_s, "settling should produce a different episode");
         }
     }
@@ -285,19 +292,30 @@ mod tests {
     fn homeostatic_decay_stays_finite() {
         let mut proc = make_proc();
         let regional: [Vec<f32>; 5] = std::array::from_fn(|i| {
-            (0..REGION_DIMS[i]).map(|j| (j as f32 * 0.05).sin()).collect()
+            (0..REGION_DIMS[i])
+                .map(|j| (j as f32 * 0.05).sin())
+                .collect()
         });
         let ep: Vec<f32> = (0..EPISODE_DIM).map(|j| (j as f32 * 0.01).cos()).collect();
         // Prime the model a bit so weights are non-trivial.
         for _ in 0..5 {
-            proc.fused_replay_wake_step_batch(&[&regional], &[ep.as_slice()]).unwrap();
+            proc.fused_replay_wake_step_batch(&[&regional], &[ep.as_slice()])
+                .unwrap();
         }
         // Apply decay at the rate used in sleep.rs (1e-4).
         proc.homeostatic_decay(1e-4);
         // Replay should still produce a finite loss after decay.
-        let (loss, mse) = proc.fused_replay_wake_step_batch(&[&regional], &[ep.as_slice()]).unwrap();
-        assert!(loss.is_finite(), "loss after homeostatic decay not finite: {loss}");
-        assert!(mse.is_finite(), "mse after homeostatic decay not finite: {mse}");
+        let (loss, mse) = proc
+            .fused_replay_wake_step_batch(&[&regional], &[ep.as_slice()])
+            .unwrap();
+        assert!(
+            loss.is_finite(),
+            "loss after homeostatic decay not finite: {loss}"
+        );
+        assert!(
+            mse.is_finite(),
+            "mse after homeostatic decay not finite: {mse}"
+        );
     }
 
     /// synthesize_episode (Phase 11b, ADR 0019): blending two regional inputs
@@ -306,20 +324,33 @@ mod tests {
     fn synthesize_episode_is_finite_and_novel() {
         let mut proc = make_proc();
         let reg_a: [Vec<f32>; 5] = std::array::from_fn(|i| {
-            (0..REGION_DIMS[i]).map(|j| (j as f32 * 0.01).sin()).collect()
+            (0..REGION_DIMS[i])
+                .map(|j| (j as f32 * 0.01).sin())
+                .collect()
         });
         let reg_b: [Vec<f32>; 5] = std::array::from_fn(|i| {
-            (0..REGION_DIMS[i]).map(|j| (j as f32 * 0.05).cos()).collect()
+            (0..REGION_DIMS[i])
+                .map(|j| (j as f32 * 0.05).cos())
+                .collect()
         });
         let synth = proc.synthesize_episode(&reg_a, &reg_b, 0.5).unwrap();
         assert_eq!(synth.len(), EPISODE_DIM, "synthetic episode has wrong dim");
-        assert!(synth.iter().all(|v| v.is_finite()), "synthetic episode has NaN/inf");
+        assert!(
+            synth.iter().all(|v| v.is_finite()),
+            "synthetic episode has NaN/inf"
+        );
 
         // Synthetic should differ from a direct forward on either source alone.
         let ep_a = proc.synthesize_episode(&reg_a, &reg_a, 0.5).unwrap();
         let ep_b = proc.synthesize_episode(&reg_b, &reg_b, 0.5).unwrap();
-        assert_ne!(synth, ep_a, "synthetic of mixed inputs should differ from source A");
-        assert_ne!(synth, ep_b, "synthetic of mixed inputs should differ from source B");
+        assert_ne!(
+            synth, ep_a,
+            "synthetic of mixed inputs should differ from source A"
+        );
+        assert_ne!(
+            synth, ep_b,
+            "synthetic of mixed inputs should differ from source B"
+        );
     }
 
     /// prune_region (Phase 12c): after growing a region, pruning it reduces
@@ -330,7 +361,11 @@ mod tests {
         let mut proc = make_proc();
         let n_grow = 64usize;
         proc.grow_region(RegionId::Visual, n_grow);
-        assert_eq!(proc.region_sizes()[2], N_UNITS + n_grow, "region did not grow");
+        assert_eq!(
+            proc.region_sizes()[2],
+            N_UNITS + n_grow,
+            "region did not grow"
+        );
 
         let n_pruned = proc.prune_region(RegionId::Visual, 0.5);
         assert!(n_pruned > 0, "prune_region should remove some grown units");
@@ -344,8 +379,11 @@ mod tests {
         );
 
         // Replay after prune must still be finite.
-        let regional: [Vec<f32>; 5] =
-            std::array::from_fn(|i| (0..REGION_DIMS[i]).map(|j| (j as f32 * 0.001).cos()).collect());
+        let regional: [Vec<f32>; 5] = std::array::from_fn(|i| {
+            (0..REGION_DIMS[i])
+                .map(|j| (j as f32 * 0.001).cos())
+                .collect()
+        });
         let loss = proc.replay_step(&regional).unwrap();
         assert!(loss.is_finite(), "loss after prune not finite: {loss}");
     }

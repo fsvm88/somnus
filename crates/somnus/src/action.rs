@@ -320,7 +320,8 @@ impl ActionDecoder {
         for v in &mut mean {
             *v /= norm;
         }
-        self.lm_hidden_cache.insert(token_ids.to_vec(), mean.clone());
+        self.lm_hidden_cache
+            .insert(token_ids.to_vec(), mean.clone());
         Ok(mean)
     }
 
@@ -583,12 +584,11 @@ impl GainWorker {
                     match msg {
                         GainMsg::UpdateWeights(w) => proj = w,
                         GainMsg::Compute(ep) => {
-                            let gain = gain_from_episode(&mut session, &proj, &ep).unwrap_or_else(
-                                |e| {
+                            let gain =
+                                gain_from_episode(&mut session, &proj, &ep).unwrap_or_else(|e| {
                                     tracing::warn!(?e, "gain computation failed");
                                     [1.0f32; 5]
-                                },
-                            );
+                                });
                             let _ = resp_tx.send(gain);
                         }
                     }

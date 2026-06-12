@@ -8,14 +8,15 @@
 /// Run: cargo run --release -p somnus-perception --bin onnx_validate_prepare -- <out_dir>
 /// Then: python3 experiments/onnx-validate/validate.py --data-dir <out_dir>
 use burn::backend::ndarray::NdArrayDevice;
-use somnus_perception::{PerceptionProcessor, K_ACTIVE, N_UNITS, EPISODE_DIM};
+use somnus_perception::{PerceptionProcessor, EPISODE_DIM, K_ACTIVE, N_UNITS};
 use std::path::PathBuf;
 
 const GRU_HIDDEN: usize = 256;
 const BOOST_STRENGTH: f32 = 1.0;
 
 fn main() {
-    let out_dir: PathBuf = std::env::args().nth(1)
+    let out_dir: PathBuf = std::env::args()
+        .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp/somnus_onnx_validate"));
 
@@ -54,19 +55,24 @@ fn main() {
     // set dc via the ingest path). For now, dc=zeros is sufficient to close the
     // GRU gate-order and Linear-transpose risks.
     let dc_init = proc.duty_cycles();
-    println!("Initial dc (should be all zeros): first 3 of region 0: {:?}", &dc_init[0][..3]);
+    println!(
+        "Initial dc (should be all zeros): first 3 of region 0: {:?}",
+        &dc_init[0][..3]
+    );
 
     // ── Step 3: generate fixed encoder inputs ─────────────────────────────────
     // Simple deterministic LCG-based float generation.
     let mut rng_state: u64 = 0xDEAD_BEEF_1234_5678;
     let next_f32 = |rng: &mut u64| -> f32 {
-        *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let u = (*rng >> 11) as f32 / (1u64 << 53) as f32;  // [0,1)
-        u * 4.0 - 2.0  // [-2, 2)
+        *rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = (*rng >> 11) as f32 / (1u64 << 53) as f32; // [0,1)
+        u * 4.0 - 2.0 // [-2, 2)
     };
 
     let speech_enc: Vec<f32> = (0..384).map(|_| next_f32(&mut rng_state)).collect();
-    let env_enc:    Vec<f32> = (0..512).map(|_| next_f32(&mut rng_state)).collect();
+    let env_enc: Vec<f32> = (0..512).map(|_| next_f32(&mut rng_state)).collect();
     let visual_enc: Vec<f32> = (0..384).map(|_| next_f32(&mut rng_state)).collect();
     // language = zeros (not provided)
     let language_zeros = vec![0.0f32; 896];
@@ -81,9 +87,11 @@ fn main() {
     let mut topk_indices: [Vec<usize>; 5] = Default::default();
 
     for (i, z) in z_vecs.iter().enumerate() {
-        let dc = &dc_init[i];  // all zeros for fresh model
-        // Boost: boosted = z + BOOST*(target_dc - dc)
-        let boosted: Vec<f32> = z.iter().zip(dc.iter())
+        let dc = &dc_init[i]; // all zeros for fresh model
+                              // Boost: boosted = z + BOOST*(target_dc - dc)
+        let boosted: Vec<f32> = z
+            .iter()
+            .zip(dc.iter())
             .map(|(&zi, &dci)| zi + BOOST_STRENGTH * (target_dc - dci))
             .collect();
         // Select top K by boosted score
@@ -93,12 +101,15 @@ fn main() {
 
         let mut szv = vec![0.0f32; N_UNITS];
         for &idx in &top_k {
-            szv[idx] = z[idx];  // value from raw z (not boosted)
+            szv[idx] = z[idx]; // value from raw z (not boosted)
         }
         sparse_z[i] = szv;
         topk_indices[i] = top_k;
     }
-    println!("sparse_z built. region 0 nonzero count: {}", sparse_z[0].iter().filter(|&&v| v != 0.0).count());
+    println!(
+        "sparse_z built. region 0 nonzero count: {}",
+        sparse_z[0].iter().filter(|&&v| v != 0.0).count()
+    );
 
     // ── Step 6: run binding area ──────────────────────────────────────────────
     // Call 1: prev_ep = zeros (first episode, no GRU history).
@@ -125,27 +136,33 @@ fn main() {
         println!("Saved {} ({} floats)", path.display(), data.len());
     };
 
-    save_vec("speech_enc",   &speech_enc);
-    save_vec("env_enc",      &env_enc);
-    save_vec("visual_enc",   &visual_enc);
+    save_vec("speech_enc", &speech_enc);
+    save_vec("env_enc", &env_enc);
+    save_vec("visual_enc", &visual_enc);
     save_vec("language_enc", &language_zeros);
 
     // Save dc (all zeros, but explicit for Python to use)
-    for (i, dc) in dc_init.iter().enumerate() { save_vec(&format!("dc_{i}"), dc); }
+    for (i, dc) in dc_init.iter().enumerate() {
+        save_vec(&format!("dc_{i}"), dc);
+    }
 
     // Save z vectors and sparse_z
-    for (i, z) in z_vecs.iter().enumerate() { save_vec(&format!("z_{i}"), z); }
-    for (i, sz) in sparse_z.iter().enumerate() { save_vec(&format!("sparse_z_{i}"), sz); }
+    for (i, z) in z_vecs.iter().enumerate() {
+        save_vec(&format!("z_{i}"), z);
+    }
+    for (i, sz) in sparse_z.iter().enumerate() {
+        save_vec(&format!("sparse_z_{i}"), sz);
+    }
 
     // Call 1 data
     save_vec("episode_1_burn", &episode_1);
-    save_vec("gru_h_1_burn",   &gru_h_1);
-    save_vec("prev_ep_1",      &prev_ep_1);
+    save_vec("gru_h_1_burn", &gru_h_1);
+    save_vec("prev_ep_1", &prev_ep_1);
     save_vec("gru_hidden_init", &vec![0.0f32; GRU_HIDDEN]);
 
     // Call 2 data (GRU exercised with non-zero input)
     save_vec("episode_2_burn", &episode_2);
-    save_vec("gru_h_2_burn",   &gru_h_2);
+    save_vec("gru_h_2_burn", &gru_h_2);
     // prev_ep_2 = episode_1, gru_hidden_2 = gru_h_1 (but h_1 = zeros, so same)
 
     // Save metadata
@@ -161,8 +178,15 @@ fn main() {
         "dc_is_zero": true,
         "note": "call_2 tests GRU with non-zero prev_episode; h_1=zeros so h_1 and gru_hidden_init same",
     });
-    std::fs::write(out_dir.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    std::fs::write(
+        out_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
 
     println!("\nAll data saved to {}", out_dir.display());
-    println!("Next: python3 experiments/onnx-validate/validate.py --data-dir {}", out_dir.display());
+    println!(
+        "Next: python3 experiments/onnx-validate/validate.py --data-dir {}",
+        out_dir.display()
+    );
 }

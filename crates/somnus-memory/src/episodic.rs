@@ -208,7 +208,13 @@ mod tests {
     fn regional_stored_correctly() {
         let mut buf = EpisodicBuffer::new(10);
         let regional = [vec![1.0f32; 4], vec![2.0f32; 5], vec![], vec![], vec![]];
-        buf.push(0.0, vec![0.0; 4], regional.clone(), f32::MAX, IngestSource::Unknown);
+        buf.push(
+            0.0,
+            vec![0.0; 4],
+            regional.clone(),
+            f32::MAX,
+            IngestSource::Unknown,
+        );
         let trace = buf.iter_traces().next().unwrap();
         assert_eq!(trace.regional[0], vec![1.0f32; 4]);
         assert_eq!(trace.regional[1], vec![2.0f32; 5]);

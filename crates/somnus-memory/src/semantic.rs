@@ -325,10 +325,16 @@ mod tests {
         let results = store.query_with_dist(&cue, 2);
         assert_eq!(results.len(), 2);
         for (dist, _rec) in &results {
-            assert!(dist.is_finite() && *dist >= 0.0, "distance not finite/non-negative: {dist}");
+            assert!(
+                dist.is_finite() && *dist >= 0.0,
+                "distance not finite/non-negative: {dist}"
+            );
         }
         // Nearest neighbour should be closer than the second.
-        assert!(results[0].0 <= results[1].0, "results not sorted by distance");
+        assert!(
+            results[0].0 <= results[1].0,
+            "results not sorted by distance"
+        );
     }
 
     /// sample_values returns at most max_n items and never panics on small stores.
