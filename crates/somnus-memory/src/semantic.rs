@@ -35,6 +35,7 @@ pub struct SemanticStore {
     records: HashMap<usize, EpisodeRecord>,
     dim: usize,
     max_records: usize,
+    search_ef: usize,
 }
 
 impl SemanticStore {
@@ -55,7 +56,12 @@ impl SemanticStore {
             records: HashMap::new(),
             dim,
             max_records,
+            search_ef: SEARCH_EF,
         }
+    }
+
+    pub fn set_search_ef(&mut self, ef: usize) {
+        self.search_ef = ef;
     }
 
     pub fn set_max_records(&mut self, max: usize) {
@@ -85,6 +91,7 @@ impl SemanticStore {
         let skip = total.saturating_sub(n);
 
         let mut fresh = SemanticStore::with_max(self.dim, self.max_records);
+        fresh.search_ef = self.search_ef;
         let mut loaded = 0usize;
         // iter_from seeks directly to the tail offset — no soft-skip loop over earlier records.
         if let Ok(iter) = cold.iter_from(skip) {
@@ -101,7 +108,7 @@ impl SemanticStore {
     /// Return up to `k` nearest episodes to `cue`, sorted by ascending L2 distance.
     pub fn query(&self, cue: &[f32], k: usize) -> Vec<&EpisodeRecord> {
         debug_assert_eq!(cue.len(), self.dim);
-        let neighbours = self.index.search(cue, k, SEARCH_EF);
+        let neighbours = self.index.search(cue, k, self.search_ef);
         neighbours
             .iter()
             .filter_map(|n| self.records.get(&n.d_id))
@@ -111,7 +118,7 @@ impl SemanticStore {
     /// Like `query` but also returns the L2 distance for each result.
     pub fn query_with_dist(&self, cue: &[f32], k: usize) -> Vec<(f32, &EpisodeRecord)> {
         debug_assert_eq!(cue.len(), self.dim);
-        let neighbours = self.index.search(cue, k, SEARCH_EF);
+        let neighbours = self.index.search(cue, k, self.search_ef);
         neighbours
             .iter()
             .filter_map(|n| self.records.get(&n.d_id).map(|r| (n.distance, r)))
@@ -154,6 +161,7 @@ impl SemanticStore {
             records: HashMap::new(),
             dim,
             max_records: 0,
+            search_ef: SEARCH_EF,
         }
     }
 
@@ -226,6 +234,7 @@ impl SemanticStore {
             records,
             dim: episode_dim,
             max_records: 0,
+            search_ef: SEARCH_EF,
         })
     }
 }

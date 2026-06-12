@@ -187,6 +187,12 @@ struct Args {
     #[arg(long, default_value = "0")]
     max_warm_records: usize,
 
+    /// ef parameter for HNSW warm-memory queries. Higher ef = more accurate recall
+    /// but slower search. Default 64. Lower values (e.g. 16) give ~4× faster queries
+    /// with some recall loss — validate with eval_metrics.py warm_recall_l2.
+    #[arg(long, default_value = "64")]
+    recall_ef: usize,
+
     /// Cap on the number of records in the cold archive. When the archive exceeds
     /// this limit during sleep, the oldest records are dropped and the file is
     /// rewritten keeping only the most recent N. 0 = unlimited (default).
@@ -806,9 +812,11 @@ async fn main() -> Result<()> {
     };
 
     let mut recall = RecollectionLayer::new(semantic, cold);
+    recall.warm.set_search_ef(args.recall_ef);
     info!(
         episodic_capacity = args.episodic_capacity,
         memory_dir = %args.memory_dir.display(),
+        recall_ef = args.recall_ef,
         "memory hierarchy ready"
     );
 
