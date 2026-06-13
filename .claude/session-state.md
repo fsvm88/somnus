@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-13
-> **Last commit on main:** e4c7275 — fix: pre-grow perception before ORT build to match saved region sizes
+> **Last commit on main:** 98828ed — docs: ADR 0024 — neuromodulatory self-regulation architecture
 > **Branch:** `main` (clean)
 
-## Status: Weight-restore bug fixed and validated (3-session test passes, all tests green). Residual c1 gist collapse is intrinsic (cross-session embedding drift); not a bug.
+## Status: ADR 0024 written. Architecture for self-regulating signals is decided. Implementation Phase 1a (adaptive salience gate) is next.
 
 ---
 
@@ -91,12 +91,14 @@ Key observations:
 
 ## Open issues / queued next
 
-1. **Runaway growth**: regions growing from 1024 → 1536 in 3 sessions without pruning. Root cause: GIST_GROWTH_THRESHOLD=0.85 almost never met at c1/c2; PRUNE_GIST_THRESHOLD never met consistently. Options: (a) lower growth threshold, (b) use mean_output_mse as growth signal (not gist), (c) add a growth cooldown.
-2. **Residual c1 gist collapse**: intrinsic to raw embedding warm store + NREM drift. Could address with re-encoding warm store after NREM (expensive) or a different gist probe strategy (e.g., probe only within-session warm entries for the growth signal).
-3. **Long-clip campaign**: once growth is under control, try `clips/long/` with `--nrem-salience-threshold 0`.
+1. **ADR 0024 Phase 1a implementation** (next): Adaptive salience gate (S1). Replaces `WAKE_RECONSTRUCT_SALIENCE_THRESHOLD = 0.8` (hardcoded const). Persist `sal_ewma_mean` + `sal_ewma_std` in `snapshot/sal_ewma.bin`; emit `sal_ewma_mean`, `sal_ewma_std`, `sal_threshold` in NDJSON. A/B validate with 2s×3c fixed-seed run. See ADR 0024 §S1 for full spec.
+2. **ADR 0024 Phase 1b** (after 1a stable): Settle-rate modulation (S2). Replaces `--settle-gate 0.85`. Prior_cosine EWMA gate.
+3. **Within-session gist probe** (prerequisite for growth controller): Filter the REM gist probe to only current-session warm entries. Needed before ADR 0024 growth controller can be implemented.
+4. **Long-clip campaign**: COMPLETE (PID 32138). Key finding: c3 gist collapsed from 0.71 → 0.22 across 5 sessions as warm grew to 49k records — embedding drift at scale. Documented as motivation in ADR 0024. Metrics at `memory/long_clip_campaign/campaign_20260613_231709/metrics.jsonl`.
 
 ## Closed items (this arc)
 
+- **Runaway growth**: fixed in 66c6f00 — `--growth-cooldown 3` (default) suppresses growth for 3 cycles after any growth event. Persisted via `snapshot/growth_cooldown.bin`; logged as `growth_cooldown_remaining` in cycle NDJSON.
 - **Worker drop rate**: 0% in real campaigns (CAPACITY=4096 + ef=16). The 25–35% was from the small-capacity validation run. No action needed.
 - **Clippy --tests lints**: fixed in 3ebf15f (pq.rs const assert, mel_parity.rs `/1` simplification).
 
