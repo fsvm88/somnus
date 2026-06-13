@@ -1,10 +1,10 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-12
-> **Last commit on main:** 2e9d1f6 — fix: wake-recon worker heads were frozen (missing require_grad)
+> **Last updated:** 2026-06-13
+> **Last commit on main:** 7f0194c — fix: restore perception and decoder weights across sessions
 > **Branch:** `main` (clean)
 
-## Status: Perf queue cleared AND validated via A/B campaign runs. Async wake-recon works after require_grad fix.
+## Status: Critical weight-restore bug fixed. A/B re-run needed to validate gist metric recovery.
 
 ---
 
@@ -47,14 +47,36 @@ Key insight: `wake_reconstruct_step` trains **only the 5 output heads**, and wak
 
 ---
 
+## Completed this session (2026-06-13)
+
+| Item | Commit | What changed |
+|------|--------|--------------|
+| Sleep-split fix | 1d8c61e | `--nrem-salience-threshold` (default 0 = disabled). Encoders in file mode ran faster than real-time, hitting the old hardcoded 16-threshold and aborting NREM before REM every c1. Live mode: pass `--nrem-salience-threshold 16`. |
+| HNSW timing metric | 37fa1eb | `warm_query_us_mean` added to cycle NDJSON (was missing — needed for ef verdict). |
+| At-scale A/B | 37fa1eb | `scripts/run_ef_scale_ab.sh` launched in background (PID 64286). A=ef64, B=ef16. 10 sessions × 3 cycles × CAPACITY=4096, two 1-hr walk clips, ONNX on. Expected ~100k warm records by end. |
+| **Critical: weight restore fix** | 7f0194c | Burn's `BinFileRecorder` calls `path.set_extension("bin")` on every save/load, replacing `.safetensors` with `.bin`. `weights_path()` returned `weights.safetensors`; the `exists()` check always failed → model trained from scratch every session. Fixed: `weights_path()` now returns stem `weights` (no extension); `exists()` checks use `.with_extension("bin")`. Decoder path fixed identically. Confirmed working: session 2 logs "perception weights restored sizes=[1152, 1088, 1152, 1152, 1024]". |
+
+---
+
+## At-scale A/B: complete (pre-fix — results partially invalidated)
+
+Both campaigns ran with the weight-restore bug active (model trained from scratch every session). Results are still valid for the **ef=16 vs ef=64 query latency comparison** (that comparison is model-agnostic). **NOT valid for gist_recall_rate** as a measure of cross-session memory quality.
+
+- ef=16 is 2.37× faster on HNSW queries with no meaningful recall degradation at 98k records → **ef=16 confirmed as default**
+- gist_recall_rate showed c1=near-zero, c2=mid, c3=high pattern EVERY session — this was the bug, not expected behavior. With fresh model each session, old warm embeddings never clustered with current ones.
+
+---
+
 ## Queued next
 
-> Recommended order (discussed end of 2026-06-12 session): start with **#3 sleep-split fix** — it taxes every file-mode campaign one cycle/session, small scope. Then launch **#1 at-scale run** in the background. Caveat for #3: the interrupt exists so live input isn't starved during sleep; fix must not break live ingest.
+1. **Re-run A/B validation** (small, 3 sessions × 3 cycles) with weight restore fix to confirm gist_recall_rate no longer collapses at c1. Expected: c1 gist should be higher now that models carry over. Also check warm_recall_l2 at c1 (was 1.2–1.3; should drop closer to c3's 0.6–0.8).
+2. **Re-evaluate growth trigger**: with working cross-session weights, the system should stop triggering growth at every c1. If growth still fires, investigate whether it's still spurious (drift within-session) or now reflects genuine capacity need.
+3. **Long-clip campaign**: after growth behavior stabilises, try training on `clips/long/` content with `--nrem-salience-threshold 0` (file mode default).
 
-1. **recall-ef verdict at scale**: re-run the A/B on a grown warm index (100k+ records, e.g. long-clips campaign with `--max-warm-records 200000`) — at ~10k records HNSW is cheap either way, so the small run couldn't show the recall/speed tradeoff.
-2. **Worker drop rate** (25–35%): decide whether to batch drained Train requests in the worker, throttle EMA responses (every Nth step), or accept. Only matters if dropped high-salience episodes hurt head convergence — current evidence says no.
-3. **Sleep-split dynamic**: pending-embeddings interrupt aborts REM, causing an empty follow-up cycle (pre-existing, not async-specific; also in 2026-06-07 baseline). Costs one effective training cycle per session in file mode. Look at the interrupt condition in `run_sleep_cycle`.
-4. Pre-existing clippy `--tests` lints in `somnus-encoding/tests/mel_parity.rs` and `somnus-memory/src/pq.rs` (identity_op, assertions_on_constants). Project gate (`cargo clippy -- -D warnings`, no `--tests`) is clean.
+## Closed items (this arc)
+
+- **Worker drop rate**: 0% in real campaigns (CAPACITY=4096 + ef=16). The 25–35% was from the small-capacity validation run. No action needed.
+- **Clippy --tests lints**: fixed in 3ebf15f (pq.rs const assert, mel_parity.rs `/1` simplification).
 
 ---
 
