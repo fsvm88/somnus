@@ -1,3 +1,18 @@
+---
+status: accepted
+date: 2026-05-12
+deferred:
+  - id: lora-lm-adaptation
+    what: Fine-tune Qwen2.5 with LoRA so the LM adapts to the episode-vector prefix distribution, not just the projection
+    when: When linear projection saturates (mean_proj_loss stops decreasing over 10+ sessions); requires LoRA + ORT pipeline
+  - id: mlp-projection
+    what: Replace linear projection (640→5×896) with a small MLP for more expressive episode→LM-space mapping
+    when: If generation quality plateaus with the linear projection after sufficient training examples
+  - id: gain-aggregation
+    what: Replace per-position hidden-state L2-norm gain with a learned aggregation across layers and heads
+    when: If gain modulation shows no measurable effect on perceptual quality after multi-session calibration
+---
+
 # ADR 0012 — Action Loop: Region-Token Decoder + Gain Modulation
 
 **Date:** 2026-05-12  

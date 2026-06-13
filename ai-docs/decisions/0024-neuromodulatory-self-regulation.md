@@ -1,7 +1,22 @@
+---
+status: accepted
+date: 2026-06-14
+deferred:
+  - id: s5-startup-queryable-priors
+    what: Query available RAM and benchmark HNSW latency at startup to auto-seed --max-warm-records and --recall-ef as bootstrap priors
+    when: After Phase 1 controllers (S1+S2) are validated
+  - id: s6-adaptive-safety-ceilings
+    what: Widen --max-wake-secs ceiling to 3× rolling mean wake duration; complement the wakefulness pressure homeostat
+    when: After S3 (wakefulness pressure homeostat) is validated
+  - id: s7-throttle-adaptation
+    what: Adapt --wake-reconstruct-interval and --gain-update-every from reconstruction quality trend; no clean signal exists yet
+    when: After Phase 2 controllers stable and wake reconstruction quality metrics are reliable per-step
+---
+
 # ADR 0024 — Neuromodulatory self-regulation: derived signals replace fixed thresholds
 
 **Status:** accepted  
-**Date:** 2026-06-13
+**Date:** 2026-06-14
 
 > **Decision:** Replace fixed-threshold CLI knobs with internal controllers driven by signals derived from the system's own runtime state. Introduce two layers — signal design (what to measure) and control law (how to regulate) — and stage implementation by signal cleanliness. Phase 1: adaptive salience gate + settle-rate modulation. Phase 2: wakefulness pressure homeostat. Growth controller explicitly deferred; prerequisite documented.  
 > **Keywords:** neuromodulation, homeostasis, EWMA controller, salience gate, settle-rate, wakefulness pressure, prior-beta, growth controller, within-session gist, self-regulation, bootstrap prior
@@ -93,24 +108,74 @@ initialises the controller's estimate, not the threshold directly.
 | `--nrem-min-traces` | 0 | replay floor |
 | `--nrem-loss-target` | 0.0 | NREM exit quality |
 
-### Bucket S — Structural / perf (stay manual)
+### Bucket S-query — Startup-queryable (will become bootstrap priors)
 
-These trade memory for accuracy, or time for throughput. No learning signal
-should change them at runtime.
+These can be seeded from the environment at process startup rather than hardcoded.
+They do not regulate during a session; they become better-informed initial priors.
 
-| Flag | Default | Meaning |
+| Flag | Default | Startup query |
 |---|---|---|
-| `--recall-ef` | 64 | HNSW ef parameter |
-| `--video-stride` | 1 | encoding throughput |
-| `--max-warm-records` | 0 | RAM bound |
-| `--max-cold-records` | 0 | RAM bound |
-| `--max-sleep-secs` | 0 | wall-time safety valve |
-| `--max-cycles` | 0 | test harness |
-| `--wake-reconstruct-interval` | 5 | reconstruct throttle |
-| `--wake-recon-async` | false | parallelism |
-| `--gain-update-every` | 20 | perf |
-| `--max-tokens` | 128 | LM budget |
-| `--asr-min-chars` | 20 | noise filter |
+| `--max-warm-records` | 0 | `free_ram_bytes × 0.35 / RECORD_BYTES` (sysinfo crate) |
+| `--recall-ef` | 64 | Benchmark 500-record synthetic HNSW; binary-search ef to hit <2 ms/query |
+| `--max-cold-records` | 0 | `free_disk_bytes × 0.20 / RECORD_BYTES` |
+
+These flags become `--init-max-warm-records`, `--init-recall-ef`, `--init-max-cold-records`
+once the startup-query logic is implemented. Deferred — see front-matter.
+
+### Bucket S-safety — Safety valves (adaptive ceiling, fixed floor)
+
+Hard minima that can never be violated — they are the emergency stops for when internal
+controllers misbehave. Once S3 (wakefulness pressure) is validated, the ceiling can
+widen to 3× the historical average: `max_wake_secs_effective = max(floor, 3 × mean_wake_secs_rolling)`.
+This makes them self-widening without removing the floor protection. Deferred — see front-matter.
+
+| Flag | Floor | Adaptive ceiling (deferred) |
+|---|---|---|
+| `--max-wake-secs` | 600 s | `max(600, 3 × mean_wake_secs_rolling)` |
+| `--max-sleep-secs` | 0 (disabled) | `max(0, 3 × mean_sleep_secs_rolling)` |
+| `--max-cycles` | 0 | test harness — permanent manual |
+
+### Bucket S-flags — Feature flags (all-on defaults)
+
+These select which subsystems are active. All should default to `true` in normal
+operation. The current `false` defaults are historical accidents from staged rollout.
+
+| Flag | Current default | Correct default |
+|---|---|---|
+| `--enable-language` | false | **true** |
+| `--enable-action-decoder` | false | **true** |
+| `--wake-recon-async` | false | **true** (validated in A/B, 2026-06-12) |
+| `--enable-gain-mod` | true | true ✓ |
+| `--migraphx` | true | true ✓ |
+
+Flipping these is a `main.rs` change alongside this ADR, not just documentation.
+Goal: `somnus --inputs <file>` works without specifying subsystem flags.
+
+### Bucket S-throttle — Throttle knobs (deferred — no clean signal yet)
+
+These tune the frequency of operations whose optimal rate depends on signals that do
+not yet exist or are not reliable. Listed in the front-matter `deferred:` section.
+
+| Flag | Default | Potential future signal |
+|---|---|---|
+| `--wake-reconstruct-interval` | 5 | Wake MSE Δ/step trend — fire more when stagnant |
+| `--gain-update-every` | 20 | Variance of `gain[i]` over N episodes — reduce if stable |
+| `--top-k-recall` | 5 | Recall diversity ratio (unique recalled episodes / top-k) |
+
+### Bucket S-ops — Structural / ops (permanent manual)
+
+These trade throughput for accuracy, select hardware, or configure observability.
+No internal learning signal can substitute for hardware knowledge or user intent.
+
+| Flag | Default | Why permanent |
+|---|---|---|
+| `--video-stride` | 1 | Content-rate tradeoff (camera fps / encode budget) |
+| `--replay-batch-size` | 128 | BLAS batch size (hardware-dependent) |
+| `--max-tokens` | 128 | LM budget (user intent, not system state) |
+| `--language-oversample` | 0 | Curriculum design (experimenter's call) |
+| `--nrem-min-traces` | 0 | Safety replay floor |
+| `--asr-min-chars` | 20 | Noise filter (content-dependent) |
+| paths, session-id, ort-profiling, inputs | — | Ops / observability |
 
 ---
 

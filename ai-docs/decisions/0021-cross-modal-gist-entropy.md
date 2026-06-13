@@ -1,3 +1,15 @@
+---
+status: accepted
+date: 2026-05-30
+deferred:
+  - id: cross-session-ingest-source
+    what: Preserve ingest_source through cold→warm promotion so the gist entropy metric covers cross-session mixing, not just within-session
+    when: After cold→warm promotion is made active (currently stubbed); requires RecollectionLayer::promote carrying source tag
+  - id: salience-weighted-cluster-assignment
+    what: Weight cluster assignment by episode salience in the gist entropy calculation to de-emphasise repetitive familiar content
+    when: After salience metadata is available per warm record
+---
+
 # ADR 0021 — Cross-modal gist entropy: ingest_source and concept probe
 
 **Status:** accepted

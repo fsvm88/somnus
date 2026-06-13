@@ -1,3 +1,15 @@
+---
+status: accepted
+date: 2026-05-11
+deferred:
+  - id: post-kwta-prior-injection
+    what: Inject prior feedback after k-WTA (into to_dense_n output) rather than before, to survive the same competitive selection as raw input
+    when: If pre-k-WTA injection shows poor prior uptake — ADR 0011 settling loop may make this unnecessary
+  - id: per-region-gating
+    what: Replace fixed β blend weight with a learned per-region scalar gate, allowing different regions to accept different amounts of top-down influence
+    when: After prior_cosine per region is stable across sessions and per-region β tuning shows clear benefit
+---
+
 # ADR 0010 — Bidirectional Top-Down Priors
 
 **Date:** 2026-05-11  

@@ -1,3 +1,18 @@
+---
+status: accepted
+date: 2026-05-10
+deferred:
+  - id: cascade-correlation-training
+    what: Train new grown units on residual error (cascade-correlation candidate pool) before insertion, rather than random init
+    when: When growth events are stable and growth quality is measurable via within-session gist probe
+  - id: adaptive-sleep-duration
+    what: Replace schedule/capacity sleep trigger with wakefulness pressure accumulator — see ADR 0024 S3
+    when: ADR 0024 Phase 2 implementation
+  - id: nrem-output-head-training
+    what: Train output heads during NREM by re-running full k-WTA+binding forward pass on stored regional traces; see ADR 0009
+    when: After output head wake-training converges and NREM replay is stable (adds significant NREM cost)
+---
+
 # ADR 0007 — Phase 5: sleep cycle + consolidation (`somnus-sleep`)
 
 **Status:** accepted  

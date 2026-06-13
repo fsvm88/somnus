@@ -1,3 +1,15 @@
+---
+status: accepted
+date: 2026-05-10
+deferred:
+  - id: grown-units-binding-exposure
+    what: Allow grown units (above N_UNITS=1024 baseline) to contribute to the binding area; currently clamped by to_dense_n(N_UNITS)
+    when: When region sizes stabilise and the episode vector dimension change is acceptable; requires snapshot format bump
+  - id: per-region-binding-projections-resize
+    what: Resize per-region linear projections when regions grow, so grown capacity is fully utilised
+    when: Blocked by grown-units-binding-exposure above
+---
+
 # ADR 0008 — Cross-attention binding area
 
 **Date:** 2026-05-10  

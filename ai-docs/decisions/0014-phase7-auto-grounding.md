@@ -1,3 +1,15 @@
+---
+status: accepted
+date: 2026-05-17
+deferred:
+  - id: visual-audio-grounding
+    what: Add grounding signal for visual and audio regions (e.g., image captions, environmental sound labels) to complement language grounding
+    when: When ActionDecoder generation quality for language-grounded episodes is stable and the richer grounding signal is worth the annotation cost
+  - id: lm-last-token-pooling
+    what: Replace mean-pool of embed table with Qwen forward pass + last-token context for LangEmbedder (richer semantic representation)
+    when: When language region prior_cosine plateaus and richer input representation is the identified bottleneck
+---
+
 # ADR 0014 — Phase 7: Auto-Grounding via Language Text Targets
 
 **Status:** Implemented

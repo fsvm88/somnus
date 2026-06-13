@@ -1,3 +1,12 @@
+---
+status: accepted
+date: 2026-05-30
+deferred:
+  - id: lang-last-token-pooling
+    what: Replace LangEmbedder mean-pool of embed table with Qwen forward pass + last-token hidden state for richer language input
+    when: Medium effort; worthwhile when language region prior_cosine plateaus and better input representation is the bottleneck; see ADR 0014
+---
+
 # ADR 0019 — Gap fixes: synthetic replay, salience-gated wake reconstruct, salience → NREM LR
 
 **Date:** 2026-05-30  

@@ -1,3 +1,15 @@
+---
+status: accepted
+date: 2026-05-11
+deferred:
+  - id: nrem-output-head-training
+    what: Train output heads during NREM by re-running k-WTA+binding forward pass on stored regional traces to produce episode vectors
+    when: After wake output_mse converges; adds O(replay_len × forward_pass) cost to NREM — profile first
+  - id: separate-output-head-optimizer
+    what: Give output heads their own AdamW with independent LR schedule, separate from the cognitive layer optimizer
+    when: If output heads and k-WTA/binding weights show conflicting gradient directions in the shared optimizer
+---
+
 # ADR 0009 — Output / Reconstruction Channel
 
 **Date:** 2026-05-11  

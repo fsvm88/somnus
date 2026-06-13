@@ -1,3 +1,15 @@
+---
+status: accepted
+date: 2026-05-10
+deferred:
+  - id: kwta-to-sae
+    what: Upgrade k-WTA to full differentiable SAE (coding loss + reconstruction loss jointly) once sufficient replay history exists
+    when: When NREM replay quality is stable and output_mse has converged (Phase 8+)
+  - id: grown-units-binding
+    what: Expose grown units (above N_UNITS=1024 baseline) to the binding area — currently clamped by to_dense_n(N_UNITS)
+    when: When growth stabilises and the binding area redesign justifies the episode vector dimension change; see ADR 0008
+---
+
 # 0005. Phase 3: somnus-perception crate — sparse coding, k-WTA, binding area, SAE decoder
 
 - **Status:** accepted

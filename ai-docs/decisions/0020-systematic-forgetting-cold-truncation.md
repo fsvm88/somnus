@@ -1,3 +1,12 @@
+---
+status: accepted
+date: 2026-05-30
+deferred:
+  - id: salience-weighted-cold-eviction
+    what: Replace recency-based truncation with salience-weighted eviction, retaining high-salience old episodes over recent low-salience ones
+    when: After salience metadata is stored in cold records (requires cold schema bump); see ADR 0006
+---
+
 # ADR 0020 — Systematic forgetting: bounded cold archive
 
 **Status:** accepted

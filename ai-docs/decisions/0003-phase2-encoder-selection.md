@@ -1,3 +1,18 @@
+---
+status: accepted
+date: 2026-04-28
+deferred:
+  - id: enc-whisper-upgrade
+    what: Upgrade Whisper-tiny to Whisper-base (512-dim) or WavLM-base if audio-speech concept quality is insufficient
+    when: When Phase 3 concept learning shows clear degradation attributable to speech encoder quality
+  - id: enc-sliding-window
+    what: Migrate Whisper to overlapping sliding window or WavLM-base to reduce 30s audio-speech chunk latency
+    when: If real-time dialogue or sub-30s concept binding is required
+  - id: enc-siglip-visual
+    what: Swap DINOv2-S for SigLIP-B when symbolic-region grounding requires language-aligned visual embeddings
+    when: When symbolic region grounding work begins in earnest (Phase 7+)
+---
+
 # 0003. Phase 2 encoder selection: Whisper-tiny + CLAP + DINOv2-S/14
 
 - **Status:** accepted

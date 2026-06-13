@@ -1,3 +1,15 @@
+---
+status: accepted
+date: 2026-05-18
+deferred:
+  - id: activation-frequency-pruning
+    what: Track per-unit activation frequency during NREM replay; remove least-activated grown units instead of lowest-L1-norm
+    when: When magnitude-based pruning shows clear false-positives (removing structurally important but low-magnitude units)
+  - id: knowledge-distillation-compression
+    what: Train a fresh smaller fixed-size encoder to match a grown encoder's outputs, then replace the grown model
+    when: If grown regions exceed 2× baseline unit count and magnitude pruning degrades recall quality
+---
+
 # ADR 0018 — Phase 12c: Regional unit pruning (distillation)
 
 **Status:** accepted  
