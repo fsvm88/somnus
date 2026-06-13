@@ -733,8 +733,10 @@ async fn main() -> Result<()> {
                     "restored from snapshot"
                 );
                 // Restore perception weights; pre-grow regions if they grew last session.
+                // Burn's BinFileRecorder appends ".bin" via set_extension, so the actual
+                // file is weights.bin — check that, not the stem path itself.
                 let w_path = weights_path(&args.memory_dir);
-                if w_path.exists() {
+                if w_path.with_extension("bin").exists() {
                     let sizes =
                         load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
                     if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
@@ -781,11 +783,12 @@ async fn main() -> Result<()> {
             args.ort_profile_dir.as_deref(),
         ) {
             Ok(mut d) => {
+                // Burn's BinFileRecorder sets extension to ".bin"; pass stem path.
                 let dec_w = args
                     .memory_dir
                     .join("snapshot")
-                    .join("decoder_weights.safetensors");
-                if dec_w.exists() {
+                    .join("decoder_weights");
+                if dec_w.with_extension("bin").exists() {
                     if let Err(e) = d.load_weights(&dec_w) {
                         tracing::warn!(?e, "decoder weight restore failed — starting fresh");
                     } else {
@@ -793,7 +796,7 @@ async fn main() -> Result<()> {
                     }
                 } else if snapshot_found {
                     tracing::warn!(
-                        "snapshot found but no decoder_weights.safetensors — \
+                        "snapshot found but no decoder_weights.bin — \
                          projection starts fresh; generation incoherent until trained"
                     );
                 }

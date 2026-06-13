@@ -143,8 +143,14 @@ pub fn save_snapshot(episodic: &EpisodicBuffer, memory_dir: &Path) -> MemoryResu
 }
 
 /// Path where perception weights should be saved.
+///
+/// The stem `weights` is used; Burn's BinFileRecorder appends `.bin` via
+/// `PathBuf::set_extension("bin")` on every save and load, so the actual
+/// file on disk is `weights.bin`. Callers that need to probe existence must
+/// check `.with_extension("bin")` (or use this path directly with Burn APIs
+/// which handle the extension internally).
 pub fn weights_path(memory_dir: &Path) -> PathBuf {
-    memory_dir.join("snapshot").join("weights.safetensors")
+    memory_dir.join("snapshot").join("weights")
 }
 
 /// Path where region sizes are saved.

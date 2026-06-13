@@ -1028,7 +1028,7 @@ pub fn run_sleep_cycle(
         if let Err(e) = recall.warm.dump(&warm_dir) {
             tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
         }
-        // Perception weights (safetensors) written to snapshot dir.
+        // Perception weights (BinFileRecorder → weights.bin) written to snapshot dir.
         let w_path = weights_path(memory_dir);
         if let Err(e) = perception.save_weights(&w_path) {
             tracing::warn!(?e, "weight snapshot write failed");
