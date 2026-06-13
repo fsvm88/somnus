@@ -85,9 +85,9 @@ use somnus_encoding::{
     VideoEmbedding, VideoEncoder,
 };
 use somnus_memory::{
-    load_growth_cooldown_remaining, load_region_sizes, load_snapshot, weights_path, ColdArchive,
-    EpisodicBuffer, IngestSource,
-    RecollectionLayer, SemanticStore,
+    load_growth_cooldown_remaining, load_region_sizes, load_sal_ewma, load_snapshot,
+    save_sal_ewma, weights_path, ColdArchive, EpisodicBuffer, IngestSource, RecollectionLayer,
+    SemanticStore,
 };
 use somnus_perception::{PerceptionProcessor, WakeReconWorker, EPISODE_DIM};
 use somnus_sensory::{
@@ -703,6 +703,8 @@ async fn main() -> Result<()> {
 
     // Load growth cooldown remaining from last session (0 if absent).
     let mut cooldown_remaining = load_growth_cooldown_remaining(&args.memory_dir);
+    // Load salience EWMA state (ADR 0024 S1). Cold-start: μ=0.8, σ=0.2, n=0.
+    let (mut sal_mu, mut sal_sigma, mut sal_n) = load_sal_ewma(&args.memory_dir);
 
     // ── Pre-grow perception to match last session's region sizes ─────────────
     // Must happen before ORT build so the ONNX is exported from the correct
@@ -1409,6 +1411,7 @@ async fn main() -> Result<()> {
                         args.wake_reconstruct_interval,
                         wake_recon_worker.as_ref(),
                         &mut wake_recon_dropped,
+                        sal_gate(sal_mu, sal_sigma, sal_n),
                     ) {
                         lang_ingest_count += 1;
                         if r.episode_produced {
@@ -1438,8 +1441,10 @@ async fn main() -> Result<()> {
                             settle_delta_sum += r.settle_delta as f64;
                         }
                         if let Some(ref es) = r.ep_stats {
+                            let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
                             accumulate_salience(
                                 es,
+                                sal_thresh,
                                 &mut salience_sum,
                                 &mut salience_n,
                                 &mut salience_min,
@@ -1451,6 +1456,7 @@ async fn main() -> Result<()> {
                                 &mut episodes_language,
                                 &mut episodes_mixed,
                             );
+                            update_sal_ewma(es.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
                         }
                         accumulate_cosines(
                             &r.prior_cosines,
@@ -1533,6 +1539,9 @@ async fn main() -> Result<()> {
             ) {
                 Ok(stats) => {
                     cooldown_remaining = stats.growth_cooldown_remaining;
+                    if let Err(e) = save_sal_ewma(sal_mu, sal_sigma, sal_n, &args.memory_dir) {
+                        tracing::warn!(?e, "sal_ewma save failed");
+                    }
                     sleep_cycle_count += 1;
                     let cycle_asr = asr_count.swap(0, Ordering::Relaxed);
                     info!(
@@ -1669,6 +1678,9 @@ async fn main() -> Result<()> {
                             "perc_settle_us":       perf_breakdown.settle_us,
                             "perc_prior_update_us": perf_breakdown.prior_update_us,
                             "warm_query_us_mean": hnsw_query_us_sum.checked_div(hnsw_query_n),
+                            "sal_ewma_mean":  sal_mu as f64,
+                            "sal_ewma_std":   sal_sigma as f64,
+                            "sal_threshold":  sal_gate(sal_mu, sal_sigma, sal_n) as f64,
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1768,7 +1780,9 @@ async fn main() -> Result<()> {
                                 if out.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += out.settle_iters; settle_delta_sum += out.settle_delta as f64; }
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
-                                    accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                    let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
+                                    accumulate_salience(rec, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                    update_sal_ewma(rec.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
                                     hnsw_query_us_sum += rec.hnsw_query_us;
                                     hnsw_query_n += 1;
                                 }
@@ -1776,7 +1790,7 @@ async fn main() -> Result<()> {
                                     wake_reconstruct_counter += 1;
                                     if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
                                         wake_reconstruct_throttle_passed += 1;
-                                        if rec.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
+                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(sal_mu, sal_sigma, sal_n)) {
                                             if let Some(ref w) = wake_recon_worker {
                                                 if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
                                                     wake_recon_dropped += 1;
@@ -1834,7 +1848,9 @@ async fn main() -> Result<()> {
                                 if out.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += out.settle_iters; settle_delta_sum += out.settle_delta as f64; }
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
-                                    accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                    let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
+                                    accumulate_salience(rec, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                    update_sal_ewma(rec.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
                                     hnsw_query_us_sum += rec.hnsw_query_us;
                                     hnsw_query_n += 1;
                                 }
@@ -1842,7 +1858,7 @@ async fn main() -> Result<()> {
                                     wake_reconstruct_counter += 1;
                                     if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
                                         wake_reconstruct_throttle_passed += 1;
-                                        if rec.as_ref().is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD) {
+                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(sal_mu, sal_sigma, sal_n)) {
                                             if let Some(ref w) = wake_recon_worker {
                                                 if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
                                                     wake_recon_dropped += 1;
@@ -1901,6 +1917,7 @@ async fn main() -> Result<()> {
                             args.wake_reconstruct_interval,
                             wake_recon_worker.as_ref(),
                             &mut wake_recon_dropped,
+                            sal_gate(sal_mu, sal_sigma, sal_n),
                         ) {
                             lang_ingest_count += 1;
                             perception_total_ms += r.perception_ms;
@@ -1921,7 +1938,9 @@ async fn main() -> Result<()> {
                             if let Some(m) = r.reconstruct_mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
                             if r.throttle_passed { wake_reconstruct_throttle_passed += 1; }
                             if let Some(ref es) = r.ep_stats {
-                                accumulate_salience(es, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
+                                accumulate_salience(es, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                update_sal_ewma(es.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
                                 hnsw_query_us_sum += es.hnsw_query_us;
                                 hnsw_query_n += 1;
                             }
@@ -2047,13 +2066,33 @@ const RECALL_BLEND_ALPHA: f32 = 0.1;
 /// rejecting cross-content noise injection.
 const RECALL_BLEND_THRESHOLD: f32 = 0.5;
 
-/// Minimum salience (warm-recall L2) for wake_reconstruct_step to fire.
-/// Recalibrated for L2-normalised episode vectors (max L2 = 2.0).
-/// Original value of 2.0 was at the maximum possible distance for unit vectors,
-/// so reconstruction effectively only fired when warm was empty (f32::MAX sentinel).
-/// 0.8 fires on content that is genuinely novel (dist > 0.8 ≈ cosine_sim < 0.68)
-/// while skipping familiar repeats. f32::MAX always passes (fresh memory dir).
-const WAKE_RECONSTRUCT_SALIENCE_THRESHOLD: f32 = 0.8;
+/// Cold-start prior for the adaptive salience gate (ADR 0024 S1).
+/// Used for the first 100 sampled episodes before the EWMA has enough data.
+const SAL_EWMA_COLD_START: f32 = 0.8;
+
+/// Compute adaptive salience gate threshold from EWMA state (ADR 0024 S1).
+/// Returns μ + 0.5·σ clamped to [0.3, 3.0] once ≥100 episodes are sampled;
+/// falls back to the cold-start prior of 0.8 before that.
+#[inline]
+fn sal_gate(mu: f32, sigma: f32, n: u64) -> f32 {
+    if n >= 100 {
+        (mu + 0.5 * sigma).clamp(0.3, 3.0)
+    } else {
+        SAL_EWMA_COLD_START
+    }
+}
+
+/// Update the per-episode salience EWMA with α=0.01 (ADR 0024 S1).
+/// Ignores f32::MAX sentinel (no warm neighbours — fresh memory or empty warm tier).
+#[inline]
+fn update_sal_ewma(salience: f32, mu: &mut f32, sigma: &mut f32, n: &mut u64) {
+    if salience < f32::MAX / 2.0 {
+        const ALPHA: f32 = 0.01;
+        *mu = ALPHA * salience + (1.0 - ALPHA) * *mu;
+        *sigma = ALPHA * (salience - *mu).abs() + (1.0 - ALPHA) * *sigma;
+        *n = n.saturating_add(1);
+    }
+}
 
 // ── language ingest helper ────────────────────────────────────────────────────
 
@@ -2092,6 +2131,7 @@ fn ingest_language_line(
     wake_reconstruct_interval: usize,
     wake_recon_worker: Option<&WakeReconWorker>,
     wake_recon_dropped: &mut u64,
+    sal_threshold: f32,
 ) -> Option<LangIngestResult> {
     let Some(le) = lang_embedder else { return None };
     let emb = match le.embed(text) {
@@ -2120,7 +2160,7 @@ fn ingest_language_line(
                         throttle_passed = true;
                         let mse = if ep_stats
                             .as_ref()
-                            .is_some_and(|r| r.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD)
+                            .is_some_and(|r| r.salience > sal_threshold)
                         {
                             if let Some(w) = wake_recon_worker {
                                 // Async: loss arrives later via try_recv_ema at the poll site.
@@ -2347,9 +2387,11 @@ fn record_episode(
 
 /// Accumulate per-episode salience and modality stats into cycle-level counters (ADR 0022).
 /// Sentinel `f32::MAX` (warm memory empty) is excluded from salience sums and high_salience count.
+/// `sal_threshold` is the adaptive gate value from `sal_gate()` (ADR 0024 S1).
 #[allow(clippy::too_many_arguments)]
 fn accumulate_salience(
     rec: &RecordedEpisode,
+    sal_threshold: f32,
     salience_sum: &mut f64,
     salience_n: &mut usize,
     salience_min: &mut f32,
@@ -2365,7 +2407,7 @@ fn accumulate_salience(
         *salience_sum += rec.salience as f64;
         *salience_n += 1;
         *salience_min = salience_min.min(rec.salience);
-        if rec.salience > WAKE_RECONSTRUCT_SALIENCE_THRESHOLD {
+        if rec.salience > sal_threshold {
             *high_salience_episodes += 1;
         }
     }

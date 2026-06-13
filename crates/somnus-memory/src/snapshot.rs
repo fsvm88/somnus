@@ -202,6 +202,30 @@ pub fn load_growth_cooldown_remaining(memory_dir: &Path) -> usize {
     u64::from_le_bytes(bytes) as usize
 }
 
+/// Save the salience EWMA state (μ, σ as f32 LE; n as u64 LE = 16 bytes; ADR 0024 S1).
+pub fn save_sal_ewma(mu: f32, sigma: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> {
+    let path = memory_dir.join("snapshot").join("sal_ewma.bin");
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&mu.to_le_bytes());
+    buf[4..8].copy_from_slice(&sigma.to_le_bytes());
+    buf[8..16].copy_from_slice(&n.to_le_bytes());
+    fs::write(path, buf)?;
+    Ok(())
+}
+
+/// Load the salience EWMA state. Returns (0.8, 0.2, 0) on absent/malformed file.
+pub fn load_sal_ewma(memory_dir: &Path) -> (f32, f32, u64) {
+    let path = memory_dir.join("snapshot").join("sal_ewma.bin");
+    let data = fs::read(path).ok().unwrap_or_default();
+    if data.len() < 16 {
+        return (0.8, 0.2, 0);
+    }
+    let mu = f32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+    let sigma = f32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4]));
+    let n = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+    (mu, sigma, n)
+}
+
 /// Restore episodic buffer + rebuild SemanticStore from `memory_dir/snapshot/`.
 ///
 /// Warm HNSW is loaded from the persisted dump in `memory_dir/warm/` when available
