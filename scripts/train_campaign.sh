@@ -125,6 +125,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --replay-batch-size 128 \
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
+            --recall-ef 16 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
@@ -146,6 +147,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --replay-batch-size 128 \
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
+            --recall-ef 16 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
