@@ -15,7 +15,8 @@ use std::{
 
 use anyhow::Result;
 use somnus_memory::{
-    save_region_sizes, save_snapshot, weights_path, EpisodicBuffer, IngestSource, RecollectionLayer,
+    save_growth_cooldown_remaining, save_region_sizes, save_snapshot, weights_path, EpisodicBuffer,
+    IngestSource, RecollectionLayer,
 };
 use somnus_perception::{PerceptionProcessor, RegionId, N_UNITS};
 
@@ -138,6 +139,8 @@ pub struct SleepStats {
     pub regions_pruned: Vec<RegionId>,
     /// Total grown units removed across all pruned regions.
     pub total_units_pruned: usize,
+    /// Cooldown cycles remaining after this cycle (persisted across sessions).
+    pub growth_cooldown_remaining: usize,
     /// Wall time for the NREM batch-replay loop (ms).
     pub nrem_wall_ms: u64,
     /// Wall time to precompute LM hidden-state targets for Gap-6 distillation (ms).
@@ -277,6 +280,8 @@ pub fn run_sleep_cycle(
     lang_oversample: usize,
     max_warm_records: usize,
     max_cold_records: usize,
+    growth_cooldown: usize,
+    cooldown_remaining: usize,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -818,8 +823,21 @@ pub fn run_sleep_cycle(
         // is too small to cluster. warm_recall_poor is logged but no longer gates growth —
         // WARM_RECALL_GROWTH_THRESHOLD (5.0) proved too noisy a signal; gist_poor is more
         // reliable for deciding when regions need more capacity.
+        //
+        // Cooldown: after any growth event, suppress growth for `growth_cooldown` cycles.
+        // c1 gist is structurally low (cross-session NREM drift) so without a cooldown
+        // the system grows every cycle. cooldown_remaining counts down to 0 each cycle;
+        // growth resets it to growth_cooldown.
         let _warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
         let gist_poor = gist_recall_rate.is_none_or(|r| r < GIST_GROWTH_THRESHOLD);
+        let growth_blocked = cooldown_remaining > 0;
+        if growth_blocked {
+            tracing::info!(
+                cooldown_remaining,
+                gist_recall_rate = ?gist_recall_rate,
+                "growth suppressed by cooldown"
+            );
+        }
         let region_ids = [
             RegionId::AudioSpeech,
             RegionId::AudioEnv,
@@ -827,22 +845,24 @@ pub fn run_sleep_cycle(
             RegionId::Symbolic,
             RegionId::Language,
         ];
-        for (i, &region) in region_ids.iter().enumerate() {
-            // Quality signal: gist-recall when available, SAE MSE otherwise.
-            let quality_poor = if gist_recall_rate.is_some() {
-                gist_poor
-            } else {
-                per_region_mse[i] > GROWTH_THRESHOLD
-            };
-            if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor {
-                tracing::info!(
-                    region = ?region,
-                    mse = per_region_mse[i],
-                    gist_recall_rate = ?gist_recall_rate,
-                    "growing region"
-                );
-                perception.grow_region(region, GROWTH_BATCH);
-                regions_grown.push(region);
+        if !growth_blocked {
+            for (i, &region) in region_ids.iter().enumerate() {
+                // Quality signal: gist-recall when available, SAE MSE otherwise.
+                let quality_poor = if gist_recall_rate.is_some() {
+                    gist_poor
+                } else {
+                    per_region_mse[i] > GROWTH_THRESHOLD
+                };
+                if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor {
+                    tracing::info!(
+                        region = ?region,
+                        mse = per_region_mse[i],
+                        gist_recall_rate = ?gist_recall_rate,
+                        "growing region"
+                    );
+                    perception.grow_region(region, GROWTH_BATCH);
+                    regions_grown.push(region);
+                }
             }
         }
 
@@ -1037,9 +1057,24 @@ pub fn run_sleep_cycle(
         if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
             tracing::warn!(?e, "region sizes write failed");
         }
+        // Growth cooldown counter: reset to growth_cooldown when something grew,
+        // otherwise decrement toward 0.
+        let new_cooldown = if !regions_grown.is_empty() {
+            growth_cooldown
+        } else {
+            cooldown_remaining.saturating_sub(1)
+        };
+        if let Err(e) = save_growth_cooldown_remaining(new_cooldown, memory_dir) {
+            tracing::warn!(?e, "growth cooldown write failed");
+        }
         tracing::info!("snapshot written");
     }
     let snapshot_wall_ms = t_snapshot.elapsed().as_millis() as u64;
+    let growth_cooldown_remaining = if !regions_grown.is_empty() {
+        growth_cooldown
+    } else {
+        cooldown_remaining.saturating_sub(1)
+    };
     tracing::info!(
         nrem_wall_ms,
         distill_precompute_ms,
@@ -1078,6 +1113,7 @@ pub fn run_sleep_cycle(
         lm_hidden_unique,
         nrem_budget_traces: n_traces,
         nrem_unique_traces,
+        growth_cooldown_remaining,
     })
 }
 

@@ -85,7 +85,8 @@ use somnus_encoding::{
     VideoEmbedding, VideoEncoder,
 };
 use somnus_memory::{
-    load_region_sizes, load_snapshot, weights_path, ColdArchive, EpisodicBuffer, IngestSource,
+    load_growth_cooldown_remaining, load_region_sizes, load_snapshot, weights_path, ColdArchive,
+    EpisodicBuffer, IngestSource,
     RecollectionLayer, SemanticStore,
 };
 use somnus_perception::{PerceptionProcessor, WakeReconWorker, EPISODE_DIM};
@@ -316,6 +317,12 @@ struct Args {
     /// Avoids thrashing on small growth steps.
     #[arg(long, default_value = "64")]
     prune_min_grown: usize,
+
+    /// After a growth event, suppress further growth for this many sleep cycles (default 3).
+    /// c1 gist is structurally low due to cross-session NREM drift, causing growth to fire
+    /// nearly every cycle without a cooldown. Set to 0 to disable (original behaviour).
+    #[arg(long, default_value = "3")]
+    growth_cooldown: usize,
 
     /// Number of traces processed per forward+backward pass during NREM replay.
     /// Higher values amortise optimizer overhead and improve BLAS utilisation.
@@ -693,6 +700,9 @@ async fn main() -> Result<()> {
         working_memory_size = args.working_memory_size,
         "perception processor initialised (n=1024, k=20, cpu)"
     );
+
+    // Load growth cooldown remaining from last session (0 if absent).
+    let mut cooldown_remaining = load_growth_cooldown_remaining(&args.memory_dir);
 
     // ── Pre-grow perception to match last session's region sizes ─────────────
     // Must happen before ORT build so the ONNX is exported from the correct
@@ -1518,8 +1528,11 @@ async fn main() -> Result<()> {
                 args.lang_oversample,
                 args.max_warm_records,
                 args.max_cold_records,
+                args.growth_cooldown,
+                cooldown_remaining,
             ) {
                 Ok(stats) => {
+                    cooldown_remaining = stats.growth_cooldown_remaining;
                     sleep_cycle_count += 1;
                     let cycle_asr = asr_count.swap(0, Ordering::Relaxed);
                     info!(
@@ -1607,6 +1620,7 @@ async fn main() -> Result<()> {
                             "cold_len":          recall.cold.len(),
                             "grew":              grew,
                             "regions_grown":     stats.regions_grown.iter().map(|r| r.as_index()).collect::<Vec<_>>(),
+                            "growth_cooldown_remaining": stats.growth_cooldown_remaining,
                             "wake_episodes":     wake_episodes,
                             "episodes_speech":   episodes_speech,
                             "episodes_env":      episodes_env,

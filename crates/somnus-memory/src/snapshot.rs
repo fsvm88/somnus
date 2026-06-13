@@ -184,6 +184,24 @@ pub fn load_region_sizes(memory_dir: &Path) -> Option<[usize; 5]> {
     Some(sizes)
 }
 
+/// Save the number of cycles remaining in the growth cooldown (single u64 LE).
+pub fn save_growth_cooldown_remaining(remaining: usize, memory_dir: &Path) -> MemoryResult<()> {
+    let path = memory_dir.join("snapshot").join("growth_cooldown.bin");
+    fs::write(path, (remaining as u64).to_le_bytes())?;
+    Ok(())
+}
+
+/// Load the growth cooldown remaining counter. Returns 0 if absent or malformed.
+pub fn load_growth_cooldown_remaining(memory_dir: &Path) -> usize {
+    let path = memory_dir.join("snapshot").join("growth_cooldown.bin");
+    let data = fs::read(path).ok().unwrap_or_default();
+    if data.len() < 8 {
+        return 0;
+    }
+    let bytes: [u8; 8] = data[..8].try_into().unwrap_or([0; 8]);
+    u64::from_le_bytes(bytes) as usize
+}
+
 /// Restore episodic buffer + rebuild SemanticStore from `memory_dir/snapshot/`.
 ///
 /// Warm HNSW is loaded from the persisted dump in `memory_dir/warm/` when available
