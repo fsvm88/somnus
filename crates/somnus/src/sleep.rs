@@ -25,8 +25,7 @@ const DECAY_RATE: f32 = 1e-4;
 const GROWTH_THRESHOLD: f32 = 0.1;
 const GROWTH_MIN_SAMPLES: usize = 16;
 const GROWTH_BATCH: usize = 64;
-/// Pending-embedding count above which sleep is considered interruptible by external salience.
-const SALIENCE_THRESHOLD: usize = 16;
+
 /// Mean warm-recall L2 above this threshold supplements the MSE growth signal.
 /// Only applied when warm had pre-spill entries (i.e., cross-cycle/cross-session data).
 /// Kept for the warm_recall_poor log field but no longer gates growth directly —
@@ -274,6 +273,7 @@ pub fn run_sleep_cycle(
     prune_min_grown: usize,
     replay_batch_size: usize,
     nrem_min_traces: usize,
+    nrem_salience_threshold: usize,
     lang_oversample: usize,
     max_warm_records: usize,
     max_cold_records: usize,
@@ -430,12 +430,14 @@ pub fn run_sleep_cycle(
 
     let mut batch_start = 0usize; // index into `traces` of the current batch start
     while batch_start < n_traces {
-        let salient = pending_embs.load(Ordering::Relaxed) > SALIENCE_THRESHOLD
+        let salient = nrem_salience_threshold > 0
+            && pending_embs.load(Ordering::Relaxed) > nrem_salience_threshold
             && batch_start >= nrem_min_traces;
         if interrupt.load(Ordering::Relaxed) || salient {
             if salient {
                 tracing::info!(
                     pending = pending_embs.load(Ordering::Relaxed),
+                    threshold = nrem_salience_threshold,
                     "sleep interrupted: salience threshold exceeded"
                 );
             }

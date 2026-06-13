@@ -330,6 +330,13 @@ struct Args {
     #[arg(long, default_value = "0")]
     nrem_min_traces: usize,
 
+    /// Pending-embedding count above which NREM is interrupted to allow live
+    /// input to be processed. 0 = disabled (default; correct for file-mode
+    /// campaigns where encoders run faster than real-time and would otherwise
+    /// abort sleep prematurely). Set to ~16 for live ingest mode.
+    #[arg(long, default_value = "0")]
+    nrem_salience_threshold: usize,
+
     /// Minimum character count for an ASR transcription to be forwarded to the
     /// language ingest path. Filters noise/silence artifacts from non-speech
     /// clips (Whisper often outputs 1–7 char strings on urban/nature audio).
@@ -1475,6 +1482,7 @@ async fn main() -> Result<()> {
                 args.prune_min_grown,
                 args.replay_batch_size,
                 args.nrem_min_traces,
+                args.nrem_salience_threshold,
                 args.lang_oversample,
                 args.max_warm_records,
                 args.max_cold_records,
