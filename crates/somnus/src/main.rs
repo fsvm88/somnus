@@ -100,7 +100,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
@@ -888,6 +888,8 @@ async fn main() -> Result<()> {
     let mut salience_min: f32 = f32::MAX;
     let mut high_salience_episodes: usize = 0;
     let mut blend_count: usize = 0;
+    let mut hnsw_query_us_sum: u64 = 0;
+    let mut hnsw_query_n: u64 = 0;
     let mut wake_reconstruct_throttle_passed: usize = 0;
     let mut episodes_speech: usize = 0;
     let mut episodes_env: usize = 0;
@@ -1622,6 +1624,7 @@ async fn main() -> Result<()> {
                             "perc_prior_us":        perf_breakdown.prior_us,
                             "perc_settle_us":       perf_breakdown.settle_us,
                             "perc_prior_update_us": perf_breakdown.prior_update_us,
+                            "warm_query_us_mean": hnsw_query_us_sum.checked_div(hnsw_query_n),
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1644,6 +1647,8 @@ async fn main() -> Result<()> {
                     salience_min = f32::MAX;
                     high_salience_episodes = 0;
                     blend_count = 0;
+                    hnsw_query_us_sum = 0;
+                    hnsw_query_n = 0;
                     wake_reconstruct_throttle_passed = 0;
                     wake_recon_dropped = 0;
                     episodes_speech = 0;
@@ -1720,6 +1725,8 @@ async fn main() -> Result<()> {
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
                                     accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                    hnsw_query_us_sum += rec.hnsw_query_us;
+                                    hnsw_query_n += 1;
                                 }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
@@ -1784,6 +1791,8 @@ async fn main() -> Result<()> {
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
                                     accumulate_salience(rec, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                    hnsw_query_us_sum += rec.hnsw_query_us;
+                                    hnsw_query_n += 1;
                                 }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
@@ -1869,6 +1878,8 @@ async fn main() -> Result<()> {
                             if r.throttle_passed { wake_reconstruct_throttle_passed += 1; }
                             if let Some(ref es) = r.ep_stats {
                                 accumulate_salience(es, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
+                                hnsw_query_us_sum += es.hnsw_query_us;
+                                hnsw_query_n += 1;
                             }
                             accumulate_cosines(&r.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
                         }
@@ -2186,6 +2197,8 @@ struct RecordedEpisode {
     blended: bool,
     /// Dominant modality tag derived from which regional inputs were non-empty.
     source: IngestSource,
+    /// Wall time of the HNSW query in microseconds (0 when warm index is empty).
+    hnsw_query_us: u64,
 }
 
 /// Queries warm memory first; blends the top-1 retrieved vector into the stored
@@ -2220,7 +2233,9 @@ fn record_episode(
     };
 
     // Recollection: find similar past episodes from warm memory.
+    let t_query = Instant::now();
     let neighbours = recall.query_warm_with_dist(&ep_norm, top_k);
+    let hnsw_query_us = t_query.elapsed().as_micros() as u64;
     let (episode_vec, blended, salience) = if let Some(&(dist, rec)) = neighbours.first() {
         tracing::info!(
             top1_id = rec.id,
@@ -2282,6 +2297,7 @@ fn record_episode(
         salience,
         blended,
         source: ingest_source,
+        hnsw_query_us,
     })
 }
 
