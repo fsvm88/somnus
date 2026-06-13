@@ -560,6 +560,7 @@ mod tests {
     fn record_bytes_constant() {
         // 24 B per record → 27.5× reduction vs 661 B INT8 record.
         assert_eq!(PQ_RECORD_BYTES, 24);
-        assert!(661 / PQ_RECORD_BYTES >= 27);
+        // Verified at compile time; the runtime test just confirms PQ_RECORD_BYTES itself.
+        const _: () = assert!(661 / PQ_RECORD_BYTES >= 27);
     }
 }
