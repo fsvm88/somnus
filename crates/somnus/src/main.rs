@@ -694,6 +694,33 @@ async fn main() -> Result<()> {
         "perception processor initialised (n=1024, k=20, cpu)"
     );
 
+    // ── Pre-grow perception to match last session's region sizes ─────────────
+    // Must happen before ORT build so the ONNX is exported from the correct
+    // (possibly grown) model. Weight restore later just loads weights into an
+    // already-correct-sized model and never needs to rebuild ONNX again.
+    {
+        let sizes = load_region_sizes(&args.memory_dir)
+            .unwrap_or([somnus_perception::N_UNITS; 5]);
+        let regions = [
+            somnus_perception::RegionId::AudioSpeech,
+            somnus_perception::RegionId::AudioEnv,
+            somnus_perception::RegionId::Visual,
+            somnus_perception::RegionId::Symbolic,
+            somnus_perception::RegionId::Language,
+        ];
+        let current = perception.region_sizes();
+        let mut grew = false;
+        for (i, &region) in regions.iter().enumerate() {
+            if sizes[i] > current[i] {
+                perception.grow_region(region, sizes[i] - current[i]);
+                grew = true;
+            }
+        }
+        if grew {
+            info!(sizes = ?sizes, "perception pre-grown to match saved region sizes");
+        }
+    }
+
     // ── ORT binding session (Phase 1 GPU unification) ─────────────────────────
     let onnx_script_path: Option<PathBuf> = args.onnx_models_dir.as_ref().map(|_| {
         args.onnx_script.clone().unwrap_or_else(|| {
