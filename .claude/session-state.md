@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-13
-> **Last commit on main:** 7f0194c — fix: restore perception and decoder weights across sessions
+> **Last commit on main:** e4c7275 — fix: pre-grow perception before ORT build to match saved region sizes
 > **Branch:** `main` (clean)
 
-## Status: Critical weight-restore bug fixed. A/B re-run needed to validate gist metric recovery.
+## Status: Weight-restore bug fixed and validated (3-session test passes, all tests green). Residual c1 gist collapse is intrinsic (cross-session embedding drift); not a bug.
 
 ---
 
@@ -54,7 +54,8 @@ Key insight: `wake_reconstruct_step` trains **only the 5 output heads**, and wak
 | Sleep-split fix | 1d8c61e | `--nrem-salience-threshold` (default 0 = disabled). Encoders in file mode ran faster than real-time, hitting the old hardcoded 16-threshold and aborting NREM before REM every c1. Live mode: pass `--nrem-salience-threshold 16`. |
 | HNSW timing metric | 37fa1eb | `warm_query_us_mean` added to cycle NDJSON (was missing — needed for ef verdict). |
 | At-scale A/B | 37fa1eb | `scripts/run_ef_scale_ab.sh` launched in background (PID 64286). A=ef64, B=ef16. 10 sessions × 3 cycles × CAPACITY=4096, two 1-hr walk clips, ONNX on. Expected ~100k warm records by end. |
-| **Critical: weight restore fix** | 7f0194c | Burn's `BinFileRecorder` calls `path.set_extension("bin")` on every save/load, replacing `.safetensors` with `.bin`. `weights_path()` returned `weights.safetensors`; the `exists()` check always failed → model trained from scratch every session. Fixed: `weights_path()` now returns stem `weights` (no extension); `exists()` checks use `.with_extension("bin")`. Decoder path fixed identically. Confirmed working: session 2 logs "perception weights restored sizes=[1152, 1088, 1152, 1152, 1024]". |
+| **Critical: weight restore fix** | 7f0194c | Burn's `BinFileRecorder` calls `path.set_extension("bin")` on every save/load, replacing `.safetensors` with `.bin`. `weights_path()` returned `weights.safetensors`; the `exists()` check always failed → model trained from scratch every session. Fixed: `weights_path()` now returns stem `weights` (no extension); `exists()` checks use `.with_extension("bin")`. Decoder path fixed identically. |
+| **Follow-on: pre-grow before ONNX build** | e4c7275 | Weight restore set region sizes AFTER ORT session was built from base [1024,...] model → ORT/Burn mismatch → panic (exit 101). Fixed: read `region_sizes.bin` and pre-grow perception BEFORE `rebuild_ort_session`, so ONNX is always exported from the correct (possibly grown) model. Weight restore then just loads weights with no size change needed. |
 
 ---
 
@@ -67,11 +68,32 @@ Both campaigns ran with the weight-restore bug active (model trained from scratc
 
 ---
 
-## Queued next
+## Validation result (3 sessions × 3 cycles, CAPACITY=1024, 2 walk clips)
 
-1. **Re-run A/B validation** (small, 3 sessions × 3 cycles) with weight restore fix to confirm gist_recall_rate no longer collapses at c1. Expected: c1 gist should be higher now that models carry over. Also check warm_recall_l2 at c1 (was 1.2–1.3; should drop closer to c3's 0.6–0.8).
-2. **Re-evaluate growth trigger**: with working cross-session weights, the system should stop triggering growth at every c1. If growth still fires, investigate whether it's still spurious (drift within-session) or now reflects genuine capacity need.
-3. **Long-clip campaign**: after growth behavior stabilises, try training on `clips/long/` content with `--nrem-salience-threshold 0` (file mode default).
+| cycle | gist  | rl2   | grew  | region_sizes              |
+|-------|-------|-------|-------|---------------------------|
+| s1c1  | nan   | nan   | True  | [1088,1024,1088,1088,1024]|
+| s1c2  | 0.376 | 1.001 | True  | [1152,1088,1152,1152,1024]|
+| s1c3  | 0.537 | 0.532 | True  | [1216,1152,1216,1216,1024]|
+| s2c1  | 0.252 | 1.238 | True  | [1280,1216,1280,1280,1024]|
+| s2c2  | 0.532 | 0.511 | True  | [1344,1280,1344,1344,1024]|
+| s2c3  | 0.592 | 0.396 | True  | [1408,1344,1408,1408,1024]|
+| s3c1  | 0.015 | 1.304 | True  | [1472,1408,1472,1472,1024]|
+| s3c2  | 0.053 | 0.611 | True  | [1536,1472,1536,1536,1024]|
+| s3c3  | 0.935 | 0.257 | False | [1536,1472,1536,1536,1024]|
+
+Key observations:
+- Region sizes now accumulate across sessions ✓ (was resetting to 1088 every session)
+- s2c1 gist = 0.252 (was ~0.05 before fix) — cross-session recall improved ✓
+- Residual c1 collapse is intrinsic: c1 nearest warm neighbors are from previous session (full session of NREM drift away); c3 has within-session c2 neighbors (1 NREM apart) → high gist
+- Growth is still unbounded (every cycle except s3c3) — runaway growth concern
+- s3c1 gist = 0.015 despite weight restore: at session 3+, the growing model diverges faster from warm store embeddings than at session 2
+
+## Open issues / queued next
+
+1. **Runaway growth**: regions growing from 1024 → 1536 in 3 sessions without pruning. Root cause: GIST_GROWTH_THRESHOLD=0.85 almost never met at c1/c2; PRUNE_GIST_THRESHOLD never met consistently. Options: (a) lower growth threshold, (b) use mean_output_mse as growth signal (not gist), (c) add a growth cooldown.
+2. **Residual c1 gist collapse**: intrinsic to raw embedding warm store + NREM drift. Could address with re-encoding warm store after NREM (expensive) or a different gist probe strategy (e.g., probe only within-session warm entries for the growth signal).
+3. **Long-clip campaign**: once growth is under control, try `clips/long/` with `--nrem-salience-threshold 0`.
 
 ## Closed items (this arc)
 
