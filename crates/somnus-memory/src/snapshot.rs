@@ -226,6 +226,28 @@ pub fn load_sal_ewma(memory_dir: &Path) -> (f32, f32, u64) {
     (mu, sigma, n)
 }
 
+/// Save the settle-cosine EWMA state (μ f32 LE + n u64 LE = 12 bytes; ADR 0024 S2).
+pub fn save_settle_ewma(mu: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> {
+    let path = memory_dir.join("snapshot").join("settle_ewma.bin");
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&mu.to_le_bytes());
+    buf[4..12].copy_from_slice(&n.to_le_bytes());
+    fs::write(path, buf)?;
+    Ok(())
+}
+
+/// Load the settle-cosine EWMA state. Returns (0.85, 0) on absent/malformed file.
+pub fn load_settle_ewma(memory_dir: &Path) -> (f32, u64) {
+    let path = memory_dir.join("snapshot").join("settle_ewma.bin");
+    let data = fs::read(path).ok().unwrap_or_default();
+    if data.len() < 12 {
+        return (0.85, 0);
+    }
+    let mu = f32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+    let n = u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]));
+    (mu, n)
+}
+
 /// Restore episodic buffer + rebuild SemanticStore from `memory_dir/snapshot/`.
 ///
 /// Warm HNSW is loaded from the persisted dump in `memory_dir/warm/` when available

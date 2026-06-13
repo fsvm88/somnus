@@ -85,9 +85,9 @@ use somnus_encoding::{
     VideoEmbedding, VideoEncoder,
 };
 use somnus_memory::{
-    load_growth_cooldown_remaining, load_region_sizes, load_sal_ewma, load_snapshot,
-    save_sal_ewma, weights_path, ColdArchive, EpisodicBuffer, IngestSource, RecollectionLayer,
-    SemanticStore,
+    load_growth_cooldown_remaining, load_region_sizes, load_sal_ewma, load_settle_ewma,
+    load_snapshot, save_sal_ewma, save_settle_ewma, weights_path, ColdArchive, EpisodicBuffer,
+    IngestSource, RecollectionLayer, SemanticStore,
 };
 use somnus_perception::{PerceptionProcessor, WakeReconWorker, EPISODE_DIM};
 use somnus_sensory::{
@@ -705,6 +705,8 @@ async fn main() -> Result<()> {
     let mut cooldown_remaining = load_growth_cooldown_remaining(&args.memory_dir);
     // Load salience EWMA state (ADR 0024 S1). Cold-start: μ=0.8, σ=0.2, n=0.
     let (mut sal_mu, mut sal_sigma, mut sal_n) = load_sal_ewma(&args.memory_dir);
+    // Load settle-cosine EWMA state (ADR 0024 S2). Cold-start: μ=0.85, n=0.
+    let (mut settle_mu, mut settle_n) = load_settle_ewma(&args.memory_dir);
 
     // ── Pre-grow perception to match last session's region sizes ─────────────
     // Must happen before ORT build so the ONNX is exported from the correct
@@ -1426,6 +1428,8 @@ async fn main() -> Result<()> {
                                     &mut perf_sleep_flag,
                                     args.perf_sleep_threshold,
                                 );
+                                update_settle_ewma(m, &mut settle_mu, &mut settle_n);
+                                perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
                             }
                         }
                         if let Some(m) = r.reconstruct_mse {
@@ -1541,6 +1545,9 @@ async fn main() -> Result<()> {
                     cooldown_remaining = stats.growth_cooldown_remaining;
                     if let Err(e) = save_sal_ewma(sal_mu, sal_sigma, sal_n, &args.memory_dir) {
                         tracing::warn!(?e, "sal_ewma save failed");
+                    }
+                    if let Err(e) = save_settle_ewma(settle_mu, settle_n, &args.memory_dir) {
+                        tracing::warn!(?e, "settle_ewma save failed");
                     }
                     sleep_cycle_count += 1;
                     let cycle_asr = asr_count.swap(0, Ordering::Relaxed);
@@ -1681,6 +1688,8 @@ async fn main() -> Result<()> {
                             "sal_ewma_mean":  sal_mu as f64,
                             "sal_ewma_std":   sal_sigma as f64,
                             "sal_threshold":  sal_gate(sal_mu, sal_sigma, sal_n) as f64,
+                            "settle_ewma_mean":   settle_mu as f64,
+                            "settle_gate_dynamic": settle_gate_val(settle_mu, settle_n, args.settle_gate) as f64,
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1813,6 +1822,8 @@ async fn main() -> Result<()> {
                                     wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
                                         update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
+                                        update_settle_ewma(m, &mut settle_mu, &mut settle_n);
+                                        perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
                                     }
                                 }
                                 if !startup_query_fired && out.episode.is_some() {
@@ -1881,6 +1892,8 @@ async fn main() -> Result<()> {
                                     wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
                                         update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
+                                        update_settle_ewma(m, &mut settle_mu, &mut settle_n);
+                                        perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
                                     }
                                 }
                                 if !startup_query_fired && out.episode.is_some() {
@@ -1925,6 +1938,8 @@ async fn main() -> Result<()> {
                                 wake_episodes += 1;
                                 if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
                                     update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
+                                    update_settle_ewma(m, &mut settle_mu, &mut settle_n);
+                                    perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
                                 }
                                 if let Some(ref gw) = gain_worker {
                                     if let Some(ref ep) = r.last_episode {
@@ -2080,6 +2095,25 @@ fn sal_gate(mu: f32, sigma: f32, n: u64) -> f32 {
     } else {
         SAL_EWMA_COLD_START
     }
+}
+
+/// Compute adaptive settle gate from prior-cosine EWMA (ADR 0024 S2).
+/// Returns μ − 0.1 clamped to [0.0, 1.0] once ≥100 episodes; cold-start prior otherwise.
+#[inline]
+fn settle_gate_val(mu: f32, n: u64, cold_start: f32) -> f32 {
+    if n >= 100 {
+        (mu - 0.1).clamp(0.0, 1.0)
+    } else {
+        cold_start
+    }
+}
+
+/// Update the prior-cosine EWMA used for adaptive settle gating with α=0.01 (ADR 0024 S2).
+#[inline]
+fn update_settle_ewma(episode_mean: f64, mu: &mut f32, n: &mut u64) {
+    const ALPHA: f32 = 0.01;
+    *mu = ALPHA * episode_mean as f32 + (1.0 - ALPHA) * *mu;
+    *n = n.saturating_add(1);
 }
 
 /// Update the per-episode salience EWMA with α=0.01 (ADR 0024 S1).

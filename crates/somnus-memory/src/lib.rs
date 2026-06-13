@@ -15,6 +15,7 @@ pub use pq::{convert_cold_to_pq, PqCodebook, PqColdArchive, PQ_K, PQ_M, PQ_SUB_D
 pub use recollection::RecollectionLayer;
 pub use semantic::SemanticStore;
 pub use snapshot::{
-    load_growth_cooldown_remaining, load_region_sizes, load_sal_ewma, load_snapshot,
-    save_growth_cooldown_remaining, save_region_sizes, save_sal_ewma, save_snapshot, weights_path,
+    load_growth_cooldown_remaining, load_region_sizes, load_sal_ewma, load_settle_ewma,
+    load_snapshot, save_growth_cooldown_remaining, save_region_sizes, save_sal_ewma,
+    save_settle_ewma, save_snapshot, weights_path,
 };
