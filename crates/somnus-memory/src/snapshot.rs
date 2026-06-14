@@ -248,6 +248,28 @@ pub fn load_settle_ewma(memory_dir: &Path) -> (f32, u64) {
     (mu, n)
 }
 
+/// Save the wake-duration EWMA state (μ f32 LE + n u64 LE = 12 bytes; ADR 0024 S6).
+pub fn save_wake_ewma(mu: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> {
+    let path = memory_dir.join("snapshot").join("wake_ewma.bin");
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&mu.to_le_bytes());
+    buf[4..12].copy_from_slice(&n.to_le_bytes());
+    fs::write(path, buf)?;
+    Ok(())
+}
+
+/// Load the wake-duration EWMA state. Returns (0.0, 0) on absent/malformed file.
+pub fn load_wake_ewma(memory_dir: &Path) -> (f32, u64) {
+    let path = memory_dir.join("snapshot").join("wake_ewma.bin");
+    let data = fs::read(path).ok().unwrap_or_default();
+    if data.len() < 12 {
+        return (0.0, 0);
+    }
+    let mu = f32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+    let n = u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]));
+    (mu, n)
+}
+
 /// Restore episodic buffer + rebuild SemanticStore from `memory_dir/snapshot/`.
 ///
 /// Warm HNSW is loaded from the persisted dump in `memory_dir/warm/` when available

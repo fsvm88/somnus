@@ -25,3 +25,4 @@ burn-ndarray       = { workspace = true }
 safetensors        = { workspace = true }
 ndarray            = { workspace = true }
 tokenizers         = "0.21"
+sysinfo            = "0.38"

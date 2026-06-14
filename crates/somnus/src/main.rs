@@ -86,8 +86,8 @@ use somnus_encoding::{
 };
 use somnus_memory::{
     load_growth_cooldown_remaining, load_region_sizes, load_sal_ewma, load_settle_ewma,
-    load_snapshot, save_sal_ewma, save_settle_ewma, weights_path, ColdArchive, EpisodicBuffer,
-    IngestSource, RecollectionLayer, SemanticStore,
+    load_snapshot, load_wake_ewma, save_sal_ewma, save_settle_ewma, save_wake_ewma, weights_path,
+    ColdArchive, EpisodicBuffer, IngestSource, RecollectionLayer, SemanticStore,
 };
 use somnus_perception::{PerceptionProcessor, WakeReconWorker, EPISODE_DIM};
 use somnus_sensory::{
@@ -103,6 +103,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use sysinfo::System;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -189,9 +190,9 @@ struct Args {
     max_warm_records: usize,
 
     /// ef parameter for HNSW warm-memory queries. Higher ef = more accurate recall
-    /// but slower search. Default 64. Lower values (e.g. 16) give ~4× faster queries
-    /// with some recall loss — validate with eval_metrics.py warm_recall_l2.
-    #[arg(long, default_value = "64")]
+    /// but slower search. Calibrated default 16 (ADR 0024 S5) — ~4× faster than 64
+    /// with negligible recall loss at scale.
+    #[arg(long, default_value = "16")]
     recall_ef: usize,
 
     /// Run wake_reconstruct_step on a background worker thread instead of
@@ -711,6 +712,8 @@ async fn main() -> Result<()> {
     let (mut sal_mu, mut sal_sigma, mut sal_n) = load_sal_ewma(&args.memory_dir);
     // Load settle-cosine EWMA state (ADR 0024 S2). Cold-start: μ=0.85, n=0.
     let (mut settle_mu, mut settle_n) = load_settle_ewma(&args.memory_dir);
+    // Load wake-duration EWMA state (ADR 0024 S6). Cold-start: μ=0.0, n=0.
+    let (mut wake_ewma_mu, mut wake_ewma_n) = load_wake_ewma(&args.memory_dir);
 
     // ── Pre-grow perception to match last session's region sizes ─────────────
     // Must happen before ORT build so the ONNX is exported from the correct
@@ -808,9 +811,18 @@ async fn main() -> Result<()> {
             }
         };
 
-    if args.max_warm_records > 0 {
-        semantic.set_max_records(args.max_warm_records);
-    }
+    // S5: auto-seed max_warm_records from available RAM when not set (ADR 0024).
+    // Warm HNSW is ~2500 bytes/record (640-dim f32 + graph edges); target 35% of free RAM.
+    let effective_max_warm = if args.max_warm_records > 0 {
+        args.max_warm_records
+    } else {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let free_bytes = sys.available_memory(); // bytes
+        let auto = ((free_bytes as f64 * 0.35) / 2500.0) as usize;
+        auto.clamp(1_000, 1_000_000)
+    };
+    semantic.set_max_records(effective_max_warm);
 
     if args.settle_steps > 0 && !snapshot_found {
         tracing::warn!(
@@ -893,11 +905,21 @@ async fn main() -> Result<()> {
         episodic_capacity = args.episodic_capacity,
         memory_dir = %args.memory_dir.display(),
         recall_ef = args.recall_ef,
+        max_warm_records = effective_max_warm,
+        max_warm_auto = args.max_warm_records == 0,
         "memory hierarchy ready"
     );
 
     let high_water = (args.episodic_capacity as f64 * args.sleep_high_water) as usize;
-    let max_wake = Duration::from_secs(args.max_wake_secs);
+    // S6: adaptive ceiling — widen when rolling mean wake > floor (ADR 0024).
+    // Cold-start (n<3): hold at floor. α=0.3 (per-cycle, not per-episode).
+    let wake_ewma_floor = args.max_wake_secs;
+    let effective_max_wake_secs = if wake_ewma_n >= 3 {
+        wake_ewma_floor.max((3.0 * wake_ewma_mu) as u64)
+    } else {
+        wake_ewma_floor
+    };
+    let mut max_wake = Duration::from_secs(effective_max_wake_secs);
     let mut wake_start = std::time::Instant::now();
 
     let interrupt = Arc::new(AtomicBool::new(false));
@@ -1509,12 +1531,13 @@ async fn main() -> Result<()> {
         };
 
         if should_sleep && !episodic.is_empty() {
+            let this_wake_secs = wake_start.elapsed().as_secs_f32();
             info!(
                 trigger = sleep_trigger,
                 wakefulness_pressure,
                 buffer_len = episodic.len(),
                 buffer_cap = args.episodic_capacity,
-                wake_secs = wake_start.elapsed().as_secs(),
+                wake_secs = this_wake_secs as u64,
                 "entering sleep"
             );
             interrupt.store(false, Ordering::Relaxed);
@@ -1570,6 +1593,24 @@ async fn main() -> Result<()> {
                     if let Err(e) = save_settle_ewma(settle_mu, settle_n, &args.memory_dir) {
                         tracing::warn!(?e, "settle_ewma save failed");
                     }
+                    // S6: update wake-duration EWMA (per-cycle α=0.3; ADR 0024).
+                    const WAKE_EWMA_ALPHA: f32 = 0.3;
+                    wake_ewma_mu = if wake_ewma_n == 0 {
+                        this_wake_secs
+                    } else {
+                        WAKE_EWMA_ALPHA * this_wake_secs + (1.0 - WAKE_EWMA_ALPHA) * wake_ewma_mu
+                    };
+                    wake_ewma_n += 1;
+                    if let Err(e) = save_wake_ewma(wake_ewma_mu, wake_ewma_n, &args.memory_dir) {
+                        tracing::warn!(?e, "wake_ewma save failed");
+                    }
+                    // Recompute max_wake from updated EWMA (floor until n≥3).
+                    let new_max_secs = if wake_ewma_n >= 3 {
+                        wake_ewma_floor.max((3.0 * wake_ewma_mu) as u64)
+                    } else {
+                        wake_ewma_floor
+                    };
+                    max_wake = Duration::from_secs(new_max_secs);
                     // Dissipate wakefulness pressure by NREM consolidation quality (ADR 0024 S3).
                     // Prefer within-session gist (clean signal); fall back to cross-session at c1.
                     let consolidation = (0.5
@@ -1761,6 +1802,8 @@ async fn main() -> Result<()> {
                             "settle_gate_dynamic": settle_gate_val(settle_mu, settle_n, args.settle_gate) as f64,
                             "wakefulness_pressure": wakefulness_pressure as f64,
                             "prior_beta_effective": if s4_beta_active { 0.05f64 } else { args.prior_beta as f64 },
+                            "wake_ewma_mean":       wake_ewma_mu as f64,
+                            "max_wake_secs_effective": max_wake.as_secs(),
                         })
                         .to_string();
                         use std::io::Write as _;
