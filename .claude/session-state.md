@@ -4,7 +4,7 @@
 > **Last commit on main:** ef4682d (items 4+5: grown-units binding exposure)
 > **Branch:** `main` (clean)
 
-## Status: All deferred items complete. Queue empty.
+## Status: Fresh ADR scan complete. Queue populated. Tier 1 triggers verified — none met. Awaiting direction.
 
 ---
 
@@ -51,6 +51,37 @@
 ---
 
 ## Open issues / queued next
+
+Fresh ADR scan 2026-06-14. Items ordered by tier and source ADR.
+
+### Tier 1 — trigger-gated (not yet met)
+
+| # | Source | Item | Trigger |
+|---|--------|------|---------|
+| A | ADR 0006 | **Cold archive O(1) promotion index** | `promote()` called AND cold > 500k records. Verified 2026-06-14: `promote()` is dead code; archive is ~37k records. Skip until both conditions hold. |
+| B | ADR 0019 / 0014 | **Language last-token pooling** | `language prior_cosine` plateaus AND bottleneck confirmed as input representation. Requires full `qwen25_lm.onnx` forward pass per line (medium effort; ADR 0019 already dropped naïve version). |
+| C | ADR 0006 | **Per-region sparse activation storage** | Replay analysis shows episode vectors insufficient for diagnostics. No sparse-code consumer currently exists. |
+
+### Tier 2 — conditional / quality-gated
+
+| # | Source | Item | Trigger |
+|---|--------|------|---------|
+| D | ADR 0005 | Full differentiable SAE (replace k-WTA with coding+reconstruction loss) | Phase 8+; after `output_mse` converges |
+| E | ADR 0009 | Separate optimizer for output heads (independent LR schedule) | Conflicting gradient directions between output heads and k-WTA observed |
+| F | ADR 0010 | Post-k-WTA prior injection | Pre-k-WTA injection shows poor `prior_cosine` uptake |
+| G | ADR 0010 | Learned per-region scalar gate (replace fixed β) | `prior_cosine` stable; per-region β tuning shows benefit |
+| H | ADR 0018 | Activation-frequency pruning (replace L1 norm) | Magnitude pruning shows false-positives. Note: `--prune-fraction` kept at 0.0 default; ADR 0018 safe-pruning assumption invalidated by ef4682d (grown units now in binding area). Enable only after A/B campaign confirms mid-run pruning doesn't degrade `warm_recall_l2`/`gist_recall_rate`. |
+| I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
+
+### Tier 3 — model swaps / Phase 7+ (not urgent)
+
+| # | Source | Item |
+|---|--------|------|
+| J | ADR 0003 | Whisper-tiny → Whisper-base / WavLM-base (audio quality) |
+| K | ADR 0003 | DINOv2-S → SigLIP-B (language-aligned visual embeddings, Phase 7+) |
+| L | ADR 0012 | LoRA fine-tuning of Qwen2.5 for episode-vector prefix |
+| M | ADR 0012 | MLP projection (640→5×896) instead of linear |
+| N | ADR 0014 | Visual/audio region grounding (captions, env sound labels) |
 
 Deferred items from ADR scan (Tier 1 + Tier 2, in priority order):
 

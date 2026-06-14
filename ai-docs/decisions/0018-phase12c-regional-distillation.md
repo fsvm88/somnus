@@ -102,3 +102,20 @@ If the system routinely needs >2× the baseline unit count to achieve good gist 
 magnitude pruning will hurt performance and a smarter selection criterion (or accepting
 the larger size) is needed.
 If `to_dense_n` clamping is removed in a future phase, pruning scope must be revisited.
+
+## Amendment — 2026-06-14: safe-pruning assumption invalidated by items 4+5 (ef4682d)
+
+ADR 0005/0008 items 4+5 (commit ef4682d) removed the `to_dense_n(N_UNITS)` clamp from
+the binding forward pass. Binding now uses `to_dense_n(region_n[i])`, so grown units
+fully participate in episode vectors and warm/cold memory retrieval.
+
+The "safe pruning scope" argument above is therefore stale. Pruning a grown unit now
+changes the encoding function mid-campaign: episodes already stored in warm/cold were
+produced under the pre-prune encoder; future episodes will be produced under the
+post-prune encoder. The HNSW index has no record of this shift.
+
+**Consequence:** `--prune-fraction` remains disabled by default (0.0) until a longer
+campaign establishes whether pruning mid-run degrades recall quality or is tolerable.
+Before enabling pruning in production campaigns, run an A/B with pruning on vs. off
+and compare `warm_recall_l2`, `gist_recall_rate`, and `per_region_mse` trajectories
+across sessions.
