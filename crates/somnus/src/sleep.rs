@@ -706,6 +706,28 @@ pub fn run_sleep_cycle(
             }
         }
 
+        // Extend the cluster histogram with a bounded warm sample so that
+        // prior-session episodes (cold→warm) contribute to cross_modal_gist_entropy.
+        if gist_available {
+            for rec in recall.warm.sample_records(GIST_SAMPLE) {
+                let probe_cluster = nearest_centroid(&gist_centroids, &rec.values);
+                let weight = if rec.salience >= f32::MAX / 2.0 {
+                    1.0f32
+                } else {
+                    rec.salience.clamp(0.01, 2.0)
+                };
+                let slot = match rec.ingest_source {
+                    IngestSource::Speech => 0,
+                    IngestSource::Env => 1,
+                    IngestSource::Visual => 2,
+                    IngestSource::Language => 3,
+                    IngestSource::Mixed => 4,
+                    IngestSource::Unknown => 5,
+                };
+                cluster_sources[probe_cluster][slot] += weight;
+            }
+        }
+
         if n_probed > 0 {
             let mean_l2 = total_l2 / n_probed as f32;
             warm_recall_l2 = Some(mean_l2);

@@ -4,7 +4,7 @@ date: 2026-05-30
 deferred:
   - id: cross-session-ingest-source
     what: Preserve ingest_source through cold→warm promotion so the gist entropy metric covers cross-session mixing, not just within-session
-    when: After cold→warm promotion is made active (currently stubbed); requires RecollectionLayer::promote carrying source tag
+    when: DONE 2026-06-14 — warm store already holds full EpisodeRecord (incl. ingest_source) via rebuild_from_recent; gist probe now also bins a bounded warm sample (GIST_SAMPLE records) into cluster_sources after the hot-tier loop
   - id: salience-weighted-cluster-assignment
     what: Weight cluster assignment by episode salience in the gist entropy calculation to de-emphasise repetitive familiar content
     when: DONE 2026-06-14 — cluster_sources now accumulates f32 weights per slot; weight = salience.clamp(0.01, 2.0), f32::MAX sentinel → 1.0
@@ -92,6 +92,18 @@ architectural changes or learning-rate schedules.
 If we add cross-session source tracking (cold→warm promotion preserves `ingest_source`),
 the probe should be extended to sample from warm as well. If salience-weighted cluster
 assignment is added, the histogram weights should be adjusted accordingly.
+
+## Amendment: cross-session gist histogram (2026-06-14)
+
+The warm store's `records: HashMap<usize, EpisodeRecord>` already carries `ingest_source`
+(and `salience`) for all cold→warm–promoted records via `rebuild_from_recent`. A new
+`SemanticStore::sample_records(max_n)` method returns an evenly-sampled slice of those
+records. After the hot-tier loop in the gist probe, a bounded warm sample (`GIST_SAMPLE`
+records) is also binned into `cluster_sources` via `nearest_centroid`, giving
+`cross_modal_gist_entropy` a cross-session signal once cold history is non-trivial.
+
+Note: hot-tier records that are also in warm are counted twice; at production scales (warm
+≫ hot) this is a negligible bias and not worth the filtering cost.
 
 ## Amendment: salience-weighted cluster assignment (2026-06-14)
 

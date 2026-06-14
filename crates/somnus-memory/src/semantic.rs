@@ -156,6 +156,18 @@ impl SemanticStore {
         }
     }
 
+    /// Return up to `max_n` records, evenly sampled from the warm store.
+    /// Used to build cross-session source histograms in the gist entropy probe.
+    pub fn sample_records(&self, max_n: usize) -> Vec<&EpisodeRecord> {
+        let records: Vec<&EpisodeRecord> = self.records.values().collect();
+        if records.len() <= max_n {
+            records
+        } else {
+            let step = records.len() / max_n;
+            (0..max_n).map(|i| records[i * step]).collect()
+        }
+    }
+
     /// Expose the underlying HNSW index (for snapshot serialisation).
     pub fn hnsw(&self) -> &Hnsw<'static, f32, DistL2> {
         &self.index
