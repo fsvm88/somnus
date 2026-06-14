@@ -7,7 +7,7 @@ deferred:
     when: When replay analysis shows episode vectors alone are insufficient for diagnostic queries
   - id: salience-weighted-eviction
     what: Replace recency-based cold truncation with salience-weighted eviction once salience metadata is stored in cold records
-    when: After cold records carry salience field; see ADR 0020
+    when: DONE 2026-06-14 — salience added to EpisodeRecord + cold format (SMNCOLD3); evict_lowest_salience() replaces truncate_to_recent() in sleep.rs
   - id: cold-warm-promotion-index
     what: Build a cold archive index to support O(1) promotion by id (currently O(N) linear scan)
     when: When cold archive exceeds ~500k records and promotion latency is measurable

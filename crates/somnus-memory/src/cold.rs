@@ -16,8 +16,8 @@ use crate::{
 /// are incompatible; MAGIC bumped so they fail gracefully.
 pub const COLD_DIM: usize = 640;
 
-// Bumped from SMNCOLD1: added ingest_source byte per record (Gap 8 / ADR 0021).
-const MAGIC: &[u8; 8] = b"SMNCOLD2";
+// Bumped from SMNCOLD2: added salience f32 per record (ADR 0020 salience-weighted eviction).
+const MAGIC: &[u8; 8] = b"SMNCOLD3";
 
 // Per-record layout (little-endian):
 //   id:            u64   8 B
@@ -25,9 +25,10 @@ const MAGIC: &[u8; 8] = b"SMNCOLD2";
 //   scale:         f32   4 B
 //   values:        [i8; COLD_DIM]  640 B
 //   ingest_source: u8    1 B
+//   salience:      f32   4 B
 //   ──────────────────────
-//   total:               661 B
-const RECORD_BYTES: usize = 8 + 8 + 4 + COLD_DIM + 1;
+//   total:               665 B
+const RECORD_BYTES: usize = 8 + 8 + 4 + COLD_DIM + 1 + 4;
 const HEADER_BYTES: usize = 8; // just the magic
 
 /// Append-only cold archive for episode vectors.
@@ -95,6 +96,7 @@ impl ColdArchive {
             std::slice::from_raw_parts(quantised.as_ptr() as *const u8, COLD_DIM)
         })?;
         w.write_all(&[record.ingest_source as u8])?;
+        w.write_all(&record.salience.to_le_bytes())?;
         w.flush()?;
         self.len += 1;
         Ok(())
@@ -148,6 +150,60 @@ impl ColdArchive {
         self.len = n;
         Ok(())
     }
+
+    /// Rewrite the archive keeping the `n` highest-salience records.
+    ///
+    /// Reads the salience field from each record (bytes 661–664 of the SMNCOLD3 layout),
+    /// selects the top-n by salience descending, then rewrites them in their original
+    /// chronological order. High salience = novel (large L2 from warm memory) = keep.
+    /// `f32::MAX` sentinel (empty warm memory) sorts as maximally salient.
+    /// No-op if `n >= self.len`.
+    pub fn evict_lowest_salience(&mut self, n: usize) -> MemoryResult<()> {
+        if n >= self.len {
+            return Ok(());
+        }
+        // Salience field offset within each record: after id(8)+ts(8)+scale(4)+values(640)+src(1).
+        const SAL_OFFSET: usize = 8 + 8 + 4 + COLD_DIM + 1;
+        let file = File::open(&self.path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        // Collect (record_index, salience) pairs.
+        let mut index_sal: Vec<(usize, f32)> = (0..self.len)
+            .map(|i| {
+                let base = HEADER_BYTES + i * RECORD_BYTES + SAL_OFFSET;
+                let sal = f32::from_le_bytes(mmap[base..base + 4].try_into().unwrap());
+                (i, sal)
+            })
+            .collect();
+
+        // Partition: find the n highest saliences.
+        // Use partial_sort equivalent: select top-n by descending salience.
+        index_sal.select_nth_unstable_by(self.len - n, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut keep: Vec<usize> = index_sal[self.len - n..].iter().map(|&(i, _)| i).collect();
+        // Restore chronological order.
+        keep.sort_unstable();
+
+        // Copy kept record bytes before releasing the mmap — File::create truncates the file,
+        // which would cause SIGBUS if the mmap were still live during writes.
+        let kept_bytes: Vec<u8> = keep
+            .iter()
+            .flat_map(|&idx| {
+                let start = HEADER_BYTES + idx * RECORD_BYTES;
+                mmap[start..start + RECORD_BYTES].to_vec()
+            })
+            .collect();
+        drop(mmap);
+        drop(file);
+
+        let mut w = BufWriter::new(File::create(&self.path)?);
+        w.write_all(MAGIC)?;
+        w.write_all(&kept_bytes)?;
+        w.flush()?;
+        self.len = n;
+        Ok(())
+    }
 }
 
 pub struct ColdIter {
@@ -177,6 +233,11 @@ impl Iterator for ColdIter {
         let qbytes = &bytes[20..20 + COLD_DIM];
         let values: Vec<f32> = qbytes.iter().map(|&b| (b as i8) as f32 * scale).collect();
         let ingest_source = IngestSource::from_u8(bytes[20 + COLD_DIM]);
+        let salience = f32::from_le_bytes(
+            bytes[20 + COLD_DIM + 1..20 + COLD_DIM + 5]
+                .try_into()
+                .unwrap(),
+        );
 
         self.pos += RECORD_BYTES;
         self.yielded += 1;
@@ -185,6 +246,7 @@ impl Iterator for ColdIter {
             timestamp_secs: ts,
             values,
             ingest_source,
+            salience,
         }))
     }
 }
@@ -200,6 +262,7 @@ mod tests {
             timestamp_secs: id as f64,
             values: vec![val; COLD_DIM],
             ingest_source: IngestSource::Unknown,
+            salience: 0.5,
         }
     }
 
@@ -287,6 +350,91 @@ mod tests {
         }
         archive.truncate_to_recent(3).unwrap();
         // Reopen and verify length + ids.
+        let archive2 = ColdArchive::open(dir.path()).unwrap();
+        assert_eq!(archive2.len(), 3);
+        let ids: Vec<u64> = archive2.iter().unwrap().map(|r| r.unwrap().id).collect();
+        assert_eq!(ids, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn salience_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        let saliences = [0.0f32, 0.25, 0.5, 1.0, f32::MAX];
+        for (i, &sal) in saliences.iter().enumerate() {
+            let mut rec = make_record(i as u64, 0.1);
+            rec.salience = sal;
+            archive.append(&rec).unwrap();
+        }
+        let back: Vec<f32> = archive
+            .iter()
+            .unwrap()
+            .map(|r| r.unwrap().salience)
+            .collect();
+        assert_eq!(back, saliences);
+    }
+
+    #[test]
+    fn evict_lowest_salience_keeps_high_salience_records() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        // Records: id 0..9, salience = id * 0.1 (id 9 = highest, id 0 = lowest).
+        for i in 0..10u64 {
+            let mut rec = make_record(i, 0.5);
+            rec.salience = i as f32 * 0.1;
+            archive.append(&rec).unwrap();
+        }
+        archive.evict_lowest_salience(4).unwrap();
+        assert_eq!(archive.len(), 4);
+        // Expect the 4 highest-salience records (ids 6,7,8,9), in chronological order.
+        let ids: Vec<u64> = archive.iter().unwrap().map(|r| r.unwrap().id).collect();
+        assert_eq!(ids, vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn evict_lowest_salience_noop_when_n_gte_len() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        for i in 0..3u64 {
+            archive.append(&make_record(i, 0.5)).unwrap();
+        }
+        archive.evict_lowest_salience(5).unwrap();
+        assert_eq!(archive.len(), 3);
+    }
+
+    #[test]
+    fn evict_lowest_salience_sentinel_max_kept() {
+        // Records with f32::MAX salience should never be evicted over real values.
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        // 5 records: first 3 have tiny salience, last 2 have f32::MAX (cold-start sentinel).
+        for i in 0..3u64 {
+            let mut rec = make_record(i, 0.5);
+            rec.salience = 0.01 * (i + 1) as f32;
+            archive.append(&rec).unwrap();
+        }
+        for i in 3..5u64 {
+            let mut rec = make_record(i, 0.5);
+            rec.salience = f32::MAX;
+            archive.append(&rec).unwrap();
+        }
+        archive.evict_lowest_salience(3).unwrap();
+        assert_eq!(archive.len(), 3);
+        let ids: Vec<u64> = archive.iter().unwrap().map(|r| r.unwrap().id).collect();
+        // Keep: id 2 (0.03) and ids 3,4 (MAX) — evict ids 0 (0.01) and 1 (0.02).
+        assert_eq!(ids, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn evict_lowest_salience_file_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        for i in 0..8u64 {
+            let mut rec = make_record(i, 0.5);
+            rec.salience = i as f32 * 0.1;
+            archive.append(&rec).unwrap();
+        }
+        archive.evict_lowest_salience(3).unwrap();
         let archive2 = ColdArchive::open(dir.path()).unwrap();
         assert_eq!(archive2.len(), 3);
         let ids: Vec<u64> = archive2.iter().unwrap().map(|r| r.unwrap().id).collect();

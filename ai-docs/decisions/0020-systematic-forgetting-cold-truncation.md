@@ -1,10 +1,6 @@
 ---
 status: accepted
 date: 2026-05-30
-deferred:
-  - id: salience-weighted-cold-eviction
-    what: Replace recency-based truncation with salience-weighted eviction, retaining high-salience old episodes over recent low-salience ones
-    when: After salience metadata is stored in cold records (requires cold schema bump); see ADR 0006
 ---
 
 # ADR 0020 — Systematic forgetting: bounded cold archive
@@ -60,3 +56,11 @@ this retains ~500 cycles of history, far more than any current training run.
 If we add salience metadata to cold records (Gap 8), revisit whether recency-based
 truncation is still the right policy or whether salience-weighted eviction is worth
 the complexity.
+
+## Amendment: salience-weighted eviction (2026-06-14)
+
+Salience (`f32`) is now added to `EpisodeRecord` and persisted in the cold archive under the `SMNCOLD3` magic (RECORD_BYTES 661 → 665). `EpisodeTrace.salience` was removed; the canonical value lives in `EpisodeRecord.salience` (set at `push()` time from the warm-recall L2 distance). `f32::MAX` is the sentinel for first-session records where warm memory is empty.
+
+`evict_lowest_salience(n)` in `ColdArchive` replaces `truncate_to_recent(n)` in the sleep loop. It selects the top-n records by salience (descending) and rewrites them in chronological order. The bytes are copied into a `Vec<u8>` before truncating the file to avoid SIGBUS from mmapping a file that was just truncated.
+
+`COLD_RECORD_BYTES` in `main.rs` updated from 661 to 665 for the disk-cap formula.

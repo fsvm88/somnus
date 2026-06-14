@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-14
-> **Last commit on main:** cbd8f63 (P2b cascade-correlation growth init)
+> **Last commit on main:** (item 3: salience-weighted cold eviction)
 > **Branch:** `main` (clean)
 
-## Status: ADR 0024 fully implemented (S1–S6, P1a, P1b, S7). ADR 0007 P2b done. Queue empty.
+## Status: ADR 0024 fully implemented. ADR 0007 P2b done. Item 3 (salience eviction) done.
 
 ---
 
@@ -54,7 +54,7 @@ Deferred items from ADR scan (Tier 1 + Tier 2, in priority order):
 |---|------|-----------|--------|
 | ~~1~~ | ~~Growth controller~~ | ADR 0024 | **DONE** — wired to `within_session_gist_rate` (e30916c) |
 | ~~2~~ | ~~NREM output-head training~~ | ADR 0009 | **DONE** — `fused_replay_wake_step_batch` uses stored episode vectors; no k-WTA re-run needed (a1c43cb / cd4364e). ADR 0009 amended. |
-| 3 | **Salience-weighted cold eviction** — replace recency-based truncation with salience-weighted eviction retaining high-salience old episodes | ADR 0006, 0020 | **NEXT** — requires adding `salience: f32` to `EpisodeRecord` + SMNCOLD3 schema bump (RECORD_BYTES 661→665) |
+| ~~3~~ | ~~Salience-weighted cold eviction~~ | ADR 0006, 0020 | **DONE** — `salience: f32` added to `EpisodeRecord`; SMNCOLD3 (665B/record); `evict_lowest_salience()` in sleep.rs. |
 | 4 | **Grown-units binding exposure** — allow grown units above N_UNITS=1024 into the binding area (currently clamped by `to_dense_n`) | ADR 0005, 0008 | Blocked by item 1 ✅. Triggers snapshot format bump. |
 | 5 | **Per-region projection resize** — resize per-region linear projections when regions grow | ADR 0008 | Blocked by item 4. |
 | 6 | **Cross-session ingest-source through promotion** — preserve `ingest_source` through cold→warm so gist entropy covers multi-session mixing | ADR 0021 | Requires item 3 (salience field). |
@@ -81,7 +81,7 @@ Deferred items from ADR scan (Tier 1 + Tier 2, in priority order):
 - S4: base=0.01 (default), scale target=0.05, enable threshold=0.65 (3 cycles), disable threshold=0.40
 - `PRIOR_BETA=0.01` is now the campaign default
 - S7: S7_MSE_ALPHA=0.3, stagnation threshold=1% improvement, consecutive=3, decrement step=1
-- COLD_RECORD_BYTES=661 (8+8+4+640+1); P1a uses 20% of free disk
+- COLD_RECORD_BYTES=665 (8+8+4+640+1+4); SMNCOLD3; P1a uses 20% of free disk; salience stored per record
 
 ---
 

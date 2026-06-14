@@ -50,10 +50,10 @@ impl EpisodicBuffer {
                 timestamp_secs,
                 values,
                 ingest_source,
+                salience,
             },
             regional,
             text_target: None,
-            salience,
         });
         id
     }
@@ -115,10 +115,10 @@ impl EpisodicBuffer {
                 timestamp_secs,
                 values,
                 ingest_source,
+                salience: f32::MAX,
             },
             regional,
             text_target: None,
-            salience: f32::MAX,
         });
     }
 

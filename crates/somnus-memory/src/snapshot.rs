@@ -521,6 +521,7 @@ mod tests {
                     timestamp_secs: i as f64,
                     values: vec![i as f32 * 0.1; dim],
                     ingest_source: crate::episode::IngestSource::Unknown,
+                    salience: 0.5,
                 })
                 .unwrap();
         }

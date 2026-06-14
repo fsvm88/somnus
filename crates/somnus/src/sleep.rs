@@ -332,7 +332,7 @@ pub fn run_sleep_cycle(
                 t.record.values.clone(),
                 t.regional.clone(),
                 t.text_target.clone(),
-                t.salience,
+                t.record.salience,
             )
         })
         .collect();
@@ -840,17 +840,16 @@ pub fn run_sleep_cycle(
             );
         }
 
-        // Cold archive size management: truncate to the most recent N records so
-        // the on-disk archive doesn't grow unboundedly across sessions.
+        // Cold archive size management: evict lowest-salience records (ADR 0020).
         if max_cold_records > 0 && recall.cold.len() > max_cold_records {
             let before = recall.cold.len();
-            match recall.cold.truncate_to_recent(max_cold_records) {
+            match recall.cold.evict_lowest_salience(max_cold_records) {
                 Ok(()) => tracing::info!(
                     before,
                     after = max_cold_records,
-                    "cold archive truncated to recent records"
+                    "cold archive: evicted lowest-salience records"
                 ),
-                Err(e) => tracing::warn!(?e, "cold archive truncation failed"),
+                Err(e) => tracing::warn!(?e, "cold archive eviction failed"),
             }
         }
     }
@@ -910,8 +909,8 @@ pub fn run_sleep_cycle(
             // Cascade-correlation init (ADR 0007, P2b): collect high-residual inputs once
             // before the growth loop so that any regions that trigger growth can use them.
             // Cap at 2 × GROWTH_BATCH seeds per region to bound memory.
-            let cc_seeds = perception
-                .collect_high_residual_inputs(&traces_for_rem, 2 * GROWTH_BATCH);
+            let cc_seeds =
+                perception.collect_high_residual_inputs(&traces_for_rem, 2 * GROWTH_BATCH);
 
             for (i, &region) in region_ids.iter().enumerate() {
                 // Quality signal: within-session gist primary (no drift); cross-session

@@ -824,8 +824,8 @@ async fn main() -> Result<()> {
     semantic.set_max_records(effective_max_warm);
 
     // P1a: auto-derive --max-cold-records from disk free space when unset (ADR 0024 ops table).
-    // Formula: free_disk_bytes × 0.20 / RECORD_BYTES (661 = 8+8+4+640+1).
-    const COLD_RECORD_BYTES: u64 = 661;
+    // Formula: free_disk_bytes × 0.20 / RECORD_BYTES (665 = 8+8+4+640+1+4).
+    const COLD_RECORD_BYTES: u64 = 665;
     let effective_max_cold = if args.max_cold_records > 0 {
         args.max_cold_records
     } else {
@@ -1773,8 +1773,7 @@ async fn main() -> Result<()> {
                         if s7_ewma_n == 0 {
                             s7_mse_ewma = mse;
                         } else {
-                            let improvement =
-                                (s7_mse_ewma - mse) / s7_mse_ewma.max(1e-9);
+                            let improvement = (s7_mse_ewma - mse) / s7_mse_ewma.max(1e-9);
                             if improvement < S7_STAGNANT_THRESHOLD {
                                 s7_stagnant += 1;
                             } else {
@@ -1788,8 +1787,7 @@ async fn main() -> Result<()> {
                                     );
                                 }
                             }
-                            s7_mse_ewma =
-                                S7_MSE_ALPHA * mse + (1.0 - S7_MSE_ALPHA) * s7_mse_ewma;
+                            s7_mse_ewma = S7_MSE_ALPHA * mse + (1.0 - S7_MSE_ALPHA) * s7_mse_ewma;
                         }
                         s7_ewma_n += 1;
                         if s7_stagnant >= S7_STAGNANT_CYCLES && effective_wake_interval > 1 {
