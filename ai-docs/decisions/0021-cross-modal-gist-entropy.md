@@ -105,6 +105,34 @@ records) is also binned into `cluster_sources` via `nearest_centroid`, giving
 Note: hot-tier records that are also in warm are counted twice; at production scales (warm
 ≫ hot) this is a negligible bias and not worth the filtering cost.
 
+## Amendment: proportional regional attribution + -0.0 fix (2026-06-15)
+
+The original `IngestSource`-slot approach collapsed all multi-modal episodes (video + audio
+campaigns) into `IngestSource::Mixed`, making `cross_modal_gist_entropy` always ~0 and
+susceptible to an IEEE 754 -0.0 artefact (`-1.0 * log2(1.0) = -0.0`).
+
+Two fixes applied (sleep.rs):
+
+1. **Proportional regional attribution**: `cluster_sources` is now filled by decomposing
+   each episode vector into 5 × (EPISODE_DIM/5) regional slices, computing the L2 norm of
+   each slice, normalising to sum=1, and distributing the episode's salience weight across
+   all 5 slots proportionally. This gives meaningful entropy even for Mixed-tagged episodes
+   because the regional breakdown is embedded in the episode vector itself.  A helper
+   `regional_weights(ep_vec)` is added in sleep.rs.  `IngestSource` is no longer used for
+   the histogram (the slot mapping is removed); `IngestSource::Mixed` is still stored on
+   `EpisodeRecord` for episode counting and other uses.
+
+2. **-0.0 float fix**: the per-term entropy formula now returns `0.0` explicitly when
+   `p >= 1.0` instead of evaluating `-p * p.log2()` (which yields `-0.0` via IEEE 754).
+
+`cluster_sources` remains `Vec<[f32; 6]>`; slot 5 stays zero (unused) so no type change is
+needed.
+
+**Long-term note:** proportional attribution from episode-vector norms is a proxy for
+true regional presence (the norms reflect binding projections, not raw k-WTA activations).
+If finer attribution is needed, store a `regional_presence: u8` bitmask on `EpisodeRecord`
+(SMNCOLD4 bump) and use explicit per-region presence flags for attribution instead.
+
 ## Amendment: salience-weighted cluster assignment (2026-06-14)
 
 `cluster_sources` changed from `Vec<[u32; 6]>` to `Vec<[f32; 6]>`. Each episode now

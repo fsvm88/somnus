@@ -167,6 +167,9 @@ pub struct SleepStats {
     pub nrem_unique_traces: usize,
 }
 
+/// Number of regions; episode vector is N_EPISODE_REGIONS × (EPISODE_DIM / N_EPISODE_REGIONS).
+const N_EPISODE_REGIONS: usize = 5;
+
 /// Number of gist clusters for REM self-probe (10c).
 const GIST_K: usize = 32;
 /// Max warm-record sample for k-means (larger warm stores are subsampled).
@@ -260,6 +263,27 @@ fn kmeans(points: &[Vec<f32>], k: usize, max_iter: usize) -> Vec<Vec<f32>> {
         }
     }
     centroids
+}
+
+/// Decompose a 640-dim episode vector into per-region salience weights for the
+/// cross-modal gist entropy histogram.
+///
+/// The episode vector is laid out as N_EPISODE_REGIONS equal-width slices (one per
+/// region). We compute the L2 norm of each slice and normalise to sum=1. This lets
+/// Mixed episodes distribute weight proportionally across all contributing regions
+/// rather than collapsing to a single "Mixed" slot, which would hide cross-modal
+/// structure in the gist clusters.
+///
+/// Degenerate case (all norms zero): returns uniform 1/5 weights.
+fn regional_weights(ep_vec: &[f32]) -> [f32; N_EPISODE_REGIONS] {
+    let d = ep_vec.len() / N_EPISODE_REGIONS;
+    let norms: [f32; N_EPISODE_REGIONS] =
+        std::array::from_fn(|i| ep_vec[i * d..(i + 1) * d].iter().map(|v| v * v).sum::<f32>().sqrt());
+    let total: f32 = norms.iter().sum();
+    if total == 0.0 {
+        return [1.0 / N_EPISODE_REGIONS as f32; N_EPISODE_REGIONS];
+    }
+    norms.map(|n| n / total)
 }
 
 /// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
@@ -630,8 +654,9 @@ pub fn run_sleep_cycle(
     let mut cross_modal_gist_entropy: Option<f32> = None;
     let mut within_session_gist_rate: Option<f32> = None;
 
+    type RemTrace = (Vec<f32>, [Vec<f32>; 5], IngestSource, f32);
     // Collect traces once for reuse in both warm probe and MSE measurement.
-    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5], IngestSource, f32)> = if !was_interrupted {
+    let traces_for_rem: Vec<RemTrace> = if !was_interrupted {
         episodic
             .iter_traces()
             .map(|t| {
@@ -669,12 +694,12 @@ pub fn run_sleep_cycle(
         let mut total_l2 = 0.0f32;
         let mut n_probed = 0usize;
         let mut gist_matches = 0usize;
-        // Per-cluster source-type weighted counts for cross-modal entropy (Gap 8).
-        // cluster_sources[k] maps IngestSource u8 → salience-weighted count.
-        // Novel episodes (high salience) contribute more; f32::MAX sentinel → weight 1.0.
+        // Per-cluster regional weight histogram for cross-modal entropy (Gap 8, ADR 0021).
+        // Slots 0–4 map to the 5 perception regions; each episode distributes its
+        // salience weight proportionally via regional_weights() (L2-norm attribution).
         let mut cluster_sources: Vec<[f32; 6]> = vec![[0.0f32; 6]; GIST_K];
 
-        for (ep_vec, _, src, salience) in &traces_for_rem {
+        for (ep_vec, _, _src, salience) in &traces_for_rem {
             if let Some((dist, neighbor)) =
                 recall.warm.query_with_dist(ep_vec, 1).into_iter().next()
             {
@@ -692,16 +717,13 @@ pub fn run_sleep_cycle(
                     } else {
                         salience.clamp(0.01, 2.0)
                     };
-                    // Bin the source into the cluster histogram (Unknown → slot 5).
-                    let slot = match src {
-                        IngestSource::Speech => 0,
-                        IngestSource::Env => 1,
-                        IngestSource::Visual => 2,
-                        IngestSource::Language => 3,
-                        IngestSource::Mixed => 4,
-                        IngestSource::Unknown => 5,
-                    };
-                    cluster_sources[probe_cluster][slot] += weight;
+                    // Distribute weight proportionally across the 5 regional slots
+                    // using L2 norms of the episode vector's per-region slices.
+                    // This gives meaningful entropy even for Mixed-tagged episodes.
+                    let rw = regional_weights(ep_vec);
+                    for (slot, &rw_i) in rw.iter().enumerate() {
+                        cluster_sources[probe_cluster][slot] += weight * rw_i;
+                    }
                 }
             }
         }
@@ -716,15 +738,10 @@ pub fn run_sleep_cycle(
                 } else {
                     rec.salience.clamp(0.01, 2.0)
                 };
-                let slot = match rec.ingest_source {
-                    IngestSource::Speech => 0,
-                    IngestSource::Env => 1,
-                    IngestSource::Visual => 2,
-                    IngestSource::Language => 3,
-                    IngestSource::Mixed => 4,
-                    IngestSource::Unknown => 5,
-                };
-                cluster_sources[probe_cluster][slot] += weight;
+                let rw = regional_weights(&rec.values);
+                for (slot, &rw_i) in rw.iter().enumerate() {
+                    cluster_sources[probe_cluster][slot] += weight * rw_i;
+                }
             }
         }
 
@@ -736,21 +753,24 @@ pub fn run_sleep_cycle(
                 gist_recall_rate = Some(rate);
 
                 // Shannon entropy per cluster (bits), averaged over occupied clusters.
-                // Only count known-source episodes (slots 0–4); skip slot 5 (Unknown).
+                // Slots 0–4 map to the 5 perception regions; slot 5 is unused now that
+                // the histogram uses proportional regional weights instead of IngestSource.
                 // Counts are salience-weighted so novel episodes contribute more.
                 let entropy_sum: f32 = cluster_sources
                     .iter()
                     .filter_map(|counts| {
                         let total: f32 = counts[0..5].iter().sum();
                         if total < 2.0 {
-                            return None; // need ≥2 known-source weight to compute entropy
+                            return None; // need ≥2 weight to compute entropy
                         }
                         let h: f32 = counts[0..5]
                             .iter()
                             .filter(|&&c| c > 0.0)
                             .map(|&c| {
                                 let p = c / total;
-                                -p * p.log2()
+                                // Guard p=1.0: log2(1.0)=0.0 exactly, so -p*log2(p)=-0.0
+                                // in IEEE 754. Return 0.0 explicitly for the pure-cluster case.
+                                if p >= 1.0 { 0.0 } else { -p * p.log2() }
                             })
                             .sum();
                         Some(h)
