@@ -4,7 +4,7 @@
 > **Last commit on main:** 7214d16 (within-session gist probe)
 > **Branch:** `main` (clean)
 
-## Status: Within-session gist probe done. Growth controller is now implementable. Next: growth controller (ADR 0024) or S5/S6.
+## Status: Growth controller wired off within_session_gist_rate (ADR 0024). Validated 5s×3c run shows false positive at S5C2 eliminated. Next: S5, S6, or ADR update.
 
 ---
 
@@ -52,13 +52,13 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 | 2 | S3 — Wakefulness pressure homeostat | **DONE** | |
 | 2b | S4 — Prior-beta scale-up controller | **DONE** (bug fixed) | 0.01→0.05, not toggle |
 | prereq | Within-session gist probe | **DONE** | `within_session_gist_rate` in NDJSON |
-| — | Growth controller | **NEXT** | can now use `within_session_gist_rate` as gating signal |
+| — | Growth controller | **DONE** | ws→gist→MSE priority; validated 5s×3c; S5C2 false positive eliminated |
 
 ---
 
 ## Open issues / queued next
 
-1. **Growth controller (ADR 0024)**: Wire growth decisions off `within_session_gist_rate` instead of (or in addition to) `gist_recall_rate`. Prerequisite now done. Needs ADR section and multi-session validation run showing decay correction.
+1. **ADR 0024 update**: Add growth controller section covering ws-primary signal, validation table (S5C2 false positive), cooldown rationale. Mark ADR complete.
 2. **S5 — Startup-queryable priors**: Trigger met (S1+S2 validated). Query RAM/HNSW at startup to auto-seed `--max-warm-records` and `--recall-ef`.
 3. **S6 — Adaptive safety ceilings**: Trigger met (S3 validated). Widen `--max-wake-secs` to 3× rolling mean wake duration.
 4. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
