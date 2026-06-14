@@ -103,7 +103,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use sysinfo::System;
+use sysinfo::{Disks, System};
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -823,6 +823,24 @@ async fn main() -> Result<()> {
     };
     semantic.set_max_records(effective_max_warm);
 
+    // P1a: auto-derive --max-cold-records from disk free space when unset (ADR 0024 ops table).
+    // Formula: free_disk_bytes × 0.20 / RECORD_BYTES (661 = 8+8+4+640+1).
+    const COLD_RECORD_BYTES: u64 = 661;
+    let effective_max_cold = if args.max_cold_records > 0 {
+        args.max_cold_records
+    } else {
+        let disks = Disks::new_with_refreshed_list();
+        let free_bytes = disks
+            .iter()
+            .filter(|d| args.memory_dir.starts_with(d.mount_point()))
+            .max_by_key(|d| d.mount_point().as_os_str().len())
+            .map(|d| d.available_space())
+            .unwrap_or(0);
+        let auto = ((free_bytes as f64 * 0.20) / COLD_RECORD_BYTES as f64) as usize;
+        auto.clamp(10_000, 10_000_000)
+    };
+    tracing::info!(effective_max_cold, "cold archive cap (auto)");
+
     if args.settle_steps > 0 && !snapshot_found {
         tracing::warn!(
             settle_steps = args.settle_steps,
@@ -986,6 +1004,15 @@ async fn main() -> Result<()> {
     let mut s4_ring: [Option<f64>; 3] = [None; 3];
     let mut s4_ring_pos: usize = 0;
     let mut s4_beta_active: bool = false;
+    // P1b: rolling sleep-duration history for auto --sleep-max-secs (ADR 0024 ops table).
+    // Cap activates after the first completed cycle; floor = 300s prevents over-tightening.
+    let mut sleep_dur_secs_history: std::collections::VecDeque<f64> =
+        std::collections::VecDeque::with_capacity(5);
+    // P2a / S7: wake-reconstruct-interval adaptation from cycle-level MSE trend (ADR 0024).
+    let mut s7_mse_ewma: f64 = 0.0;
+    let mut s7_ewma_n: usize = 0;
+    let mut s7_stagnant: u32 = 0;
+    let mut effective_wake_interval: usize = args.wake_reconstruct_interval;
     // ASR count shared with the audio encoder task.
     let asr_count = Arc::new(AtomicUsize::new(0));
 
@@ -1439,7 +1466,7 @@ async fn main() -> Result<()> {
                         &recall,
                         &mut decoder,
                         &mut wake_reconstruct_counter,
-                        args.wake_reconstruct_interval,
+                        effective_wake_interval,
                         wake_recon_worker.as_ref(),
                         &mut wake_recon_dropped,
                         sal_gate(sal_mu, sal_sigma, sal_n),
@@ -1567,6 +1594,16 @@ async fn main() -> Result<()> {
                     None => tracing::warn!("wake-recon worker died — heads not merged"),
                 }
             }
+            // P1b: auto --sleep-max-secs: cap = max(300, 3 × mean_sleep_secs) after first cycle.
+            let effective_sleep_max_secs: u64 = if args.sleep_max_secs > 0 {
+                args.sleep_max_secs
+            } else if sleep_dur_secs_history.is_empty() {
+                0 // no history yet — no cap
+            } else {
+                let mean = sleep_dur_secs_history.iter().sum::<f64>()
+                    / sleep_dur_secs_history.len() as f64;
+                (mean * 3.0).max(300.0) as u64
+            };
             match sleep::run_sleep_cycle(
                 &mut perception,
                 &mut episodic,
@@ -1576,7 +1613,7 @@ async fn main() -> Result<()> {
                 Arc::clone(&pending_embs),
                 &mut decoder,
                 args.sleep_loss_target,
-                args.sleep_max_secs,
+                effective_sleep_max_secs,
                 args.prune_fraction,
                 args.prune_min_grown,
                 args.replay_batch_size,
@@ -1584,7 +1621,7 @@ async fn main() -> Result<()> {
                 args.nrem_salience_threshold,
                 args.lang_oversample,
                 args.max_warm_records,
-                args.max_cold_records,
+                effective_max_cold,
                 args.growth_cooldown,
                 cooldown_remaining,
                 session_start_secs,
@@ -1700,15 +1737,66 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                    // P1b: record sleep duration for auto sleep-max-secs cap.
+                    let total_sleep_secs = (stats.nrem_wall_ms
+                        + stats.rem_wall_ms
+                        + stats.spill_wall_ms
+                        + stats.snapshot_wall_ms) as f64
+                        / 1000.0;
+                    if sleep_dur_secs_history.len() >= 5 {
+                        sleep_dur_secs_history.pop_front();
+                    }
+                    sleep_dur_secs_history.push_back(total_sleep_secs);
+
+                    // P2a / S7: adapt effective_wake_interval from cycle-level MSE trend.
+                    // Reduces interval when MSE improves < 1% for 3 consecutive cycles;
+                    // restores toward user default when MSE starts improving again.
+                    let mean_mse_wake = if wake_output_mse_n > 0 {
+                        Some(wake_output_mse_sum / wake_output_mse_n as f64)
+                    } else {
+                        None
+                    };
+                    const S7_STAGNANT_THRESHOLD: f64 = 0.01;
+                    const S7_STAGNANT_CYCLES: u32 = 3;
+                    const S7_MSE_ALPHA: f64 = 0.3;
+                    if let Some(mse) = mean_mse_wake {
+                        if s7_ewma_n == 0 {
+                            s7_mse_ewma = mse;
+                        } else {
+                            let improvement =
+                                (s7_mse_ewma - mse) / s7_mse_ewma.max(1e-9);
+                            if improvement < S7_STAGNANT_THRESHOLD {
+                                s7_stagnant += 1;
+                            } else {
+                                s7_stagnant = 0;
+                                if effective_wake_interval < args.wake_reconstruct_interval {
+                                    effective_wake_interval = (effective_wake_interval + 1)
+                                        .min(args.wake_reconstruct_interval);
+                                    tracing::info!(
+                                        effective_wake_interval,
+                                        "S7: restored wake_reconstruct_interval"
+                                    );
+                                }
+                            }
+                            s7_mse_ewma =
+                                S7_MSE_ALPHA * mse + (1.0 - S7_MSE_ALPHA) * s7_mse_ewma;
+                        }
+                        s7_ewma_n += 1;
+                        if s7_stagnant >= S7_STAGNANT_CYCLES && effective_wake_interval > 1 {
+                            effective_wake_interval -= 1;
+                            s7_stagnant = 0;
+                            tracing::info!(
+                                effective_wake_interval,
+                                s7_mse_ewma,
+                                "S7: reduced wake_reconstruct_interval (stagnant MSE)"
+                            );
+                        }
+                    }
+
                     // Write metrics NDJSON line.
                     if let Some(ref mut mf) = metrics_sink {
                         let region_sizes = perception.region_sizes();
                         let grew = !stats.regions_grown.is_empty();
-                        let mean_mse_wake = if wake_output_mse_n > 0 {
-                            Some(wake_output_mse_sum / wake_output_mse_n as f64)
-                        } else {
-                            None
-                        };
                         let prior_cosine_mean: Vec<Option<f64>> = (0..5)
                             .map(|i| {
                                 if prior_cosine_counts[i] > 0 {
@@ -1814,6 +1902,10 @@ async fn main() -> Result<()> {
                             "prior_beta_effective": if s4_beta_active { 0.05f64 } else { args.prior_beta as f64 },
                             "wake_ewma_mean":       wake_ewma_mu as f64,
                             "max_wake_secs_effective": max_wake.as_secs(),
+                            "max_cold_records_effective": effective_max_cold,
+                            "sleep_max_secs_effective": effective_sleep_max_secs,
+                            "wake_interval_effective": effective_wake_interval,
+                            "s7_mse_ewma":           if s7_ewma_n > 0 { Some(s7_mse_ewma) } else { None },
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1922,7 +2014,7 @@ async fn main() -> Result<()> {
                                 }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                    if wake_reconstruct_counter.is_multiple_of(effective_wake_interval) {
                                         wake_reconstruct_throttle_passed += 1;
                                         if rec.as_ref().is_some_and(|r| r.salience > sal_gate(sal_mu, sal_sigma, sal_n)) {
                                             if let Some(ref w) = wake_recon_worker {
@@ -1993,7 +2085,7 @@ async fn main() -> Result<()> {
                                 }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
                                     wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(args.wake_reconstruct_interval) {
+                                    if wake_reconstruct_counter.is_multiple_of(effective_wake_interval) {
                                         wake_reconstruct_throttle_passed += 1;
                                         if rec.as_ref().is_some_and(|r| r.salience > sal_gate(sal_mu, sal_sigma, sal_n)) {
                                             if let Some(ref w) = wake_recon_worker {
@@ -2053,7 +2145,7 @@ async fn main() -> Result<()> {
                             &recall,
                             &mut decoder,
                             &mut wake_reconstruct_counter,
-                            args.wake_reconstruct_interval,
+                            effective_wake_interval,
                             wake_recon_worker.as_ref(),
                             &mut wake_recon_dropped,
                             sal_gate(sal_mu, sal_sigma, sal_n),

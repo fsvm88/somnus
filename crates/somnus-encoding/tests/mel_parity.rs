@@ -166,11 +166,7 @@ fn dino_checkerboard_parity() {
     let mut data = vec![0u8; 240 * 320 * 3];
     for row in 0..240usize {
         for col in 0..320usize {
-            let val = if (row + col) % 2 == 0 {
-                0u8
-            } else {
-                255u8
-            };
+            let val = if (row + col) % 2 == 0 { 0u8 } else { 255u8 };
             let base = (row * 320 + col) * 3;
             data[base] = val;
             data[base + 1] = val;
