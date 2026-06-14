@@ -43,6 +43,9 @@ CLIPS="${CLIPS:-clips/talking_head.mp4 clips/urban.mp4 clips/animation.mp4 clips
 # Space-separated glob of .txt files. Leave empty to disable.
 TEXT_CORPUS="${TEXT_CORPUS:-}"
 TEXT_RATE="${TEXT_RATE:-5}"      # chunks per second fed to --language stdin
+# Small non-zero base so prior cosines are always measured; S4 scales up to 0.05
+# when predictions mature (ADR 0024). Set higher to override S4.
+PRIOR_BETA="${PRIOR_BETA:-0.01}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 # When set, enables ORT encoder+binding sessions (Phase 1 + 1.5).
 # Maps to --onnx-models-dir; writes ONNX graphs relative to MEMORY_DIR by default.
@@ -69,6 +72,7 @@ CLIPS=${CLIPS}
 MEMORY_DIR=${MEMORY_DIR}
 ONNX_MODELS_DIR=${ONNX_MODELS_DIR}
 ONNX_SCRIPT=${ONNX_SCRIPT}
+PRIOR_BETA=${PRIOR_BETA}
 EXTRA_ARGS=${EXTRA_ARGS}
 started=$(date -Iseconds)
 EOF
@@ -117,7 +121,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --memory-dir "$MEMORY_DIR" \
             --language \
             --action \
-            --prior-beta 0.1 \
+            --prior-beta "$PRIOR_BETA" \
             --settle-steps 1 \
             --working-memory-size 8 \
             --episodic-capacity "$CAPACITY" \
@@ -139,7 +143,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --memory-dir "$MEMORY_DIR" \
             --language \
             --action \
-            --prior-beta 0.1 \
+            --prior-beta "$PRIOR_BETA" \
             --settle-steps 1 \
             --working-memory-size 8 \
             --episodic-capacity "$CAPACITY" \

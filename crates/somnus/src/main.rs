@@ -1600,9 +1600,11 @@ async fn main() -> Result<()> {
                             gw.update_weights(dec.proj_weights_flat());
                         }
                     }
-                    // S4: prior-beta auto-enable controller (ADR 0024).
-                    // Only active when --prior-beta 0.0 (default); explicit override skips.
-                    if args.prior_beta == 0.0 {
+                    // S4: prior-beta scale-up controller (ADR 0024).
+                    // Scales from base --prior-beta to 0.05 when global prior_cosine > 0.65
+                    // for 3 consecutive cycles; drops back to base when any cycle < 0.40.
+                    // Only engages when base beta is below the scale target (0.05).
+                    if args.prior_beta < 0.05 {
                         let global_cosine: Option<f64> = {
                             let vals: Vec<f64> = (0..5)
                                 .filter_map(|i| {
@@ -1624,14 +1626,14 @@ async fn main() -> Result<()> {
                         if let Some(c) = global_cosine {
                             if c < 0.40 && s4_beta_active {
                                 s4_beta_active = false;
-                                perception.set_prior_beta(0.0);
-                                tracing::info!(prior_cosine = c, "S4: prior-beta disabled (< 0.40)");
+                                perception.set_prior_beta(args.prior_beta);
+                                tracing::info!(prior_cosine = c, "S4: prior-beta scaled down to base (< 0.40)");
                             } else if !s4_beta_active && s4_ring_pos >= 3 {
                                 let all_high = s4_ring.iter().all(|v| v.is_some_and(|x| x > 0.65));
                                 if all_high {
                                     s4_beta_active = true;
                                     perception.set_prior_beta(0.05);
-                                    tracing::info!(prior_cosine = c, "S4: prior-beta enabled (> 0.65 for 3 cycles)");
+                                    tracing::info!(prior_cosine = c, "S4: prior-beta scaled up to 0.05 (> 0.65 for 3 cycles)");
                                 }
                             }
                         }
@@ -1746,7 +1748,7 @@ async fn main() -> Result<()> {
                             "settle_ewma_mean":    settle_mu as f64,
                             "settle_gate_dynamic": settle_gate_val(settle_mu, settle_n, args.settle_gate) as f64,
                             "wakefulness_pressure": wakefulness_pressure as f64,
-                            "prior_beta_effective": if s4_beta_active && args.prior_beta == 0.0 { 0.05f64 } else { args.prior_beta as f64 },
+                            "prior_beta_effective": if s4_beta_active { 0.05f64 } else { args.prior_beta as f64 },
                         })
                         .to_string();
                         use std::io::Write as _;

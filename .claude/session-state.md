@@ -1,46 +1,57 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-14
-> **Last commit on main:** dfcdd7c — feat(S4): prior-beta auto-enable — cosine-gated controller (ADR 0024)
-> **Branch:** `main` (clean)
+> **Last commit on main:** (pending — see below)
+> **Branch:** `main` (dirty — changes staged for commit)
 
-## Status: ADR 0024 Phase 1+2 complete. S1–S4 all implemented. Growth controller deferred (needs within-session gist probe). Next: A/B validate the controllers, then tackle within-session gist probe.
+## Status: ADR 0024 fully validated. S4 chicken-and-egg bug found and fixed (prior_beta default 0.0→0.01). All four controllers confirmed working. Next: within-session gist probe (growth controller prerequisite).
 
 ---
 
 ## Completed this session
 
-| Item | Commit | What changed |
-|------|--------|--------------|
-| ADR 0024 written | 98828ed | Architecture for neuromodulatory self-regulation. Bucket S split into S-query/S-safety/S-flags/S-throttle/S-ops. YAML front-matter deferred items across all 14 ADRs. |
-| **S1 — Adaptive salience gate** | 039b1a7 | Replaced `WAKE_RECONSTRUCT_SALIENCE_THRESHOLD=0.8` with EWMA-based threshold. State in `snapshot/sal_ewma.bin`. NDJSON: `sal_ewma_mean`, `sal_ewma_std`, `sal_threshold`. |
-| **S2 — Settle-rate modulation** | 880391d | `--settle-gate 0.85` replaced by prior-cosine EWMA gate C[t]−0.1. State in `snapshot/settle_ewma.bin`. NDJSON: `settle_ewma_mean`, `settle_gate_dynamic`. |
-| **S3 — Wakefulness pressure homeostat** | 83a94d5 | Novelty accumulator P ∈ [0, 3.0]; fires sleep at P≥1.0 (after sal_n≥500, ≥120 eps guard). Dissipated by 0.5×gist_recall_rate per NREM. NDJSON: `wakefulness_pressure`. |
-| **S4 — Prior-beta auto-enable** | dfcdd7c | 3-cycle ring buffer of global prior_cosine_mean. Enable β=0.05 when all 3 > 0.65; disable when any < 0.40. NDJSON: `prior_beta_effective`. |
+| Item | What changed |
+|------|-------------|
+| ADR 0024 S1–S4 implemented | S1–S4 committed in prior session (039b1a7–dfcdd7c) |
+| S4 bug found | `blend_with_prior` returns `None` cosine when `prior_beta <= 0.0` → chicken-and-egg: S4 ring buffer never fills, S2 settle EWMA freezes at cold start |
+| S4 fix | `--prior-beta` default changed 0.0 → 0.01; S4 guard changed to `args.prior_beta < 0.05`; on scale-down resets to `args.prior_beta` (base) not 0.0 |
+| Campaign script | `PRIOR_BETA` env var added (default 0.01); replaces hardcoded `--prior-beta 0.1` |
+| ADR 0024 updated | S4 section rewritten as scale-up controller; mapping table updated; amendment with validation data appended; s5/s6 deferred triggers marked met |
+| Confirmatory run | 2s×3c fresh memory, PRIOR_BETA=0.01 — all four controllers confirmed ✅ |
+
+### Confirmatory run key metrics (memory/adr0024_ab2/campaign_20260614_114140)
+
+| c | s | trigger | wake_eps | sal_threshold | settle_gate_dynamic | pressure | prior_beta_eff |
+|---|---|---------|----------|--------------|-------------------|----------|---------------|
+| 1 | 1 | high_water | 3276 | 0.800 | 0.638 | 0.000 | 0.010 |
+| 2 | 1 | pressure | 500 | 1.023 | 0.576 | 2.796 | 0.010 |
+| 3 | 1 | pressure | 120 | 0.825 | 0.618 | 2.611 | 0.010 |
+| 1 | 2 | pressure | 287 | 0.345 | 0.697 | 0.732 | 0.010 |
+| 2 | 2 | pressure | 120 | 0.424 | 0.567 | 2.504 | 0.010 |
+| 3 | 2 | pressure | 120 | 0.519 | 0.593 | 2.645 | **0.050** |
+
+S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 
 ---
 
 ## ADR 0024 implementation sequence
 
-| Phase | Signal | Status | Replaces |
-|-------|--------|--------|---------|
-| 1a | S1 — Adaptive salience gate | **DONE** (039b1a7) | `WAKE_RECONSTRUCT_SALIENCE_THRESHOLD=0.8` |
-| 1b | S2 — Settle-rate modulation | **DONE** (880391d) | `--settle-gate 0.85` |
-| 2 | S3 — Wakefulness pressure homeostat | **DONE** (83a94d5) | capacity fill + schedule (additive, not replacing) |
-| 2b | S4 — Prior-beta auto-enable | **DONE** (dfcdd7c) | `--prior-beta 0.0` |
+| Phase | Signal | Status | Notes |
+|-------|--------|--------|-------|
+| 1a | S1 — Adaptive salience gate | **DONE** | |
+| 1b | S2 — Settle-rate modulation | **DONE** | |
+| 2 | S3 — Wakefulness pressure homeostat | **DONE** | |
+| 2b | S4 — Prior-beta scale-up controller | **DONE** (bug fixed) | 0.01→0.05, not toggle |
 | — | Growth controller | **DEFERRED** | prerequisite: within-session gist probe |
 
 ---
 
 ## Open issues / queued next
 
-1. **A/B validate S1–S4**: Run 2s×3c fresh-memory run to confirm:
-   - `sal_threshold` moves away from 0.8 cold-start after ~100 eps
-   - `settle_gate_dynamic` tracks below `settle_ewma_mean`
-   - `wakefulness_pressure` accumulates and triggers sleep (or high_water still fires in warm-up)
-   - `prior_beta_effective` remains 0.0 (priors likely < 0.65 at 6 total cycles)
-2. **Within-session gist probe**: Filter the REM gist probe to only current-session warm entries. Needed before growth controller can be implemented. Separate from ADR 0024 sequence.
-3. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
+1. **Within-session gist probe**: Filter the REM gist probe to only current-session warm entries. Needed before growth controller can be implemented. Requires tagging warm records with session ID (non-trivial). This is the highest-leverage prereq.
+2. **S5 — Startup-queryable priors**: Trigger met (S1+S2 validated). Query RAM/HNSW at startup to auto-seed `--max-warm-records` and `--recall-ef`.
+3. **S6 — Adaptive safety ceilings**: Trigger met (S3 validated). Widen `--max-wake-secs` to 3× rolling mean wake duration.
+4. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
 
 ---
 
@@ -60,7 +71,8 @@
 - wake_reconstruct_interval=5 (default)
 - SAL_EWMA_COLD_START=0.8, α=0.01 for S1/S2 EWMAs
 - S3: P_THRESHOLD=1.0, P_MAX=3.0, P_COLD_START_N=500, P_MIN_EPISODES=120
-- S4: enable threshold=0.65 (3 cycles), disable threshold=0.40
+- S4: base=0.01 (default), scale target=0.05, enable threshold=0.65 (3 cycles), disable threshold=0.40
+- `PRIOR_BETA=0.01` is now the campaign default (was 0.1 hardcoded, then parametrized)
 
 ---
 

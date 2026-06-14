@@ -4,10 +4,10 @@ date: 2026-06-14
 deferred:
   - id: s5-startup-queryable-priors
     what: Query available RAM and benchmark HNSW latency at startup to auto-seed --max-warm-records and --recall-ef as bootstrap priors
-    when: After Phase 1 controllers (S1+S2) are validated
+    when: Trigger met (S1+S2 validated 2026-06-14); ready to implement
   - id: s6-adaptive-safety-ceilings
     what: Widen --max-wake-secs ceiling to 3× rolling mean wake duration; complement the wakefulness pressure homeostat
-    when: After S3 (wakefulness pressure homeostat) is validated
+    when: Trigger met (S3 validated 2026-06-14); ready to implement
   - id: s7-throttle-adaptation
     what: Adapt --wake-reconstruct-interval and --gain-update-every from reconstruction quality trend; no clean signal exists yet
     when: After Phase 2 controllers stable and wake reconstruction quality metrics are reliable per-step
@@ -87,7 +87,7 @@ as the system state changes. Good candidates for derived-signal controllers.
 | `--max-wake-secs` | 600 | sleep onset (safety valve) |
 | `--settle-gate` | 0.85 | settle firing (prior_cosine gate) |
 | `--settle-every` | 1 | settle firing (throttle) |
-| `--prior-beta` | 0.0 | top-down prior blend |
+| `--prior-beta` | 0.01 | top-down prior blend (base; S4 scales to 0.05) |
 | `--perf-sleep-threshold` | 0.0 | early sleep on EWMA prior_cosine drop |
 | `--growth-cooldown` + `GIST_GROWTH_THRESHOLD` | 3 / 0.85 | region growth |
 
@@ -400,37 +400,47 @@ If it is unreliable, the capacity trigger remains active in parallel as fallback
 
 ---
 
-### S4 — Prior-beta auto-enable (Phase 2b)
+### S4 — Prior-beta scale-up controller (Phase 2b)
 
 **Replaces:** `--prior-beta 0.0` manual enable.
 
 **What it controls:** Weight β of the top-down prior blend during wake.
-Currently enabled by hand after the model appears converged.
+Previously set manually to 0 until "the model seemed converged".
+
+**Design note (2026-06-14 amendment):** The original design used a toggle
+(0.0 → 0.05), but `blend_with_prior` returns `None` cosine when
+`prior_beta <= 0.0`, so the ring buffer never fills at cold start —
+chicken-and-egg. The fix is a small non-zero base (`--prior-beta 0.01`):
+prior cosines are always measured, the blend is negligible when predictions
+are poor (1% of noise), and S4 scales up to 0.05 when predictions mature.
 
 **Signal source:** `prior_cosine_mean` (global, rolling). Already emitted
 per cycle.
 
-**Controller:** EWMA-smoothed rolling mean P_c over the last 3 sleep cycles.
+**Controller:** 3-cycle ring buffer of per-cycle global prior_cosine_mean.
 
 ```
-Enable (β = 0.05):  P_c > 0.65  for >= 3 consecutive cycles
-Disable (β = 0.0):  P_c < 0.40
+Scale up   (β = 0.05):  all 3 ring values > 0.65
+Scale down (β = base):  any ring value    < 0.40
 ```
 
-Hysteresis gap (0.40–0.65) prevents rapid toggling.
+Base β is `--prior-beta` (default 0.01). Hysteresis gap (0.40–0.65)
+prevents rapid oscillation. Only engages when `--prior-beta < 0.05`.
 
-**Cold-start:** Start disabled (β = 0). Current behavior.
+**Cold-start:** β = `--prior-beta` (0.01). Prior cosines are measured from
+episode 1 (output heads produce predictions after the first episode).
 
 **Observability:**
 ```json
-"prior_cosine_cycle_ewma": 0.61,
+"prior_cosine_mean": [0.71, 0.89, 0.62, 0.84, 0.33],
 "prior_beta_effective": 0.05
 ```
 
 **What would invalidate S4:** If prior_cosine stays below 0.65 indefinitely
 due to model architecture or content properties (not lack of convergence),
-auto-enable never fires. Mitigation: expose `--prior-beta-threshold` as an
-override.
+scale-up never fires. Mitigation: expose `--prior-beta-threshold` as an
+override. If the base 0.01 blend measurably degrades learning, reduce to
+0.001 or add a flag.
 
 ---
 
@@ -481,7 +491,7 @@ cycles (matching current cooldown) but with rate governed by internal state.
 | `--sleep-trigger-fraction 0.8` | sleep onset | Wakefulness pressure P (novelty accumulator) | ep_salience (above τ_s) per episode + NREM dissipation | P += novelty_weight/baseline_rate per ep; sleep when P ≥ 1.0 | P = 1.0 (target: ~3500 eps per sleep) | P ∈ [0, 3.0] clamped | Capacity fill at 0.8 until N=500 | Hard min 120 eps before sleep; P clamped | `wakefulness_pressure`, `wake_trigger` | Sleep driven by actual novelty load; long-familiar content doesn't trigger sleep | **2** |
 | `--max-wake-secs 600` | sleep onset (safety valve) | — | — | Stays as hard wall-time safety valve | — | — | — | Cannot be replaced: safety is structural | `wake_secs` (existing) | No change; safety valve kept | stays manual (Bucket S) |
 | `--perf-sleep-threshold 0.0` | early sleep on prior_cosine drop | P impulse on prior_cosine collapse | prior_cosine EWMA (S2) | Prior_cosine EWMA drop > 0.2 → P += 0.5 (boost) | — | impulse [0, 0.5] | 0.0 (disabled, no boost) | Boost capped at 0.5/cycle | `perf_sleep_boost` | Destabilisation triggers consolidation faster | **2** (requires S3 live) |
-| `--prior-beta 0.0` | top-down prior blend weight | Rolling prior_cosine mean across cycles | prior_cosine_mean, per cycle | Enable β=0.05 when 3-cycle mean > 0.65; disable when < 0.40 | Hysteresis band [0.40, 0.65] | P_c ∈ [0, 1] | 0.0 (disabled) | Hysteresis prevents toggling | `prior_beta_effective`, `prior_cosine_cycle_ewma` | Removes manual convergence judgement | **2b** |
+| `--prior-beta 0.01` | top-down prior blend weight | Rolling prior_cosine mean across cycles (3-cycle ring) | prior_cosine_mean, per cycle | Scale up β→0.05 when all 3 ring values > 0.65; scale down to base when any < 0.40 | Hysteresis band [0.40, 0.65] | P_c ∈ [0, 1] | 0.01 (base; cosines measured from ep 1) | Hysteresis; only engages when base < 0.05 | `prior_beta_effective`, `prior_cosine_mean` | Removes manual convergence judgement; base 0.01 avoids chicken-and-egg | **2b** |
 | `--growth-cooldown 3` + `GIST_GROWTH_THRESHOLD` | region capacity growth | within-session gist rate | gist restricted to current-session warm entries | Plasticity depletion/recovery model | — | plasticity ∈ [0, 1] | Current cooldown stays | plasticity_floor = 0.3 | `plasticity`, `within_session_gist` | Growth signal clean; runaway fixed at root | **deferred** |
 
 ---
@@ -529,3 +539,41 @@ cycles (matching current cooldown) but with rate governed by internal state.
   `--growth-cooldown` and `GIST_GROWTH_THRESHOLD` should be retired. If gist
   stays contaminated after the within-session fix, the growth controller must be
   redesigned around a different capacity signal (e.g. per-region MSE trend).
+
+---
+
+## Amendment — S4 chicken-and-egg fix + full validation (2026-06-14)
+
+### Bug found during confirmatory run
+
+The original S4 design gated on `args.prior_beta == 0.0` and started β at 0.
+`blend_with_prior` in `somnus-perception` returns `(values, None)` cosine when
+`prior_beta <= 0.0`. With prior cosines always `None`, the S4 ring buffer never
+filled, S4 never triggered, and S2's settle EWMA (which tracks prior cosines
+via `episode_cosine_mean`) also froze at cold start (0.85) indefinitely.
+
+### Fix
+
+Changed `--prior-beta` default from `0.0` to `0.01`. This is self-calibrating:
+when predictions are poor, 1% blend barely touches the input; as predictions
+improve, the same β contributes directionally. Prior cosines are always measured
+from episode 1 — no change to `blend_with_prior` required. S4 guard changed
+from `args.prior_beta == 0.0` to `args.prior_beta < 0.05`; on scale-down, β
+resets to `args.prior_beta` (base) rather than 0.0. Campaign script
+`PRIOR_BETA` env var defaults to `0.01`.
+
+### Confirmatory run results (2s × 3c, fresh memory, CAPACITY=4096)
+
+| cycle | session | trigger | wake_eps | sal_threshold | settle_gate_dynamic | wakefulness_pressure | prior_beta_effective | prior_cosine (r0–r4) |
+|-------|---------|---------|----------|--------------|--------------------|--------------------|---------------------|----------------------|
+| 1 | 1 | high_water | 3276 | 0.800 | 0.638 | 0.000 | 0.010 | [0.517, 0.603, 0.496, 0.680, 0.292] |
+| 2 | 1 | pressure | 500 | 1.023 | 0.576 | 2.796 | 0.010 | [0.653, 0.736, 0.506, 0.699, 0.209] |
+| 3 | 1 | pressure | 120 | 0.825 | 0.618 | 2.611 | 0.010 | [null, null, 0.667, 0.836, null] |
+| 1 | 2 | pressure | 287 | 0.345 | 0.697 | 0.732 | 0.010 | [0.713, 0.889, 0.620, 0.843, 0.328] |
+| 2 | 2 | pressure | 120 | 0.424 | 0.567 | 2.504 | 0.010 | [0.733, 0.935, 0.526, 0.739, null] |
+| 3 | 2 | pressure | 120 | 0.519 | 0.593 | 2.645 | **0.050** | [null, null, 0.628, 0.770, null] |
+
+**S1** ✅ `sal_threshold` adapts away from 0.8 cold-start from cycle 2 onward.  
+**S2** ✅ `settle_gate_dynamic` live and tracking ~0.10 below `settle_ewma_mean`.  
+**S3** ✅ Wakefulness pressure triggers sleep from cycle 2; 120-ep minimum guard active.  
+**S4** ✅ `prior_beta_effective` scales up to 0.05 at S2C3 (3 consecutive cycles with active-region cosines > 0.65).
