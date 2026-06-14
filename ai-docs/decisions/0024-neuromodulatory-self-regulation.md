@@ -140,19 +140,19 @@ schedule trigger seen in session-state key-facts). Validate against long-clip ru
 
 ### Bucket S-flags — Feature flags (all-on defaults)
 
-These select which subsystems are active. All should default to `true` in normal
-operation. The current `false` defaults are historical accidents from staged rollout.
+These select which subsystems are active. All default to `true`. Historical `false`
+defaults were staging accidents from staged rollout; flipped in commit 6d42f2a
+(2026-06-14).
 
-| Flag | Current default | Correct default |
-|---|---|---|
-| `--enable-language` | false | **true** |
-| `--enable-action-decoder` | false | **true** |
-| `--wake-recon-async` | false | **true** (validated in A/B, 2026-06-12) |
-| `--enable-gain-mod` | true | true ✓ |
-| `--migraphx` | true | true ✓ |
+| Flag | Default |
+|---|---|
+| `--language` | true ✓ |
+| `--action` | true ✓ |
+| `--wake-recon-async` | true ✓ |
+| `--action-gain` | true ✓ |
+| `--migraphx` | true ✓ |
 
-Flipping these is a `main.rs` change alongside this ADR, not just documentation.
-Goal: `somnus --inputs <file>` works without specifying subsystem flags.
+`somnus --inputs <file>` now works without specifying subsystem flags.
 
 ### Bucket S-throttle — Throttle knobs (deferred — no clean signal yet)
 

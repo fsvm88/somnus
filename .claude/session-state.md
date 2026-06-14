@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-14
-> **Last commit on main:** 88b4080 (S5+S6 complete)
+> **Last commit on main:** 6d42f2a (feature flag defaults flipped to true)
 > **Branch:** `main` (clean)
 
 ## Status: ADR 0024 fully implemented (S1–S4, growth controller 2c, S5, S6). Queue empty.
@@ -60,7 +60,7 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 
 ## Open issues / queued next
 
-1. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
+1. ~~**Feature flag defaults**~~ — **DONE** (commit 6d42f2a, 2026-06-14): `--language`, `--action`, `--wake-recon-async` all default to `true`. ADR 0024 updated.
 2. **S7 — Throttle adaptation**: deferred; no clean signal for `--wake-reconstruct-interval` or `--gain-update-every` yet.
 
 ---
