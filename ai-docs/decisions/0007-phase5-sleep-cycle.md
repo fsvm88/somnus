@@ -2,9 +2,6 @@
 status: accepted
 date: 2026-05-10
 deferred:
-  - id: cascade-correlation-training
-    what: Train new grown units on residual error (cascade-correlation candidate pool) before insertion, rather than random init
-    when: When growth events are stable and growth quality is measurable via within-session gist probe
   - id: adaptive-sleep-duration
     what: Replace schedule/capacity sleep trigger with wakefulness pressure accumulator — see ADR 0024 S3
     when: ADR 0024 Phase 2 implementation
@@ -179,8 +176,27 @@ The Phase 4 eager insert into SemanticStore is removed. During wake, episodes go
 ## What this does not address
 
 - Region-sharded warm-tier eviction (Phase 6).
-- Cascade-correlation candidate training for growth (Phase 6).
 - Salience-gated sleep interruptibility (Phase 6).
-- Adaptive sleep duration (Phase 6).
-- Neuromodulation signals (future).
+- Adaptive sleep duration (Phase 6, see ADR 0024 S3 + P1b).
+- Neuromodulation signals (ADR 0024).
 - GPU execution (currently CPU; CUDA is a future concern when model scales warrant it).
+
+---
+
+## Amendment — Cascade-correlation growth init implemented (2026-06-14, commit cbd8f63)
+
+The deferred `cascade-correlation-training` item is now implemented as **seeded growth
+init** (P2b). Rather than training a full candidate pool before insertion, new encoder
+columns are seeded with normalized high-residual training inputs × 0.01:
+
+1. `collect_high_residual_inputs<T>()` (in `somnus-perception/src/lib.rs`): scores all
+   hot-buffer traces by SAE reconstruction MSE per region, returns top `2 × GROWTH_BATCH`
+   inputs sorted by MSE descending.
+2. `grow_region_seeded()`: seeds each new encoder column with a normalized seed × 0.01;
+   decoder rows remain zero-init. Falls back to `grow_region()` when seeds are empty.
+3. `sleep.rs`: collects seeds before REM growth, passes them to `grow_region_seeded()`.
+
+This is a lightweight approximation of cascade-correlation: new units are biased toward
+the inputs the model already fails on, rather than random. Full candidate-pool pre-training
+(train new units for N epochs in isolation before insertion) remains deferred until growth
+quality metrics stabilize.

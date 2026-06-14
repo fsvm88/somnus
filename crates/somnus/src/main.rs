@@ -836,8 +836,18 @@ async fn main() -> Result<()> {
             .max_by_key(|d| d.mount_point().as_os_str().len())
             .map(|d| d.available_space())
             .unwrap_or(0);
-        let auto = ((free_bytes as f64 * 0.20) / COLD_RECORD_BYTES as f64) as usize;
-        auto.clamp(10_000, 10_000_000)
+        if free_bytes == 0 {
+            // Disk not found via sysinfo (btrfs subvolumes, network fs, etc.).
+            // Fall back to unlimited so we don't cap too aggressively.
+            tracing::warn!(
+                memory_dir = %args.memory_dir.display(),
+                "auto cold cap: disk not found via sysinfo — cap disabled"
+            );
+            0
+        } else {
+            let auto = ((free_bytes as f64 * 0.20) / COLD_RECORD_BYTES as f64) as usize;
+            auto.clamp(10_000, 10_000_000)
+        }
     };
     tracing::info!(effective_max_cold, "cold archive cap (auto)");
 

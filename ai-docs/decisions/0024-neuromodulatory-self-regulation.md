@@ -1,10 +1,6 @@
 ---
 status: accepted
 date: 2026-06-14
-deferred:
-  - id: s7-throttle-adaptation
-    what: Adapt --wake-reconstruct-interval and --gain-update-every from reconstruction quality trend; no clean signal exists yet
-    when: After Phase 2 controllers stable and wake reconstruction quality metrics are reliable per-step
 ---
 
 # ADR 0024 — Neuromodulatory self-regulation: derived signals replace fixed thresholds
@@ -111,7 +107,7 @@ They do not regulate during a session; they become better-informed initial prior
 |---|---|---|---|
 | `--max-warm-records` | 0 (auto) | `free_ram_bytes × 0.35 / 2500` bytes/record via sysinfo | **Done (S5, 88b4080)** |
 | `--recall-ef` | 16 | Calibrated at scale; benchmark deferred | **Done (S5, 88b4080)** |
-| `--max-cold-records` | 0 | `free_disk_bytes × 0.20 / RECORD_BYTES` | Deferred |
+| `--max-cold-records` | 0 | `free_disk_bytes × 0.20 / COLD_RECORD_BYTES (661)` | **Done (P1a, 7964eb3)** |
 
 **S5 design note (2026-06-14):** `0` now means "auto-query" for `--max-warm-records`
 (was "unlimited"). No flag rename — the `--init-` prefix scheme described in
@@ -130,7 +126,7 @@ average: `max_wake_secs_effective = max(floor, 3 × wake_ewma_mu)` after N≥3 c
 | Flag | Floor | Adaptive ceiling | Status |
 |---|---|---|---|
 | `--max-wake-secs` | 600 s | `max(600, 3 × wake_ewma_mu)` after N≥3 cycles | **Done (S6, 88b4080)** |
-| `--max-sleep-secs` | 0 (disabled) | `max(0, 3 × mean_sleep_secs_rolling)` | Deferred |
+| `--max-sleep-secs` | 0 (disabled) | `max(300, 3 × mean_sleep_secs_rolling)` rolling 5-cycle window | **Done (P1b, 7964eb3)** |
 | `--max-cycles` | 0 | test harness — permanent manual | n/a |
 
 **S6 validation note:** In fast-clip runs S3 triggers sleep after ~120 episodes (< 30s
@@ -161,8 +157,8 @@ not yet exist or are not reliable. Listed in the front-matter `deferred:` sectio
 
 | Flag | Default | Potential future signal |
 |---|---|---|
-| `--wake-reconstruct-interval` | 5 | Wake MSE Δ/step trend — fire more when stagnant |
-| `--gain-update-every` | 20 | Variance of `gain[i]` over N episodes — reduce if stable |
+| `--wake-reconstruct-interval` | 5 | Wake MSE EWMA stagnation — decrement toward 1 when improvement < 1% for 3 cycles | **Done (S7, 7964eb3)** |
+| `--gain-update-every` | 20 | Variance of `gain[i]` over N episodes — reduce if stable | Deferred |
 | `--top-k-recall` | 5 | Recall diversity ratio (unique recalled episodes / top-k) |
 
 ### Bucket S-ops — Structural / ops (permanent manual)
@@ -694,3 +690,58 @@ improves as more sleep cycles are observed.
 **Known inertness in fast runs:** When S3 triggers sleep at ~120 episodes (≈10–30s wake),
 `3 × wake_ewma_mu ≈ 30–90s < 600s floor` — ceiling stays at floor. S6 activates only
 when wakes approach the floor (long-clip runs with schedule-triggered sleep at ~602s).
+
+---
+
+## Amendment — P1a cold cap, P1b sleep cap, S7 wake-interval throttle (2026-06-14, commit 7964eb3)
+
+### P1a — Auto cold cap (`--max-cold-records 0` → auto)
+
+`COLD_RECORD_BYTES = 661` (8+8+4+640+1). At startup when `args.max_cold_records == 0`:
+query `sysinfo::Disks::new_with_refreshed_list()`, find the mount point that is a prefix
+of `args.memory_dir` (longest match), read `available_space()`. Compute
+`(free_bytes × 0.20 / 661.0) as usize`, clamp `[10_000, 10_000_000]`. If disk lookup
+returns 0 (btrfs subvolumes, network FS, etc.), log a warning and fall back to `0`
+(unlimited), so the system is never over-capped when the disk cannot be probed.
+Emitted per-cycle as `max_cold_records_effective`.
+
+### P1b — Auto sleep cap (`--max-sleep-secs 0` → rolling window)
+
+Rolling 5-cycle window of sleep durations (sum of `nrem_wall_ms + rem_wall_ms +
+spill_wall_ms + snapshot_wall_ms`). Computed just before each sleep call:
+- Window empty (first cycle): `effective = 0` (no cap, preserves cold-start behavior).
+- Window non-empty: `effective = max(300, 3 × mean_sleep_secs)`.
+
+Manual `--max-sleep-secs > 0` bypasses the auto-cap entirely.
+Emitted per-cycle as `sleep_max_secs_effective`.
+
+**Validation notes (2S×3C, fast clips):** C1 correctly gets `sleep_max_secs_effective=0`
+(no history). C2/C3 get `300` (fast clips → short sleeps → 3× mean hits the 300s floor).
+S7 EWMA updates correctly each cycle; no interval change observed in short runs
+(stagnation requires 3 consecutive low-improvement cycles).
+
+### S7 — Wake-interval throttle adaptation
+
+**What it controls:** `--wake-reconstruct-interval` — how often wake reconstruction
+fires per wake episode.
+
+**Signal:** `mean_output_mse_wake` (already tracked per cycle).
+
+**Controller:** EWMA of wake MSE with α=0.3. Stagnation = MSE improvement < 1%
+for 3 consecutive cycles (relative: `(prev - cur) / prev < 0.01`). On stagnation,
+`effective_wake_interval` decrements toward 1 (reconstruct more often — model stagnant,
+needs more signal). On improvement resuming (`improvement ≥ 1%`), `s7_stagnant`
+counter resets; interval stays at current value until another stagnation episode
+(recovery toward user default not implemented — one-way pressure downward only).
+
+```rust
+// per cycle, after mean_mse_wake computed:
+s7_mse_ewma = S7_MSE_ALPHA * mean_mse_wake + (1.0 - S7_MSE_ALPHA) * s7_mse_ewma;
+if s7_ewma_n >= 2 {
+    let improvement = (prev_ewma - s7_mse_ewma) / prev_ewma;
+    if improvement < 0.01 { s7_stagnant += 1 } else { s7_stagnant = 0 }
+    if s7_stagnant >= 3 && effective_wake_interval > 1 { effective_wake_interval -= 1 }
+}
+```
+
+Emitted per-cycle as `wake_interval_effective` and `s7_mse_ewma`.

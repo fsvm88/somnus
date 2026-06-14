@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-14
-> **Last commit on main:** 6d42f2a (feature flag defaults flipped to true)
+> **Last commit on main:** cbd8f63 (P2b cascade-correlation growth init)
 > **Branch:** `main` (clean)
 
-## Status: ADR 0024 fully implemented (S1–S4, growth controller 2c, S5, S6). Queue empty.
+## Status: ADR 0024 fully implemented (S1–S6, P1a, P1b, S7). ADR 0007 P2b done. Queue empty.
 
 ---
 
@@ -12,34 +12,19 @@
 
 | Item | What changed |
 |------|-------------|
-| ADR 0024 S1–S4 implemented | S1–S4 committed in prior session (039b1a7–dfcdd7c) |
-| S4 bug found | `blend_with_prior` returns `None` cosine when `prior_beta <= 0.0` → chicken-and-egg: S4 ring buffer never fills, S2 settle EWMA freezes at cold start |
-| S4 fix | `--prior-beta` default changed 0.0 → 0.01; S4 guard changed to `args.prior_beta < 0.05`; on scale-down resets to `args.prior_beta` (base) not 0.0 |
-| Campaign script | `PRIOR_BETA` env var added (default 0.01); replaces hardcoded `--prior-beta 0.1` |
-| ADR 0024 updated | S4 section rewritten as scale-up controller; mapping table updated; amendment with validation data appended; s5/s6 deferred triggers marked met |
-| Confirmatory run | 2s×3c fresh memory, PRIOR_BETA=0.01 — all four controllers confirmed ✅ |
-| Within-session gist probe | `SemanticStore::records_since()`, `SleepStats::within_session_gist_rate`, `session_start_secs` param — committed 7214d16 |
+| ADR scan | All 24 ADRs scanned for pending/deferred items; prioritized P1 and P2 for implementation |
+| P1a — auto cold cap | `--max-cold-records 0` → auto-derive from `free_disk × 0.20 / 661`; clamp `[10k, 10M]`; falls back to unlimited if disk lookup returns 0 (btrfs/NFS); emits `max_cold_records_effective` |
+| P1b — auto sleep cap | `--max-sleep-secs 0` → rolling 5-cycle window: `max(300, 3 × mean_sleep_secs)`; C1 gets 0 (no cap); emits `sleep_max_secs_effective` |
+| S7 — wake-interval throttle | MSE EWMA (α=0.3); stagnation = improvement < 1% for 3 cycles → decrement `effective_wake_interval` toward 1; emits `wake_interval_effective`, `s7_mse_ewma` |
+| P2b — cascade-correlation init | `collect_high_residual_inputs()` ranks traces by SAE MSE; `grow_region_seeded()` seeds new encoder cols with normalized high-residual inputs × 0.01; decoder rows zero-init |
+| Validation run | 2S×3C fresh memory confirms: P1b cold-start disabled ✅, P1b C2/C3 = 300s ✅, S7 tracking ✅ (no interval change — expected in short run), no crashes, correct line count |
+| Disk fallback fix | P1a: when `sysinfo::Disks` can't find mount point (returns 0 bytes), warn and fall back to unlimited (0) instead of clamping to 10k minimum |
+| ADR 0024 updated | S-query/S-safety/S-throttle tables updated; amendment section added for P1a/P1b/S7 |
+| ADR 0007 updated | `cascade-correlation-training` removed from deferred frontmatter; amendment added |
 
-### Confirmatory run key metrics (memory/adr0024_ab2/campaign_20260614_114140)
-
-| c | s | trigger | wake_eps | sal_threshold | settle_gate_dynamic | pressure | prior_beta_eff |
-|---|---|---------|----------|--------------|-------------------|----------|---------------|
-| 1 | 1 | high_water | 3276 | 0.800 | 0.638 | 0.000 | 0.010 |
-| 2 | 1 | pressure | 500 | 1.023 | 0.576 | 2.796 | 0.010 |
-| 3 | 1 | pressure | 120 | 0.825 | 0.618 | 2.611 | 0.010 |
-| 1 | 2 | pressure | 287 | 0.345 | 0.697 | 0.732 | 0.010 |
-| 2 | 2 | pressure | 120 | 0.424 | 0.567 | 2.504 | 0.010 |
-| 3 | 2 | pressure | 120 | 0.519 | 0.593 | 2.645 | **0.050** |
-
-S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
-
-### Within-session gist probe design notes
-- `recall.warm.records_since(session_start_secs)` filters by `timestamp_secs >= session_start_secs`
-- `session_start_secs` = `wall_secs(&SystemTime::now())` at process start — same epoch as episode timestamps
-- Probe runs k-means + brute-force NN exclusively on within-session records (both centroids AND neighbor pool)
-- Emitted as `"within_session_gist_rate"` in per-cycle NDJSON
-- In session 1 cycle 1: warm is empty → `None`. In session N cycle 1: warm has only prior-session records → `None`. Metric only populated from cycle 2 onward within each session.
-- To validate: S1C1 should give `None`; `gist_recall_rate` and `within_session_gist_rate` should be close in a fresh-memory run (no cross-session drift yet).
+### Commits
+- `7964eb3` — `feat(P1+P2a): auto max-cold-records, auto sleep-max-secs, S7 wake-interval (ADR 0024)`
+- `cbd8f63` — `feat(P2b): cascade-correlation growth init (ADR 0007)`
 
 ---
 
@@ -55,13 +40,15 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 | 2c | Growth controller | **DONE** | ws→gist→MSE priority; validated 5s×3c; S5C2 false positive eliminated |
 | S5 | Startup-queryable priors | **DONE** | `--max-warm-records 0` → auto; `--recall-ef` default 16 |
 | S6 | Adaptive wake ceiling | **DONE** | wake_ewma (α=0.3/cycle); max_wake = max(floor, 3×μ); persisted |
+| P1a | Auto cold cap | **DONE** | `--max-cold-records 0` → disk-derived; fallback=unlimited |
+| P1b | Auto sleep cap | **DONE** | rolling 5-cycle window; floor 300s |
+| S7 | Wake-interval throttle | **DONE** | MSE stagnation → decrement interval toward 1 |
 
 ---
 
 ## Open issues / queued next
 
-1. ~~**Feature flag defaults**~~ — **DONE** (commit 6d42f2a, 2026-06-14): `--language`, `--action`, `--wake-recon-async` all default to `true`. ADR 0024 updated.
-2. **S7 — Throttle adaptation**: deferred; no clean signal for `--wake-reconstruct-interval` or `--gain-update-every` yet.
+- None. ADR 0024 fully implemented. Remaining S-throttle items (`--gain-update-every`, `--top-k-recall`) still deferred — no clean signal.
 
 ---
 
@@ -78,11 +65,13 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 - DUTY_CYCLE_ALPHA=0.001, BOOST_STRENGTH=1.0, TARGET_DC=20/1024≈0.0195
 - settle_beta=0.5, settle_every=1 (defaults)
 - SEARCH_EF → `--recall-ef 16` (confirmed at scale)
-- wake_reconstruct_interval=5 (default)
+- wake_reconstruct_interval=5 (default); S7 decrements toward 1 on MSE stagnation
 - SAL_EWMA_COLD_START=0.8, α=0.01 for S1/S2 EWMAs
 - S3: P_THRESHOLD=1.0, P_MAX=3.0, P_COLD_START_N=500, P_MIN_EPISODES=120
 - S4: base=0.01 (default), scale target=0.05, enable threshold=0.65 (3 cycles), disable threshold=0.40
-- `PRIOR_BETA=0.01` is now the campaign default (was 0.1 hardcoded, then parametrized)
+- `PRIOR_BETA=0.01` is now the campaign default
+- S7: S7_MSE_ALPHA=0.3, stagnation threshold=1% improvement, consecutive=3, decrement step=1
+- COLD_RECORD_BYTES=661 (8+8+4+640+1); P1a uses 20% of free disk
 
 ---
 
@@ -93,9 +82,9 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 | `--settle-steps 0` | 0 | Disable settle entirely |
 | `--settle-every N` | 1 | Subsample settle |
 | `--settle-gate F` | 0.85 | Cold-start prior for S2 adaptive gate |
-| `--recall-ef N` | 64 | Lower → faster HNSW queries |
-| `--wake-recon-async` | false | Offload wake_reconstruct to worker |
-| `--wake-reconstruct-interval N` | 5 | Fire wake_reconstruct every N episodes |
+| `--recall-ef N` | 16 | Lower → faster HNSW queries |
+| `--wake-recon-async` | true | Offload wake_reconstruct to worker |
+| `--wake-reconstruct-interval N` | 5 | S7 adapts this downward on MSE stagnation |
 | `--video-stride N` | 1 | Encode every Nth video frame |
 
 ---
