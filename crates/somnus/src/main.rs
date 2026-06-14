@@ -200,7 +200,7 @@ struct Args {
     /// latency spikes on high-salience episodes). Head weights merge back into
     /// the main model at sleep entry; EMA prediction weights stream back
     /// continuously with a few-episode lag.
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "true")]
     wake_recon_async: bool,
 
     /// Cap on the number of records in the cold archive. When the archive exceeds
@@ -212,7 +212,7 @@ struct Args {
 
     /// Enable ActionDecoder: per-episode LM forward for gain modulation + stdin generation (ADR 0012).
     /// Requires qwen25_lm.onnx, qwen25_embed_table.safetensors, qwen25_tokenizer.json in --models-dir.
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "true")]
     action: bool,
 
     /// Enable per-region gain modulation from LM attention (ADR 0012).
@@ -252,7 +252,7 @@ struct Args {
     /// Requires qwen25_embed_table.safetensors and qwen25_tokenizer.json in
     /// --models-dir. When combined with --action, the same stdin line is also
     /// routed to the query channel for generation.
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "true")]
     language: bool,
 
     /// Write tracing logs directly to this file instead of stderr.
@@ -720,8 +720,7 @@ async fn main() -> Result<()> {
     // (possibly grown) model. Weight restore later just loads weights into an
     // already-correct-sized model and never needs to rebuild ONNX again.
     {
-        let sizes = load_region_sizes(&args.memory_dir)
-            .unwrap_or([somnus_perception::N_UNITS; 5]);
+        let sizes = load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
         let regions = [
             somnus_perception::RegionId::AudioSpeech,
             somnus_perception::RegionId::AudioEnv,
@@ -841,10 +840,7 @@ async fn main() -> Result<()> {
         ) {
             Ok(mut d) => {
                 // Burn's BinFileRecorder sets extension to ".bin"; pass stem path.
-                let dec_w = args
-                    .memory_dir
-                    .join("snapshot")
-                    .join("decoder_weights");
+                let dec_w = args.memory_dir.join("snapshot").join("decoder_weights");
                 if dec_w.with_extension("bin").exists() {
                     if let Err(e) = d.load_weights(&dec_w) {
                         tracing::warn!(?e, "decoder weight restore failed — starting fresh");
@@ -1462,7 +1458,11 @@ async fn main() -> Result<()> {
                                     args.perf_sleep_threshold,
                                 );
                                 update_settle_ewma(m, &mut settle_mu, &mut settle_n);
-                                perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
+                                perception.set_settle_gate(settle_gate_val(
+                                    settle_mu,
+                                    settle_n,
+                                    args.settle_gate,
+                                ));
                             }
                         }
                         if let Some(m) = r.reconstruct_mse {
@@ -1494,7 +1494,11 @@ async fn main() -> Result<()> {
                                 &mut episodes_mixed,
                             );
                             update_sal_ewma(es.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
-                            accumulate_wakefulness_pressure(es.salience, sal_thresh, &mut wakefulness_pressure);
+                            accumulate_wakefulness_pressure(
+                                es.salience,
+                                sal_thresh,
+                                &mut wakefulness_pressure,
+                            );
                         }
                         accumulate_cosines(
                             &r.prior_cosines,
@@ -1679,13 +1683,19 @@ async fn main() -> Result<()> {
                             if c < 0.40 && s4_beta_active {
                                 s4_beta_active = false;
                                 perception.set_prior_beta(args.prior_beta);
-                                tracing::info!(prior_cosine = c, "S4: prior-beta scaled down to base (< 0.40)");
+                                tracing::info!(
+                                    prior_cosine = c,
+                                    "S4: prior-beta scaled down to base (< 0.40)"
+                                );
                             } else if !s4_beta_active && s4_ring_pos >= 3 {
                                 let all_high = s4_ring.iter().all(|v| v.is_some_and(|x| x > 0.65));
                                 if all_high {
                                     s4_beta_active = true;
                                     perception.set_prior_beta(0.05);
-                                    tracing::info!(prior_cosine = c, "S4: prior-beta scaled up to 0.05 (> 0.65 for 3 cycles)");
+                                    tracing::info!(
+                                        prior_cosine = c,
+                                        "S4: prior-beta scaled up to 0.05 (> 0.65 for 3 cycles)"
+                                    );
                                 }
                             }
                         }
