@@ -957,6 +957,9 @@ async fn main() -> Result<()> {
     let mut cosine_baseline_accum: f64 = 0.0;
     let mut cosine_baseline_n: usize = 0;
     let mut perf_sleep_flag = false;
+    // Wakefulness pressure accumulator P (ADR 0024 S3). Starts fresh each session;
+    // dissipated by NREM consolidation quality; fires sleep when P >= P_THRESHOLD.
+    let mut wakefulness_pressure: f32 = 0.0;
     // ASR count shared with the audio encoder task.
     let asr_count = Arc::new(AtomicUsize::new(0));
 
@@ -1461,6 +1464,7 @@ async fn main() -> Result<()> {
                                 &mut episodes_mixed,
                             );
                             update_sal_ewma(es.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
+                            accumulate_wakefulness_pressure(es.salience, sal_thresh, &mut wakefulness_pressure);
                         }
                         accumulate_cosines(
                             &r.prior_cosines,
@@ -1480,9 +1484,16 @@ async fn main() -> Result<()> {
         let high_water_hit = episodic.len() >= high_water;
         let schedule_hit = wake_start.elapsed() >= max_wake;
         let perf_degradation_hit = perf_sleep_flag && args.perf_sleep_threshold > 0.0;
-        let should_sleep = high_water_hit || schedule_hit || perf_degradation_hit;
+        // S3: pressure trigger active once sal_n >= 500 and min-episode guard is satisfied.
+        // Capacity fill remains active during cold-start as the primary trigger.
+        let pressure_hit = sal_n >= P_COLD_START_N
+            && wake_episodes >= P_MIN_EPISODES
+            && wakefulness_pressure >= P_THRESHOLD;
+        let should_sleep = high_water_hit || schedule_hit || perf_degradation_hit || pressure_hit;
         let sleep_trigger = if high_water_hit {
             "high_water"
+        } else if pressure_hit {
+            "pressure"
         } else if perf_degradation_hit {
             "perf_degradation"
         } else {
@@ -1492,6 +1503,7 @@ async fn main() -> Result<()> {
         if should_sleep && !episodic.is_empty() {
             info!(
                 trigger = sleep_trigger,
+                wakefulness_pressure,
                 buffer_len = episodic.len(),
                 buffer_cap = args.episodic_capacity,
                 wake_secs = wake_start.elapsed().as_secs(),
@@ -1549,6 +1561,9 @@ async fn main() -> Result<()> {
                     if let Err(e) = save_settle_ewma(settle_mu, settle_n, &args.memory_dir) {
                         tracing::warn!(?e, "settle_ewma save failed");
                     }
+                    // Dissipate wakefulness pressure by NREM consolidation quality (ADR 0024 S3).
+                    let consolidation = (0.5 * stats.gist_recall_rate.unwrap_or(0.0)).clamp(0.0, 0.5);
+                    wakefulness_pressure = (wakefulness_pressure - consolidation).max(0.0);
                     sleep_cycle_count += 1;
                     let cycle_asr = asr_count.swap(0, Ordering::Relaxed);
                     info!(
@@ -1688,8 +1703,9 @@ async fn main() -> Result<()> {
                             "sal_ewma_mean":  sal_mu as f64,
                             "sal_ewma_std":   sal_sigma as f64,
                             "sal_threshold":  sal_gate(sal_mu, sal_sigma, sal_n) as f64,
-                            "settle_ewma_mean":   settle_mu as f64,
+                            "settle_ewma_mean":    settle_mu as f64,
                             "settle_gate_dynamic": settle_gate_val(settle_mu, settle_n, args.settle_gate) as f64,
+                            "wakefulness_pressure": wakefulness_pressure as f64,
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -1792,6 +1808,7 @@ async fn main() -> Result<()> {
                                     let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
                                     accumulate_salience(rec, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
                                     update_sal_ewma(rec.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
+                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut wakefulness_pressure);
                                     hnsw_query_us_sum += rec.hnsw_query_us;
                                     hnsw_query_n += 1;
                                 }
@@ -1862,6 +1879,7 @@ async fn main() -> Result<()> {
                                     let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
                                     accumulate_salience(rec, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
                                     update_sal_ewma(rec.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
+                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut wakefulness_pressure);
                                     hnsw_query_us_sum += rec.hnsw_query_us;
                                     hnsw_query_n += 1;
                                 }
@@ -1956,6 +1974,7 @@ async fn main() -> Result<()> {
                                 let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
                                 accumulate_salience(es, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
                                 update_sal_ewma(es.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
+                                accumulate_wakefulness_pressure(es.salience, sal_thresh, &mut wakefulness_pressure);
                                 hnsw_query_us_sum += es.hnsw_query_us;
                                 hnsw_query_n += 1;
                             }
@@ -2084,6 +2103,26 @@ const RECALL_BLEND_THRESHOLD: f32 = 0.5;
 /// Cold-start prior for the adaptive salience gate (ADR 0024 S1).
 /// Used for the first 100 sampled episodes before the EWMA has enough data.
 const SAL_EWMA_COLD_START: f32 = 0.8;
+
+/// Sleep fires when wakefulness_pressure reaches this value (ADR 0024 S3).
+const P_THRESHOLD: f32 = 1.0;
+/// Wakefulness pressure is clamped to this ceiling to prevent runaway (ADR 0024 S3).
+const P_MAX: f32 = 3.0;
+/// sal_n must reach this before the S3 pressure trigger replaces the capacity fill (ADR 0024 S3).
+const P_COLD_START_N: u64 = 500;
+/// Hard minimum wake episodes before the pressure trigger can fire (ADR 0024 S3).
+const P_MIN_EPISODES: usize = 120;
+
+/// Accumulate novelty pressure for one episode (ADR 0024 S3).
+/// novelty_weight = max(0, salience − τ_s); increments P by novelty_weight / τ_s so that
+/// one unit of pressure is added when salience = 2×τ_s. Skips f32::MAX sentinel.
+#[inline]
+fn accumulate_wakefulness_pressure(salience: f32, sal_threshold: f32, pressure: &mut f32) {
+    if salience < f32::MAX / 2.0 && sal_threshold > 0.0 {
+        let novelty = (salience - sal_threshold).max(0.0);
+        *pressure = (*pressure + novelty / sal_threshold).min(P_MAX);
+    }
+}
 
 /// Compute adaptive salience gate threshold from EWMA state (ADR 0024 S1).
 /// Returns μ + 0.5·σ clamped to [0.3, 3.0] once ≥100 episodes are sampled;
