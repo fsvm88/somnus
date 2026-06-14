@@ -7,7 +7,7 @@ deferred:
     when: After cold→warm promotion is made active (currently stubbed); requires RecollectionLayer::promote carrying source tag
   - id: salience-weighted-cluster-assignment
     what: Weight cluster assignment by episode salience in the gist entropy calculation to de-emphasise repetitive familiar content
-    when: After salience metadata is available per warm record
+    when: DONE 2026-06-14 — cluster_sources now accumulates f32 weights per slot; weight = salience.clamp(0.01, 2.0), f32::MAX sentinel → 1.0
 ---
 
 # ADR 0021 — Cross-modal gist entropy: ingest_source and concept probe
@@ -92,3 +92,13 @@ architectural changes or learning-rate schedules.
 If we add cross-session source tracking (cold→warm promotion preserves `ingest_source`),
 the probe should be extended to sample from warm as well. If salience-weighted cluster
 assignment is added, the histogram weights should be adjusted accordingly.
+
+## Amendment: salience-weighted cluster assignment (2026-06-14)
+
+`cluster_sources` changed from `Vec<[u32; 6]>` to `Vec<[f32; 6]>`. Each episode now
+contributes `weight = salience.clamp(0.01, 2.0)` to its cluster/source slot instead of 1.
+Episodes with `salience == f32::MAX` (first-session, warm was empty) use weight 1.0.
+The entropy computation operates on `f32` weighted totals throughout; the cluster-occupied
+threshold is now `>= 2.0` (weighted sum). `traces_for_rem` tuple extended to 4 elements
+`(ep_vec, regional, ingest_source, salience)` and `collect_high_residual_inputs` in
+`somnus-perception` updated to `<T, U>` to remain generic over the trailing two elements.

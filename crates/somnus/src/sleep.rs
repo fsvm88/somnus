@@ -631,7 +631,7 @@ pub fn run_sleep_cycle(
     let mut within_session_gist_rate: Option<f32> = None;
 
     // Collect traces once for reuse in both warm probe and MSE measurement.
-    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5], IngestSource)> = if !was_interrupted {
+    let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5], IngestSource, f32)> = if !was_interrupted {
         episodic
             .iter_traces()
             .map(|t| {
@@ -639,6 +639,7 @@ pub fn run_sleep_cycle(
                     t.record.values.clone(),
                     t.regional.clone(),
                     t.record.ingest_source,
+                    t.record.salience,
                 )
             })
             .collect()
@@ -668,11 +669,12 @@ pub fn run_sleep_cycle(
         let mut total_l2 = 0.0f32;
         let mut n_probed = 0usize;
         let mut gist_matches = 0usize;
-        // Per-cluster source-type counts for cross-modal entropy (Gap 8).
-        // cluster_sources[k] maps IngestSource u8 → count.
-        let mut cluster_sources: Vec<[u32; 6]> = vec![[0u32; 6]; GIST_K];
+        // Per-cluster source-type weighted counts for cross-modal entropy (Gap 8).
+        // cluster_sources[k] maps IngestSource u8 → salience-weighted count.
+        // Novel episodes (high salience) contribute more; f32::MAX sentinel → weight 1.0.
+        let mut cluster_sources: Vec<[f32; 6]> = vec![[0.0f32; 6]; GIST_K];
 
-        for (ep_vec, _, src) in &traces_for_rem {
+        for (ep_vec, _, src, salience) in &traces_for_rem {
             if let Some((dist, neighbor)) =
                 recall.warm.query_with_dist(ep_vec, 1).into_iter().next()
             {
@@ -684,6 +686,12 @@ pub fn run_sleep_cycle(
                     if probe_cluster == neighbor_cluster {
                         gist_matches += 1;
                     }
+                    // Salience weight: unknown (f32::MAX) → 1.0; otherwise clamp [0.01, 2.0].
+                    let weight = if *salience >= f32::MAX / 2.0 {
+                        1.0f32
+                    } else {
+                        salience.clamp(0.01, 2.0)
+                    };
                     // Bin the source into the cluster histogram (Unknown → slot 5).
                     let slot = match src {
                         IngestSource::Speech => 0,
@@ -693,7 +701,7 @@ pub fn run_sleep_cycle(
                         IngestSource::Mixed => 4,
                         IngestSource::Unknown => 5,
                     };
-                    cluster_sources[probe_cluster][slot] += 1;
+                    cluster_sources[probe_cluster][slot] += weight;
                 }
             }
         }
@@ -707,19 +715,19 @@ pub fn run_sleep_cycle(
 
                 // Shannon entropy per cluster (bits), averaged over occupied clusters.
                 // Only count known-source episodes (slots 0–4); skip slot 5 (Unknown).
+                // Counts are salience-weighted so novel episodes contribute more.
                 let entropy_sum: f32 = cluster_sources
                     .iter()
                     .filter_map(|counts| {
-                        let total: u32 = counts[0..5].iter().sum();
-                        if total < 2 {
-                            return None; // need ≥2 known-source eps to compute entropy
+                        let total: f32 = counts[0..5].iter().sum();
+                        if total < 2.0 {
+                            return None; // need ≥2 known-source weight to compute entropy
                         }
-                        let n = total as f32;
                         let h: f32 = counts[0..5]
                             .iter()
-                            .filter(|&&c| c > 0)
+                            .filter(|&&c| c > 0.0)
                             .map(|&c| {
-                                let p = c as f32 / n;
+                                let p = c / total;
                                 -p * p.log2()
                             })
                             .sum();
@@ -728,7 +736,7 @@ pub fn run_sleep_cycle(
                     .sum();
                 let n_occupied = cluster_sources
                     .iter()
-                    .filter(|counts| counts[0..5].iter().sum::<u32>() >= 2)
+                    .filter(|counts| counts[0..5].iter().sum::<f32>() >= 2.0)
                     .count();
                 if n_occupied > 0 {
                     cross_modal_gist_entropy = Some((entropy_sum / n_occupied as f32).max(0.0));
@@ -766,7 +774,7 @@ pub fn run_sleep_cycle(
             let ws_centroids = kmeans(&ws_vecs, GIST_K, GIST_MAX_ITER);
             let mut ws_matches = 0usize;
             let mut ws_probed = 0usize;
-            for (ep_vec, _, _) in &traces_for_rem {
+            for (ep_vec, _, _, _) in &traces_for_rem {
                 // Brute-force nearest within-session neighbor (no HNSW for this subset).
                 let nearest = ws_records.iter().min_by(|a, b| {
                     let da: f32 = a
@@ -861,7 +869,7 @@ pub fn run_sleep_cycle(
     let t_rem2 = Instant::now();
     if !was_interrupted {
         // Measure SAE reconstruction quality without updating weights.
-        for (_, regional, _) in &traces_for_rem {
+        for (_, regional, _, _) in &traces_for_rem {
             match perception.measure_mse(regional) {
                 Ok(mse) => {
                     for i in 0..5 {
@@ -1002,7 +1010,7 @@ pub fn run_sleep_cycle(
         let mut real_mse_n = 0usize;
         for j in 0..real_sample_n {
             let idx = j * step / real_sample_n;
-            let (ep_vec, regional, _) = &traces_for_rem[idx];
+            let (ep_vec, regional, _, _) = &traces_for_rem[idx];
             match perception.measure_output_mse_inference(ep_vec, regional) {
                 Ok(mse) => {
                     real_mse_total += mse;
@@ -1026,8 +1034,8 @@ pub fn run_sleep_cycle(
                 if synthetics_produced >= REM_SYNTH_MAX_N {
                     break 'outer;
                 }
-                let (ep_a, reg_a, _) = &traces_for_rem[i];
-                let (_, reg_b, _) = &traces_for_rem[j];
+                let (ep_a, reg_a, _, _) = &traces_for_rem[i];
+                let (_, reg_b, _, _) = &traces_for_rem[j];
                 let l2 = l2_sq(ep_a, &traces_for_rem[j].0).sqrt();
                 if l2 < REM_SYNTH_MIN_L2 {
                     continue;

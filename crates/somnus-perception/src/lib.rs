@@ -1677,18 +1677,15 @@ impl PerceptionProcessor {
             let n_seeds = sorted_inputs.len();
             for k in 0..n_new {
                 let seed = &sorted_inputs[k % n_seeds];
-                let norm: f32 =
-                    seed.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                let norm: f32 = seed.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
                 for &x in seed {
                     cols.push(x / norm * 0.01);
                 }
             }
-            let cols_t: Tensor<TrainB, 2> = Tensor::from_inner(
-                Tensor::<NdArray, 2>::from_data(
-                    burn::tensor::TensorData::new(cols, [n_in, n_new]),
-                    &device,
-                ),
-            );
+            let cols_t: Tensor<TrainB, 2> = Tensor::from_inner(Tensor::<NdArray, 2>::from_data(
+                burn::tensor::TensorData::new(cols, [n_in, n_new]),
+                &device,
+            ));
 
             let old_w: Tensor<NdArray, 2> = layer.linear.weight.val().inner();
             let new_w: Tensor<TrainB, 2> =
@@ -1720,16 +1717,16 @@ impl PerceptionProcessor {
     /// Traces with empty regional input are skipped. Returns at most `cap` inputs per
     /// region to bound memory use.
     #[allow(clippy::type_complexity)]
-    pub fn collect_high_residual_inputs<T>(
+    pub fn collect_high_residual_inputs<T, U>(
         &mut self,
-        traces: &[(Vec<f32>, [Vec<f32>; 5], T)],
+        traces: &[(Vec<f32>, [Vec<f32>; 5], T, U)],
         cap: usize,
     ) -> [Vec<Vec<f32>>; 5] {
         let device = self.device;
         // Per-region: (residual_mse, input_vec)
         let mut scored: [Vec<(f32, Vec<f32>)>; 5] = Default::default();
 
-        for (_, regional, _) in traces {
+        for (_, regional, _, _) in traces {
             for (idx, input) in regional.iter().enumerate() {
                 if input.is_empty() {
                     continue;
@@ -1768,11 +1765,7 @@ impl PerceptionProcessor {
         let mut result: [Vec<Vec<f32>>; 5] = Default::default();
         for i in 0..5 {
             scored[i].sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            result[i] = scored[i]
-                .drain(..)
-                .take(cap)
-                .map(|(_, v)| v)
-                .collect();
+            result[i] = scored[i].drain(..).take(cap).map(|(_, v)| v).collect();
         }
         result
     }
