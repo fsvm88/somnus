@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-14
-> **Last commit on main:** (item 3: salience-weighted cold eviction)
+> **Last commit on main:** ef4682d (items 4+5: grown-units binding exposure)
 > **Branch:** `main` (clean)
 
-## Status: Items 3, 6, 7 done this session. Items 4+5 require scoping conversation before starting.
+## Status: All deferred items complete. Queue empty.
 
 ---
 
@@ -63,8 +63,10 @@ Deferred items from ADR scan (Tier 1 + Tier 2, in priority order):
 | 5 | **Per-region projection resize** — resize per-region linear projections when regions grow | ADR 0008 | Blocked by item 4. |
 | ~~6~~ | ~~Cross-session ingest-source through promotion~~ | ADR 0021 | **DONE** — `sample_records()` on warm store; bounded warm sample binned into `cluster_sources` after hot-tier loop (9c4731f). |
 | ~~7~~ | ~~Salience-weighted cluster assignment~~ | ADR 0021 | **DONE** — `cluster_sources` changed to `Vec<[f32;6]>`; weight = `salience.clamp(0.01,2.0)`; sentinel f32::MAX → 1.0 (76e156d). |
+| ~~4~~ | ~~Grown-units binding exposure~~ | ADR 0005, 0008 | **DONE** — `region_n:[usize;5]` skip field in BindingArea; `forward()` uses `region_n[i]` not N_UNITS; `grow_region`/`grow_region_seeded`/`prune_region` now resize binding projection in sync; `load_weights` reconstructs `region_n` from weight dims (ef4682d). |
+| ~~5~~ | ~~Per-region projection resize~~ | ADR 0008 | **DONE** — implemented with item 4 above (ef4682d). |
 
-### Item 4+5 scope note
+### Item 4+5 scope note (resolved)
 
 Items 4+5 are a multi-commit subsystem change, **not** a "one functional commit" unit:
 - `try_bind` in `binding.rs` uses `act.to_dense_n(N_UNITS)` — clamps every region at 1024 regardless of actual grown size
@@ -73,7 +75,7 @@ Items 4+5 are a multi-commit subsystem change, **not** a "one functional commit"
 - Snapshot format bump (VarMap `[N_UNITS, D_PROJ]` projection weights) + optimizer-state migration for grown rows
 - Prerequisite: regions actually need to exceed 1024 in practice — to be verified before spending time on this
 
-**Action needed before starting items 4+5:** check whether any region has ever exceeded N_UNITS=1024 in practice; if not, this is low-value and should be deferred explicitly.
+**Resolved:** confirmed via campaign logs — regions reached up to 1920 units. Items 4+5 implemented in ef4682d.
 
 ---
 
