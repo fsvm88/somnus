@@ -2,9 +2,6 @@
 status: accepted
 date: 2026-05-11
 deferred:
-  - id: nrem-output-head-training
-    what: Train output heads during NREM by re-running k-WTA+binding forward pass on stored regional traces to produce episode vectors
-    when: After wake output_mse converges; adds O(replay_len × forward_pass) cost to NREM — profile first
   - id: separate-output-head-optimizer
     what: Give output heads their own AdamW with independent LR schedule, separate from the cognitive layer optimizer
     when: If output heads and k-WTA/binding weights show conflicting gradient directions in the shared optimizer
@@ -53,9 +50,11 @@ The language head (index 4, 896-dim) was added in Phase 6 (ADR 0013). Empty-regi
 
 Called once per episode, immediately after `try_bind` produces an episode vector, using the raw (pre-blend) episode vector and the stored `regional_inputs`. Non-empty regions contribute equally to the loss; empty regions are masked out (zero contribution). The optimizer is shared with the rest of the cognitive layer; the same AdamW instance is used for SAE, binding, and output heads.
 
-### NREM integration: deferred
+### NREM integration: implemented (amendment 2026-06-14)
 
-During NREM replay, only regional encoder inputs are stored in `EpisodeTrace` — the episode vector is not. Training output heads during sleep would require re-running the full k-WTA + binding forward pass for each trace to re-produce the episode vector. This is feasible but changes `replay_step` significantly; deferred to a subsequent step to keep this change focused.
+`EpisodeTrace` was later found to store both `regional` encoder inputs **and** the episode vector (`record.values`), which was set at push time. This made re-running k-WTA+binding unnecessary. The implementation (`fused_replay_wake_step_batch`, committed in `a1c43cb` / `cd4364e`) passes the stored episode vectors directly alongside regional inputs, accumulating both SAE-decoder and output-head losses into a single backward pass — no extra forward pass cost. The O(replay × forward_pass) cost noted in the original deferral does not apply because the episode vector is already available.
+
+**Trade-off vs. the deferred design:** stored episode vectors reflect the binding-area weights at wake time, not at replay time. As NREM updates SAE weights, the output heads learn to reconstruct from slightly stale episode representations. This is expected and acceptable at this stage.
 
 ## Alternatives considered
 

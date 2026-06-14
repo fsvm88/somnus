@@ -48,7 +48,17 @@
 
 ## Open issues / queued next
 
-- None. ADR 0024 fully implemented. Remaining S-throttle items (`--gain-update-every`, `--top-k-recall`) still deferred — no clean signal.
+Deferred items from ADR scan (Tier 1 + Tier 2, in priority order):
+
+| # | Item | Source ADR | Status |
+|---|------|-----------|--------|
+| ~~1~~ | ~~Growth controller~~ | ADR 0024 | **DONE** — wired to `within_session_gist_rate` (e30916c) |
+| ~~2~~ | ~~NREM output-head training~~ | ADR 0009 | **DONE** — `fused_replay_wake_step_batch` uses stored episode vectors; no k-WTA re-run needed (a1c43cb / cd4364e). ADR 0009 amended. |
+| 3 | **Salience-weighted cold eviction** — replace recency-based truncation with salience-weighted eviction retaining high-salience old episodes | ADR 0006, 0020 | **NEXT** — requires adding `salience: f32` to `EpisodeRecord` + SMNCOLD3 schema bump (RECORD_BYTES 661→665) |
+| 4 | **Grown-units binding exposure** — allow grown units above N_UNITS=1024 into the binding area (currently clamped by `to_dense_n`) | ADR 0005, 0008 | Blocked by item 1 ✅. Triggers snapshot format bump. |
+| 5 | **Per-region projection resize** — resize per-region linear projections when regions grow | ADR 0008 | Blocked by item 4. |
+| 6 | **Cross-session ingest-source through promotion** — preserve `ingest_source` through cold→warm so gist entropy covers multi-session mixing | ADR 0021 | Requires item 3 (salience field). |
+| 7 | **Salience-weighted cluster assignment** — weight cluster assignment by salience in gist entropy calculation | ADR 0021 | Requires item 3 (salience metadata per warm record). |
 
 ---
 
