@@ -1,13 +1,6 @@
 ---
 status: accepted
 date: 2026-05-10
-deferred:
-  - id: grown-units-binding-exposure
-    what: Allow grown units (above N_UNITS=1024 baseline) to contribute to the binding area; currently clamped by to_dense_n(N_UNITS)
-    when: When region sizes stabilise and the episode vector dimension change is acceptable; requires snapshot format bump
-  - id: per-region-binding-projections-resize
-    what: Resize per-region linear projections when regions grow, so grown capacity is fully utilised
-    when: Blocked by grown-units-binding-exposure above
 ---
 
 # ADR 0008 — Cross-attention binding area
@@ -93,3 +86,26 @@ Three changes relative to the original Phase 3 decision, all reflected in the ma
 - **Gated fusion:** each region multiplied by a learned scalar gate, then summed. Simpler but still no cross-regional context before aggregation.
 - **Cross-attention (asymmetric):** one region queries others. More complex to wire since we'd need to designate a "query region". Self-attention over all four regions is symmetric and requires no such designation.
 - **Multi-head attention:** implemented (N_HEADS=4, see Amendment). Originally deferred; adopted once 5-region binding and GRU temporal context increased the representational demand.
+
+## Amendment — grown-units binding exposure (2026-06-14)
+
+Items 4+5 from the ADR scan deferred list, implemented once runs confirmed regions reach 1920 units (max observed across campaign logs).
+
+### What changed
+
+- `BindingArea` gains a `#[module(skip)] region_n: [usize; 5]` field, initialized to `[N_UNITS; 5]`.
+- `forward()` uses `self.region_n[i]` instead of `N_UNITS` for `to_dense_n` and the input tensor shape, so grown units pass through to the projection rather than being silently dropped.
+- `grow_region`, `grow_region_seeded`, and `prune_region` now also resize the corresponding binding projection weight (`[old_n, D_PROJ] → [new_n, D_PROJ]`, zero-initialized new rows) and update `region_n[i]`.
+- `load_weights` reconstructs `region_n` from the actual projection weight shapes after loading (skip fields reset on deserialisation; weight dims are authoritative).
+
+### EPISODE_DIM is unchanged
+
+Each region projects `region_n[i] → D_PROJ=128` independently; the output is still `5 × 128 = 640 = EPISODE_DIM`. HNSW/cold-store/gist are unaffected. The original note in the deferred item about "episode vector dimension change" applied to the old concat+linear design and was stale.
+
+### ORT path limitation
+
+The compiled ONNX binding graph accepts fixed `[1, N_UNITS]` inputs and cannot grow with the burn model. `try_bind` continues to call `to_dense_n(N_UNITS)` when routing through ORT; grown units reach binding only via the burn path.
+
+### Snapshot compatibility
+
+Old snapshots (saved before this amendment) have `[1024, 128]` binding projection weights. When loaded into a grown processor, burn's recorder logs a shape-mismatch warning and falls back to the zero-initialized weights produced by `grow_region`. Functionality is preserved; projections retrain from zero.

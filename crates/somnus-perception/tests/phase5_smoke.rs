@@ -173,6 +173,37 @@ mod tests {
         assert!(loss.is_finite(), "loss after grow not finite: {loss}");
     }
 
+    /// After growing regions, binding.forward must use the wider projection
+    /// so grown units contribute to the episode vector (items 4+5, ADR 0008).
+    #[test]
+    fn grow_then_bind_produces_finite_episode() {
+        use somnus_perception::RegionId;
+        let mut proc = make_proc();
+        proc.grow_region(RegionId::AudioSpeech, 64);
+        proc.grow_region(RegionId::Visual, 64);
+
+        // Ingest enough regions to trigger binding (need all 4 primary regions).
+        let out_sp = proc.ingest_speech(&speech_input()).unwrap();
+        let out_en = proc.ingest_env(&env_input()).unwrap();
+        let out_vi = proc.ingest_visual(&visual_input()).unwrap();
+        // Second speech ingest fires binding.
+        let out_sp2 = proc.ingest_speech(&speech_input()).unwrap();
+
+        // At least one call should have produced an episode vector.
+        let episodes: Vec<_> = [&out_sp, &out_en, &out_vi, &out_sp2]
+            .iter()
+            .filter_map(|o| o.episode.as_ref())
+            .collect();
+        assert!(!episodes.is_empty(), "no episode produced after ingest sequence");
+        for ep in &episodes {
+            assert_eq!(ep.0.len(), 640, "episode dim wrong after grow");
+            assert!(
+                ep.0.iter().all(|v| v.is_finite()),
+                "non-finite in episode after grow"
+            );
+        }
+    }
+
     // ── Documented-behaviour tests (ADRs 0010, 0011, 0013; Phases 11b, 12c) ──
 
     /// All five ingest paths (speech, env, visual, language, and symbolic-via-speech)

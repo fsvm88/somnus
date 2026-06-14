@@ -1643,6 +1643,25 @@ impl PerceptionProcessor {
             decoder.n_units = new_n;
         }
 
+        {
+            // Binding projection weight: [n_units, D_PROJ] — grow by appending zero rows.
+            // New units have zero projection weights; gradients will shape them over time.
+            let binding_proj = match region {
+                RegionId::AudioSpeech => &mut model.binding.region_0,
+                RegionId::AudioEnv => &mut model.binding.region_1,
+                RegionId::Visual => &mut model.binding.region_2,
+                RegionId::Symbolic => &mut model.binding.region_3,
+                RegionId::Language => &mut model.binding.region_4,
+            };
+            let old_w: Tensor<NdArray, 2> = binding_proj.weight.val().inner();
+            let d_proj = old_w.dims()[1];
+            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<TrainB, 2> =
+                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            binding_proj.weight = Param::initialized(ParamId::new(), new_w);
+            model.binding.region_n[region.as_index()] = new_n;
+        }
+
         self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
         tracing::info!(region = ?region, n_new, "region grown");
     }
@@ -1704,6 +1723,23 @@ impl PerceptionProcessor {
                 Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_w);
             decoder.n_units = new_n;
+        }
+
+        {
+            let binding_proj = match region {
+                RegionId::AudioSpeech => &mut model.binding.region_0,
+                RegionId::AudioEnv => &mut model.binding.region_1,
+                RegionId::Visual => &mut model.binding.region_2,
+                RegionId::Symbolic => &mut model.binding.region_3,
+                RegionId::Language => &mut model.binding.region_4,
+            };
+            let old_w: Tensor<NdArray, 2> = binding_proj.weight.val().inner();
+            let d_proj = old_w.dims()[1];
+            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<TrainB, 2> =
+                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            binding_proj.weight = Param::initialized(ParamId::new(), new_w);
+            model.binding.region_n[region.as_index()] = new_n;
         }
 
         self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
@@ -1852,6 +1888,33 @@ impl PerceptionProcessor {
                 Tensor::from_data(TensorData::new(new_dec_flat, [new_n, n_in]), &device);
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_dec);
             decoder.n_units = new_n;
+        }
+
+        {
+            // Binding projection: [current_n, D_PROJ] — keep rows matching `keep`.
+            let binding_proj = match region {
+                RegionId::AudioSpeech => &mut model.binding.region_0,
+                RegionId::AudioEnv => &mut model.binding.region_1,
+                RegionId::Visual => &mut model.binding.region_2,
+                RegionId::Symbolic => &mut model.binding.region_3,
+                RegionId::Language => &mut model.binding.region_4,
+            };
+            let bind_flat: Vec<f32> = binding_proj
+                .weight
+                .val()
+                .into_data()
+                .convert::<f32>()
+                .to_vec()
+                .unwrap();
+            let d_proj = bind_flat.len() / current_n;
+            let new_bind_flat: Vec<f32> = keep
+                .iter()
+                .flat_map(|&i| bind_flat[i * d_proj..(i + 1) * d_proj].iter().copied())
+                .collect();
+            let new_bind: Tensor<TrainB, 2> =
+                Tensor::from_data(TensorData::new(new_bind_flat, [new_n, d_proj]), &device);
+            binding_proj.weight = Param::initialized(ParamId::new(), new_bind);
+            model.binding.region_n[region.as_index()] = new_n;
         }
 
         self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
@@ -2065,7 +2128,16 @@ impl PerceptionProcessor {
         let model = self.model.take().unwrap();
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         match model.load_file(path_str, &recorder, &device) {
-            Ok(loaded) => {
+            Ok(mut loaded) => {
+                // Reconstruct region_n from projection weight shapes — the skip field is
+                // not serialised by burn's recorder, so it resets to usize default (0).
+                loaded.binding.region_n = [
+                    loaded.binding.region_0.weight.val().inner().dims()[0],
+                    loaded.binding.region_1.weight.val().inner().dims()[0],
+                    loaded.binding.region_2.weight.val().inner().dims()[0],
+                    loaded.binding.region_3.weight.val().inner().dims()[0],
+                    loaded.binding.region_4.weight.val().inner().dims()[0],
+                ];
                 self.ema_heads = EmaOutputHeads::from_model(&loaded);
                 self.model = Some(loaded);
                 Ok(())
@@ -2104,7 +2176,7 @@ impl PerceptionProcessor {
     /// Weight naming convention (must match Python script):
     ///   W_enc_{i}              – KWtaLayer linear, shape [n_in, n_units]  (i = 0..4)
     ///   W_cross                – cross_modal_proj, shape [CROSS_MODAL_DIM, 384]
-    ///   W_region_{i}           – BindingArea region projection, shape [N_UNITS, D_PROJ]
+    ///   W_region_{i}           – BindingArea region projection, shape [region_n[i], D_PROJ]
     ///   W_q / W_k / W_v        – Attention QKV, shape [D_PROJ, D_PROJ]
     ///   gru_{gate}_input_W     – GRU input weight, shape [GRU_INPUT, GRU_HIDDEN]  (gate=update/reset/new)
     ///   gru_{gate}_hidden_W    – GRU hidden weight, shape [GRU_HIDDEN, GRU_HIDDEN]

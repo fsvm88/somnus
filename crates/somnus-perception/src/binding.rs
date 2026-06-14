@@ -10,7 +10,7 @@ pub const EPISODE_DIM: usize = 640;
 
 /// Per-region projection dim. 5 × D_PROJ == EPISODE_DIM, so the attention
 /// output can be flattened directly to the episode vector — no final linear.
-const D_PROJ: usize = 128;
+pub(crate) const D_PROJ: usize = 128;
 const _: () = assert!(5 * D_PROJ == EPISODE_DIM);
 
 /// Number of attention heads. Each head attends over D_HEAD = D_PROJ / N_HEADS features.
@@ -35,8 +35,8 @@ pub struct EpisodeVector(pub Vec<f32>);
 /// lets every region attend to every other region. The attention output
 /// [5, D_PROJ] is flattened to [640] = EPISODE_DIM without a final linear.
 ///
-/// Input is always clamped to N_UNITS via `to_dense_n` so the binding area
-/// remains fixed-size regardless of how much the regional k-WTA layers have grown.
+/// Input width per region tracks the grown size via `region_n`; `grow_region` keeps
+/// `region_n` and the projection weight in sync so grown units reach the binding area.
 /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
 /// The Language slot is zero-padded when no text embedding is available.
 #[derive(Module, Debug)]
@@ -61,6 +61,10 @@ pub struct BindingArea<B: Backend> {
     /// step per ingest instead of re-running the full WM window each time.
     #[module(skip)]
     pub(crate) gru_hidden: Option<Vec<f32>>,
+    /// Per-region projection input width; starts at N_UNITS and grows when a region grows.
+    /// Kept in sync with the corresponding region_N weight matrix by grow_region.
+    #[module(skip)]
+    pub(crate) region_n: [usize; 5],
 }
 
 impl<B: Backend> BindingArea<B> {
@@ -89,6 +93,7 @@ impl<B: Backend> BindingArea<B> {
                 .with_bias(false)
                 .init(device),
             gru_hidden: None,
+            region_n: [N_UNITS; 5],
         }
     }
 
@@ -114,13 +119,15 @@ impl<B: Backend> BindingArea<B> {
             &self.region_4,
         ];
 
-        // Project each region: N_UNITS → D_PROJ
+        // Project each region: region_n[i] → D_PROJ (region_n[i] == N_UNITS until grown)
         let projected: Vec<Tensor<B, 2>> = acts
             .iter()
             .zip(region_projs.iter())
-            .map(|(act, proj)| {
-                let dense = act.to_dense_n(N_UNITS);
-                let t = Tensor::<B, 2>::from_data(TensorData::new(dense, [1, N_UNITS]), device);
+            .enumerate()
+            .map(|(i, (act, proj))| {
+                let n = self.region_n[i];
+                let dense = act.to_dense_n(n);
+                let t = Tensor::<B, 2>::from_data(TensorData::new(dense, [1, n]), device);
                 let out: Tensor<B, 2> = proj.forward(t); // [1, D_PROJ]
                 out
             })
