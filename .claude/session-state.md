@@ -4,7 +4,7 @@
 > **Last commit on main:** (item 3: salience-weighted cold eviction)
 > **Branch:** `main` (clean)
 
-## Status: ADR 0024 fully implemented. ADR 0007 P2b done. Item 3 (salience eviction) done.
+## Status: Items 3, 6, 7 done this session. Items 4+5 require scoping conversation before starting.
 
 ---
 
@@ -25,6 +25,10 @@
 ### Commits
 - `7964eb3` — `feat(P1+P2a): auto max-cold-records, auto sleep-max-secs, S7 wake-interval (ADR 0024)`
 - `cbd8f63` — `feat(P2b): cascade-correlation growth init (ADR 0007)`
+- `0afc38a` — `docs: reconcile items 1+2; ADR 0009 NREM amendment`
+- `34fbc3e` — `feat(item3): salience-weighted cold eviction (ADR 0006, 0020)`
+- `76e156d` — `feat(item7): salience-weighted gist cluster histogram (ADR 0021)`
+- `9c4731f` — `feat(item6): cross-session ingest-source in gist entropy (ADR 0021)`
 
 ---
 
@@ -55,10 +59,21 @@ Deferred items from ADR scan (Tier 1 + Tier 2, in priority order):
 | ~~1~~ | ~~Growth controller~~ | ADR 0024 | **DONE** — wired to `within_session_gist_rate` (e30916c) |
 | ~~2~~ | ~~NREM output-head training~~ | ADR 0009 | **DONE** — `fused_replay_wake_step_batch` uses stored episode vectors; no k-WTA re-run needed (a1c43cb / cd4364e). ADR 0009 amended. |
 | ~~3~~ | ~~Salience-weighted cold eviction~~ | ADR 0006, 0020 | **DONE** — `salience: f32` added to `EpisodeRecord`; SMNCOLD3 (665B/record); `evict_lowest_salience()` in sleep.rs. |
-| 4 | **Grown-units binding exposure** — allow grown units above N_UNITS=1024 into the binding area (currently clamped by `to_dense_n`) | ADR 0005, 0008 | Blocked by item 1 ✅. Triggers snapshot format bump. |
+| 4 | **Grown-units binding exposure** — allow grown units above N_UNITS=1024 into the binding area (currently clamped by `to_dense_n`) | ADR 0005, 0008 | Multi-commit subsystem change — see notes below. |
 | 5 | **Per-region projection resize** — resize per-region linear projections when regions grow | ADR 0008 | Blocked by item 4. |
-| 6 | **Cross-session ingest-source through promotion** — preserve `ingest_source` through cold→warm so gist entropy covers multi-session mixing | ADR 0021 | Requires item 3 (salience field). |
-| 7 | **Salience-weighted cluster assignment** — weight cluster assignment by salience in gist entropy calculation | ADR 0021 | Requires item 3 (salience metadata per warm record). |
+| ~~6~~ | ~~Cross-session ingest-source through promotion~~ | ADR 0021 | **DONE** — `sample_records()` on warm store; bounded warm sample binned into `cluster_sources` after hot-tier loop (9c4731f). |
+| ~~7~~ | ~~Salience-weighted cluster assignment~~ | ADR 0021 | **DONE** — `cluster_sources` changed to `Vec<[f32;6]>`; weight = `salience.clamp(0.01,2.0)`; sentinel f32::MAX → 1.0 (76e156d). |
+
+### Item 4+5 scope note
+
+Items 4+5 are a multi-commit subsystem change, **not** a "one functional commit" unit:
+- `try_bind` in `binding.rs` uses `act.to_dense_n(N_UNITS)` — clamps every region at 1024 regardless of actual grown size
+- `binding.rs` projections are `LinearConfig::new(N_UNITS, D_PROJ)` fixed-size
+- ORT path (`onnx_session.rs`) builds `Array2::from_shape_vec((1, N_UNITS), …)` and feeds fixed `[1, N_UNITS]` tensors to a compiled graph — changing region width means re-exporting the ONNX model under MIGraphX constraints
+- Snapshot format bump (VarMap `[N_UNITS, D_PROJ]` projection weights) + optimizer-state migration for grown rows
+- Prerequisite: regions actually need to exceed 1024 in practice — to be verified before spending time on this
+
+**Action needed before starting items 4+5:** check whether any region has ever exceeded N_UNITS=1024 in practice; if not, this is low-value and should be deferred explicitly.
 
 ---
 
