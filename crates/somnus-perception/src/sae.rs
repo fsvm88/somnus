@@ -55,6 +55,16 @@ impl<B: Backend> SaeDecoder<B> {
             / self.n_in as f32
     }
 
+    /// Decoder reconstruction of `act` as a dense Vec (same length as n_in).
+    /// Inference only — no gradient tracking.
+    pub fn reconstruct(&self, act: &SparseActivation, device: &B::Device) -> Vec<f32> {
+        let dense = act.to_dense_n(self.n_units);
+        let dense_t =
+            Tensor::<B, 2>::from_data(TensorData::new(dense, [1, self.n_units]), device);
+        let recon_t: Tensor<B, 2> = self.decoder.forward(dense_t);
+        recon_t.into_data().convert::<f32>().to_vec().unwrap()
+    }
+
     /// Batched MSE loss for NREM replay (B=1 for sequential, B>1 for batched).
     ///
     /// `input_batch`: `[B, n_in]` (target, detached).

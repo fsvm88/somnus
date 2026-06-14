@@ -1647,6 +1647,136 @@ impl PerceptionProcessor {
         tracing::info!(region = ?region, n_new, "region grown");
     }
 
+    /// Cascade-correlation init: grow a region using high-residual inputs as encoder
+    /// weight seeds (ADR 0007, P2b). `sorted_inputs` should be ordered by reconstruction
+    /// residual magnitude (descending). Falls back to random init when the list is empty.
+    ///
+    /// Each new unit's encoder column is set to the corresponding seed (normalized to
+    /// unit L2 × 0.01 scale), cycling through seeds when `n_new > sorted_inputs.len()`.
+    /// The decoder row is initialised to zeros (same as `grow_region`).
+    pub fn grow_region_seeded(
+        &mut self,
+        region: RegionId,
+        n_new: usize,
+        sorted_inputs: &[Vec<f32>],
+    ) {
+        if sorted_inputs.is_empty() {
+            return self.grow_region(region, n_new);
+        }
+        let device = self.device;
+        let n_in = REGION_DIMS[region.as_index()];
+        let model = self.model.as_mut().unwrap();
+
+        let new_n = {
+            let layer = Self::layer_mut(model, region);
+            let old_n = layer.n_units;
+            let new_n = old_n + n_new;
+
+            // Build encoder columns: normalised seed × 0.01 (matches grow_region scale).
+            let mut cols: Vec<f32> = Vec::with_capacity(n_in * n_new);
+            let n_seeds = sorted_inputs.len();
+            for k in 0..n_new {
+                let seed = &sorted_inputs[k % n_seeds];
+                let norm: f32 =
+                    seed.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+                for &x in seed {
+                    cols.push(x / norm * 0.01);
+                }
+            }
+            let cols_t: Tensor<TrainB, 2> = Tensor::from_inner(
+                Tensor::<NdArray, 2>::from_data(
+                    burn::tensor::TensorData::new(cols, [n_in, n_new]),
+                    &device,
+                ),
+            );
+
+            let old_w: Tensor<NdArray, 2> = layer.linear.weight.val().inner();
+            let new_w: Tensor<TrainB, 2> =
+                Tensor::from_inner(Tensor::cat(vec![old_w, cols_t.inner()], 1));
+            layer.linear.weight = Param::initialized(ParamId::new(), new_w);
+            layer.n_units = new_n;
+            layer.duty_cycle.extend(vec![0.0f32; n_new]);
+            new_n
+        };
+
+        {
+            let decoder = Self::decoder_mut(model, region);
+            let old_w: Tensor<NdArray, 2> = decoder.decoder.weight.val().inner();
+            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, n_in], &device);
+            let new_w: Tensor<TrainB, 2> =
+                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            decoder.decoder.weight = Param::initialized(ParamId::new(), new_w);
+            decoder.n_units = new_n;
+        }
+
+        self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+        tracing::info!(region = ?region, n_new, "region grown (seeded)");
+    }
+
+    /// For each region, return inputs from `traces` sorted by reconstruction residual
+    /// magnitude (highest first). Used by `grow_region_seeded` to orient new units
+    /// toward inputs the current network reconstructs poorly (cascade-correlation, P2b).
+    ///
+    /// Traces with empty regional input are skipped. Returns at most `cap` inputs per
+    /// region to bound memory use.
+    #[allow(clippy::type_complexity)]
+    pub fn collect_high_residual_inputs<T>(
+        &mut self,
+        traces: &[(Vec<f32>, [Vec<f32>; 5], T)],
+        cap: usize,
+    ) -> [Vec<Vec<f32>>; 5] {
+        let device = self.device;
+        // Per-region: (residual_mse, input_vec)
+        let mut scored: [Vec<(f32, Vec<f32>)>; 5] = Default::default();
+
+        for (_, regional, _) in traces {
+            for (idx, input) in regional.iter().enumerate() {
+                if input.is_empty() {
+                    continue;
+                }
+                let (act, recon) = {
+                    let model = self.model.as_mut().unwrap();
+                    let act = match idx {
+                        0 => model.speech_layer.forward(input, &device),
+                        1 => model.env_layer.forward(input, &device),
+                        2 => model.visual_layer.forward(input, &device),
+                        3 => model.symbolic_layer.forward(input, &device),
+                        4 => model.language_layer.forward(input, &device),
+                        _ => unreachable!(),
+                    };
+                    let recon = match idx {
+                        0 => model.speech_decoder.reconstruct(&act, &device),
+                        1 => model.env_decoder.reconstruct(&act, &device),
+                        2 => model.visual_decoder.reconstruct(&act, &device),
+                        3 => model.symbolic_decoder.reconstruct(&act, &device),
+                        4 => model.language_decoder.reconstruct(&act, &device),
+                        _ => unreachable!(),
+                    };
+                    (act, recon)
+                };
+                let _ = act;
+                let mse: f32 = input
+                    .iter()
+                    .zip(&recon)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    / input.len() as f32;
+                scored[idx].push((mse, input.clone()));
+            }
+        }
+
+        let mut result: [Vec<Vec<f32>>; 5] = Default::default();
+        for i in 0..5 {
+            scored[i].sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            result[i] = scored[i]
+                .drain(..)
+                .take(cap)
+                .map(|(_, v)| v)
+                .collect();
+        }
+        result
+    }
+
     /// Prune low-magnitude grown units from a region (Phase 12c).
     /// Only removes units with index >= N_UNITS. Returns number pruned.
     pub fn prune_region(&mut self, region: RegionId, prune_fraction: f32) -> usize {

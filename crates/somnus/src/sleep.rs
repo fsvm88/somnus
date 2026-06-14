@@ -907,6 +907,12 @@ pub fn run_sleep_cycle(
             RegionId::Language,
         ];
         if !growth_blocked {
+            // Cascade-correlation init (ADR 0007, P2b): collect high-residual inputs once
+            // before the growth loop so that any regions that trigger growth can use them.
+            // Cap at 2 × GROWTH_BATCH seeds per region to bound memory.
+            let cc_seeds = perception
+                .collect_high_residual_inputs(&traces_for_rem, 2 * GROWTH_BATCH);
+
             for (i, &region) in region_ids.iter().enumerate() {
                 // Quality signal: within-session gist primary (no drift); cross-session
                 // gist at c1 of any session (ws always None before first spill); MSE
@@ -921,9 +927,10 @@ pub fn run_sleep_cycle(
                         region = ?region,
                         mse = per_region_mse[i],
                         gist_recall_rate = ?gist_recall_rate,
-                        "growing region"
+                        seeds = cc_seeds[i].len(),
+                        "growing region (cascade-correlation)"
                     );
-                    perception.grow_region(region, GROWTH_BATCH);
+                    perception.grow_region_seeded(region, GROWTH_BATCH, &cc_seeds[i]);
                     regions_grown.push(region);
                 }
             }
