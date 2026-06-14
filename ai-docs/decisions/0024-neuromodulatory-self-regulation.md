@@ -189,7 +189,7 @@ Signal cleanliness governs sequencing, not knob priority.
 | **1b** | Settle-rate modulation | Yes — prior_cosine already tracked | Replaces `--settle-gate` + (later) `--settle-every` |
 | **2** | Wakefulness pressure homeostat | Mostly — safeties needed | Replaces `--sleep-trigger-fraction` + `--max-wake-secs` |
 | **2b** | Prior-beta auto-enable | Yes — prior_cosine mean | Replaces `--prior-beta` manual enable |
-| **deferred** | Growth controller | No — gist contaminated | Requires within-session gist probe first |
+| **2c** | Growth controller — within-session signal | Yes (c2+); noisy at c1 | `within_session_gist_rate` primary; cross-session gist fallback at c1; cooldown retained |
 
 ---
 
@@ -444,39 +444,57 @@ override. If the base 0.01 blend measurably degrades learning, reduce to
 
 ---
 
-### Growth controller — Deferred
+### Growth controller — within-session signal (Phase 2c)
 
-**Prerequisite (not optional):** within-session gist probe — restrict the REM
-gist probe to only episodes encoded *in the current session's wake phase* (not
-the full warm store). This removes the cross-session NREM embedding drift that
-contaminates the current `gist_recall_rate` signal.
+**Prerequisite resolved (2026-06-14):** within-session gist probe landed in
+commit 7214d16. `SemanticStore::records_since(session_start_secs)` filters warm
+by `timestamp_secs`, giving a clean per-session subset. `within_session_gist_rate`
+is emitted in every per-cycle NDJSON record.
 
-**Why deferred:** The long-clip campaign (2026-06-13) showed c3 gist declining
-0.71 → 0.22 across 5 sessions as warm grew to 49k records, independent of
-whether the region actually needed capacity. Regulating growth on this signal
-means the controller reads "always low" and never stops growing — same runaway
-as before the cooldown, but with an EWMA wrapper.
+**Why the prerequisite was non-negotiable:** The long-clip campaign (2026-06-13)
+showed c3 gist declining 0.71 → 0.22 across 5 sessions as warm grew to 49k
+records, independent of whether any region needed capacity. Regulating growth on
+`gist_recall_rate` means the controller reads "always poor" and never stops
+growing. `within_session_gist_rate` removes this: only warm records from the
+current session are used for both the k-means centroids and the nearest-neighbour
+search, so drift from prior-session NREM weight updates cannot contaminate the
+signal.
 
-**Current safeguard:** `--growth-cooldown 3` (ADR 0023). This stays in place
-until the within-session probe lands.
-
-**Target design (post-prerequisite):**
-
-Signal: `within_session_gist_rate` — gist recall restricted to episodes from the
-current wake session. Expected properties: low variance (bounded by session
-length, not index age), no cross-session drift, defined even at c1.
-
-Controller: plasticity depletion/recovery model.
+**Implemented signal priority (sleep.rs):**
 
 ```
-plasticity[t] = clamp(plasticity[t-1] - cost_per_growth + recovery_per_cycle, 0, 1.0)
+quality_poor = match (within_session_gist_rate, gist_recall_rate) {
+    (Some(ws), _)   => ws < GIST_GROWTH_THRESHOLD,   // c2+: clean within-session
+    (None, Some(_)) => gist_poor,                      // c1: noisy cross-session fallback
+    (None, None)    => per_region_mse[i] > GROWTH_THRESHOLD, // S1C1: no warm yet
+}
 ```
 
-Grow when `within_session_gist_rate < GIST_GROWTH_THRESHOLD` AND
-`plasticity[t] > plasticity_floor = 0.3`.
-After growth, `plasticity` decreases by `growth_cost = 0.7`, dissipating
-linearly at `recovery_per_cycle = 0.25`. Effective refractory period: ~2.8
-cycles (matching current cooldown) but with rate governed by internal state.
+`within_session_gist_rate` is always `None` at cycle 1 of every session (nothing
+has spilled into warm from the current session yet). The cross-session gist
+fallback at c1 is noisier, which is why the cooldown is retained as a backstop.
+
+**Pruning gate** also switched to `within_session_gist_rate.or(gist_recall_rate)`.
+`None` (c1) → no pruning, which is conservative and correct.
+
+**Pressure dissipation** in main.rs uses the same `ws.or(gist)` preference,
+so NREM consolidation quality drives wakefulness recovery with the cleaner signal
+where available.
+
+**Cooldown retained:** The target design in this ADR specified a plasticity
+depletion/recovery model. The simpler approach — keep the existing cooldown but
+switch to the cleaner signal — was chosen first because:
+- c1 (ws=None) is still cross-session-gist-driven and remains noisy.
+- The cooldown provides a backstop against spurious c1 growth cascades.
+- The plasticity model adds complexity without measurable benefit until the c1
+  signal is also solved (requires either tagging episodes with session IDs or
+  accumulating within-session episodes in the episodic buffer across cycles).
+
+**Observability:**
+```json
+"gist_recall_rate": 0.797,
+"within_session_gist_rate": 0.906
+```
 
 ---
 
@@ -492,7 +510,7 @@ cycles (matching current cooldown) but with rate governed by internal state.
 | `--max-wake-secs 600` | sleep onset (safety valve) | — | — | Stays as hard wall-time safety valve | — | — | — | Cannot be replaced: safety is structural | `wake_secs` (existing) | No change; safety valve kept | stays manual (Bucket S) |
 | `--perf-sleep-threshold 0.0` | early sleep on prior_cosine drop | P impulse on prior_cosine collapse | prior_cosine EWMA (S2) | Prior_cosine EWMA drop > 0.2 → P += 0.5 (boost) | — | impulse [0, 0.5] | 0.0 (disabled, no boost) | Boost capped at 0.5/cycle | `perf_sleep_boost` | Destabilisation triggers consolidation faster | **2** (requires S3 live) |
 | `--prior-beta 0.01` | top-down prior blend weight | Rolling prior_cosine mean across cycles (3-cycle ring) | prior_cosine_mean, per cycle | Scale up β→0.05 when all 3 ring values > 0.65; scale down to base when any < 0.40 | Hysteresis band [0.40, 0.65] | P_c ∈ [0, 1] | 0.01 (base; cosines measured from ep 1) | Hysteresis; only engages when base < 0.05 | `prior_beta_effective`, `prior_cosine_mean` | Removes manual convergence judgement; base 0.01 avoids chicken-and-egg | **2b** |
-| `--growth-cooldown 3` + `GIST_GROWTH_THRESHOLD` | region capacity growth | within-session gist rate | gist restricted to current-session warm entries | Plasticity depletion/recovery model | — | plasticity ∈ [0, 1] | Current cooldown stays | plasticity_floor = 0.3 | `plasticity`, `within_session_gist` | Growth signal clean; runaway fixed at root | **deferred** |
+| `--growth-cooldown 3` + `GIST_GROWTH_THRESHOLD` | region capacity growth | `within_session_gist_rate` primary; cross-session gist at c1; MSE at S1C1 | warm records filtered by session_start_secs | `ws < 0.85` → grow; `None` at c1 falls back to gist; cooldown backstop retained | — | ws ∈ [0, 1]; None at c1 of every session | cooldown=3 until c1 noise resolved | cooldown; None→no-prune at c1 | `gist_recall_rate`, `within_session_gist_rate` | Eliminates cross-session drift false positives (validated: S5C2 suppressed) | **2c** |
 
 ---
 
@@ -577,3 +595,56 @@ resets to `args.prior_beta` (base) rather than 0.0. Campaign script
 **S2** ✅ `settle_gate_dynamic` live and tracking ~0.10 below `settle_ewma_mean`.  
 **S3** ✅ Wakefulness pressure triggers sleep from cycle 2; 120-ep minimum guard active.  
 **S4** ✅ `prior_beta_effective` scales up to 0.05 at S2C3 (3 consecutive cycles with active-region cosines > 0.65).
+
+---
+
+## Amendment — Growth controller implemented (2026-06-14)
+
+### Within-session gist probe (prerequisite, commit 7214d16)
+
+`SemanticStore::records_since(since_secs: f64)` filters warm by timestamp.
+`run_sleep_cycle` takes `session_start_secs: f64` (captured at process start via
+`wall_secs(&SystemTime::now())`). Within-session probe runs k-means + brute-force
+NN on the filtered subset only — both centroids and neighbor pool are from
+within-session records, so cross-session drift affects neither.
+
+`within_session_gist_rate` is always `None` at c1 (nothing spilled yet this
+session). The chart `gist_quality.png` shows both metrics over time.
+
+### Validation run: 5s × 3c, CAPACITY=4096, fresh memory
+
+| s | c | gist_recall | ws_gist | grew | notes |
+|---|---|-------------|---------|------|-------|
+| 1 | 1 | None | None | **Y** | S1C1: MSE-driven (warm empty) |
+| 1 | 2 | 0.646 | 0.555 | — | cooldown |
+| 1 | 3 | 0.930 | 0.969 | — | cooldown |
+| 2 | 1 | 0.717 | None | — | cooldown |
+| 2 | 2 | 0.852 | 0.781 | — | cooldown |
+| 2 | 3 | 0.508 | 0.805 | **Y** | both < 0.85; growth real |
+| 3 | 1 | 0.961 | None | — | gist high; no growth needed |
+| 3 | 2 | 0.953 | 0.875 | — | |
+| 3 | 3 | 0.750 | 0.883 | — | |
+| 4 | 1 | 0.798 | None | **Y** | c1 gist fallback; MSE still elevated |
+| 4 | 2 | 0.844 | 0.852 | — | cooldown |
+| 4 | 3 | 0.984 | 1.000 | — | cooldown |
+| 5 | 1 | 0.781 | None | — | cooldown |
+| 5 | 2 | 0.797 | **0.906** | **Y (old)** | ← false positive eliminated by ws |
+| 5 | 3 | 0.938 | 0.867 | — | |
+
+**Key finding — S5C2:** Cross-session gist=0.797 fell below the 0.85 threshold
+and triggered growth on all 5 regions. Within-session gist=0.906 correctly
+identifies the quality as good. With ws-primary, this growth event is suppressed.
+
+**S2C3** confirms the signal is not always conservative: gist=0.508, ws=0.805 —
+both below threshold, both agree growth is needed. ws-primary still grows.
+
+**S4C1** (c1 fallback): gist=0.798, ws=None → gist fallback fires, grew. Per-region
+MSE at S4C1 was elevated (speech 0.435, visual 0.385), so growth was legitimate.
+The cooldown absorbs the remaining c1 risk.
+
+### Growth controller change (commit e30916c)
+
+- `sleep.rs`: `quality_poor` uses `match (within_session_gist_rate, gist_recall_rate)`
+- `sleep.rs`: `prune_ok` uses `within_session_gist_rate.or(gist_recall_rate)` — None → no pruning at c1
+- `main.rs`: wakefulness pressure dissipation uses `ws.or(gist).unwrap_or(0.0)`
+- Cooldown retained; plasticity model deferred pending c1 signal improvement
