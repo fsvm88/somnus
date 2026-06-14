@@ -701,6 +701,10 @@ async fn main() -> Result<()> {
         "perception processor initialised (n=1024, k=20, cpu)"
     );
 
+    // Capture process-start time as the within-session warm filter boundary (ADR 0024).
+    // Warm records with timestamp_secs >= session_start_secs belong to this session only.
+    let session_start_secs = wall_secs(&SystemTime::now());
+
     // Load growth cooldown remaining from last session (0 if absent).
     let mut cooldown_remaining = load_growth_cooldown_remaining(&args.memory_dir);
     // Load salience EWMA state (ADR 0024 S1). Cold-start: μ=0.8, σ=0.2, n=0.
@@ -1556,6 +1560,7 @@ async fn main() -> Result<()> {
                 args.max_cold_records,
                 args.growth_cooldown,
                 cooldown_remaining,
+                session_start_secs,
             ) {
                 Ok(stats) => {
                     cooldown_remaining = stats.growth_cooldown_remaining;
@@ -1685,6 +1690,7 @@ async fn main() -> Result<()> {
                             "per_region_mse":    stats.per_region_mse,
                             "warm_recall_l2":    stats.warm_recall_l2,
                             "gist_recall_rate":        stats.gist_recall_rate,
+                            "within_session_gist_rate": stats.within_session_gist_rate,
                             "cross_modal_gist_entropy": stats.cross_modal_gist_entropy,
                             "was_interrupted":   stats.was_interrupted,
                             "nrem_exit_reason":  stats.nrem_exit_reason,

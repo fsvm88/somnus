@@ -133,6 +133,15 @@ impl SemanticStore {
         self.records.is_empty()
     }
 
+    /// Return all records whose `timestamp_secs >= since_secs`.
+    /// Used by the within-session gist probe to exclude prior-session embeddings.
+    pub fn records_since(&self, since_secs: f64) -> Vec<&EpisodeRecord> {
+        self.records
+            .values()
+            .filter(|r| r.timestamp_secs >= since_secs)
+            .collect()
+    }
+
     /// Return up to `max_n` episode vectors, evenly sampled from the records map.
     /// Used to build k-means centroids for gist-level probing during REM.
     pub fn sample_values(&self, max_n: usize) -> Vec<Vec<f32>> {

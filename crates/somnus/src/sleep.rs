@@ -135,6 +135,10 @@ pub struct SleepStats {
     /// None when warm is too small to cluster or all episodes have Unknown source.
     /// High = diverse modalities in same cluster (cross-modal grounding).
     pub cross_modal_gist_entropy: Option<f32>,
+    /// Gist recall rate computed only on within-session warm records (ADR 0024).
+    /// Excludes prior-session embeddings that may have drifted due to NREM weight updates.
+    /// None when the within-session warm subset is below GIST_MIN_WARM (typical for cycle 1).
+    pub within_session_gist_rate: Option<f32>,
     /// Regions that had grown units pruned during REM (12c).
     pub regions_pruned: Vec<RegionId>,
     /// Total grown units removed across all pruned regions.
@@ -282,6 +286,7 @@ pub fn run_sleep_cycle(
     max_cold_records: usize,
     growth_cooldown: usize,
     cooldown_remaining: usize,
+    session_start_secs: f64,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -623,6 +628,7 @@ pub fn run_sleep_cycle(
     let mut warm_recall_l2: Option<f32> = None;
     let mut gist_recall_rate: Option<f32> = None;
     let mut cross_modal_gist_entropy: Option<f32> = None;
+    let mut within_session_gist_rate: Option<f32> = None;
 
     // Collect traces once for reuse in both warm probe and MSE measurement.
     let traces_for_rem: Vec<(Vec<f32>, [Vec<f32>; 5], IngestSource)> = if !was_interrupted {
@@ -739,6 +745,63 @@ pub fn run_sleep_cycle(
                 );
             } else {
                 tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
+            }
+        }
+    }
+
+    // ── Within-session gist probe ─────────────────────────────────────────────
+    // Re-runs gist with a within-session warm subset (timestamp_secs >= session_start_secs).
+    // Prior-session embeddings are excluded because NREM weight updates cause embedding
+    // drift, making cross-session nearest-neighbor matches semantically unreliable.
+    // This is the clean signal for the growth controller (ADR 0024).
+    if !was_interrupted {
+        let ws_records = recall.warm.records_since(session_start_secs);
+        if ws_records.len() >= GIST_MIN_WARM {
+            let ws_vecs: Vec<Vec<f32>> = ws_records.iter().map(|r| r.values.clone()).collect();
+            tracing::debug!(
+                ws_warm_len = ws_records.len(),
+                k = GIST_K,
+                "within-session gist: running k-means"
+            );
+            let ws_centroids = kmeans(&ws_vecs, GIST_K, GIST_MAX_ITER);
+            let mut ws_matches = 0usize;
+            let mut ws_probed = 0usize;
+            for (ep_vec, _, _) in &traces_for_rem {
+                // Brute-force nearest within-session neighbor (no HNSW for this subset).
+                let nearest = ws_records.iter().min_by(|a, b| {
+                    let da: f32 = a
+                        .values
+                        .iter()
+                        .zip(ep_vec.iter())
+                        .map(|(x, y)| (x - y) * (x - y))
+                        .sum();
+                    let db: f32 = b
+                        .values
+                        .iter()
+                        .zip(ep_vec.iter())
+                        .map(|(x, y)| (x - y) * (x - y))
+                        .sum();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                if let Some(neighbor) = nearest {
+                    let probe_cluster = nearest_centroid(&ws_centroids, ep_vec);
+                    let neighbor_cluster = nearest_centroid(&ws_centroids, &neighbor.values);
+                    if probe_cluster == neighbor_cluster {
+                        ws_matches += 1;
+                    }
+                    ws_probed += 1;
+                }
+            }
+            if ws_probed > 0 {
+                let rate = ws_matches as f32 / ws_probed as f32;
+                within_session_gist_rate = Some(rate);
+                tracing::info!(
+                    ws_warm_len = ws_records.len(),
+                    rate,
+                    ws_matches,
+                    ws_probed,
+                    "within-session gist probe"
+                );
             }
         }
     }
@@ -1096,6 +1159,7 @@ pub fn run_sleep_cycle(
         warm_recall_l2,
         gist_recall_rate,
         cross_modal_gist_entropy,
+        within_session_gist_rate,
         mean_proj_loss,
         proj_loss_max: proj_loss_max_opt,
         decoder_trainable_records,
