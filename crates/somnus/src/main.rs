@@ -1571,7 +1571,13 @@ async fn main() -> Result<()> {
                         tracing::warn!(?e, "settle_ewma save failed");
                     }
                     // Dissipate wakefulness pressure by NREM consolidation quality (ADR 0024 S3).
-                    let consolidation = (0.5 * stats.gist_recall_rate.unwrap_or(0.0)).clamp(0.0, 0.5);
+                    // Prefer within-session gist (clean signal); fall back to cross-session at c1.
+                    let consolidation = (0.5
+                        * stats
+                            .within_session_gist_rate
+                            .or(stats.gist_recall_rate)
+                            .unwrap_or(0.0))
+                    .clamp(0.0, 0.5);
                     wakefulness_pressure = (wakefulness_pressure - consolidation).max(0.0);
                     sleep_cycle_count += 1;
                     let cycle_asr = asr_count.swap(0, Ordering::Relaxed);

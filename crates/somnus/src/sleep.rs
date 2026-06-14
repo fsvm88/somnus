@@ -882,15 +882,13 @@ pub fn run_sleep_cycle(
             }
         }
 
-        // Growth trigger: gist-recall is the primary signal; SAE MSE fallback when warm
-        // is too small to cluster. warm_recall_poor is logged but no longer gates growth —
-        // WARM_RECALL_GROWTH_THRESHOLD (5.0) proved too noisy a signal; gist_poor is more
-        // reliable for deciding when regions need more capacity.
+        // Growth trigger: within-session gist is the primary signal (no cross-session drift).
+        // Falls back to cross-session gist at c1 of each session (within_session always None
+        // before the first spill). Last resort: SAE MSE when no warm existed at all (S1C1).
+        // warm_recall_poor is logged but no longer gates growth (too noisy).
         //
-        // Cooldown: after any growth event, suppress growth for `growth_cooldown` cycles.
-        // c1 gist is structurally low (cross-session NREM drift) so without a cooldown
-        // the system grows every cycle. cooldown_remaining counts down to 0 each cycle;
-        // growth resets it to growth_cooldown.
+        // Cooldown: suppresses growth for `growth_cooldown` cycles after any event.
+        // c1 cross-session gist is still noisy; cooldown backstops spurious c1 growth.
         let _warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
         let gist_poor = gist_recall_rate.is_none_or(|r| r < GIST_GROWTH_THRESHOLD);
         let growth_blocked = cooldown_remaining > 0;
@@ -910,11 +908,13 @@ pub fn run_sleep_cycle(
         ];
         if !growth_blocked {
             for (i, &region) in region_ids.iter().enumerate() {
-                // Quality signal: gist-recall when available, SAE MSE otherwise.
-                let quality_poor = if gist_recall_rate.is_some() {
-                    gist_poor
-                } else {
-                    per_region_mse[i] > GROWTH_THRESHOLD
+                // Quality signal: within-session gist primary (no drift); cross-session
+                // gist at c1 of any session (ws always None before first spill); MSE
+                // last resort when warm was empty (S1C1).
+                let quality_poor = match (within_session_gist_rate, gist_recall_rate) {
+                    (Some(ws), _) => ws < GIST_GROWTH_THRESHOLD,
+                    (None, Some(_)) => gist_poor,
+                    (None, None) => per_region_mse[i] > GROWTH_THRESHOLD,
                 };
                 if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor {
                     tracing::info!(
@@ -944,7 +944,11 @@ pub fn run_sleep_cycle(
     // ── REM pruning of grown units (12c) ─────────────────────────────────────
     // Prune only when gist recall is high (system not struggling) and prune_fraction > 0.
     if !was_interrupted && prune_fraction > 0.0 {
-        let prune_ok = gist_recall_rate.is_some_and(|r| r >= PRUNE_GIST_THRESHOLD);
+        // Prefer within-session gist for prune safety check; fall back to cross-session.
+        // None at c1 → no pruning (conservative when quality can't be assessed).
+        let prune_ok = within_session_gist_rate
+            .or(gist_recall_rate)
+            .is_some_and(|r| r >= PRUNE_GIST_THRESHOLD);
         if prune_ok {
             let region_ids = [
                 RegionId::AudioSpeech,
