@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-14
-> **Last commit on main:** (pending — see below)
-> **Branch:** `main` (dirty — changes staged for commit)
+> **Last commit on main:** 7214d16 (within-session gist probe)
+> **Branch:** `main` (clean)
 
-## Status: ADR 0024 fully validated. S4 chicken-and-egg bug found and fixed (prior_beta default 0.0→0.01). All four controllers confirmed working. Next: within-session gist probe (growth controller prerequisite).
+## Status: Within-session gist probe done. Growth controller is now implementable. Next: growth controller (ADR 0024) or S5/S6.
 
 ---
 
@@ -18,6 +18,7 @@
 | Campaign script | `PRIOR_BETA` env var added (default 0.01); replaces hardcoded `--prior-beta 0.1` |
 | ADR 0024 updated | S4 section rewritten as scale-up controller; mapping table updated; amendment with validation data appended; s5/s6 deferred triggers marked met |
 | Confirmatory run | 2s×3c fresh memory, PRIOR_BETA=0.01 — all four controllers confirmed ✅ |
+| Within-session gist probe | `SemanticStore::records_since()`, `SleepStats::within_session_gist_rate`, `session_start_secs` param — committed 7214d16 |
 
 ### Confirmatory run key metrics (memory/adr0024_ab2/campaign_20260614_114140)
 
@@ -32,6 +33,14 @@
 
 S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 
+### Within-session gist probe design notes
+- `recall.warm.records_since(session_start_secs)` filters by `timestamp_secs >= session_start_secs`
+- `session_start_secs` = `wall_secs(&SystemTime::now())` at process start — same epoch as episode timestamps
+- Probe runs k-means + brute-force NN exclusively on within-session records (both centroids AND neighbor pool)
+- Emitted as `"within_session_gist_rate"` in per-cycle NDJSON
+- In session 1 cycle 1: warm is empty → `None`. In session N cycle 1: warm has only prior-session records → `None`. Metric only populated from cycle 2 onward within each session.
+- To validate: S1C1 should give `None`; `gist_recall_rate` and `within_session_gist_rate` should be close in a fresh-memory run (no cross-session drift yet).
+
 ---
 
 ## ADR 0024 implementation sequence
@@ -42,13 +51,14 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 | 1b | S2 — Settle-rate modulation | **DONE** | |
 | 2 | S3 — Wakefulness pressure homeostat | **DONE** | |
 | 2b | S4 — Prior-beta scale-up controller | **DONE** (bug fixed) | 0.01→0.05, not toggle |
-| — | Growth controller | **DEFERRED** | prerequisite: within-session gist probe |
+| prereq | Within-session gist probe | **DONE** | `within_session_gist_rate` in NDJSON |
+| — | Growth controller | **NEXT** | can now use `within_session_gist_rate` as gating signal |
 
 ---
 
 ## Open issues / queued next
 
-1. **Within-session gist probe**: Filter the REM gist probe to only current-session warm entries. Needed before growth controller can be implemented. Requires tagging warm records with session ID (non-trivial). This is the highest-leverage prereq.
+1. **Growth controller (ADR 0024)**: Wire growth decisions off `within_session_gist_rate` instead of (or in addition to) `gist_recall_rate`. Prerequisite now done. Needs ADR section and multi-session validation run showing decay correction.
 2. **S5 — Startup-queryable priors**: Trigger met (S1+S2 validated). Query RAM/HNSW at startup to auto-seed `--max-warm-records` and `--recall-ef`.
 3. **S6 — Adaptive safety ceilings**: Trigger met (S3 validated). Widen `--max-wake-secs` to 3× rolling mean wake duration.
 4. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
