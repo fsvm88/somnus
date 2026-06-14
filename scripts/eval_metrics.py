@@ -631,6 +631,59 @@ def plot_modality_balance(records, out_path, x_labels):
     print(f"  wrote {out_path}")
 
 
+def plot_gist_quality(records, out_path, x_labels):
+    """Gist recall rate (cross-session vs within-session) and growth trigger signal."""
+    has_gist = any(get(r, "gist_recall_rate") is not None for r in records)
+    if not has_gist:
+        print(f"  skip: no gist_recall_rate field — {out_path} not written")
+        return
+
+    x = np.arange(len(records))
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, len(records) * 0.5), 7),
+                                          gridspec_kw={"height_ratios": [3, 1]})
+    draw_session_lines(ax_top, records)
+    draw_session_lines(ax_bot, records)
+
+    gist = [get(r, "gist_recall_rate") for r in records]
+    ws_gist = [get(r, "within_session_gist_rate") for r in records]
+
+    for ys, label, color, ls in [
+        (gist,    "gist_recall_rate (cross-session)",   "#e06c75", "-"),
+        (ws_gist, "within_session_gist_rate (clean)",   "#98c379", "--"),
+    ]:
+        valid = [(xi, y) for xi, y in zip(x, ys) if y is not None]
+        if valid:
+            xs_v, ys_v = zip(*valid)
+            ax_top.plot(xs_v, ys_v, color=color, linewidth=1.8, marker="o",
+                        markersize=4, linestyle=ls, label=label)
+
+    ax_top.axhline(0.85, color="#e5c07b", linewidth=1.0, linestyle=":",
+                   label="GIST_GROWTH_THRESHOLD (0.85)", alpha=0.8)
+    ax_top.set_title("Gist recall rate: cross-session vs within-session (ADR 0024)")
+    ax_top.set_ylabel("gist recall rate")
+    ax_top.set_ylim(0, 1.05)
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels([""] * len(x))
+    ax_top.legend(loc="lower right", fontsize=8)
+    ax_top.grid(True, alpha=0.3)
+
+    grew = [1 if get(r, "grew") else 0 for r in records]
+    ax_bot.bar(x, grew, color="#e06c75", width=0.6, label="growth event")
+    ax_bot.set_ylabel("grew")
+    ax_bot.set_yticks([0, 1])
+    ax_bot.set_ylim(0, 1.4)
+    ax_bot.set_xlabel("sleep cycle")
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    ax_bot.legend(loc="upper right", fontsize=8)
+    ax_bot.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -687,6 +740,9 @@ def main():
     plot_modality_balance(records,
                           os.path.join(out_dir, "modality_balance.png"),
                           x_labels)
+    plot_gist_quality(records,
+                      os.path.join(out_dir, "gist_quality.png"),
+                      x_labels)
     print("Done.")
 
 
