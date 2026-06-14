@@ -960,6 +960,10 @@ async fn main() -> Result<()> {
     // Wakefulness pressure accumulator P (ADR 0024 S3). Starts fresh each session;
     // dissipated by NREM consolidation quality; fires sleep when P >= P_THRESHOLD.
     let mut wakefulness_pressure: f32 = 0.0;
+    // S4: prior-beta auto-enable ring buffer (3 cycles) and active flag (ADR 0024).
+    let mut s4_ring: [Option<f64>; 3] = [None; 3];
+    let mut s4_ring_pos: usize = 0;
+    let mut s4_beta_active: bool = false;
     // ASR count shared with the audio encoder task.
     let asr_count = Arc::new(AtomicUsize::new(0));
 
@@ -1596,6 +1600,42 @@ async fn main() -> Result<()> {
                             gw.update_weights(dec.proj_weights_flat());
                         }
                     }
+                    // S4: prior-beta auto-enable controller (ADR 0024).
+                    // Only active when --prior-beta 0.0 (default); explicit override skips.
+                    if args.prior_beta == 0.0 {
+                        let global_cosine: Option<f64> = {
+                            let vals: Vec<f64> = (0..5)
+                                .filter_map(|i| {
+                                    if prior_cosine_counts[i] > 0 {
+                                        Some(prior_cosine_sums[i] / prior_cosine_counts[i] as f64)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if vals.is_empty() {
+                                None
+                            } else {
+                                Some(vals.iter().sum::<f64>() / vals.len() as f64)
+                            }
+                        };
+                        s4_ring[s4_ring_pos % 3] = global_cosine;
+                        s4_ring_pos += 1;
+                        if let Some(c) = global_cosine {
+                            if c < 0.40 && s4_beta_active {
+                                s4_beta_active = false;
+                                perception.set_prior_beta(0.0);
+                                tracing::info!(prior_cosine = c, "S4: prior-beta disabled (< 0.40)");
+                            } else if !s4_beta_active && s4_ring_pos >= 3 {
+                                let all_high = s4_ring.iter().all(|v| v.is_some_and(|x| x > 0.65));
+                                if all_high {
+                                    s4_beta_active = true;
+                                    perception.set_prior_beta(0.05);
+                                    tracing::info!(prior_cosine = c, "S4: prior-beta enabled (> 0.65 for 3 cycles)");
+                                }
+                            }
+                        }
+                    }
                     // Write metrics NDJSON line.
                     if let Some(ref mut mf) = metrics_sink {
                         let region_sizes = perception.region_sizes();
@@ -1706,6 +1746,7 @@ async fn main() -> Result<()> {
                             "settle_ewma_mean":    settle_mu as f64,
                             "settle_gate_dynamic": settle_gate_val(settle_mu, settle_n, args.settle_gate) as f64,
                             "wakefulness_pressure": wakefulness_pressure as f64,
+                            "prior_beta_effective": if s4_beta_active && args.prior_beta == 0.0 { 0.05f64 } else { args.prior_beta as f64 },
                         })
                         .to_string();
                         use std::io::Write as _;
