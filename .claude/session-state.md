@@ -4,7 +4,7 @@
 > **Last commit on main:** 7214d16 (within-session gist probe)
 > **Branch:** `main` (clean)
 
-## Status: Growth controller wired off within_session_gist_rate (ADR 0024). Validated 5s×3c run shows false positive at S5C2 eliminated. Next: S5, S6, or ADR update.
+## Status: ADR 0024 complete (S1–S4 + growth controller 2c, docs updated). Next: S5 (startup-queryable priors) or S6 (adaptive sleep ceilings).
 
 ---
 
@@ -58,8 +58,7 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 
 ## Open issues / queued next
 
-1. **ADR 0024 update**: Add growth controller section covering ws-primary signal, validation table (S5C2 false positive), cooldown rationale. Mark ADR complete.
-2. **S5 — Startup-queryable priors**: Trigger met (S1+S2 validated). Query RAM/HNSW at startup to auto-seed `--max-warm-records` and `--recall-ef`.
+1. **S5 — Startup-queryable priors**: Trigger met (S1+S2 validated). Query RAM/HNSW at startup to auto-seed `--max-warm-records` and `--recall-ef`.
 3. **S6 — Adaptive safety ceilings**: Trigger met (S3 validated). Widen `--max-wake-secs` to 3× rolling mean wake duration.
 4. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
 
