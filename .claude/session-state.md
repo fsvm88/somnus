@@ -1,10 +1,10 @@
 # Session state — somnus
 
 > **Last updated:** 2026-06-14
-> **Last commit on main:** 7214d16 (within-session gist probe)
+> **Last commit on main:** 88b4080 (S5+S6 complete)
 > **Branch:** `main` (clean)
 
-## Status: ADR 0024 complete (S1–S4 + growth controller 2c, docs updated). Next: S5 (startup-queryable priors) or S6 (adaptive sleep ceilings).
+## Status: ADR 0024 fully implemented (S1–S4, growth controller 2c, S5, S6). Queue empty.
 
 ---
 
@@ -52,15 +52,16 @@ S4 scaled up at S2C3 — prior cosines exceeded 0.65 for 3 consecutive cycles.
 | 2 | S3 — Wakefulness pressure homeostat | **DONE** | |
 | 2b | S4 — Prior-beta scale-up controller | **DONE** (bug fixed) | 0.01→0.05, not toggle |
 | prereq | Within-session gist probe | **DONE** | `within_session_gist_rate` in NDJSON |
-| — | Growth controller | **DONE** | ws→gist→MSE priority; validated 5s×3c; S5C2 false positive eliminated |
+| 2c | Growth controller | **DONE** | ws→gist→MSE priority; validated 5s×3c; S5C2 false positive eliminated |
+| S5 | Startup-queryable priors | **DONE** | `--max-warm-records 0` → auto; `--recall-ef` default 16 |
+| S6 | Adaptive wake ceiling | **DONE** | wake_ewma (α=0.3/cycle); max_wake = max(floor, 3×μ); persisted |
 
 ---
 
 ## Open issues / queued next
 
-1. **S5 — Startup-queryable priors**: Trigger met (S1+S2 validated). Query RAM/HNSW at startup to auto-seed `--max-warm-records` and `--recall-ef`.
-3. **S6 — Adaptive safety ceilings**: Trigger met (S3 validated). Widen `--max-wake-secs` to 3× rolling mean wake duration.
-4. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
+1. **Feature flag defaults** (noted in ADR 0024): `--enable-language`, `--enable-action-decoder`, `--wake-recon-async` should default to `true`. Low priority until pipeline is stable.
+2. **S7 — Throttle adaptation**: deferred; no clean signal for `--wake-reconstruct-interval` or `--gain-update-every` yet.
 
 ---
 

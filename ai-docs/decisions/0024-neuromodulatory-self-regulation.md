@@ -2,12 +2,6 @@
 status: accepted
 date: 2026-06-14
 deferred:
-  - id: s5-startup-queryable-priors
-    what: Query available RAM and benchmark HNSW latency at startup to auto-seed --max-warm-records and --recall-ef as bootstrap priors
-    when: Trigger met (S1+S2 validated 2026-06-14); ready to implement
-  - id: s6-adaptive-safety-ceilings
-    what: Widen --max-wake-secs ceiling to 3× rolling mean wake duration; complement the wakefulness pressure homeostat
-    when: Trigger met (S3 validated 2026-06-14); ready to implement
   - id: s7-throttle-adaptation
     what: Adapt --wake-reconstruct-interval and --gain-update-every from reconstruction quality trend; no clean signal exists yet
     when: After Phase 2 controllers stable and wake reconstruction quality metrics are reliable per-step
@@ -108,32 +102,41 @@ initialises the controller's estimate, not the threshold directly.
 | `--nrem-min-traces` | 0 | replay floor |
 | `--nrem-loss-target` | 0.0 | NREM exit quality |
 
-### Bucket S-query — Startup-queryable (will become bootstrap priors)
+### Bucket S-query — Startup-queryable (bootstrap priors)
 
-These can be seeded from the environment at process startup rather than hardcoded.
+These are seeded from the environment at process startup rather than hardcoded.
 They do not regulate during a session; they become better-informed initial priors.
 
-| Flag | Default | Startup query |
-|---|---|---|
-| `--max-warm-records` | 0 | `free_ram_bytes × 0.35 / RECORD_BYTES` (sysinfo crate) |
-| `--recall-ef` | 64 | Benchmark 500-record synthetic HNSW; binary-search ef to hit <2 ms/query |
-| `--max-cold-records` | 0 | `free_disk_bytes × 0.20 / RECORD_BYTES` |
+| Flag | Default | Startup query | Status |
+|---|---|---|---|
+| `--max-warm-records` | 0 (auto) | `free_ram_bytes × 0.35 / 2500` bytes/record via sysinfo | **Done (S5, 88b4080)** |
+| `--recall-ef` | 16 | Calibrated at scale; benchmark deferred | **Done (S5, 88b4080)** |
+| `--max-cold-records` | 0 | `free_disk_bytes × 0.20 / RECORD_BYTES` | Deferred |
 
-These flags become `--init-max-warm-records`, `--init-recall-ef`, `--init-max-cold-records`
-once the startup-query logic is implemented. Deferred — see front-matter.
+**S5 design note (2026-06-14):** `0` now means "auto-query" for `--max-warm-records`
+(was "unlimited"). No flag rename — the `--init-` prefix scheme described in
+implementation notes was skipped (CLAUDE.md: no backcompat shims for research code).
+`sysinfo 0.38` was already a transitive dep; no new lockfile resolution needed.
+HNSW benchmark deferred: calibration confirmed 16 at scale, no new data from
+synthetic benchmark expected.
 
 ### Bucket S-safety — Safety valves (adaptive ceiling, fixed floor)
 
 Hard minima that can never be violated — they are the emergency stops for when internal
-controllers misbehave. Once S3 (wakefulness pressure) is validated, the ceiling can
-widen to 3× the historical average: `max_wake_secs_effective = max(floor, 3 × mean_wake_secs_rolling)`.
-This makes them self-widening without removing the floor protection. Deferred — see front-matter.
+controllers misbehave. S6 (implemented 88b4080) widens the ceiling to 3× the historical
+average: `max_wake_secs_effective = max(floor, 3 × wake_ewma_mu)` after N≥3 cycles.
+α=0.3 per cycle (not per episode). Persisted as `snapshot/wake_ewma.bin`.
 
-| Flag | Floor | Adaptive ceiling (deferred) |
-|---|---|---|
-| `--max-wake-secs` | 600 s | `max(600, 3 × mean_wake_secs_rolling)` |
-| `--max-sleep-secs` | 0 (disabled) | `max(0, 3 × mean_sleep_secs_rolling)` |
-| `--max-cycles` | 0 | test harness — permanent manual |
+| Flag | Floor | Adaptive ceiling | Status |
+|---|---|---|---|
+| `--max-wake-secs` | 600 s | `max(600, 3 × wake_ewma_mu)` after N≥3 cycles | **Done (S6, 88b4080)** |
+| `--max-sleep-secs` | 0 (disabled) | `max(0, 3 × mean_sleep_secs_rolling)` | Deferred |
+| `--max-cycles` | 0 | test harness — permanent manual | n/a |
+
+**S6 validation note:** In fast-clip runs S3 triggers sleep after ~120 episodes (< 30s
+wake), so `3 × wake_ewma_mu ≈ 90s < 600s` — `max(floor, …) = floor` and S6 is
+effectively inert. S6 activates in long-clip runs where wakes approach the floor (602s
+schedule trigger seen in session-state key-facts). Validate against long-clip runs.
 
 ### Bucket S-flags — Feature flags (all-on defaults)
 
@@ -190,6 +193,8 @@ Signal cleanliness governs sequencing, not knob priority.
 | **2** | Wakefulness pressure homeostat | Mostly — safeties needed | Replaces `--sleep-trigger-fraction` + `--max-wake-secs` |
 | **2b** | Prior-beta auto-enable | Yes — prior_cosine mean | Replaces `--prior-beta` manual enable |
 | **2c** | Growth controller — within-session signal | Yes (c2+); noisy at c1 | `within_session_gist_rate` primary; cross-session gist fallback at c1; cooldown retained |
+| **S5** | Startup-queryable priors | Stateless per-startup | `--max-warm-records 0` → auto (35% free RAM / 2500 B); `--recall-ef` default 16 |
+| **S6** | Adaptive wake ceiling | Stateful EWMA per cycle | `max_wake = max(floor, 3 × wake_ewma_mu)` after N≥3; persisted `wake_ewma.bin` |
 
 ---
 
@@ -507,7 +512,7 @@ switch to the cleaner signal — was chosen first because:
 | `--settle-gate 0.85` | settle firing (per episode) | Rolling prior_cosine EWMA C[t] | prior_cosine, per episode | Fire when prior_cosine < C[t] - 0.1; EWMA α=0.005 | Fires on below-average episodes | C[t] ∈ [0.0, 1.0]; expected 0.3–0.7 | C[t] = 0.85 until N=200 | Δ floor 0.05 | `settle_cosine_ewma`, `settle_gate_effective` | Settle fires when model is uncertain; idle when well-calibrated | **1b** |
 | `--settle-every 1` | settle throttle | C[t] convergence trend (S2 EWMA) | derived from S2 | Increase settle-every by 1 when C[t] > 0.6 for 3 cycles; reset to 1 when C[t] < 0.4 | Auto-scale with convergence | settle_every ∈ [1, 4] | 1 (current) | Step-by-step; max 4 | `settle_every_effective` | Reduces settle overhead as model converges | **1b** (after S2 stable) |
 | `--sleep-trigger-fraction 0.8` | sleep onset | Wakefulness pressure P (novelty accumulator) | ep_salience (above τ_s) per episode + NREM dissipation | P += novelty_weight/baseline_rate per ep; sleep when P ≥ 1.0 | P = 1.0 (target: ~3500 eps per sleep) | P ∈ [0, 3.0] clamped | Capacity fill at 0.8 until N=500 | Hard min 120 eps before sleep; P clamped | `wakefulness_pressure`, `wake_trigger` | Sleep driven by actual novelty load; long-familiar content doesn't trigger sleep | **2** |
-| `--max-wake-secs 600` | sleep onset (safety valve) | — | — | Stays as hard wall-time safety valve | — | — | — | Cannot be replaced: safety is structural | `wake_secs` (existing) | No change; safety valve kept | stays manual (Bucket S) |
+| `--max-wake-secs 600` | sleep onset (safety valve) | Wake-duration EWMA per cycle | `wake_start.elapsed()` at sleep entry | `max_wake = max(floor, 3×wake_ewma_mu)` after N≥3; α=0.3/cycle | Ceiling widens with observed wakes | μ ∈ [0, ∞); floor=600s | floor until N≥3 | Floor is inviolable; n<3 cold-start stays at floor | `wake_ewma_mean`, `max_wake_secs_effective` | Self-widens for long-clip runs; inert (floor binding) in short-clip runs | **S6** |
 | `--perf-sleep-threshold 0.0` | early sleep on prior_cosine drop | P impulse on prior_cosine collapse | prior_cosine EWMA (S2) | Prior_cosine EWMA drop > 0.2 → P += 0.5 (boost) | — | impulse [0, 0.5] | 0.0 (disabled, no boost) | Boost capped at 0.5/cycle | `perf_sleep_boost` | Destabilisation triggers consolidation faster | **2** (requires S3 live) |
 | `--prior-beta 0.01` | top-down prior blend weight | Rolling prior_cosine mean across cycles (3-cycle ring) | prior_cosine_mean, per cycle | Scale up β→0.05 when all 3 ring values > 0.65; scale down to base when any < 0.40 | Hysteresis band [0.40, 0.65] | P_c ∈ [0, 1] | 0.01 (base; cosines measured from ep 1) | Hysteresis; only engages when base < 0.05 | `prior_beta_effective`, `prior_cosine_mean` | Removes manual convergence judgement; base 0.01 avoids chicken-and-egg | **2b** |
 | `--growth-cooldown 3` + `GIST_GROWTH_THRESHOLD` | region capacity growth | `within_session_gist_rate` primary; cross-session gist at c1; MSE at S1C1 | warm records filtered by session_start_secs | `ws < 0.85` → grow; `None` at c1 falls back to gist; cooldown backstop retained | — | ws ∈ [0, 1]; None at c1 of every session | cooldown=3 until c1 noise resolved | cooldown; None→no-prune at c1 | `gist_recall_rate`, `within_session_gist_rate` | Eliminates cross-session drift false positives (validated: S5C2 suppressed) | **2c** |
@@ -648,3 +653,44 @@ The cooldown absorbs the remaining c1 risk.
 - `sleep.rs`: `prune_ok` uses `within_session_gist_rate.or(gist_recall_rate)` — None → no pruning at c1
 - `main.rs`: wakefulness pressure dissipation uses `ws.or(gist).unwrap_or(0.0)`
 - Cooldown retained; plasticity model deferred pending c1 signal improvement
+
+---
+
+## Amendment — S5 startup-queryable priors + S6 adaptive wake ceiling (2026-06-14, commit 88b4080)
+
+### S5 — Startup-queryable priors
+
+**What changed:**
+- `--max-warm-records 0` now means auto-query (was unlimited). At startup when
+  `args.max_warm_records == 0`: query `sysinfo::System::available_memory()`, compute
+  `(free_bytes × 0.35 / 2500.0) as usize`, clamp `[1_000, 1_000_000]`, call
+  `semantic.set_max_records(effective)`. Logged as `max_warm_records` and `max_warm_auto`
+  in the "memory hierarchy ready" tracing event.
+- `--recall-ef` default changed 64 → **16**. Calibration at scale confirmed 16 is the
+  right operating point (ADR 0022 campaign, 2026-06-13). HNSW benchmark deferred —
+  synthetic benchmark expected to reproduce the same result.
+- `sysinfo = "0.38"` added as a direct dep; was already a transitive dep (zero lockfile churn).
+- No flag rename: the `--init-` prefix scheme in implementation note 1 was skipped.
+  CLAUDE.md policy: no backcompat shims. `0` = "auto" is a clean semantic change.
+
+**Stateless:** S5 is re-evaluated at every process start. RAM availability changes
+between sessions; the auto-derived cap adapts to current system state without EWMA or
+persistence.
+
+### S6 — Adaptive wake ceiling
+
+**What changed:**
+- Per-cycle wake-duration EWMA added: `wake_ewma_mu` (f32), `wake_ewma_n` (u64).
+  Persisted as `snapshot/wake_ewma.bin` (same 12-byte pattern as `settle_ewma.bin`).
+- α=0.3 per sleep cycle (not per episode). Cold-start initialised to the measured
+  duration of the first sleep cycle (`n=0` → assign, not blend).
+- `max_wake` recomputed after each cycle: `max(wake_ewma_floor, (3.0 × wake_ewma_mu) as u64)`
+  where `wake_ewma_floor = args.max_wake_secs`. Floor held until `n ≥ 3`.
+- NDJSON: `wake_ewma_mean` and `max_wake_secs_effective` emitted each cycle.
+
+**Stateful:** S6 EWMA accumulates across sessions via snapshot, so the adaptive ceiling
+improves as more sleep cycles are observed.
+
+**Known inertness in fast runs:** When S3 triggers sleep at ~120 episodes (≈10–30s wake),
+`3 × wake_ewma_mu ≈ 30–90s < 600s floor` — ceiling stays at floor. S6 activates only
+when wakes approach the floor (long-clip runs with schedule-triggered sleep at ~602s).
