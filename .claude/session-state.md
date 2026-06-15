@@ -1,14 +1,32 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-14
-> **Last commit on main:** ef4682d (items 4+5: grown-units binding exposure)
+> **Last updated:** 2026-06-15
+> **Last commit on main:** b113724 (fix gist entropy: proportional regional attribution + -0.0)
 > **Branch:** `main` (clean)
 
-## Status: Fresh ADR scan complete. Queue populated. Tier 1 triggers verified — none met. Awaiting direction.
+## Status: ADR scan complete; queue populated A–N. No triggers met. Two bug fixes landed. Ready for longer campaign.
 
 ---
 
-## Completed this session
+## Completed this session (2026-06-15)
+
+| Item | What changed |
+|------|-------------|
+| ADR scan | All 24 ADRs scanned; 14 deferred items (A–N) queued across Tier 1/2/3 |
+| Tier 1 verification | All 3 triggers unmet: `promote()` dead code, cold ~37k records (need 500k), SAE/prior plateau unconfirmed |
+| Tier 2/3 verification | No triggers met from campaign metrics; pruning never fires (prune_fraction=0.0 default) |
+| ADR 0018 amendment | Noted that ef4682d invalidated the "safe pruning scope" — grown units now in binding area; A/B required before enabling |
+| Gist entropy -0.0 fix | `p >= 1.0` now returns `0.0` explicitly (IEEE 754 -0.0 via `-1.0 * log2(1.0)`) |
+| Gist entropy semantic fix | `regional_weights()` decomposes 640-dim episode vector into 5×128 slices, L2-norms each, distributes weight proportionally — Mixed no longer collapses entropy to 0 |
+| ADR 0021 amended | Proportional attribution approach documented; long-term bitmask alternative noted |
+
+### Commits this session
+- `03eb9b5` — `docs(adr0018): note safe-pruning assumption invalidated by ef4682d`
+- `b113724` — `fix(gist-entropy): proportional regional attribution + -0.0 float fix`
+
+---
+
+## Completed previous session (2026-06-14)
 
 | Item | What changed |
 |------|-------------|
