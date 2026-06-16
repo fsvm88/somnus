@@ -10,7 +10,7 @@
 # Options (environment variables):
 #   SESSIONS         Number of sessions to run  (default: 10)
 #   CYCLES           Sleep cycles per session   (default: 3)
-#   CAPACITY         Episodic buffer size; sleep triggers at 80% (default: 4096)
+#   CAPACITY         Episodic buffer size; sleep triggers at 80% (default: 8192)
 #                    Set small for fast validation, e.g. CAPACITY=64 → ~51 episodes/cycle
 #   CLIPS            Space-separated clip paths (default: all four in clips/)
 #   CAMPAIGN_DIR     Directory for metrics/logs (default: memory/campaign_<timestamp>)
@@ -35,7 +35,7 @@ cd "$REPO_ROOT"
 SESSIONS="${SESSIONS:-10}"
 SESSION_START="${SESSION_START:-1}"    # first session number (for continuations)
 CYCLES="${CYCLES:-3}"
-CAPACITY="${CAPACITY:-4096}"
+CAPACITY="${CAPACITY:-8192}"
 MEMORY_DIR="${MEMORY_DIR:-memory}"
 CAMPAIGN_DIR="${CAMPAIGN_DIR:-${MEMORY_DIR}/campaign_$(date +%Y%m%d_%H%M%S)}"
 CLIPS="${CLIPS:-clips/talking_head.mp4 clips/urban.mp4 clips/animation.mp4 clips/nature.mp4}"
@@ -131,6 +131,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
             --recall-ef 16 \
+            --max-warm-records 200000 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
@@ -154,6 +155,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
             --recall-ef 16 \
+            --max-warm-records 200000 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
