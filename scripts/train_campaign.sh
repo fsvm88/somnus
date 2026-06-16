@@ -121,6 +121,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --memory-dir "$MEMORY_DIR" \
             --language \
             --action \
+            --action-distill-only \
             --prior-beta "$PRIOR_BETA" \
             --settle-steps 1 \
             --working-memory-size 8 \
@@ -143,6 +144,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --memory-dir "$MEMORY_DIR" \
             --language \
             --action \
+            --action-distill-only \
             --prior-beta "$PRIOR_BETA" \
             --settle-steps 1 \
             --working-memory-size 8 \
@@ -162,7 +164,9 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
     # Exit code 139 (SIGSEGV) is a known MIGraphX destructor race on gfx1201/RDNA4:
     # GPU encoder threads may be mid-kernel when process::exit(0) tears down the process.
     # All work is written to disk before this crash; treat it as success.
-    if [ $EXIT -ne 0 ] && [ $EXIT -ne 139 ]; then
+    # 139 = SIGSEGV from MIGraphX destructor race (known, safe to ignore).
+    # 120 = pipefail picks up inject_text.py's SIGPIPE exit when somnus exits cleanly.
+    if [ $EXIT -ne 0 ] && [ $EXIT -ne 139 ] && [ $EXIT -ne 120 ]; then
         echo "[campaign] session ${i} exited with code ${EXIT} — check ${SESSION_LOG}"
         echo "[campaign] stopping campaign."
         exit $EXIT

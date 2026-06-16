@@ -239,6 +239,12 @@ struct Args {
     #[arg(long, default_value = "128")]
     action_max_tokens: usize,
 
+    /// Skip autoregressive generation; only run LM hidden-state distillation.
+    /// Text from stdin feeds lang_rx (distillation) but not query_rx (generation).
+    /// Use during training campaigns where generation output is not needed.
+    #[arg(long, default_value = "false")]
+    action_distill_only: bool,
+
     /// Loop the input file indefinitely. Restarts from the beginning each time
     /// the file ends, keeping warm memory alive across iterations. Useful for
     /// calibration runs where a single file is too short to trigger multiple
@@ -1056,7 +1062,7 @@ async fn main() -> Result<()> {
     {
         let needs_stdin = decoder.is_some() || lang_embedder.is_some();
         if needs_stdin {
-            let qtx = if decoder.is_some() {
+            let qtx = if decoder.is_some() && !args.action_distill_only {
                 Some(query_tx)
             } else {
                 None

@@ -1,130 +1,161 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-15
-> **Last commit on main:** b113724 (fix gist entropy: proportional regional attribution + -0.0)
-> **Branch:** `main` (clean)
+> **Last updated:** 2026-06-16
+> **Last commit on main:** (pending — see below)
+> **Branch:** `main`
 
-## Status: ADR scan complete; queue populated A–N. No triggers met. Two bug fixes landed. Ready for longer campaign.
+## Status: Wiki campaign 3 complete. Next: run text injection on top of mixed_campaign memory.
 
 ---
 
-## Completed this session (2026-06-15)
+## Completed this session (2026-06-16)
 
 | Item | What changed |
 |------|-------------|
-| ADR scan | All 24 ADRs scanned; 14 deferred items (A–N) queued across Tier 1/2/3 |
-| Tier 1 verification | All 3 triggers unmet: `promote()` dead code, cold ~37k records (need 500k), SAE/prior plateau unconfirmed |
-| Tier 2/3 verification | No triggers met from campaign metrics; pruning never fires (prune_fraction=0.0 default) |
-| ADR 0018 amendment | Noted that ef4682d invalidated the "safe pruning scope" — grown units now in binding area; A/B required before enabling |
-| Gist entropy -0.0 fix | `p >= 1.0` now returns `0.0` explicitly (IEEE 754 -0.0 via `-1.0 * log2(1.0)`) |
-| Gist entropy semantic fix | `regional_weights()` decomposes 640-dim episode vector into 5×128 slices, L2-norms each, distributes weight proportionally — Mixed no longer collapses entropy to 0 |
-| ADR 0021 amended | Proportional attribution approach documented; long-term bitmask alternative noted |
-
-### Commits this session
-- `03eb9b5` — `docs(adr0018): note safe-pruning assumption invalidated by ef4682d`
-- `b113724` — `fix(gist-entropy): proportional regional attribution + -0.0 float fix`
+| extract_wiki.py table-leak fix | Strip lines starting with `\|` or `!` after `{|...\|}` removal; re-extracted 271k articles, 294 files, 297 MB |
+| Profiling (running binary) | `perf record`: 97.45% in libonnxruntime.so, 1517% CPU, GPU at 3% util |
+| MIGraphX LM investigation | `qwen25_lm.onnx` silently falls back to CPU: dynamic `seq_len` (Range/Shape ops) prevents MIGraphX static compilation. DINOv2 hits 72% GPU; qwen stays at 3% — confirmed via Python ORT + rocm-smi |
+| Real bottleneck found | LM autoregressive generation ("pre-sleep drain") = 205 calls × ~14s = 2870s/session = 96% of wall time |
+| `--action-distill-only` flag | New flag in `main.rs`: sets `qtx=None` so stdin text feeds `lang_rx` (distillation) only, not `query_rx` (generation). Hardened into `train_campaign.sh` |
+| Exit code 120 fix | `train_campaign.sh`: whitelist exit 120 (pipefail picks up inject_text.py SIGPIPE when somnus exits cleanly) alongside 139 |
+| Wiki campaign 2 killed | 30 sessions × 3 cycles; 1 session completed; cycles took 1000–1200s each due to generation |
+| Wiki campaign 3 | 11 sessions × 2 cycles, TEXT_RATE=1, distill-only, cold start, `memory/wiki_campaign3/` |
 
 ---
 
-## Completed previous session (2026-06-14)
+## Wiki campaign 3 results (full)
+
+| s | c | lang | mse | p_lang | p_vis |
+|---|---|------|-----|--------|-------|
+| 1 | 1 | 303 | 0.2265 | 0.202 | 0.665 |
+| 1 | 2 | 84 | 0.1489 | 0.308 | 0.703 |
+| 2 | 1 | 74 | 0.2569 | 0.183 | 0.628 |
+| 2 | 2 | 15 | 0.2440 | 0.163 | 0.703 |
+| 3 | 1 | 80 | 0.1943 | 0.248 | 0.674 |
+| 3 | 2 | 31 | 0.1998 | 0.227 | 0.419 |
+| 4 | 1 | 91 | 0.1975 | 0.192 | 0.729 |
+| 4 | 2 | 10 | 0.1870 | 0.329 | 0.718 |
+| 5 | 1 | 75 | 0.1405 | **0.504** | 0.769 |
+| 5 | 2 | 14 | 0.1773 | 0.324 | 0.712 |
+| 6 | 1 | 66 | 0.1343 | 0.357 | 0.805 |
+| 6 | 2 | 13 | 0.2446 | 0.162 | 0.739 |
+| 7 | 1 | 48 | 0.1102 | 0.428 | 0.820 |
+| 7 | 2 | 15 | 0.2126 | 0.236 | 0.730 |
+| 8 | 1 | 88 | 0.1328 | 0.208 | 0.795 |
+| 8 | 2 | 11 | 0.1376 | 0.262 | 0.719 |
+| 9 | 1 | 88 | 0.1248 | 0.311 | 0.827 |
+| 9 | 2 | 22 | 0.1507 | 0.219 | 0.800 |
+| 10 | 1 | 45 | 0.1112 | 0.300 | 0.827 |
+| 10 | 2 | 11 | 0.2577 | 0.212 | 0.750 |
+| 11 | 1 | — | — | — | — |
+| 11 | 2 | — | 0.1018 | 0.106 | — |
+
+**Key findings:**
+- MSE: clear downward trend 0.2265 → 0.1018 (halved) — system is genuinely converging
+- p_lang: peaked at 0.504 (s5c1), oscillated 0.183–0.504, no cumulative drift across sessions
+- Cycle-2 starvation: lang_ingest drops from 66–303 (cycle 1) to 10–31 (cycle 2) — warm memory fills at capacity 4096, slowing HNSW, reducing time for text ingestion
+- Episodes capped at 120/cycle from session 2 onward (capacity ceiling)
+- p_vis healthy 0.628–0.827 throughout
+- Mixed campaign baseline at s30: p_lang=0.557. Cold-start wiki campaign peaks at 0.504 by s5 but doesn't compound
+
+---
+
+## Queued next (top priority)
+
+### 1. Run text injection on warm mixed_campaign memory
+The critical comparison: start from `memory/mixed_campaign/campaign_20260615_230556/` (p_lang=0.557 baseline) and run wiki text injection. Use `--snapshot-dir` or copy snapshot, then:
+
+```bash
+cp -r memory/mixed_campaign/campaign_20260615_230556 memory/wiki_on_mixed/
+CLIPS="$(ls clips/shorts/*.mp4 clips/h3h3/*.mp4 | tr '\n' ' ')" \
+TEXT_CORPUS="$(ls data/wiki_text/*.txt | tr '\n' ' ')" \
+TEXT_RATE=1 \
+SESSIONS=10 \
+CYCLES=2 \
+CAPACITY=4096 \
+MEMORY_DIR=memory/wiki_on_mixed \
+SESSION_START=31 \
+scripts/train_campaign.sh
+```
+
+Goal: does p_lang climb above 0.557 with dense text? If yes, text injection is additive. If not, capacity ceiling is the limiter.
+
+### 2. Fix cycle-2 starvation
+Cycle 2 gets only 10–31 lang_ingests vs 66–303 in cycle 1. Root cause: after cycle 1 fills warm memory to 4096, HNSW queries slow significantly, fewer episode ticks per second, less time for lang_rx processing. Options:
+- Increase CAPACITY (8192?) to delay the slowdown
+- Or: investigate whether `--max-warm-records 200000` (from calibration notes) was accidentally omitted — if warm memory is unlimited, no eviction pressure → HNSW degrades. Setting it should trigger eviction and keep queries fast.
+
+### 3. Commit pending changes
+All in working tree, not yet committed:
+- `crates/somnus/src/main.rs`: `--action-distill-only` flag
+- `scripts/train_campaign.sh`: `--action-distill-only` hardened in; exit 120 whitelisted
+- `scripts/extract_wiki.py`: table-leak fix (strip `^[|!]` lines)
+- `experiments/ort-smoke/src/main.rs`: qwen25_lm MIGraphX smoke test + GPU vs CPU benchmark
+- `scripts/download_h3h3.sh`, `scripts/download_shorts.sh`, `scripts/download_wiki_text.sh`, `scripts/extract_wiki.py`: new untracked scripts
+
+---
+
+## Completed previous session (2026-06-15)
 
 | Item | What changed |
 |------|-------------|
-| ADR scan | All 24 ADRs scanned for pending/deferred items; prioritized P1 and P2 for implementation |
-| P1a — auto cold cap | `--max-cold-records 0` → auto-derive from `free_disk × 0.20 / 661`; clamp `[10k, 10M]`; falls back to unlimited if disk lookup returns 0 (btrfs/NFS); emits `max_cold_records_effective` |
-| P1b — auto sleep cap | `--max-sleep-secs 0` → rolling 5-cycle window: `max(300, 3 × mean_sleep_secs)`; C1 gets 0 (no cap); emits `sleep_max_secs_effective` |
-| S7 — wake-interval throttle | MSE EWMA (α=0.3); stagnation = improvement < 1% for 3 cycles → decrement `effective_wake_interval` toward 1; emits `wake_interval_effective`, `s7_mse_ewma` |
-| P2b — cascade-correlation init | `collect_high_residual_inputs()` ranks traces by SAE MSE; `grow_region_seeded()` seeds new encoder cols with normalized high-residual inputs × 0.01; decoder rows zero-init |
-| Validation run | 2S×3C fresh memory confirms: P1b cold-start disabled ✅, P1b C2/C3 = 300s ✅, S7 tracking ✅ (no interval change — expected in short run), no crashes, correct line count |
-| Disk fallback fix | P1a: when `sysinfo::Disks` can't find mount point (returns 0 bytes), warn and fall back to unlimited (0) instead of clamping to 10k minimum |
-| ADR 0024 updated | S-query/S-safety/S-throttle tables updated; amendment section added for P1a/P1b/S7 |
-| ADR 0007 updated | `cascade-correlation-training` removed from deferred frontmatter; amendment added |
-
-### Commits
-- `7964eb3` — `feat(P1+P2a): auto max-cold-records, auto sleep-max-secs, S7 wake-interval (ADR 0024)`
-- `cbd8f63` — `feat(P2b): cascade-correlation growth init (ADR 0007)`
-- `0afc38a` — `docs: reconcile items 1+2; ADR 0009 NREM amendment`
-- `34fbc3e` — `feat(item3): salience-weighted cold eviction (ADR 0006, 0020)`
-- `76e156d` — `feat(item7): salience-weighted gist cluster histogram (ADR 0021)`
-- `9c4731f` — `feat(item6): cross-session ingest-source in gist entropy (ADR 0021)`
+| Shorts download | `scripts/download_shorts.sh` — 84 clips, 144 min, 20 categories → `clips/shorts/` |
+| Shorts-only campaign | 30 sessions, `memory/shorts_campaign/` — language region dead (0 ASR), output_mse 0.498 |
+| H3 Podcast download | `scripts/download_h3h3.sh` — 5 episodes (32–215 min) → `clips/h3h3/` |
+| Mixed campaign | 30 sessions, `memory/mixed_campaign/` — language region alive; output_mse 0.049; Visual prior_cosine 0.553→0.848 |
+| Wikipedia dump | `data/wiki_dump/simplewiki-latest-pages-articles.xml.bz2` (334 MB) |
+| Wikipedia extraction | `scripts/extract_wiki.py` (stdlib, no deps) → 272k articles, 319 files, 324 MB in `data/wiki_text/` |
+| Wiki campaign (killed) | Started `memory/wiki_campaign/`; only 1 session in 17 min — TEXT_RATE=5 too fast; killed cleanly |
 
 ---
 
-## ADR 0024 implementation sequence
+## ADR 0024 implementation sequence — all done
 
-| Phase | Signal | Status | Notes |
-|-------|--------|--------|-------|
-| 1a | S1 — Adaptive salience gate | **DONE** | |
-| 1b | S2 — Settle-rate modulation | **DONE** | |
-| 2 | S3 — Wakefulness pressure homeostat | **DONE** | |
-| 2b | S4 — Prior-beta scale-up controller | **DONE** (bug fixed) | 0.01→0.05, not toggle |
-| prereq | Within-session gist probe | **DONE** | `within_session_gist_rate` in NDJSON |
-| 2c | Growth controller | **DONE** | ws→gist→MSE priority; validated 5s×3c; S5C2 false positive eliminated |
-| S5 | Startup-queryable priors | **DONE** | `--max-warm-records 0` → auto; `--recall-ef` default 16 |
-| S6 | Adaptive wake ceiling | **DONE** | wake_ewma (α=0.3/cycle); max_wake = max(floor, 3×μ); persisted |
-| P1a | Auto cold cap | **DONE** | `--max-cold-records 0` → disk-derived; fallback=unlimited |
-| P1b | Auto sleep cap | **DONE** | rolling 5-cycle window; floor 300s |
-| S7 | Wake-interval throttle | **DONE** | MSE stagnation → decrement interval toward 1 |
+All P1/P2/S1–S7 items complete.
 
 ---
 
-## Open issues / queued next
-
-Fresh ADR scan 2026-06-14. Items ordered by tier and source ADR.
+## Open issues / queued (ADR scan 2026-06-14/15)
 
 ### Tier 1 — trigger-gated (not yet met)
 
 | # | Source | Item | Trigger |
 |---|--------|------|---------|
-| A | ADR 0006 | **Cold archive O(1) promotion index** | `promote()` called AND cold > 500k records. Verified 2026-06-14: `promote()` is dead code; archive is ~37k records. Skip until both conditions hold. |
-| B | ADR 0019 / 0014 | **Language last-token pooling** | `language prior_cosine` plateaus AND bottleneck confirmed as input representation. Requires full `qwen25_lm.onnx` forward pass per line (medium effort; ADR 0019 already dropped naïve version). |
-| C | ADR 0006 | **Per-region sparse activation storage** | Replay analysis shows episode vectors insufficient for diagnostics. No sparse-code consumer currently exists. |
+| A | ADR 0006 | Cold archive O(1) promotion index | `promote()` called AND cold > 500k records |
+| B | ADR 0019 / 0014 | Language last-token pooling | `language prior_cosine` plateaus AND bottleneck confirmed as input representation |
+| C | ADR 0006 | Per-region sparse activation storage | Replay analysis shows episode vectors insufficient |
 
 ### Tier 2 — conditional / quality-gated
 
 | # | Source | Item | Trigger |
 |---|--------|------|---------|
-| D | ADR 0005 | Full differentiable SAE (replace k-WTA with coding+reconstruction loss) | Phase 8+; after `output_mse` converges |
-| E | ADR 0009 | Separate optimizer for output heads (independent LR schedule) | Conflicting gradient directions between output heads and k-WTA observed |
+| D | ADR 0005 | Full differentiable SAE | `output_mse` converges (0.1018 in wiki campaign — approaching) |
+| E | ADR 0009 | Separate optimizer for output heads | Conflicting gradient directions observed |
 | F | ADR 0010 | Post-k-WTA prior injection | Pre-k-WTA injection shows poor `prior_cosine` uptake |
-| G | ADR 0010 | Learned per-region scalar gate (replace fixed β) | `prior_cosine` stable; per-region β tuning shows benefit |
-| H | ADR 0018 | Activation-frequency pruning (replace L1 norm) | Magnitude pruning shows false-positives. Note: `--prune-fraction` kept at 0.0 default; ADR 0018 safe-pruning assumption invalidated by ef4682d (grown units now in binding area). Enable only after A/B campaign confirms mid-run pruning doesn't degrade `warm_recall_l2`/`gist_recall_rate`. |
+| G | ADR 0010 | Learned per-region scalar gate | `prior_cosine` stable; per-region β tuning shows benefit |
+| H | ADR 0018 | Activation-frequency pruning | Magnitude pruning false-positives; A/B required first |
 | I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
 
-### Tier 3 — model swaps / Phase 7+ (not urgent)
+### Tier 3 — model swaps / Phase 7+
 
 | # | Source | Item |
 |---|--------|------|
-| J | ADR 0003 | Whisper-tiny → Whisper-base / WavLM-base (audio quality) |
-| K | ADR 0003 | DINOv2-S → SigLIP-B (language-aligned visual embeddings, Phase 7+) |
-| L | ADR 0012 | LoRA fine-tuning of Qwen2.5 for episode-vector prefix |
-| M | ADR 0012 | MLP projection (640→5×896) instead of linear |
-| N | ADR 0014 | Visual/audio region grounding (captions, env sound labels) |
+| J | ADR 0003 | Whisper-tiny → Whisper-base / WavLM-base |
+| K | ADR 0003 | DINOv2-S → SigLIP-B |
+| L | ADR 0012 | LoRA fine-tuning of Qwen2.5 |
+| M | ADR 0012 | MLP projection (640→5×896) |
+| N | ADR 0014 | Visual/audio region grounding |
 
-Deferred items from ADR scan (Tier 1 + Tier 2, in priority order):
+---
 
-| # | Item | Source ADR | Status |
-|---|------|-----------|--------|
-| ~~1~~ | ~~Growth controller~~ | ADR 0024 | **DONE** — wired to `within_session_gist_rate` (e30916c) |
-| ~~2~~ | ~~NREM output-head training~~ | ADR 0009 | **DONE** — `fused_replay_wake_step_batch` uses stored episode vectors; no k-WTA re-run needed (a1c43cb / cd4364e). ADR 0009 amended. |
-| ~~3~~ | ~~Salience-weighted cold eviction~~ | ADR 0006, 0020 | **DONE** — `salience: f32` added to `EpisodeRecord`; SMNCOLD3 (665B/record); `evict_lowest_salience()` in sleep.rs. |
-| 4 | **Grown-units binding exposure** — allow grown units above N_UNITS=1024 into the binding area (currently clamped by `to_dense_n`) | ADR 0005, 0008 | Multi-commit subsystem change — see notes below. |
-| 5 | **Per-region projection resize** — resize per-region linear projections when regions grow | ADR 0008 | Blocked by item 4. |
-| ~~6~~ | ~~Cross-session ingest-source through promotion~~ | ADR 0021 | **DONE** — `sample_records()` on warm store; bounded warm sample binned into `cluster_sources` after hot-tier loop (9c4731f). |
-| ~~7~~ | ~~Salience-weighted cluster assignment~~ | ADR 0021 | **DONE** — `cluster_sources` changed to `Vec<[f32;6]>`; weight = `salience.clamp(0.01,2.0)`; sentinel f32::MAX → 1.0 (76e156d). |
-| ~~4~~ | ~~Grown-units binding exposure~~ | ADR 0005, 0008 | **DONE** — `region_n:[usize;5]` skip field in BindingArea; `forward()` uses `region_n[i]` not N_UNITS; `grow_region`/`grow_region_seeded`/`prune_region` now resize binding projection in sync; `load_weights` reconstructs `region_n` from weight dims (ef4682d). |
-| ~~5~~ | ~~Per-region projection resize~~ | ADR 0008 | **DONE** — implemented with item 4 above (ef4682d). |
+## Campaign results summary
 
-### Item 4+5 scope note (resolved)
-
-Items 4+5 are a multi-commit subsystem change, **not** a "one functional commit" unit:
-- `try_bind` in `binding.rs` uses `act.to_dense_n(N_UNITS)` — clamps every region at 1024 regardless of actual grown size
-- `binding.rs` projections are `LinearConfig::new(N_UNITS, D_PROJ)` fixed-size
-- ORT path (`onnx_session.rs`) builds `Array2::from_shape_vec((1, N_UNITS), …)` and feeds fixed `[1, N_UNITS]` tensors to a compiled graph — changing region width means re-exporting the ONNX model under MIGraphX constraints
-- Snapshot format bump (VarMap `[N_UNITS, D_PROJ]` projection weights) + optimizer-state migration for grown rows
-- Prerequisite: regions actually need to exceed 1024 in practice — to be verified before spending time on this
-
-**Resolved:** confirmed via campaign logs — regions reached up to 1920 units. Items 4+5 implemented in ef4682d.
+| Campaign | Sessions | output_mse (final) | p_lang (peak) | Notes |
+|---|---|---|---|---|
+| shorts-only | 30 | 0.498 | None (dead) | No ASR in short clips |
+| mixed (shorts+H3) | 30 | 0.049 | 0.557 | Language alive; all regions growing |
+| wiki campaign 2 | 1 | — | — | Killed; generation blocking (96% wall time) |
+| wiki campaign 3 | 11 (cold) | 0.1018 | 0.504 | Distill-only; p_lang noisy, MSE converging |
 
 ---
 
@@ -132,8 +163,9 @@ Items 4+5 are a multi-commit subsystem change, **not** a "one functional commit"
 
 - `--replay-batch-size 128` hardcoded in `train_campaign.sh`
 - `--working-memory-size 8` hardcoded in `train_campaign.sh`
+- `--action-distill-only` now hardcoded in `train_campaign.sh`
 - `--asr-min-chars 5` for noisy-audio clips
-- `--max-warm-records 200000` recommended for long runs
+- `--max-warm-records 200000` recommended for long runs — was NOT set in wiki campaign 3 (may explain cycle-2 starvation)
 - Wake schedule trigger at 602s/cycle; N_UNITS=1024, K_ACTIVE=20, D_PROJ=128, EPISODE_DIM=640
 - GRU_INPUT=640, GRU_HIDDEN=256, CROSS_MODAL_DIM=2176
 - burn GRU: reset_after=True → ONNX linear_before_reset=1
@@ -147,7 +179,12 @@ Items 4+5 are a multi-commit subsystem change, **not** a "one functional commit"
 - S4: base=0.01 (default), scale target=0.05, enable threshold=0.65 (3 cycles), disable threshold=0.40
 - `PRIOR_BETA=0.01` is now the campaign default
 - S7: S7_MSE_ALPHA=0.3, stagnation threshold=1% improvement, consecutive=3, decrement step=1
-- COLD_RECORD_BYTES=665 (8+8+4+640+1+4); SMNCOLD3; P1a uses 20% of free disk; salience stored per record
+- COLD_RECORD_BYTES=665 (8+8+4+640+1+4); SMNCOLD3; P1a uses 20% of free disk
+- Mixed campaign memory: `memory/mixed_campaign/campaign_20260615_230556/` (best result so far, p_lang=0.557)
+- Wikipedia corpus: `data/wiki_text/` (294 files, 297 MB, 271k Simple English articles, table-leak fixed)
+- `qwen25_lm.onnx` runs on CPU only (dynamic seq_len via Range/Shape ops blocks MIGraphX)
+- LM generation was 96% of campaign wall time — fixed via `--action-distill-only`
+- Exit code 120 from pipefail when somnus exits cleanly — whitelisted in train_campaign.sh
 
 ---
 
@@ -162,9 +199,12 @@ Items 4+5 are a multi-commit subsystem change, **not** a "one functional commit"
 | `--wake-recon-async` | true | Offload wake_reconstruct to worker |
 | `--wake-reconstruct-interval N` | 5 | S7 adapts this downward on MSE stagnation |
 | `--video-stride N` | 1 | Encode every Nth video frame |
+| `--action-distill-only` | false | Skip generation, keep LM distillation |
+| `--max-warm-records N` | unlimited | Cap warm memory to keep HNSW fast |
 
 ---
 
 ## MIGraphX constraint (hard)
 
 Never expose ScatterElements or INT64 outputs. Two-graph split, topk/masking on CPU.
+`qwen25_lm.onnx` also blocked (dynamic seq_len) — would need fixed-shape re-export + attention_mask input.
