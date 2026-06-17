@@ -3,7 +3,7 @@
 > **Last updated:** 2026-06-17
 > **Branch:** `main`
 
-## Status: Items B and D complete. Queue empty.
+## Status: H closed (pruning unsafe at warm scale). Queue empty — awaiting direction.
 
 ---
 
@@ -14,6 +14,8 @@
 | **B: --lang-use-lm** | `ActionDecoder.text_hidden_states()` wired into `ingest_language_line`; `--lang-use-lm` flag in `main.rs`; hardened into `train_campaign.sh` | A/B confirmed 4× p_lang improvement (0.557→0.85–0.91). Commit 7eea3ae. |
 | **lm-on-mixed campaign** | s41–50 × 2 cycles continuing mixed_campaign memory | p[4] peaked 0.910 (s46c1), stable 0.80–0.91 from s42+; MSE 0.026–0.053 |
 | **D: SAE L1 coding loss** | `--sae-l1-coeff` flag (default 0.0) in `main.rs`; `sae_l1_coeff` field + `set_sae_l1_coeff()` on `PerceptionProcessor`; L1 term in `fused_replay_wake_step_batch` NREM loop | A/B result: λ=0.1 made MSE 27% WORSE (control 0.315 vs treatment 0.398 avg s3–5). Item D closed. ADR 0025. |
+| **J/K/L/M item review** | Checked per-region cosines at steady state (s43–50 mixed_campaign). Speech=0.973 (strongest), language=0.843, visual=0.885. J (Whisper-base) not applicable — speech is already best region. K not triggered (Phase 7+ grounding). L not triggered (proj_loss still declining: 0.0023→0.0007). | Items J, K, L, M all deferred. |
+| **H: Magnitude pruning A/B** | Cold A/B inconclusive (regions only 1.2× baseline). Warm A/B (s51–53 from 50-session memory, regions at 2.7×): 2 thresholds failed — env cosine −0.065 (persistent, not transient); gist +0.069 (positive direction). Cascade: 4384→2192→1096→548 units pruned on consecutive cycles (no prune cooldown). warm_recall_l2 average PASS is timing artifact. **FAIL. ADR 0026 closed.** Pruning stays at --prune-fraction 0.0. |
 
 ---
 
@@ -44,7 +46,7 @@
 | E | ADR 0009 | Separate optimizer for output heads | Conflicting gradient directions observed |
 | F | ADR 0010 | Post-k-WTA prior injection | Pre-k-WTA injection shows poor `prior_cosine` uptake |
 | G | ADR 0010 | Learned per-region scalar gate | `prior_cosine` stable; per-region β tuning shows benefit |
-| H | ADR 0018 | Activation-frequency pruning | Magnitude pruning false-positives; A/B required first |
+| H | ADR 0018 | Activation-frequency pruning (+ base magnitude pruning) | **Closed** — magnitude pruning failed warm A/B; activation-freq pruning has same root problem (mid-run encoder change); grown size (2.7×) not a bottleneck |
 | I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
 
 ### Tier 3 — model swaps / Phase 7+
@@ -63,6 +65,7 @@
 |---|--------|------|---------|
 | B | ADR 0019/0014 | Language last-token pooling | Done — LM hidden states 4× better; hardened |
 | D | ADR 0005 | Full differentiable SAE | Closed — L1 coding term at λ=0.1 destabilised MSE by 27%; item answered |
+| H | ADR 0018 | Magnitude/frequency pruning | **FAIL (warm A/B)** — env cosine −0.065 persistent; cascade (no cooldown); activation-freq pruning same root problem. --prune-fraction 0.0 stays. ADR 0026. |
 
 ---
 
