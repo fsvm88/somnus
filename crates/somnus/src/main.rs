@@ -254,6 +254,13 @@ struct Args {
     #[arg(long, default_value = "false")]
     lang_use_lm: bool,
 
+    /// L1 sparsity penalty coefficient on SAE activations, added to the NREM
+    /// reconstruction loss.  0.0 = off (default).  Positive values encourage
+    /// sparser codes; use A/B runs to find a value that lowers MSE without
+    /// destabilising prior cosines.
+    #[arg(long, default_value = "0.0")]
+    sae_l1_coeff: f32,
+
     /// Loop the input file indefinitely. Restarts from the beginning each time
     /// the file ends, keeping warm memory alive across iterations. Useful for
     /// calibration runs where a single file is too short to trigger multiple
@@ -709,6 +716,7 @@ async fn main() -> Result<()> {
     perception.set_settle_gate(args.settle_gate);
     perception.set_settle_every(args.settle_every);
     perception.set_wm_size(args.working_memory_size);
+    perception.set_sae_l1_coeff(args.sae_l1_coeff);
     info!(
         prior_beta = args.prior_beta,
         settle_steps = args.settle_steps,

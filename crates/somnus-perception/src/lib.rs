@@ -297,6 +297,10 @@ pub struct PerceptionProcessor {
     /// Flat [n_in × d_out] copy of cross_modal_proj weights for allocation-free inference.
     /// Row-major: flat[i * d_out + j] = weight[i][j].  Synced after each NREM weight update.
     cross_modal_proj_flat: Option<Vec<f32>>,
+
+    /// L1 sparsity penalty coefficient added to the SAE reconstruction loss during NREM.
+    /// 0.0 (default) = off; positive values encourage sparser codes.
+    sae_l1_coeff: f32,
 }
 
 impl PerceptionProcessor {
@@ -331,6 +335,7 @@ impl PerceptionProcessor {
             perf_prior_update_us: 0,
             ort_session: None,
             cross_modal_proj_flat: None,
+            sae_l1_coeff: 0.0,
         }
     }
 
@@ -1182,6 +1187,7 @@ impl PerceptionProcessor {
         let device = self.device;
 
         // ── Phase 1: SAE replay losses (needs &mut model for duty-cycle updates) ──
+        let sae_l1_coeff = self.sae_l1_coeff;
         let mut sae_loss: Option<Tensor<TrainB, 1>> = None;
         let mut sae_n_terms = 0usize;
         {
@@ -1232,16 +1238,25 @@ impl PerceptionProcessor {
                     Tensor::from_data(TensorData::new(flat_masks, [b, n_units]), &device);
                 let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
                 let sparse_z = z_batch * mask;
+                let l1_term: Option<Tensor<TrainB, 1>> = if sae_l1_coeff > 0.0 {
+                    Some(sparse_z.clone().abs().mean())
+                } else {
+                    None
+                };
                 let target: Tensor<TrainB, 2> =
                     Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
 
-                let region_loss = match region_idx {
+                let mse_loss = match region_idx {
                     0 => model.speech_decoder.mse_loss_batch(target, sparse_z),
                     1 => model.env_decoder.mse_loss_batch(target, sparse_z),
                     2 => model.visual_decoder.mse_loss_batch(target, sparse_z),
                     3 => model.symbolic_decoder.mse_loss_batch(target, sparse_z),
                     4 => model.language_decoder.mse_loss_batch(target, sparse_z),
                     _ => unreachable!(),
+                };
+                let region_loss = match l1_term {
+                    Some(l1) => mse_loss + l1.mul_scalar(sae_l1_coeff),
+                    None => mse_loss,
                 };
                 sae_loss = Some(match sae_loss {
                     None => region_loss,
@@ -2089,6 +2104,10 @@ impl PerceptionProcessor {
 
     pub fn learning_rate(&self) -> f64 {
         self.current_lr
+    }
+
+    pub fn set_sae_l1_coeff(&mut self, coeff: f32) {
+        self.sae_l1_coeff = coeff;
     }
 
     // ── Save / Load ──────────────────────────────────────────────────────────

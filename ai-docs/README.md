@@ -20,6 +20,7 @@ For *behavioral* expectations on the assistant, see `../CLAUDE.md`. This folder 
 
 - [`research/`](research/) — research notes, by topic. Each file cites primary sources.
 - [`decisions/`](decisions/) — ADRs, numbered sequentially.
+  - 0025: SAE L1 coding loss — closed; λ=0.1 destabilised cold-start MSE by 27%; item D answered.
 
 ## Conventions
 
