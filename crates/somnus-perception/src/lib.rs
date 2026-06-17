@@ -270,7 +270,7 @@ pub struct PerceptionProcessor {
     ema_heads: EmaOutputHeads,
 
     prior_predictions: [Option<Vec<f32>>; 5],
-    prior_beta: f32,
+    prior_betas: [f32; 5],
     latest: [Option<SparseActivation>; 5],
     latest_inputs: [Option<Vec<f32>>; 5],
     settle_steps: usize,
@@ -315,7 +315,7 @@ impl PerceptionProcessor {
             current_lr: TrainConfig::default().lr,
             device,
             prior_predictions: [None, None, None, None, None],
-            prior_beta: 0.0,
+            prior_betas: [0.0; 5],
             latest: [None, None, None, None, None],
             latest_inputs: [None, None, None, None, None],
             settle_steps: 0,
@@ -2039,7 +2039,17 @@ impl PerceptionProcessor {
     }
 
     pub fn set_prior_beta(&mut self, beta: f32) {
-        self.prior_beta = beta;
+        self.prior_betas = [beta; 5];
+    }
+
+    pub fn set_prior_beta_region(&mut self, idx: usize, beta: f32) {
+        if idx < 5 {
+            self.prior_betas[idx] = beta;
+        }
+    }
+
+    pub fn prior_betas(&self) -> [f32; 5] {
+        self.prior_betas
     }
 
     pub fn set_settle_steps(&mut self, steps: usize) {
@@ -2731,14 +2741,14 @@ impl PerceptionProcessor {
     }
 
     fn blend_with_prior(&self, values: &[f32], idx: usize) -> (Vec<f32>, Option<f32>) {
-        if self.prior_beta <= 0.0 {
+        let beta = self.prior_betas[idx];
+        if beta <= 0.0 {
             return (values.to_vec(), None);
         }
         match &self.prior_predictions[idx] {
             None => (values.to_vec(), None),
             Some(prior) => {
                 let cosine = cosine_sim(values, prior);
-                let beta = self.prior_beta;
                 let raw_norm = values.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
                 let prior_norm = prior.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
                 let amp_scale = raw_norm / prior_norm;

@@ -76,7 +76,7 @@ fn onnx_thread_budget() -> (usize, usize) {
 use action::{ActionDecoder, GainWorker};
 use whisper_asr::WhisperDecoder;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use burn::backend::ndarray::NdArrayDevice;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
@@ -155,6 +155,13 @@ struct Args {
     /// output_mse has converged; random heads inject noise if enabled too early.
     #[arg(long, default_value = "0.0")]
     prior_beta: f32,
+
+    /// Per-region prior blend weights as five comma-separated floats:
+    /// speech,env,visual,symbolic,language (e.g. "0.05,0.04,0.03,0.05,0.01").
+    /// When set, overrides --prior-beta for each region independently and
+    /// disables the S4 global controller (static mode).
+    #[arg(long)]
+    prior_beta_regions: Option<String>,
 
     /// Number of settling iterations per episode (0 = disabled). Enable only
     /// after output_mse has converged; random heads distort settling inputs (ADR 0011).
@@ -710,7 +717,27 @@ async fn main() -> Result<()> {
 
     // ── perception processor ──────────────────────────────────────────────────
     let mut perception = PerceptionProcessor::new(NdArrayDevice::Cpu);
-    perception.set_prior_beta(args.prior_beta);
+    let prior_beta_regions_static: Option<[f32; 5]> =
+        if let Some(ref s) = args.prior_beta_regions {
+            let parts: Vec<&str> = s.split(',').collect();
+            if parts.len() != 5 {
+                anyhow::bail!("--prior-beta-regions requires exactly 5 comma-separated floats");
+            }
+            let mut betas = [0.0f32; 5];
+            for (i, p) in parts.iter().enumerate() {
+                betas[i] = p.trim().parse::<f32>().with_context(|| {
+                    format!("--prior-beta-regions: cannot parse '{}' as f32", p.trim())
+                })?;
+            }
+            perception.set_prior_beta(0.0); // clear base first
+            for (i, &b) in betas.iter().enumerate() {
+                perception.set_prior_beta_region(i, b);
+            }
+            Some(betas)
+        } else {
+            perception.set_prior_beta(args.prior_beta);
+            None
+        };
     perception.set_settle_steps(args.settle_steps);
     perception.set_settle_beta(args.settle_beta);
     perception.set_settle_gate(args.settle_gate);
@@ -719,6 +746,7 @@ async fn main() -> Result<()> {
     perception.set_sae_l1_coeff(args.sae_l1_coeff);
     info!(
         prior_beta = args.prior_beta,
+        prior_beta_regions = ?prior_beta_regions_static,
         settle_steps = args.settle_steps,
         settle_beta = args.settle_beta,
         working_memory_size = args.working_memory_size,
@@ -1730,8 +1758,8 @@ async fn main() -> Result<()> {
                     // S4: prior-beta scale-up controller (ADR 0024).
                     // Scales from base --prior-beta to 0.05 when global prior_cosine > 0.65
                     // for 3 consecutive cycles; drops back to base when any cycle < 0.40.
-                    // Only engages when base beta is below the scale target (0.05).
-                    if args.prior_beta < 0.05 {
+                    // Disabled in static per-region mode (--prior-beta-regions).
+                    if prior_beta_regions_static.is_none() && args.prior_beta < 0.05 {
                         let global_cosine: Option<f64> = {
                             let vals: Vec<f64> = (0..5)
                                 .filter_map(|i| {
@@ -1932,6 +1960,7 @@ async fn main() -> Result<()> {
                             "settle_gate_dynamic": settle_gate_val(settle_mu, settle_n, args.settle_gate) as f64,
                             "wakefulness_pressure": wakefulness_pressure as f64,
                             "prior_beta_effective": if s4_beta_active { 0.05f64 } else { args.prior_beta as f64 },
+                            "prior_betas_effective": perception.prior_betas().map(|b| b as f64),
                             "wake_ewma_mean":       wake_ewma_mu as f64,
                             "max_wake_secs_effective": max_wake.as_secs(),
                             "max_cold_records_effective": effective_max_cold,
