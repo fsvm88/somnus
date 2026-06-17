@@ -3,7 +3,7 @@
 > **Last updated:** 2026-06-17
 > **Branch:** `main`
 
-## Status: H closed (pruning unsafe at warm scale). Queue empty — awaiting direction.
+## Status: G queued — learned per-region β gate.
 
 ---
 
