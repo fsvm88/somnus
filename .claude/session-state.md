@@ -3,7 +3,7 @@
 > **Last updated:** 2026-06-17
 > **Branch:** `main`
 
-## Status: G closed (gist regression in cold A/B). Queue empty — awaiting direction.
+## Status: All ADR backlog items deferred. Awaiting new direction.
 
 ---
 

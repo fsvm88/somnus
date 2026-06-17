@@ -54,3 +54,9 @@ When wrapping a session at a logical break point (a substantive set of edits has
 - `.claude/session-state.md` — last-known session state; read on "resume SOMNUS prompt".
 - `experiments/` — throwaway prototypes; expect frequent churn. No CI gates, no API stability.
 - `crates/` — main system code, once it exists.
+
+## Deferred architectural items (as of 2026-06-17)
+
+All remaining ADR backlog items are **deferred indefinitely** — do not propose or implement them unless the user explicitly raises one or a concrete trigger condition is met. The items and their triggers are tracked in `.claude/session-state.md`. Do not suggest revisiting them unprompted.
+
+Items deferred: A (cold archive promotion index), C (sparse activation storage), E (separate output-head optimizer), F (post-k-WTA prior injection), I (knowledge distillation compression), J (Whisper-base), K (SigLIP-B), L (LoRA fine-tuning), M (MLP projection), N (visual/audio grounding).
