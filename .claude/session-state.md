@@ -3,7 +3,7 @@
 > **Last updated:** 2026-06-17
 > **Branch:** `main`
 
-## Status: All ADR backlog items deferred. Awaiting new direction.
+## Status: Interaction capability queue active. Next: Q1 (Qwen CPU), then R1–R3 (recall / conversation / introspection), then M and L.
 
 ---
 
@@ -39,6 +39,90 @@ Three concrete gaps identified in the architecture review. Ordered by severity:
 | **Q1** | Qwen LM on CPU during NREM | `qwen25_lm.onnx` blocked by dynamic seq_len on MIGraphX. Every projection training step runs a Qwen forward pass on CPU. Fixed-shape re-export + `attention_mask` input would unlock MIGraphX. Alternative: batch and background all LM calls outside the hot NREM loop. | Medium — tolerable at current scale, will hurt if NREM batch or session depth scales |
 | **Q2** | Pruning disabled, regions grow monotonically | `--prune-fraction 0.0` after magnitude-based A/B failure. Grown units (>N_UNITS=1024) are clamped by `to_dense_n` — unreachable but accumulating. No pruning strategy yet works. Item I (knowledge distillation) is the correct next step once regions grow large enough to matter (trigger: any region > 2× baseline). | Low — not a current bottleneck |
 | **Q3** | Top-down prior is weak in practice | Language region prior_cosine 0.843 at steady state. The McGurk-style disambiguation described in architecture.md is not yet realized. β=0.05 (via S4) is a soft uniform blend, not a reliable predictive-coding feedback loop. Would require much stronger per-region priors before disambiguation is useful. | Low — research frontier, no clear fix without better prior signal |
+
+---
+
+## Interaction capability queue (committed roadmap — 2026-06-17)
+
+These three capabilities are required for the system to be useful as an interactive agent. They are not deferred; they are the next substantive development arc after the performance gaps. Ordered by dependency.
+
+### R1 — Memory recall in generation
+
+**What:** When a query arrives, retrieve top-k semantically relevant past episodes from the warm store and include their projections in the generation context, not just the current episode.
+
+**Why this is the gap:** Currently generation only sees 5 region tokens from the *current* episode. Retrieved memories never reach the LLM. The recollection layer queries warm during wake (for reconstruction and gain), but that path is completely separate from the generation path.
+
+**Mechanism:**
+1. On stdin query, encode the query text through the language k-WTA to get a query episode vector.
+2. Query HNSW top-k (k=3–5) from warm store using that vector.
+3. For each recalled episode record, project its stored episode vector → 5 region tokens via the same `ActionDecoder` projection.
+4. Prepend all recalled token sets before the query tokens: `[recall_0_tokens | recall_1_tokens | ... | query_tokens]`.
+5. Autoregressive decode as before.
+
+**Dependencies:** Projection must be trained well enough to produce coherent region tokens (proj_loss ≤ 0.001, or empirically coherent). R1 can be implemented now and enabled once projection converges.
+
+**ADR needed:** yes — design choices around k, how to order recalled episodes, whether to include recency weighting.
+
+---
+
+### R2 — Multi-turn conversation
+
+**What:** Maintain a sliding context window of recent (query, response) pairs across turns within a wake session. Prepend prior turns to each new generation call.
+
+**Why this is the gap:** Each query is currently independent. The LLM has no memory of what was said one turn ago.
+
+**Mechanism:**
+1. A ring buffer of `(query_tokens, response_tokens)` pairs, bounded by token budget (e.g. 512 tokens of conversation history).
+2. On each generation call: `[recall_tokens (R1) | conversation_history | current_query_tokens]`.
+3. Buffer clears on sleep entry (wake-local by design, matching working memory).
+4. Context budget split: ~256 tokens conversation history, ~128 tokens recall context, query gets the rest up to Qwen's context limit.
+
+**Dependencies:** Simpler than R1; no new training required. Can be implemented before R1 if desired — just requires the conversation ring and token budget tracking.
+
+**ADR needed:** yes — token budget allocation, truncation policy (oldest-first vs. summarise).
+
+---
+
+### R3 — Introspection: explain what it learned
+
+**What:** Allow the system to answer questions about its own memory contents — what it has seen, what concepts it has consolidated, what it knows.
+
+**Why this is the gap:** The system builds rich warm and cold memory but has no path to *describe* that memory in language. The semantic store contains episode vectors (sparse activations) with no associated labels that can be surfaced to the LLM.
+
+**Mechanism (two-phase):**
+
+*Phase 1 — recent history narration (simpler, implement first):*
+- Maintain a text log of ASR transcripts and text-bypass lines per session (already available as `text_target` fields on EpisodeRecord).
+- On an introspective query ("what did you just hear?", "what have we been talking about?"), retrieve the N most recent `text_target` strings from hot/warm, concatenate, and include as conversation context alongside the query.
+- This gives the system access to a textual record of what it recently perceived.
+
+*Phase 2 — semantic memory narration (harder, later):*
+- During REM or on demand, sample diverse episode vectors from warm, decode each through the output heads to get reconstructed encoder inputs, then use the action decoder to generate a short description of each cluster.
+- Requires output heads that reconstruct interpretable encoder inputs — currently they reconstruct raw embeddings (not text), so this needs the recollection-to-generation bridge plus good reconstruction quality.
+
+**Dependencies:** Phase 1 depends on R2 (conversation context) and on `text_target` text being threaded into the generation prompt. Phase 2 depends on R1 and significantly better reconstruction quality.
+
+**ADR needed:** yes — at Phase 1 implementation.
+
+---
+
+### M — MLP projection (after R1–R3 stable)
+
+**Source:** ADR 0012 deferred item. Replace linear projection (640→5×896) with a small MLP (640→1024→5×896, ~5.4M params) for more expressive episode→LM-space mapping.
+
+**Trigger:** proj_loss plateaus across 10+ sessions with linear projection, OR generation quality assessed as insufficient after R1–R3 are working and the bottleneck is clearly the projection expressivity.
+
+**ADR needed:** yes — MLP architecture choice, whether to retrain from current projection weights or cold-start.
+
+---
+
+### L — LoRA fine-tuning of Qwen2.5 (after M stable)
+
+**Source:** ADR 0012 deferred item. Fine-tune Qwen2.5-0.5B with LoRA so the LM adapts to the episode-vector prefix distribution.
+
+**Trigger:** Generation quality is coherent but clearly limited by Qwen's pretrained prior not matching the system's learned episode representation. Concrete signal: perplexity of generated text is high for domain-specific content the system has ingested.
+
+**ADR needed:** yes — LoRA rank, which layers, ORT compatibility or switch to a different inference path.
 
 ---
 
