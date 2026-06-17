@@ -245,6 +245,15 @@ struct Args {
     #[arg(long, default_value = "false")]
     action_distill_only: bool,
 
+    /// Use LM forward-pass hidden states for language region input instead of
+    /// the frozen embed-table mean-pool. Requires --action (loads qwen25_lm.onnx).
+    /// Each text line runs a single non-autoregressive LM forward pass; hidden
+    /// states are mean-pooled and L2-normalised to produce the 896-dim embedding.
+    /// A/B flag: compare p_lang vs embed-table baseline to confirm representation
+    /// quality is the bottleneck before hardening.
+    #[arg(long, default_value = "false")]
+    lang_use_lm: bool,
+
     /// Loop the input file indefinitely. Restarts from the beginning each time
     /// the file ends, keeping warm memory alive across iterations. Useful for
     /// calibration runs where a single file is too short to trigger multiple
@@ -1475,6 +1484,7 @@ async fn main() -> Result<()> {
                     if let Some(r) = ingest_language_line(
                         &text,
                         &lang_embedder,
+                        args.lang_use_lm,
                         &mut perception,
                         &mut sink,
                         &mut episodic,
@@ -2152,6 +2162,7 @@ async fn main() -> Result<()> {
                         if let Some(r) = ingest_language_line(
                             &text,
                             &lang_embedder,
+                            args.lang_use_lm,
                             &mut perception,
                             &mut sink,
                             &mut episodic,
@@ -2408,6 +2419,7 @@ struct LangIngestResult {
 fn ingest_language_line(
     text: &str,
     lang_embedder: &Option<LangEmbedder>,
+    lang_use_lm: bool,
     perception: &mut PerceptionProcessor,
     sink: &mut Option<BufWriter<std::fs::File>>,
     episodic: &mut EpisodicBuffer,
@@ -2421,11 +2433,32 @@ fn ingest_language_line(
     sal_threshold: f32,
 ) -> Option<LangIngestResult> {
     let Some(le) = lang_embedder else { return None };
-    let emb = match le.embed(text) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(?e, "language embed failed");
-            return None;
+    let emb = if lang_use_lm {
+        // Use LM forward-pass hidden states (contextualized, richer than embed-table).
+        // Reuses the ActionDecoder's already-loaded qwen25_lm.onnx session; no extra load.
+        // Falls back to embed-table if decoder is unavailable.
+        let lm_result = decoder.as_mut().and_then(|dec| {
+            dec.tokenize(text)
+                .ok()
+                .and_then(|ids| dec.text_hidden_states(&ids).ok())
+        });
+        match lm_result {
+            Some(v) => v,
+            None => match le.embed(text) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(?e, "language embed failed");
+                    return None;
+                }
+            },
+        }
+    } else {
+        match le.embed(text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(?e, "language embed failed");
+                return None;
+            }
         }
     };
     tracing::info!(chars = text.len(), "language ingest");

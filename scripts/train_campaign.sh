@@ -122,6 +122,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --language \
             --action \
             --action-distill-only \
+            --lang-use-lm \
             --prior-beta "$PRIOR_BETA" \
             --settle-steps 1 \
             --working-memory-size 8 \
@@ -146,6 +147,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --language \
             --action \
             --action-distill-only \
+            --lang-use-lm \
             --prior-beta "$PRIOR_BETA" \
             --settle-steps 1 \
             --working-memory-size 8 \

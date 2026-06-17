@@ -1,14 +1,45 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-16
-> **Last commit on main:** (pending — see below)
+> **Last updated:** 2026-06-17
+> **Last commit on main:** 02a241a fix(campaign): raise CAPACITY default to 8192 and add --max-warm-records 200000
 > **Branch:** `main`
 
-## Status: Wiki campaign 3 complete. Next: run text injection on top of mixed_campaign memory.
+## Status: Wiki-on-mixed complete. Next: implement B (--lang-use-lm) + A/B test.
 
 ---
 
-## Completed this session (2026-06-16)
+## Completed this session (2026-06-17)
+
+| Item | What changed |
+|------|-------------|
+| Wiki-on-mixed campaign | s31–40 × 2 cycles; MSE 0.049→0.028 (↓40%); p[4]/lang noisy, peak 0.564 (barely above 0.557 baseline); text injection NOT additive for p_lang |
+| Cycle-2 starvation fix | `train_campaign.sh`: CAPACITY default 4096 → 8192; `--max-warm-records 200000` added to both branches |
+
+---
+
+## Wiki-on-mixed results (s31–40)
+
+| s | c | lang | mse | p[4] lang | notes |
+|---|---|------|-----|-----------|-------|
+| 31 | 1 | 66 | 0.0682 | 0.217 | initial drop from 0.557 baseline |
+| 31 | 2 | 27 | 0.0750 | 0.278 | |
+| 32 | 1 | 70 | 0.0625 | 0.476 | |
+| 32 | 2 | 21 | 0.0363 | 0.296 | |
+| 33 | 1 | 46 | 0.0465 | 0.544 | |
+| 34 | 1 | 47 | 0.0523 | 0.465 | |
+| 35 | 1 | 73 | 0.0413 | 0.383 | |
+| 36 | 1 | 49 | 0.0503 | 0.507 | |
+| 37 | 1 | 77 | 0.0420 | 0.205 | |
+| 38 | 1 | 99 | 0.0427 | 0.193 | |
+| 39 | 1 | 81 | 0.0566 | **0.564** | new peak, barely above baseline |
+| 40 | 1 | 89 | 0.0428 | 0.414 | |
+| 40 | 2 | 18 | 0.0284 | 0.353 | MSE best; lang still noisy |
+
+**Findings:** MSE improved 40% (0.049→0.028). p[4]/lang oscillated 0.193–0.564 with no cumulative trend. 0.557 H3H3 baseline was not reliably exceeded. Representation quality (embed-table mean-pool) is the next hypothesis.
+
+---
+
+## Completed previous session (2026-06-16)
 
 | Item | What changed |
 |------|-------------|
@@ -62,36 +93,41 @@
 
 ## Queued next (top priority)
 
-### 1. Run text injection on warm mixed_campaign memory
-The critical comparison: start from `memory/mixed_campaign/campaign_20260615_230556/` (p_lang=0.557 baseline) and run wiki text injection. Use `--snapshot-dir` or copy snapshot, then:
+### 1. Implement B: --lang-use-lm flag (LM-hidden language embeddings)
 
-```bash
-cp -r memory/mixed_campaign/campaign_20260615_230556 memory/wiki_on_mixed/
-CLIPS="$(ls clips/shorts/*.mp4 clips/h3h3/*.mp4 | tr '\n' ' ')" \
-TEXT_CORPUS="$(ls data/wiki_text/*.txt | tr '\n' ' ')" \
-TEXT_RATE=1 \
-SESSIONS=10 \
-CYCLES=2 \
-CAPACITY=4096 \
-MEMORY_DIR=memory/wiki_on_mixed \
-SESSION_START=31 \
-scripts/train_campaign.sh
-```
+**Why:** p_lang plateaued at 0.557 with embed-table mean-pool. LM forward-pass hidden states are contextualized — this ablation confirms/refutes whether representation quality is the bottleneck.
 
-Goal: does p_lang climb above 0.557 with dense text? If yes, text injection is additive. If not, capacity ceiling is the limiter.
+**What:** Replace `LangEmbedder.embed()` (static embed-table mean-pool) with `ActionDecoder.text_hidden_states()` (single LM forward pass, mean-pool over hidden states, L2-normalized). Same 896 dims, same interface — richer representation.
 
-### 2. Fix cycle-2 starvation
-Cycle 2 gets only 10–31 lang_ingests vs 66–303 in cycle 1. Root cause: after cycle 1 fills warm memory to 4096, HNSW queries slow significantly, fewer episode ticks per second, less time for lang_rx processing. Options:
-- Increase CAPACITY (8192?) to delay the slowdown
-- Or: investigate whether `--max-warm-records 200000` (from calibration notes) was accidentally omitted — if warm memory is unlimited, no eviction pressure → HNSW degrades. Setting it should trigger eviction and keep queries fast.
+**How (concrete changes to `crates/somnus/src/main.rs`):**
+1. Add `--lang-use-lm` bool flag to `Args`
+2. Add `fn tokenize(&self, text: &str) -> Result<Vec<u32>>` to `LangEmbedder` (expose tokenization without embedding)
+3. Modify `ingest_language_line` signature: add `lm_emb: Option<&[f32]>` param; when `Some`, skip `LangEmbedder.embed()` and use it directly
+4. At both `ingest_language_line` call sites (wake loop, ~lines 1475 and 2152): if `args.lang_use_lm && decoder.is_some()`, call `LangEmbedder.tokenize()` → `decoder.text_hidden_states(ids)` → pass result as `lm_emb`
+5. No changes to `action.rs` — `text_hidden_states()` already exists and is correct
 
-### 3. Commit pending changes
-All in working tree, not yet committed:
-- `crates/somnus/src/main.rs`: `--action-distill-only` flag
-- `scripts/train_campaign.sh`: `--action-distill-only` hardened in; exit 120 whitelisted
-- `scripts/extract_wiki.py`: table-leak fix (strip `^[|!]` lines)
-- `experiments/ort-smoke/src/main.rs`: qwen25_lm MIGraphX smoke test + GPU vs CPU benchmark
-- `scripts/download_h3h3.sh`, `scripts/download_shorts.sh`, `scripts/download_wiki_text.sh`, `scripts/extract_wiki.py`: new untracked scripts
+**A/B validation:** fresh cold-start runs, 5 sessions × 2 cycles each:
+- A: current (`--lang-use-lm` off) → p_lang baseline
+- B: `--lang-use-lm` on → p_lang with LM embeddings
+- If B > A: representation was the bottleneck; keep the flag, harden into train_campaign.sh
+- If B ≈ A: data diversity is the limiter; defer further language work; proceed to D
+
+### 2. Implement D: full differentiable SAE — defer until B result known
+
+**Context:** Encoder weights ARE already being trained (gradient flows through masked z). The k-WTA mask acts as a straight-through estimator naturally. Two options:
+- **(a) Add L1 coding term** to existing k-WTA sleep loss: `loss = mse_loss + λ * |sparse_z|.mean()`. Marginal win — cardinality is already fixed at K_ACTIVE=20, so L1 only shrinks active magnitudes.
+- **(b) Replace k-WTA with ReLU+L1 encoder** (principled SAE). Binding uses `to_dense_n(N_UNITS)` → fixed-k NOT assumed downstream. Architecturally safe. Breaks duty-cycle boosting; would need L1 λ tuning to maintain ~20 active units.
+
+**Decision rule:** If B shows p_lang improvement → representation matters → do D option (b). If B is flat → data is the limiter → D is unlikely to help p_lang either; reconsider priority.
+
+---
+
+## Completed this session (2026-06-17)
+
+| Item | What changed |
+|------|-------------|
+| Wiki-on-mixed campaign | 10 sessions × 2 cycles (s31–40), `memory/mixed_campaign/campaign_20260617_122244/` |
+| Cycle-2 starvation fix | `train_campaign.sh`: CAPACITY default 4096 → 8192; `--max-warm-records 200000` added to both branches |
 
 ---
 
@@ -162,6 +198,8 @@ All P1/P2/S1–S7 items complete.
 ## Key facts
 
 - `--replay-batch-size 128` hardcoded in `train_campaign.sh`
+- `--max-warm-records 200000` hardcoded in `train_campaign.sh` (fixes cycle-2 HNSW starvation)
+- CAPACITY default is now 8192 (was 4096); overrideable via env var
 - `--working-memory-size 8` hardcoded in `train_campaign.sh`
 - `--action-distill-only` now hardcoded in `train_campaign.sh`
 - `--asr-min-chars 5` for noisy-audio clips
