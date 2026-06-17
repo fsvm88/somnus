@@ -18,6 +18,7 @@ Everything durable belongs in `ai-docs/`. Treat docs as the project's long-term 
 - Non-obvious decisions get a short ADR in `ai-docs/decisions/NNNN-title.md` (sequentially numbered). Capture *why*, alternatives considered, and what would invalidate the decision.
 - Research that informs design lands in `ai-docs/research/<topic>.md`, with citations (paper title, authors, year, link, one-line takeaway).
 - Update `ai-docs/architecture.md` when system structure changes. It is the canonical mental model.
+- Update `ai-docs/architecture.svg` whenever the architecture or its key parameters change (encoders, region count, EPISODE_DIM, GRU_HIDDEN, D_PROJ, N_UNITS, K_ACTIVE, memory tier sizing, new subsystems, removed/closed items). The SVG is the visual companion to `architecture.md`; both must stay in sync. The SVG lives in git alongside the docs.
 - Define new terms in `ai-docs/glossary.md` once and link from elsewhere.
 - Keep `ai-docs/README.md` as the working index of what's where.
 - **Don't write speculative architecture into the foundation docs.** Speculation goes in `research/`, clearly marked. Foundation docs describe what *is* or what was just decided.
