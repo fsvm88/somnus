@@ -3,7 +3,7 @@
 > **Last updated:** 2026-06-17
 > **Branch:** `main`
 
-## Status: G queued — learned per-region β gate.
+## Status: G closed (gist regression in cold A/B). Queue empty — awaiting direction.
 
 ---
 
@@ -45,7 +45,7 @@
 |---|--------|------|---------|
 | E | ADR 0009 | Separate optimizer for output heads | Conflicting gradient directions observed |
 | F | ADR 0010 | Post-k-WTA prior injection | Pre-k-WTA injection shows poor `prior_cosine` uptake |
-| G | ADR 0010 | Learned per-region scalar gate | `prior_cosine` stable; per-region β tuning shows benefit |
+| G | ADR 0010 | Learned per-region scalar gate | **Closed** — gist −0.061 (FAIL); S4 never fired in control (comparison confounded); ADR 0027 |
 | H | ADR 0018 | Activation-frequency pruning (+ base magnitude pruning) | **Closed** — magnitude pruning failed warm A/B; activation-freq pruning has same root problem (mid-run encoder change); grown size (2.7×) not a bottleneck |
 | I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
 
@@ -66,6 +66,7 @@
 | B | ADR 0019/0014 | Language last-token pooling | Done — LM hidden states 4× better; hardened |
 | D | ADR 0005 | Full differentiable SAE | Closed — L1 coding term at λ=0.1 destabilised MSE by 27%; item answered |
 | H | ADR 0018 | Magnitude/frequency pruning | **FAIL (warm A/B)** — env cosine −0.065 persistent; cascade (no cooldown); activation-freq pruning same root problem. --prune-fraction 0.0 stays. ADR 0026. |
+| G | ADR 0010 | Per-region prior beta | **FAIL (cold A/B)** — gist −0.061; S4 never fired so comparison was 0.01 vs 0.05 (confounded); --prior-beta-regions flag ships but not in campaign. ADR 0027. |
 
 ---
 

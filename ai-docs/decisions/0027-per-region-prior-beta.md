@@ -6,7 +6,7 @@ date: 2026-06-17
 # ADR 0027 — Per-Region Prior Beta (Item G)
 
 **Date:** 2026-06-17  
-**Status:** In progress — plumbing complete; static A/B pending
+**Status:** Closed — FAIL (gist regression). Per-region static beta not enabled. Uniform β via S4 retained.
 
 ## Context
 
@@ -77,3 +77,48 @@ independently tracked). File the adaptive dynamics as a follow-on deferred item.
 
 Accept that uniform β (via S4) is adequate. Item G closed. The ADR 0010 deferred item for
 a gradient-learned gate remains open only if a concrete motivation surfaces.
+
+## Cold-start A/B result (2026-06-17) — FAIL
+
+5 sessions × 2 cycles, fresh cold memory. Both arms built from the same binary.
+
+| Metric | Control (s3–5 avg) | Treatment (s3–5 avg) | Δ | Threshold | Verdict |
+|---|---|---|---|---|---|
+| mean_output_mse_wake | 0.8014 | 0.5366 | −33.0% | ≤ctrl×1.10 | PASS |
+| warm_recall_l2 | 0.5162 | 0.4456 | −13.7% | ±15% | PASS |
+| gist_recall_rate | 0.8229 | 0.7617 | −0.061 | ±0.05 | **FAIL** |
+| prior cosine — speech | 0.639 | 0.844 | +0.205 | ±0.05 | FAIL† |
+| prior cosine — env | 0.807 | 0.869 | +0.062 | ±0.05 | FAIL† |
+| prior cosine — visual | 0.488 | 0.543 | +0.054 | ±0.05 | FAIL† |
+| prior cosine — symbolic | 0.736 | 0.745 | +0.009 | ±0.05 | PASS |
+| prior cosine — language | 0.819 | 0.929 | +0.110 | ±0.05 | FAIL† |
+
+† Prior cosine FAILs are all in the positive direction (treatment uniformly higher). Not
+a quality regression; the higher cosines are partly self-reinforcing (blending prior into
+input raises cos(input, prior) by construction). Not counted against the verdict.
+
+**Gist regression is real and in the wrong direction.** Treatment gist 6.1 points lower
+than control — the system consolidates warm episodes less effectively when per-region high
+betas are active. Plausible mechanism: high-β prior injection biases the k-WTA inputs
+away from the raw signal; the resulting sparse activations stored in warm memory are
+slightly different from what the NREM replay loop trained on (which uses raw encoder
+targets per ADR 0010). The mismatch accumulates over 5 sessions and degrades gist.
+
+**Confound: S4 never fired in the control arm.** The control ran at β=0.01 for all 10
+cycles; the intended comparison was "S4-scaled 0.05 uniform" vs "per-region 0.05/0.04/
+0.03/0.05/0.01." The actual comparison was "0.01 uniform" vs "0.05 per-region" — a 5×
+difference in effective beta for four of five regions. The MSE improvement in treatment
+(−33%) reflects that high-β prior injection from session 1 accelerates convergence in
+cold start; this is a cold-start effect, not a per-region distribution effect.
+
+**The intended comparison was not tested.** The question "does distributing a 0.05 budget
+unevenly across regions improve on the uniform 0.05 that S4 eventually delivers?" remains
+unanswered. This is not a reason to run another A/B — uniform 0.05 (via S4) is the
+current campaign behavior and not a proven bottleneck. A per-region distribution buys
+meaningful improvement only if the budget allocation matters, and there is no evidence
+of that from this run.
+
+**Verdict:** FAIL by pre-stated rule (gist threshold breached, wrong direction). Uniform
+β via S4 is retained as-is. Per-region beta plumbing ships in the binary as a
+`--prior-beta-regions` flag for future experimentation but is not hardcoded in
+`train_campaign.sh`.
