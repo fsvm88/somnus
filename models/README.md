@@ -47,6 +47,20 @@ All models are FP32, opset 18.
 | `dinov2_small.onnx` | 1 532 061 | `0162d995523dab09f72f980f738fbeaf17ecc660ee5e24cb4755edda379db4e9` |
 | `dinov2_small.onnx.data` | 88 342 528 | `be262910b67687076ec54b9d21c08d4dd3a96a62478eeecc6c68082ce07611cc` |
 
+### qwen25_text_hidden
+
+- **Source:** `Qwen/Qwen2.5-0.5B` @ `060db6499f32faf8b98477b0a26969ef7d8b9987`
+- **Input:** `inputs_embeds` — `(1, 128, 896)` float32 — pre-embedded tokens, padded with zeros
+- **Output:** `last_hidden_state` — `(1, 128, 896)` float32 — Rust mean-pools first `n` real positions
+- **Notes:** Base Qwen2Model only (no LM head). Static shape (MAX_TEXT_SEQ=128) enables MIGraphX.
+  Causal attention means end-padding zeros do not affect hidden states at real positions 0..n-1.
+  Used by `text_hidden_states()` as the GPU path for NREM distillation targets.
+  Sequences longer than 128 tokens are truncated; cosine similarity vs full-sequence CPU path is ≥0.9999.
+
+| File | Total MB | SHA-256 (graph) |
+|------|----------|-----------------|
+| `qwen25_text_hidden.onnx` + `.onnx.data` | 1436 | `e2fe55893599d09689b65a328207779c954778dd480e0e50b0d604b353139aa3` |
+
 ## Verification
 
 ```bash

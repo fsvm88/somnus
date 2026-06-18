@@ -251,6 +251,12 @@ def export_whisper_decoder() -> None:
 
 # ── Qwen2.5-0.5B wrappers (ADR 0012) ──────────────────────────────────────────
 
+# Fixed sequence length for qwen25_text_hidden.onnx (GPU distillation-target path).
+# Covers p97+ of observed text inputs (p95 ≈ 205 chars ≈ 52–68 tokens); longer sequences
+# are truncated to this length before embedding, which is acceptable for distillation.
+# Must match MAX_TEXT_SEQ in crates/somnus/src/action.rs.
+MAX_TEXT_SEQ = 128
+
 class Qwen25GainWrapper(torch.nn.Module):
     """Qwen2Model (base transformer only, no LM head).
 
@@ -294,10 +300,12 @@ class Qwen25LMWrapper(torch.nn.Module):
 def export_qwen25() -> None:
     gain_out = MODELS_DIR / "qwen25_gain.onnx"
     lm_out = MODELS_DIR / "qwen25_lm.onnx"
+    text_hidden_out = MODELS_DIR / "qwen25_text_hidden.onnx"
     embed_out = MODELS_DIR / "qwen25_embed_table.safetensors"
     tok_out = MODELS_DIR / "qwen25_tokenizer.json"
 
-    if gain_out.exists() and lm_out.exists() and embed_out.exists() and tok_out.exists():
+    if (gain_out.exists() and lm_out.exists() and text_hidden_out.exists()
+            and embed_out.exists() and tok_out.exists()):
         print(f"  skip: qwen25 artifacts already present")
         return
 
@@ -327,6 +335,24 @@ def export_qwen25() -> None:
                 opset_version=17,
             )
         report(gain_out)
+
+    if not text_hidden_out.exists():
+        # Static [1, MAX_TEXT_SEQ, hidden_size] — identical structure to gain but for text sequences.
+        # Causal attention ensures end-padding zeros don't affect earlier positions, so Rust can
+        # mean-pool only the first real_n positions without passing an attention_mask.
+        text_hidden_wrapper = Qwen25GainWrapper(model).eval()
+        dummy_text = torch.zeros(1, MAX_TEXT_SEQ, hidden_size)
+        print(f"  exporting qwen25_text_hidden.onnx (static [1,{MAX_TEXT_SEQ},{hidden_size}], no LM head)…")
+        with torch.no_grad():
+            torch.onnx.export(
+                text_hidden_wrapper,
+                dummy_text,
+                str(text_hidden_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state"],
+                opset_version=17,
+            )
+        report(text_hidden_out)
 
     if not lm_out.exists():
         wrapper = Qwen25LMWrapper(model).eval()

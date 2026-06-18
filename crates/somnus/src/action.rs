@@ -30,6 +30,9 @@ pub const N_REGIONS: usize = 5;
 const EPISODE_DIM: usize = 640;
 const PROJ_LR: f64 = 1e-4;
 const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
+/// Fixed sequence length for the GPU text-hidden-state path (qwen25_text_hidden.onnx).
+/// Must match MAX_TEXT_SEQ in scripts/export_models.py.
+const MAX_TEXT_SEQ: usize = 128;
 
 type TrainB = Autodiff<NdArray>;
 type ProjOptim = OptimizerAdaptor<AdamW, ProjModel<TrainB>, TrainB>;
@@ -49,6 +52,9 @@ pub struct ActionDecoder {
     gain_session: Option<Session>,
     /// Full model with LM head, dynamic seq_len — used by generate().
     lm_session: Session,
+    /// Base model only (no LM head), static [1, MAX_TEXT_SEQ, 896] — MIGraphX-eligible.
+    /// Used by text_hidden_states() when present; falls back to lm_session on CPU if absent.
+    text_hidden_session: Option<Session>,
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
     #[allow(dead_code)]
@@ -83,6 +89,14 @@ impl ActionDecoder {
         let gain_session = Some(crate::migraphx_session(&gain_path)?);
         let lm_profile_prefix = ort_profile_dir.map(|d| d.join("qwen25_lm"));
         let lm_session = crate::cpu_session(&lm_path, lm_profile_prefix.as_deref())?;
+        let text_hidden_path = models_dir.join("qwen25_text_hidden.onnx");
+        let text_hidden_session = if text_hidden_path.exists() {
+            tracing::info!("loading qwen25_text_hidden.onnx — GPU path active for distillation targets");
+            Some(crate::migraphx_session(&text_hidden_path)?)
+        } else {
+            tracing::info!("qwen25_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session");
+            None
+        };
 
         let bytes = std::fs::read(&embed_path)?;
         let st = SafeTensors::deserialize(&bytes)
@@ -114,6 +128,7 @@ impl ActionDecoder {
             embed_table,
             gain_session,
             lm_session,
+            text_hidden_session,
             tokenizer,
             gain: [1.0; 5],
             device,
@@ -277,13 +292,13 @@ impl ActionDecoder {
 
     /// Compute L2-normalised mean LM hidden state for a token sequence.
     ///
-    /// Embeds `token_ids` via the frozen embed table, runs them through the full
-    /// LM transformer (qwen25_lm.onnx, `last_hidden_state` output), and returns
-    /// the mean-pooled, L2-normalised [LM_HIDDEN] vector.
+    /// GPU path (qwen25_text_hidden.onnx, MIGraphX): pads to MAX_TEXT_SEQ, runs the base
+    /// transformer without LM head, mean-pools the first `n` real positions. Causal attention
+    /// guarantees end-padding positions do not affect hidden states at real positions, so no
+    /// attention_mask is needed. Sequences longer than MAX_TEXT_SEQ are truncated.
     ///
-    /// Used as the distillation target for projection training: richer than the
-    /// static embed-table mean because Qwen contextualises the tokens before
-    /// pooling, encoding inter-token relationships.
+    /// CPU fallback (qwen25_lm.onnx): original dynamic-seq-len path, used when the GPU model
+    /// is absent.
     pub fn text_hidden_states(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
         if token_ids.is_empty() {
             return Ok(vec![0.0; LM_HIDDEN]);
@@ -291,38 +306,55 @@ impl ActionDecoder {
         if let Some(cached) = self.lm_hidden_cache.get(token_ids) {
             return Ok(cached.clone());
         }
-        let embeds = self.embed_flat(token_ids)?;
-        let n = token_ids.len();
-        let input = Array3::from_shape_vec((1, n, LM_HIDDEN), embeds)
-            .map_err(|e| anyhow::anyhow!("shape error: {e}"))?;
-        let tensor = TensorRef::from_array_view(&input)?;
-        let outputs = self
-            .lm_session
-            .run(ort::inputs!["inputs_embeds" => tensor])?;
-        let (shape, hidden_data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
-        if shape.len() < 3 {
-            bail!("unexpected last_hidden_state shape: {:?}", shape);
-        }
-        let hidden = hidden_data.to_vec();
-        // Mean-pool over token positions.
+
+        // Truncate to MAX_TEXT_SEQ before embedding; embed_flat borrows self before session.
+        let n = token_ids.len().min(MAX_TEXT_SEQ);
+        let embeds = self.embed_flat(&token_ids[..n])?;
+
+        // embed_flat borrows embed_table only; compute before borrowing any session.
+        let hidden_vec = if let Some(sess) = self.text_hidden_session.as_mut() {
+            // GPU path: pad embeds to [1, MAX_TEXT_SEQ, LM_HIDDEN] with zeros.
+            let mut padded = embeds;
+            padded.resize(MAX_TEXT_SEQ * LM_HIDDEN, 0.0);
+            let input = Array3::from_shape_vec((1, MAX_TEXT_SEQ, LM_HIDDEN), padded)
+                .map_err(|e| anyhow::anyhow!("shape error: {e}"))?;
+            let tensor = TensorRef::from_array_view(&input)?;
+            let outputs = sess.run(ort::inputs!["inputs_embeds" => tensor])?;
+            let (_, hidden_data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+            hidden_data.to_vec()
+            // outputs and sess borrow drop here
+        } else {
+            // CPU fallback: dynamic seq_len via lm_session.
+            let input = Array3::from_shape_vec((1, n, LM_HIDDEN), embeds)
+                .map_err(|e| anyhow::anyhow!("shape error: {e}"))?;
+            let tensor = TensorRef::from_array_view(&input)?;
+            let outputs = self
+                .lm_session
+                .run(ort::inputs!["inputs_embeds" => tensor])?;
+            let (shape, hidden_data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+            if shape.len() < 3 {
+                bail!("unexpected last_hidden_state shape: {:?}", shape);
+            }
+            hidden_data.to_vec()
+        };
+
+        // Mean-pool the first n real positions (GPU path: n ≤ MAX_TEXT_SEQ; CPU: n = full len).
         let mut mean = vec![0.0f32; LM_HIDDEN];
         for tok in 0..n {
             for d in 0..LM_HIDDEN {
-                mean[d] += hidden[tok * LM_HIDDEN + d];
+                mean[d] += hidden_vec[tok * LM_HIDDEN + d];
             }
         }
         let scale = 1.0 / n as f32;
         for v in &mut mean {
             *v *= scale;
         }
+
         // L2-normalise.
         let norm = (mean.iter().map(|x| x * x).sum::<f32>() + 1e-8).sqrt();
-        for v in &mut mean {
-            *v /= norm;
-        }
-        self.lm_hidden_cache
-            .insert(token_ids.to_vec(), mean.clone());
-        Ok(mean)
+        let result: Vec<f32> = mean.iter().map(|x| x / norm).collect();
+        self.lm_hidden_cache.insert(token_ids.to_vec(), result.clone());
+        Ok(result)
     }
 
     /// Batched surrogate projection training step (embed-table mean target).

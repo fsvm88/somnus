@@ -1,9 +1,9 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-17
+> **Last updated:** 2026-06-18
 > **Branch:** `main`
 
-## Status: Interaction capability queue active. Next: Q1 (Qwen CPU), then R1–R3 (recall / conversation / introspection), then M and L.
+## Status: Interaction capability queue active. Q1 done. Next: R1 (memory recall in generation), then R2, R3, M, L.
 
 ---
 
@@ -36,7 +36,7 @@ Three concrete gaps identified in the architecture review. Ordered by severity:
 
 | # | Gap | What to do | Priority |
 |---|-----|------------|----------|
-| **Q1** | Qwen LM on CPU during NREM | `qwen25_lm.onnx` blocked by dynamic seq_len on MIGraphX. Every projection training step runs a Qwen forward pass on CPU. Fixed-shape re-export + `attention_mask` input would unlock MIGraphX. Alternative: batch and background all LM calls outside the hot NREM loop. | Medium — tolerable at current scale, will hurt if NREM batch or session depth scales |
+| **Q1** | Qwen LM on CPU during NREM | **Done (2026-06-18).** Exported `qwen25_text_hidden.onnx` — static `[1, 128, 896]`, no LM head — loaded via `migraphx_session`. `ActionDecoder::text_hidden_states()` uses GPU path when file present; falls back to CPU `lm_session`. Causal-padding invariant verified (cosine ≥0.9999). MAX_TEXT_SEQ=128 covers p97+ of observed text lengths (p95≈68 tokens). **Needs A/B validation** on proj_loss trajectory after switchover (distillation targets differ for n>128 inputs, ~2-3% of traces). | Medium |
 | **Q2** | Pruning disabled, regions grow monotonically | `--prune-fraction 0.0` after magnitude-based A/B failure. Grown units (>N_UNITS=1024) are clamped by `to_dense_n` — unreachable but accumulating. No pruning strategy yet works. Item I (knowledge distillation) is the correct next step once regions grow large enough to matter (trigger: any region > 2× baseline). | Low — not a current bottleneck |
 | **Q3** | Top-down prior is weak in practice | Language region prior_cosine 0.843 at steady state. The McGurk-style disambiguation described in architecture.md is not yet realized. β=0.05 (via S4) is a soft uniform blend, not a reliable predictive-coding feedback loop. Would require much stronger per-region priors before disambiguation is useful. | Low — research frontier, no clear fix without better prior signal |
 
