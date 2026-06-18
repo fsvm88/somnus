@@ -1672,6 +1672,10 @@ async fn main() -> Result<()> {
                     / sleep_dur_secs_history.len() as f64;
                 (mean * 3.0).max(300.0) as u64
             };
+            // Clear conversation history at sleep entry (R2 — wake-local by design).
+            if let Some(ref mut dec) = decoder {
+                dec.clear_conversation();
+            }
             match sleep::run_sleep_cycle(
                 &mut perception,
                 &mut episodic,

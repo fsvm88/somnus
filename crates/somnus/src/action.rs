@@ -33,6 +33,15 @@ const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
 /// Fixed sequence length for the GPU text-hidden-state path (qwen25_text_hidden.onnx).
 /// Must match MAX_TEXT_SEQ in scripts/export_models.py.
 const MAX_TEXT_SEQ: usize = 128;
+/// Token budget for conversation history across turns (R2).
+/// Oldest turns are evicted when the total exceeds this limit.
+const CONV_HISTORY_BUDGET: usize = 256;
+
+/// One (query, response) turn stored for conversation history (R2).
+struct ConvTurn {
+    query_ids: Vec<u32>,
+    response_ids: Vec<u32>,
+}
 
 type TrainB = Autodiff<NdArray>;
 type ProjOptim = OptimizerAdaptor<AdamW, ProjModel<TrainB>, TrainB>;
@@ -63,6 +72,11 @@ pub struct ActionDecoder {
     /// Cross-cycle LM hidden-state cache. Clips loop so token sequences repeat; after the first
     /// cycle each unique text pays the ORT cost exactly once for the lifetime of the session.
     lm_hidden_cache: std::collections::HashMap<Vec<u32>, Vec<f32>>,
+    /// Conversation history ring buffer (R2). Evicted oldest-first when total tokens exceed
+    /// CONV_HISTORY_BUDGET. Cleared on sleep entry (wake-local by design).
+    conversation: std::collections::VecDeque<ConvTurn>,
+    /// Running total of tokens across all turns in `conversation`.
+    conv_token_count: usize,
 }
 
 impl ActionDecoder {
@@ -133,6 +147,8 @@ impl ActionDecoder {
             gain: [1.0; 5],
             device,
             lm_hidden_cache: std::collections::HashMap::new(),
+            conversation: std::collections::VecDeque::new(),
+            conv_token_count: 0,
         })
     }
 
@@ -178,11 +194,12 @@ impl ActionDecoder {
 
     /// Autoregressive greedy generation given a current episode vector and a text query.
     ///
-    /// Prepends projected region tokens as a soft prefix:
-    ///   `[recalled_0_tokens | ... | recalled_k_tokens | current_tokens | query_tokens]`
-    /// `recalled_episodes` is ordered furthest-first so the closest recalled episode
-    /// sits immediately before the current episode (most salient to the LM's causal window).
-    /// Pass an empty slice to skip recall (pre-R1 behaviour).
+    /// Sequence layout (R1 + R2):
+    ///   `[recalled_0_tokens | ... | recalled_k_tokens | current_tokens | hist_turn_0 | ... | hist_turn_N | query_tokens]`
+    /// Recalled episodes are furthest-first (closest sits immediately before current episode).
+    /// Conversation history is oldest-first within CONV_HISTORY_BUDGET tokens.
+    /// Pass an empty slice for `recalled_episodes` to skip recall.
+    /// Pushes (query_ids, response_ids) into the conversation buffer after each successful call.
     /// Returns the generated text (decoded, EOS stripped).
     pub fn generate(
         &mut self,
@@ -194,14 +211,51 @@ impl ActionDecoder {
         let query_ids = self.tokenize(query)?;
         let query_embeds = self.embed_flat(&query_ids)?; // [n_query * LM_HIDDEN]
 
+        // Collect conversation history turns that fit within the token budget.
+        // We need to split the borrow: collect turn IDs first, then embed them.
+        let history_ids: Vec<(&[u32], &[u32])> = {
+            let mut remaining = CONV_HISTORY_BUDGET;
+            let mut turns: Vec<(&[u32], &[u32])> = Vec::new();
+            // Walk oldest→newest; include turns that fit.
+            for turn in &self.conversation {
+                let n = turn.query_ids.len() + turn.response_ids.len();
+                if n <= remaining {
+                    turns.push((&turn.query_ids, &turn.response_ids));
+                    remaining -= n;
+                }
+                // Don't break: a larger older turn may block a smaller newer one; accept
+                // the simplicity of first-fit oldest-first.
+            }
+            turns
+        };
+        let history_turn_count = history_ids.len();
+
         // Prepend recalled episode tokens (furthest first), then current episode tokens.
         let mut all_embeds: Vec<f32> = Vec::new();
         for rec_ep in recalled_episodes {
             all_embeds.extend(self.project_flat(rec_ep)?);
         }
         all_embeds.extend(self.project_flat(episode)?); // current episode [N_REGIONS * LM_HIDDEN]
+
+        // Append conversation history (oldest first).
+        let mut history_token_count: usize = 0;
+        for (q_ids, r_ids) in &history_ids {
+            all_embeds.extend(self.embed_flat(q_ids)?);
+            all_embeds.extend(self.embed_flat(r_ids)?);
+            history_token_count += q_ids.len() + r_ids.len();
+        }
+
         all_embeds.extend_from_slice(&query_embeds);
-        let mut seq_len = (1 + recalled_episodes.len()) * N_REGIONS + query_ids.len();
+        let mut seq_len =
+            (1 + recalled_episodes.len()) * N_REGIONS + history_token_count + query_ids.len();
+
+        tracing::info!(
+            history_turns = history_turn_count,
+            history_tokens = history_token_count,
+            recalled = recalled_episodes.len(),
+            seq_len,
+            "generation starting"
+        );
 
         let mut generated: Vec<u32> = Vec::new();
 
@@ -243,7 +297,33 @@ impl ActionDecoder {
             .tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+
+        // Push this turn into the conversation buffer (R2).
+        // Strip trailing EOS so it's never embedded as mid-context end-of-sequence.
+        let mut response_ids = generated;
+        if response_ids.last() == Some(&EOS_TOKEN_ID) {
+            response_ids.pop();
+        }
+        let turn_tokens = query_ids.len() + response_ids.len();
+        self.conv_token_count += turn_tokens;
+        self.conversation.push_back(ConvTurn { query_ids, response_ids });
+        // Evict oldest turns until within budget.
+        while self.conv_token_count > CONV_HISTORY_BUDGET {
+            if let Some(front) = self.conversation.pop_front() {
+                let n = front.query_ids.len() + front.response_ids.len();
+                self.conv_token_count = self.conv_token_count.saturating_sub(n);
+            } else {
+                break;
+            }
+        }
+
         Ok(text)
+    }
+
+    /// Clear the conversation history buffer (R2). Called at sleep entry.
+    pub fn clear_conversation(&mut self) {
+        self.conversation.clear();
+        self.conv_token_count = 0;
     }
 
     /// Surrogate projection training step (ADR 0012, NREM).
