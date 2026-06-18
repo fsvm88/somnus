@@ -3,7 +3,7 @@
 > **Last updated:** 2026-06-18
 > **Branch:** `main`
 
-## Status: Interaction capability queue active. Q1 + R1 done. Next: R2 (multi-turn conversation), then R3, M, L.
+## Status: Interaction capability queue active. Q1 + R1 + R2 done. Next: R3 (introspection — recent history narration), then M, L.
 
 ---
 
@@ -38,6 +38,7 @@ Three concrete gaps identified in the architecture review. Ordered by severity:
 |---|-----|------------|----------|
 | **Q1** | Qwen LM on CPU during NREM | **Done + A/B confirmed (2026-06-18).** Exported `qwen25_text_hidden.onnx` — static `[1, 128, 896]`, no LM head — loaded via `migraphx_session`. `text_hidden_states()` uses GPU path when present; CPU fallback otherwise. A/B (5s×2c fresh memory, h3h3+shorts): proj_loss 0.0021 vs 0.0021 (+2.1%, PASS). | Medium |
 | **R1** | Memory recall in generation | **Done (2026-06-18).** `generate()` now takes `recalled_episodes: &[Vec<f32>]`. Query handlers call `query_recalled_episodes()` to fetch top-k warm HNSW results (default k=3, `--recall-k` flag), filtered for self-match, reversed so closest-recalled is nearest to query tokens. Startup query gets empty recall. ADR 0028. | — |
+| **R2** | Multi-turn conversation | **Done (2026-06-18).** `ConvTurn` ring buffer on `ActionDecoder`; `CONV_HISTORY_BUDGET=256` tokens; oldest-first eviction at push-time; EOS stripped from stored response_ids; cleared at sleep entry via `clear_conversation()`. Layout: `[recalled | current_episode | history | query]`. `tracing::info!` logs `history_turns`/`history_tokens`/`seq_len` per call. ADR 0029. Commit ae29a70. | — |
 | **Q2** | Pruning disabled, regions grow monotonically | `--prune-fraction 0.0` after magnitude-based A/B failure. Grown units (>N_UNITS=1024) are clamped by `to_dense_n` — unreachable but accumulating. No pruning strategy yet works. Item I (knowledge distillation) is the correct next step once regions grow large enough to matter (trigger: any region > 2× baseline). | Low — not a current bottleneck |
 | **Q3** | Top-down prior is weak in practice | Language region prior_cosine 0.843 at steady state. The McGurk-style disambiguation described in architecture.md is not yet realized. β=0.05 (via S4) is a soft uniform blend, not a reliable predictive-coding feedback loop. Would require much stronger per-region priors before disambiguation is useful. | Low — research frontier, no clear fix without better prior signal |
 
