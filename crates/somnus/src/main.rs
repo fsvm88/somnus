@@ -246,6 +246,11 @@ struct Args {
     #[arg(long, default_value = "128")]
     action_max_tokens: usize,
 
+    /// Number of past episodes to retrieve from warm memory and prepend as recall
+    /// context before each generation query (ADR 0028, R1). Set to 0 to disable.
+    #[arg(long, default_value = "3")]
+    recall_k: usize,
+
     /// Skip autoregressive generation; only run LM hidden-state distillation.
     /// Text from stdin feeds lang_rx (distillation) but not query_rx (generation).
     /// Use during training campaigns where generation output is not needed.
@@ -1446,28 +1451,29 @@ async fn main() -> Result<()> {
         // This ensures queries are never blocked behind a sleep cycle.
         while let Ok(query) = query_rx.try_recv() {
             tracing::info!(query = %query, "query received (pre-sleep drain)");
-            let ep_vec = episodic
-                .iter_traces()
-                .last()
-                .map(|t| t.record.values.clone());
-            match ep_vec {
+            let last_trace = episodic.iter_traces().last();
+            let ep_info = last_trace.map(|t| (t.record.id, t.record.values.clone()));
+            match ep_info {
                 None => {
                     println!(
                         "{}",
                         serde_json::json!({"type":"action_response","error":"no episode yet"})
                     );
                 }
-                Some(ep) => {
+                Some((last_id, ep)) => {
                     if let Some(ref mut dec) = decoder {
                         if let Ok(ids) = dec.tokenize(&query) {
                             episodic.set_last_text_target(ids);
                         }
-                        tracing::info!("starting generation (pre-sleep)");
+                        let recalled = query_recalled_episodes(
+                            &recall, &ep, Some(last_id), args.recall_k,
+                        );
+                        tracing::info!(recall_n = recalled.len(), "starting generation (pre-sleep)");
                         let ep_clone = ep.clone();
                         let query_clone = query.clone();
                         let max_tokens = args.action_max_tokens;
                         let result = tokio::task::block_in_place(|| {
-                            dec.generate(&ep_clone, &query_clone, max_tokens)
+                            dec.generate(&ep_clone, &recalled, &query_clone, max_tokens)
                         });
                         match result {
                             Ok(response) => {
@@ -2270,21 +2276,25 @@ async fn main() -> Result<()> {
                 );
             }
             Some(query) = query_rx.recv() => {
-                // Query: generate a response using the current episode as context (ADR 0012).
+                // Query: generate a response using the current episode as context (ADR 0012, R1).
                 // The query text is also stored as text_target on the latest episode for NREM training.
                 tracing::info!(query = %query, "query received");
-                let ep_vec = episodic.iter_traces().last().map(|t| t.record.values.clone());
-                match ep_vec {
+                let last_trace = episodic.iter_traces().last();
+                let ep_info = last_trace.map(|t| (t.record.id, t.record.values.clone()));
+                match ep_info {
                     None => {
                         println!("{}", serde_json::json!({"type":"action_response","error":"no episode yet"}));
                     }
-                    Some(ep) => {
+                    Some((last_id, ep)) => {
                         if let Some(ref mut dec) = decoder {
                             // Store query as text_target before generation so it's available for NREM.
                             if let Ok(ids) = dec.tokenize(&query) {
                                 episodic.set_last_text_target(ids);
                             }
-                            tracing::info!("starting generation");
+                            let recalled = query_recalled_episodes(
+                                &recall, &ep, Some(last_id), args.recall_k,
+                            );
+                            tracing::info!(recall_n = recalled.len(), "starting generation");
                             // Run generation in a blocking thread so we don't stall the async runtime.
                             let ep_clone = ep.clone();
                             let query_clone = query.clone();
@@ -2292,7 +2302,7 @@ async fn main() -> Result<()> {
                             // SAFETY: ActionDecoder is not Send. We run generation synchronously
                             // here (blocking the current async task via block_in_place).
                             let result = tokio::task::block_in_place(|| {
-                                dec.generate(&ep_clone, &query_clone, max_tokens)
+                                dec.generate(&ep_clone, &recalled, &query_clone, max_tokens)
                             });
                             match result {
                                 Ok(response) => {
@@ -2587,6 +2597,33 @@ fn ingest_language_line(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/// Retrieve up to `k` recalled episode vectors from warm memory for R1 generation context.
+///
+/// Returns vectors ordered furthest-first (closest last) so the most similar recalled episode
+/// sits immediately before the current-episode tokens in the LLM's causal window.
+/// Returns an empty vec when `k == 0`, warm is too small, or there are too few results.
+fn query_recalled_episodes(
+    recall: &RecollectionLayer,
+    cue: &[f32],
+    last_ep_id: Option<u64>,
+    k: usize,
+) -> Vec<Vec<f32>> {
+    if k == 0 || recall.warm.len() < 2 {
+        return vec![];
+    }
+    // Fetch k+1 so we can drop the self-match without going short.
+    let results = recall.query_warm(cue, k + 1);
+    let mut out: Vec<Vec<f32>> = results
+        .into_iter()
+        .filter(|r| Some(r.id) != last_ep_id)
+        .take(k)
+        .map(|r| r.values.clone())
+        .collect();
+    // HNSW returns closest-first; reverse so closest is last (nearest to query tokens).
+    out.reverse();
+    out
+}
+
 /// Fire the --query one-shot generation. Returns true if the query was sent (caller should set
 /// startup_query_fired). No-ops when query is None or decoder is absent.
 fn maybe_startup_query(
@@ -2607,7 +2644,8 @@ fn maybe_startup_query(
         return false;
     };
     let q_clone = q.clone();
-    let result = tokio::task::block_in_place(|| dec.generate(&ep, &q_clone, max_tokens));
+    // No recall context at startup — warm memory is likely empty at this point.
+    let result = tokio::task::block_in_place(|| dec.generate(&ep, &[], &q_clone, max_tokens));
     match result {
         Ok(response) => {
             let ts_ms = std::time::SystemTime::now()

@@ -178,18 +178,30 @@ impl ActionDecoder {
 
     /// Autoregressive greedy generation given a current episode vector and a text query.
     ///
-    /// Prepends the N_REGIONS projected region tokens as a soft prefix before the query tokens.
+    /// Prepends projected region tokens as a soft prefix:
+    ///   `[recalled_0_tokens | ... | recalled_k_tokens | current_tokens | query_tokens]`
+    /// `recalled_episodes` is ordered furthest-first so the closest recalled episode
+    /// sits immediately before the current episode (most salient to the LM's causal window).
+    /// Pass an empty slice to skip recall (pre-R1 behaviour).
     /// Returns the generated text (decoded, EOS stripped).
-    pub fn generate(&mut self, episode: &[f32], query: &str, max_tokens: usize) -> Result<String> {
-        let proj_flat = self.project_flat(episode)?; // [N_REGIONS * LM_HIDDEN]
-
+    pub fn generate(
+        &mut self,
+        episode: &[f32],
+        recalled_episodes: &[Vec<f32>],
+        query: &str,
+        max_tokens: usize,
+    ) -> Result<String> {
         let query_ids = self.tokenize(query)?;
         let query_embeds = self.embed_flat(&query_ids)?; // [n_query * LM_HIDDEN]
 
-        // Concatenate region tokens + query embeds → [N_REGIONS + n_query, LM_HIDDEN]
-        let mut all_embeds: Vec<f32> = proj_flat;
+        // Prepend recalled episode tokens (furthest first), then current episode tokens.
+        let mut all_embeds: Vec<f32> = Vec::new();
+        for rec_ep in recalled_episodes {
+            all_embeds.extend(self.project_flat(rec_ep)?);
+        }
+        all_embeds.extend(self.project_flat(episode)?); // current episode [N_REGIONS * LM_HIDDEN]
         all_embeds.extend_from_slice(&query_embeds);
-        let mut seq_len = N_REGIONS + query_ids.len();
+        let mut seq_len = (1 + recalled_episodes.len()) * N_REGIONS + query_ids.len();
 
         let mut generated: Vec<u32> = Vec::new();
 
