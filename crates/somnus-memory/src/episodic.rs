@@ -131,6 +131,20 @@ impl EpisodicBuffer {
         self.next_id = next;
     }
 
+    /// Return token-ID sequences for the N most recent traces that have a text_target,
+    /// oldest-first. Used by R3 introspection to surface what the system recently perceived.
+    pub fn recent_text_targets(&self, n: usize) -> Vec<Vec<u32>> {
+        let mut out: Vec<Vec<u32>> = self
+            .buf
+            .iter()
+            .rev()
+            .filter_map(|t| t.text_target.clone())
+            .take(n)
+            .collect();
+        out.reverse();
+        out
+    }
+
     /// Clear all traces and reset the replay checkpoint.
     ///
     /// Called by the sleep controller after a successful hot→cold spill, so the

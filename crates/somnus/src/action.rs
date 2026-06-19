@@ -569,6 +569,13 @@ impl ActionDecoder {
             .map_err(|e| anyhow::anyhow!("end_profiling failed: {e}"))
     }
 
+    /// Decode token IDs back to a UTF-8 string. Used by R3 introspection.
+    pub fn decode_ids(&self, ids: &[u32]) -> Result<String> {
+        self.tokenizer
+            .decode(ids, true)
+            .map_err(|e| anyhow::anyhow!("decode failed: {e}"))
+    }
+
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         let enc = self
             .tokenizer

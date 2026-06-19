@@ -1451,6 +1451,11 @@ async fn main() -> Result<()> {
         // This ensures queries are never blocked behind a sleep cycle.
         while let Ok(query) = query_rx.try_recv() {
             tracing::info!(query = %query, "query received (pre-sleep drain)");
+            let raw_targets = if is_introspective_query(&query) {
+                episodic.recent_text_targets(8)
+            } else {
+                vec![]
+            };
             let last_trace = episodic.iter_traces().last();
             let ep_info = last_trace.map(|t| (t.record.id, t.record.values.clone()));
             match ep_info {
@@ -1465,15 +1470,15 @@ async fn main() -> Result<()> {
                         if let Ok(ids) = dec.tokenize(&query) {
                             episodic.set_last_text_target(ids);
                         }
+                        let effective_query = build_query_with_history(&query, raw_targets, dec);
                         let recalled = query_recalled_episodes(
                             &recall, &ep, Some(last_id), args.recall_k,
                         );
-                        tracing::info!(recall_n = recalled.len(), "starting generation (pre-sleep)");
+                        tracing::info!(recall_n = recalled.len(), introspective = effective_query.len() != query.len(), "starting generation (pre-sleep)");
                         let ep_clone = ep.clone();
-                        let query_clone = query.clone();
                         let max_tokens = args.action_max_tokens;
                         let result = tokio::task::block_in_place(|| {
-                            dec.generate(&ep_clone, &recalled, &query_clone, max_tokens)
+                            dec.generate(&ep_clone, &recalled, &effective_query, max_tokens)
                         });
                         match result {
                             Ok(response) => {
@@ -2283,6 +2288,12 @@ async fn main() -> Result<()> {
                 // Query: generate a response using the current episode as context (ADR 0012, R1).
                 // The query text is also stored as text_target on the latest episode for NREM training.
                 tracing::info!(query = %query, "query received");
+                // Collect recent text history before borrowing decoder (R3 Phase 1).
+                let raw_targets = if is_introspective_query(&query) {
+                    episodic.recent_text_targets(8)
+                } else {
+                    vec![]
+                };
                 let last_trace = episodic.iter_traces().last();
                 let ep_info = last_trace.map(|t| (t.record.id, t.record.values.clone()));
                 match ep_info {
@@ -2295,18 +2306,18 @@ async fn main() -> Result<()> {
                             if let Ok(ids) = dec.tokenize(&query) {
                                 episodic.set_last_text_target(ids);
                             }
+                            let effective_query = build_query_with_history(&query, raw_targets, dec);
                             let recalled = query_recalled_episodes(
                                 &recall, &ep, Some(last_id), args.recall_k,
                             );
-                            tracing::info!(recall_n = recalled.len(), "starting generation");
+                            tracing::info!(recall_n = recalled.len(), introspective = effective_query.len() != query.len(), "starting generation");
                             // Run generation in a blocking thread so we don't stall the async runtime.
                             let ep_clone = ep.clone();
-                            let query_clone = query.clone();
                             let max_tokens = args.action_max_tokens;
                             // SAFETY: ActionDecoder is not Send. We run generation synchronously
                             // here (blocking the current async task via block_in_place).
                             let result = tokio::task::block_in_place(|| {
-                                dec.generate(&ep_clone, &recalled, &query_clone, max_tokens)
+                                dec.generate(&ep_clone, &recalled, &effective_query, max_tokens)
                             });
                             match result {
                                 Ok(response) => {
@@ -2626,6 +2637,55 @@ fn query_recalled_episodes(
     // HNSW returns closest-first; reverse so closest is last (nearest to query tokens).
     out.reverse();
     out
+}
+
+/// True when the query is asking the system to describe what it recently perceived.
+/// Triggers R3 text-history injection before generation.
+fn is_introspective_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "what did you hear",
+        "what have you heard",
+        "what did you see",
+        "what have you seen",
+        "what have you been",
+        "what have we been",
+        "what do you remember",
+        "what do you know",
+        "what have you learned",
+        "what was that",
+        "recent",
+        "recap",
+    ]
+    .iter()
+    .any(|kw| q.contains(kw))
+}
+
+/// Build the generation query string, prepending a recent-text context block for
+/// introspective queries (R3 Phase 1).
+fn build_query_with_history(
+    query: &str,
+    raw_targets: Vec<Vec<u32>>,
+    dec: &ActionDecoder,
+) -> String {
+    if raw_targets.is_empty() {
+        return query.to_owned();
+    }
+    let texts: Vec<String> = raw_targets
+        .iter()
+        .filter_map(|ids| dec.decode_ids(ids).ok())
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    if texts.is_empty() {
+        return query.to_owned();
+    }
+    let entries = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!("{}. {t}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("[Recent perceived text:\n{entries}\n]\n{query}")
 }
 
 /// Fire the --query one-shot generation. Returns true if the query was sent (caller should set
