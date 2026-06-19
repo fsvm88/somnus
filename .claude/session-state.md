@@ -1,9 +1,18 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-19
+> **Last updated:** 2026-06-20
 > **Branch:** `main`
 
-## Status: Interaction capability queue active. Q1 + R1 + R2 + R3 Phase 1 done. Next: M (MLP projection, trigger-gated), then L (LoRA, trigger-gated).
+## Status: R1+R2+R3 all done and live-tested. Generation quality limited by linear projection (expected). Next: qwen25_lm.onnx → GPU (fixed-shape re-export), or M (MLP projection, trigger-gated).
+
+---
+
+## Completed this session (2026-06-19–20)
+
+| Item | What changed | Result |
+|------|-------------|--------|
+| **ORT log suppression** | Default `EnvFilter` changed from `"info"` to `"info,ort=warn"` in `main.rs`. `RUST_LOG` overrides still work. | Eliminates `[Static memory planning] Could not resolve shape` spam (~24× per decode step from `qwen25_lm.onnx` dynamic shapes) and BFCArena extension messages. Commit a874166. |
+| **Live test (R1+R2+R3)** | Full interactive test with `memory/mixed_campaign`, `--models-dir models`, `--recall-k 3`, `--action-max-tokens 200` | System launched, recalled 3 episodes, generated 42 tokens. Response quality: complete hallucination (real vs. imaginary numbers) — unrelated to ingested content. Expected: linear projection bottleneck. R3 didn't trigger on "what can you actually recall" (keyword "recall" not in list; "recap"/"recent" are). Left as-is. |
 
 ---
 
