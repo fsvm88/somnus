@@ -680,7 +680,7 @@ async fn main() -> Result<()> {
             .with_writer(writer)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ort=warn")),
             )
             .init();
     }
@@ -692,14 +692,17 @@ async fn main() -> Result<()> {
         std::fs::write(pid_path, format!("{}\n", std::process::id()))?;
     }
 
-    for name in &[
-        "whisper_tiny_encoder.onnx",
-        "clap_audio_encoder.onnx",
-        "dinov2_small.onnx",
-    ] {
-        let p = args.models_dir.join(name);
-        if !p.exists() {
-            anyhow::bail!("model file not found: {}", p.display());
+    // Audio/visual model files are only needed when a media file is provided.
+    if !args.file.is_empty() {
+        for name in &[
+            "whisper_tiny_encoder.onnx",
+            "clap_audio_encoder.onnx",
+            "dinov2_small.onnx",
+        ] {
+            let p = args.models_dir.join(name);
+            if !p.exists() {
+                anyhow::bail!("model file not found: {}", p.display());
+            }
         }
     }
 
