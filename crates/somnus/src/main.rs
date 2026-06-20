@@ -257,6 +257,13 @@ struct Args {
     #[arg(long, default_value = "false")]
     action_distill_only: bool,
 
+    /// Use qwen25_lm_fixed.onnx (GPU, fixed seq_len=1024) for autoregressive generation
+    /// instead of the default CPU path (qwen25_lm.onnx, dynamic seq_len).
+    /// NOTE: on gfx1201 (RDNA 4) the GPU path is ~14× slower than CPU at typical seq_lens
+    /// due to immature MIGraphX support. Re-evaluate when ROCm matures for RDNA 4.
+    #[arg(long, default_value = "false")]
+    gpu_generation: bool,
+
     /// Use LM forward-pass hidden states for language region input instead of
     /// the frozen embed-table mean-pool. Requires --action (loads qwen25_lm.onnx).
     /// Each text line runs a single non-autoregressive LM forward pass; hidden
@@ -924,6 +931,7 @@ async fn main() -> Result<()> {
             &args.models_dir,
             NdArrayDevice::Cpu,
             args.ort_profile_dir.as_deref(),
+            args.gpu_generation,
         ) {
             Ok(mut d) => {
                 // Burn's BinFileRecorder sets extension to ".bin"; pass stem path.

@@ -71,8 +71,12 @@ pub struct ActionDecoder {
     /// Base model only (no LM head), static [1, MAX_GEN_SEQ, 896] — MIGraphX-eligible.
     /// GPU generation path: Rust extracts hidden[seq_len-1] and computes logits via
     /// dot(hidden, embed_table^T). Works because Qwen2.5-0.5B ties lm_head == embed_tokens.
-    /// Falls back to lm_session (CPU) when absent.
+    /// Falls back to lm_session (CPU) when absent or when use_gpu_gen is false.
     lm_fixed_session: Option<Session>,
+    /// Whether to use the GPU generation path (lm_fixed_session) when present.
+    /// Opt-in via --gpu-generation: on gfx1201 the fixed-1024 path is ~14× slower than
+    /// CPU at typical seq_lens; re-evaluate when ROCm/MIGraphX matures for RDNA 4.
+    use_gpu_gen: bool,
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
     #[allow(dead_code)]
@@ -98,6 +102,7 @@ impl ActionDecoder {
         models_dir: &std::path::Path,
         device: NdArrayDevice,
         ort_profile_dir: Option<&std::path::Path>,
+        gpu_generation: bool,
     ) -> Result<Self> {
         let gain_path = models_dir.join("qwen25_gain.onnx");
         let lm_path = models_dir.join("qwen25_lm.onnx");
@@ -121,11 +126,14 @@ impl ActionDecoder {
             None
         };
         let lm_fixed_path = models_dir.join("qwen25_lm_fixed.onnx");
-        let lm_fixed_session = if lm_fixed_path.exists() {
-            tracing::info!("loading qwen25_lm_fixed.onnx — GPU generation path active");
+        let lm_fixed_session = if gpu_generation && lm_fixed_path.exists() {
+            tracing::info!("loading qwen25_lm_fixed.onnx — GPU generation path active (--gpu-generation)");
             Some(crate::migraphx_session(&lm_fixed_path)?)
+        } else if gpu_generation {
+            tracing::info!("qwen25_lm_fixed.onnx absent — --gpu-generation ignored, using CPU lm_session");
+            None
         } else {
-            tracing::info!("qwen25_lm_fixed.onnx absent — generate() uses CPU lm_session");
+            tracing::info!("generate() using CPU lm_session (pass --gpu-generation to use qwen25_lm_fixed.onnx)");
             None
         };
 
@@ -161,6 +169,7 @@ impl ActionDecoder {
             lm_session,
             text_hidden_session,
             lm_fixed_session,
+            use_gpu_gen: gpu_generation,
             tokenizer,
             gain: [1.0; 5],
             device,
@@ -277,7 +286,7 @@ impl ActionDecoder {
 
         let mut generated: Vec<u32> = Vec::new();
 
-        if self.lm_fixed_session.is_some() {
+        if self.use_gpu_gen {
             // GPU path: fixed [1, MAX_GEN_SEQ, LM_HIDDEN] buffer.
             // Causal attention ensures hidden[seq_len-1] is unaffected by zero-padding at
             // positions seq_len..MAX_GEN_SEQ. Logits computed on CPU via embed_table dot.
@@ -291,9 +300,9 @@ impl ActionDecoder {
                     break;
                 }
                 // Inner block: sess + outputs borrow released before logits_from_hidden
-                // borrows self immutably.
+                // borrows self immutably. use_gpu_gen guarantees lm_fixed_session is Some.
                 let hidden = {
-                    let sess = self.lm_fixed_session.as_mut().unwrap();
+                    let sess = self.lm_fixed_session.as_mut().expect("use_gpu_gen set but lm_fixed_session is None");
                     let input =
                         Array3::from_shape_vec((1, MAX_GEN_SEQ, LM_HIDDEN), gpu_buf.clone())
                             .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
