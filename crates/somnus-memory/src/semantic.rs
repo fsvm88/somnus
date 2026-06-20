@@ -207,8 +207,8 @@ impl SemanticStore {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Sidecar
-        let encoded =
-            bincode::serialize(&self.records).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let encoded = bincode::serde::encode_to_vec(&self.records, bincode::config::standard())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         fs::write(warm_dir.join("records.bin"), encoded)?;
 
         Ok(())
@@ -243,7 +243,10 @@ impl SemanticStore {
 
         // Sidecar records
         let sidecar_bytes = fs::read(&sidecar_path).ok()?;
-        let records: HashMap<usize, EpisodeRecord> = bincode::deserialize(&sidecar_bytes).ok()?;
+        let records: HashMap<usize, EpisodeRecord> =
+            bincode::serde::decode_from_slice(&sidecar_bytes, bincode::config::standard())
+                .ok()
+                .map(|(v, _)| v)?;
 
         // HNSW — leak HnswIo so the returned Hnsw<'static, ...> is valid
         let io = Box::new(HnswIo::new(warm_dir, "index"));
