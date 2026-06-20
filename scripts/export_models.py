@@ -256,6 +256,10 @@ def export_whisper_decoder() -> None:
 # are truncated to this length before embedding, which is acceptable for distillation.
 # Must match MAX_TEXT_SEQ in crates/somnus/src/action.rs.
 MAX_TEXT_SEQ = 128
+# Fixed sequence length for qwen25_lm_fixed.onnx (GPU generation path).
+# Must cover: recalled (3×5) + current (5) + history (256) + query (~50) + generated (200) ≈ 526.
+# Must match MAX_GEN_SEQ in crates/somnus/src/action.rs.
+MAX_GEN_SEQ = 1024
 
 class Qwen25GainWrapper(torch.nn.Module):
     """Qwen2Model (base transformer only, no LM head).
@@ -300,12 +304,13 @@ class Qwen25LMWrapper(torch.nn.Module):
 def export_qwen25() -> None:
     gain_out = MODELS_DIR / "qwen25_gain.onnx"
     lm_out = MODELS_DIR / "qwen25_lm.onnx"
+    lm_fixed_out = MODELS_DIR / "qwen25_lm_fixed.onnx"
     text_hidden_out = MODELS_DIR / "qwen25_text_hidden.onnx"
     embed_out = MODELS_DIR / "qwen25_embed_table.safetensors"
     tok_out = MODELS_DIR / "qwen25_tokenizer.json"
 
-    if (gain_out.exists() and lm_out.exists() and text_hidden_out.exists()
-            and embed_out.exists() and tok_out.exists()):
+    if (gain_out.exists() and lm_out.exists() and lm_fixed_out.exists()
+            and text_hidden_out.exists() and embed_out.exists() and tok_out.exists()):
         print(f"  skip: qwen25 artifacts already present")
         return
 
@@ -316,6 +321,11 @@ def export_qwen25() -> None:
     print(f"  loading {repo} @ {rev or 'main'}…")
     model = Qwen2ForCausalLM.from_pretrained(repo, revision=rev, torch_dtype=torch.float32).eval()
     tokenizer = AutoTokenizer.from_pretrained(repo, revision=rev)
+
+    assert model.config.tie_word_embeddings, (
+        "qwen25_lm_fixed GPU path requires tied embeddings (lm_head == embed_tokens) "
+        "so Rust can compute logits using the already-loaded embed_table."
+    )
 
     hidden_size = model.config.hidden_size  # 896 for Qwen2.5-0.5B
 
@@ -374,6 +384,27 @@ def export_qwen25() -> None:
                 opset_version=17,
             )
         report(lm_out)
+
+    if not lm_fixed_out.exists():
+        # Static [1, MAX_GEN_SEQ, hidden_size] — base transformer only (no LM head).
+        # GPU-eligible via MIGraphX (fixed shape, no ScatterElements/INT64 outputs).
+        # Causal attention ensures position i only attends to 0..i, so zero-padding after
+        # seq_len cannot corrupt hidden[seq_len-1]. Rust reads hidden[seq_len-1] and computes
+        # logits as dot(hidden, embed_table^T) using the already-loaded embed_table.
+        # This avoids shipping vocab_size*hidden_size logits off GPU per decode step.
+        lm_fixed_wrapper = Qwen25GainWrapper(model).eval()
+        dummy_lm_fixed = torch.zeros(1, MAX_GEN_SEQ, hidden_size)
+        print(f"  exporting qwen25_lm_fixed.onnx (static [1,{MAX_GEN_SEQ},{hidden_size}], no LM head)…")
+        with torch.no_grad():
+            torch.onnx.export(
+                lm_fixed_wrapper,
+                dummy_lm_fixed,
+                str(lm_fixed_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state"],
+                opset_version=17,
+            )
+        report(lm_fixed_out)
 
     if not embed_out.exists():
         print(f"  saving qwen25_embed_table.safetensors…")

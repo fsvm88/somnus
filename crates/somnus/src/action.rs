@@ -33,6 +33,10 @@ const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
 /// Fixed sequence length for the GPU text-hidden-state path (qwen25_text_hidden.onnx).
 /// Must match MAX_TEXT_SEQ in scripts/export_models.py.
 const MAX_TEXT_SEQ: usize = 128;
+/// Fixed sequence length for the GPU generation path (qwen25_lm_fixed.onnx).
+/// Covers recalled (3×5) + current (5) + history (256) + query (~50) + generated (200) ≈ 526.
+/// Must match MAX_GEN_SEQ in scripts/export_models.py.
+const MAX_GEN_SEQ: usize = 1024;
 /// Token budget for conversation history across turns (R2).
 /// Oldest turns are evicted when the total exceeds this limit.
 const CONV_HISTORY_BUDGET: usize = 256;
@@ -59,11 +63,16 @@ pub struct ActionDecoder {
     /// Transformer-only (no LM head), static [1,5,896].
     /// Moved to GainWorker via `create_gain_worker`; None afterwards.
     gain_session: Option<Session>,
-    /// Full model with LM head, dynamic seq_len — used by generate().
+    /// Full model with LM head, dynamic seq_len — CPU fallback for generate().
     lm_session: Session,
     /// Base model only (no LM head), static [1, MAX_TEXT_SEQ, 896] — MIGraphX-eligible.
     /// Used by text_hidden_states() when present; falls back to lm_session on CPU if absent.
     text_hidden_session: Option<Session>,
+    /// Base model only (no LM head), static [1, MAX_GEN_SEQ, 896] — MIGraphX-eligible.
+    /// GPU generation path: Rust extracts hidden[seq_len-1] and computes logits via
+    /// dot(hidden, embed_table^T). Works because Qwen2.5-0.5B ties lm_head == embed_tokens.
+    /// Falls back to lm_session (CPU) when absent.
+    lm_fixed_session: Option<Session>,
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
     #[allow(dead_code)]
@@ -111,6 +120,14 @@ impl ActionDecoder {
             tracing::info!("qwen25_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session");
             None
         };
+        let lm_fixed_path = models_dir.join("qwen25_lm_fixed.onnx");
+        let lm_fixed_session = if lm_fixed_path.exists() {
+            tracing::info!("loading qwen25_lm_fixed.onnx — GPU generation path active");
+            Some(crate::migraphx_session(&lm_fixed_path)?)
+        } else {
+            tracing::info!("qwen25_lm_fixed.onnx absent — generate() uses CPU lm_session");
+            None
+        };
 
         let bytes = std::fs::read(&embed_path)?;
         let st = SafeTensors::deserialize(&bytes)
@@ -143,6 +160,7 @@ impl ActionDecoder {
             gain_session,
             lm_session,
             text_hidden_session,
+            lm_fixed_session,
             tokenizer,
             gain: [1.0; 5],
             device,
@@ -259,38 +277,84 @@ impl ActionDecoder {
 
         let mut generated: Vec<u32> = Vec::new();
 
-        #[allow(clippy::explicit_counter_loop)]
-        for _ in 0..max_tokens {
-            // Scope the ORT call so SessionOutputs (and its internal borrow of lm_session)
-            // is dropped before embed_flat borrows self again.
-            let next_id = {
-                let input = Array3::from_shape_vec((1, seq_len, LM_HIDDEN), all_embeds.clone())
-                    .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
-                let tensor = TensorRef::from_array_view(&input)?;
-                let outputs = self
-                    .lm_session
-                    .run(ort::inputs!["inputs_embeds" => tensor])?;
-                let (_shape, logits_data) = outputs["logits"].try_extract_tensor::<f32>()?;
-                let logits_flat = logits_data.to_vec();
-                let vocab_size = logits_flat.len() / seq_len;
-                let last_logits = &logits_flat[(seq_len - 1) * vocab_size..];
-                // Repetition penalty: divide logit by 1.3 for each previously generated token.
-                // Prevents degenerate loops common in greedy decoding.
-                let mut penalized: Vec<f32> = last_logits.to_vec();
-                for &id in &generated {
-                    penalized[id as usize] /= 1.3;
-                }
-                argmax(&penalized)
-                // outputs dropped here; lm_session borrow released
-            };
+        if self.lm_fixed_session.is_some() {
+            // GPU path: fixed [1, MAX_GEN_SEQ, LM_HIDDEN] buffer.
+            // Causal attention ensures hidden[seq_len-1] is unaffected by zero-padding at
+            // positions seq_len..MAX_GEN_SEQ. Logits computed on CPU via embed_table dot.
+            let mut gpu_buf = vec![0.0f32; MAX_GEN_SEQ * LM_HIDDEN];
+            let copy_len = all_embeds.len().min(gpu_buf.len());
+            gpu_buf[..copy_len].copy_from_slice(&all_embeds[..copy_len]);
 
-            generated.push(next_id);
-            if next_id == EOS_TOKEN_ID {
-                break;
+            #[allow(clippy::explicit_counter_loop)]
+            for _ in 0..max_tokens {
+                if seq_len > MAX_GEN_SEQ {
+                    break;
+                }
+                // Inner block: sess + outputs borrow released before logits_from_hidden
+                // borrows self immutably.
+                let hidden = {
+                    let sess = self.lm_fixed_session.as_mut().unwrap();
+                    let input =
+                        Array3::from_shape_vec((1, MAX_GEN_SEQ, LM_HIDDEN), gpu_buf.clone())
+                            .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
+                    let tensor = TensorRef::from_array_view(&input)?;
+                    let outputs = sess.run(ort::inputs!["inputs_embeds" => tensor])?;
+                    let (_, hidden_data) =
+                        outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+                    let start = (seq_len - 1) * LM_HIDDEN;
+                    hidden_data[start..start + LM_HIDDEN].to_vec()
+                    // outputs + sess dropped here
+                };
+                let next_id = {
+                    let mut logits = self.logits_from_hidden(&hidden);
+                    for &id in &generated {
+                        logits[id as usize] /= 1.3;
+                    }
+                    argmax(&logits)
+                };
+
+                generated.push(next_id);
+                if next_id == EOS_TOKEN_ID {
+                    break;
+                }
+                if seq_len < MAX_GEN_SEQ {
+                    let next_embed = self.embed_flat(&[next_id])?;
+                    gpu_buf[seq_len * LM_HIDDEN..(seq_len + 1) * LM_HIDDEN]
+                        .copy_from_slice(&next_embed);
+                }
+                seq_len += 1;
             }
-            let next_embed = self.embed_flat(&[next_id])?;
-            all_embeds.extend_from_slice(&next_embed);
-            seq_len += 1;
+        } else {
+            // CPU fallback: dynamic seq_len via lm_session.
+            #[allow(clippy::explicit_counter_loop)]
+            for _ in 0..max_tokens {
+                let next_id = {
+                    let input =
+                        Array3::from_shape_vec((1, seq_len, LM_HIDDEN), all_embeds.clone())
+                            .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
+                    let tensor = TensorRef::from_array_view(&input)?;
+                    let outputs = self
+                        .lm_session
+                        .run(ort::inputs!["inputs_embeds" => tensor])?;
+                    let (_shape, logits_data) = outputs["logits"].try_extract_tensor::<f32>()?;
+                    let logits_flat = logits_data.to_vec();
+                    let vocab_size = logits_flat.len() / seq_len;
+                    let last_logits = &logits_flat[(seq_len - 1) * vocab_size..];
+                    let mut penalized: Vec<f32> = last_logits.to_vec();
+                    for &id in &generated {
+                        penalized[id as usize] /= 1.3;
+                    }
+                    argmax(&penalized)
+                };
+
+                generated.push(next_id);
+                if next_id == EOS_TOKEN_ID {
+                    break;
+                }
+                let next_embed = self.embed_flat(&[next_id])?;
+                all_embeds.extend_from_slice(&next_embed);
+                seq_len += 1;
+            }
         }
 
         let text = self
@@ -659,6 +723,21 @@ impl ActionDecoder {
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
+
+    /// Compute logits for every vocabulary token given a single hidden-state vector.
+    ///
+    /// `logit[v] = dot(hidden, embed_table[v])` — valid when lm_head and embed_tokens are
+    /// tied (Qwen2.5-0.5B always ties them). Called by the GPU generation path to avoid
+    /// shipping vocab_size * LM_HIDDEN floats off the GPU per decode step.
+    fn logits_from_hidden(&self, hidden: &[f32]) -> Vec<f32> {
+        let vocab = self.embed_table.len() / LM_HIDDEN;
+        let mut out = vec![0.0f32; vocab];
+        for (v, logit) in out.iter_mut().enumerate() {
+            let row = &self.embed_table[v * LM_HIDDEN..(v + 1) * LM_HIDDEN];
+            *logit = hidden.iter().zip(row).map(|(h, e)| h * e).sum();
+        }
+        out
+    }
 
     /// Project episode → flat Vec<f32> of length [N_REGIONS * LM_HIDDEN].
     fn project_flat(&self, episode: &[f32]) -> Result<Vec<f32>> {
