@@ -92,34 +92,34 @@ impl AudioCapture {
 
         let stream = match fmt {
             cpal::SampleFormat::I8 => {
-                device.build_input_stream(&stream_config, make_cb!(i8), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(i8), err_cb, None)
             }
             cpal::SampleFormat::I16 => {
-                device.build_input_stream(&stream_config, make_cb!(i16), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(i16), err_cb, None)
             }
             cpal::SampleFormat::I32 => {
-                device.build_input_stream(&stream_config, make_cb!(i32), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(i32), err_cb, None)
             }
             cpal::SampleFormat::I64 => {
-                device.build_input_stream(&stream_config, make_cb!(i64), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(i64), err_cb, None)
             }
             cpal::SampleFormat::U8 => {
-                device.build_input_stream(&stream_config, make_cb!(u8), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(u8), err_cb, None)
             }
             cpal::SampleFormat::U16 => {
-                device.build_input_stream(&stream_config, make_cb!(u16), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(u16), err_cb, None)
             }
             cpal::SampleFormat::U32 => {
-                device.build_input_stream(&stream_config, make_cb!(u32), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(u32), err_cb, None)
             }
             cpal::SampleFormat::U64 => {
-                device.build_input_stream(&stream_config, make_cb!(u64), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(u64), err_cb, None)
             }
             cpal::SampleFormat::F32 => {
-                device.build_input_stream(&stream_config, make_cb!(f32), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(f32), err_cb, None)
             }
             cpal::SampleFormat::F64 => {
-                device.build_input_stream(&stream_config, make_cb!(f64), err_cb, None)
+                device.build_input_stream(stream_config, make_cb!(f64), err_cb, None)
             }
             other => return Err(SensorError::UnsupportedSampleFormat(other)),
         };

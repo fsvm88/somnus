@@ -1,13 +1,13 @@
 #![allow(dead_code)] // SincResampler used by binary, not the lib itself
 
 use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 
 pub struct SincResampler {
-    inner: SincFixedIn<f32>,
-    in_buf: Vec<Vec<f32>>,
-    out_buf: Vec<Vec<f32>>,
+    inner: Async<f32>,
 }
 
 impl SincResampler {
@@ -20,23 +20,18 @@ impl SincResampler {
             oversampling_factor: 256,
             window: WindowFunction::BlackmanHarris2,
         };
-        let inner = SincFixedIn::<f32>::new(ratio, 2.0, params, chunk_frames, 1)?;
-        let in_buf = inner.input_buffer_allocate(true);
-        let out_buf = inner.output_buffer_allocate(true);
-        Ok(Self {
-            inner,
-            in_buf,
-            out_buf,
-        })
+        let inner =
+            Async::<f32>::new_sinc(ratio, 2.0, &params, chunk_frames, 1, FixedAsync::Input)
+                .map_err(|e| anyhow::anyhow!("rubato init: {e}"))?;
+        Ok(Self { inner })
     }
 
     /// Resample a mono f32 slice. Input length must equal the chunk_frames used
     /// at construction time.
     pub fn process(&mut self, input: &[f32]) -> anyhow::Result<Vec<f32>> {
-        self.in_buf[0].clear();
-        self.in_buf[0].extend_from_slice(input);
-        self.inner
-            .process_into_buffer(&self.in_buf, &mut self.out_buf, None)?;
-        Ok(self.out_buf[0].clone())
+        let in_buf = InterleavedSlice::new(input, 1, input.len())
+            .map_err(|e| anyhow::anyhow!("rubato in_buf: {e}"))?;
+        let out = self.inner.process(&in_buf, 0, None)?;
+        Ok(out.take_data())
     }
 }

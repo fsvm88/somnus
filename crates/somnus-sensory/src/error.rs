@@ -5,13 +5,13 @@ pub enum SensorError {
     NoAudioDevice,
 
     #[error("audio build stream: {0}")]
-    AudioBuild(#[source] cpal::BuildStreamError),
+    AudioBuild(#[source] cpal::Error),
 
     #[error("audio play stream: {0}")]
-    AudioPlay(#[source] cpal::PlayStreamError),
+    AudioPlay(#[source] cpal::Error),
 
     #[error("audio default config: {0}")]
-    AudioConfig(#[source] cpal::DefaultStreamConfigError),
+    AudioConfig(#[source] cpal::Error),
 
     #[error("video device {index} unavailable")]
     NoVideoDevice { index: u32 },
