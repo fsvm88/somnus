@@ -1,18 +1,19 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-20
+> **Last updated:** 2026-06-21
 > **Branch:** `main`
 
-## Status: R1+R2+R3 all done and live-tested. Generation quality limited by linear projection (expected). Next: qwen25_lm.onnx → GPU (fixed-shape re-export), or M (MLP projection, trigger-gated).
+## Status: Task 1 (GPU generation via qwen25_lm_fixed.onnx) and Task 2 (MLP projection ADR 0032) both complete. Next: A/B to verify proj_loss improvement with MLP, then L (LoRA, trigger-gated).
 
 ---
 
-## Completed this session (2026-06-19–20)
+## Completed this session (2026-06-21)
 
 | Item | What changed | Result |
 |------|-------------|--------|
-| **ORT log suppression** | Default `EnvFilter` changed from `"info"` to `"info,ort=warn"` in `main.rs`. `RUST_LOG` overrides still work. | Eliminates `[Static memory planning] Could not resolve shape` spam (~24× per decode step from `qwen25_lm.onnx` dynamic shapes) and BFCArena extension messages. Commit a874166. |
-| **Live test (R1+R2+R3)** | Full interactive test with `memory/mixed_campaign`, `--models-dir models`, `--recall-k 3`, `--action-max-tokens 200` | System launched, recalled 3 episodes, generated 42 tokens. Response quality: complete hallucination (real vs. imaginary numbers) — unrelated to ingested content. Expected: linear projection bottleneck. R3 didn't trigger on "what can you actually recall" (keyword "recall" not in list; "recap"/"recent" are). Left as-is. |
+| **GPU generation (Task 1)** | `qwen25_lm_fixed.onnx` exported at `[1, 1024, 896]` (no LM head); Rust extracts `hidden[seq_len-1]` and computes logits via `embed_table^T` dot. `--gpu-generation` flag gates it. ADR 0031. Commits c7f43b4, 332c7c1, 3d619ce. | Token-match A/B confirmed correctness. Timing: GPU 2.1s/token vs CPU 0.14s/token on gfx1201 (RDNA 4) — GPU is 14× slower due to immature MIGraphX support. `--gpu-generation` is opt-in; default uses CPU. ADR updated with honest timing. |
+| **MLP projection (Task 2)** | `ProjModel` updated to 2-layer MLP: fc1 [640→1024] + ReLU + fc2 [1024→4480]. `proj_weights_flat()` returns [W1\|W2]. `gain_from_episode()` updated for 2-layer forward. Old `decoder_weights.bin` incompatible — graceful cold-start with ADR 0032 log message. ADR 0032. Commit f9e5faa. | proj_loss plateau at ~0.0007 (sessions 46–50) triggered M. MLP should reduce proj_loss further; evaluate over 3–5 sessions post-deploy via `mean_proj_loss`. Persistent hallucination is not expected to change — that's L's domain. |
+| **Completed this session (2026-06-19–20)** | ORT log suppression (a874166), live test (R1+R2+R3 generating 42 tokens, complete hallucination as expected). | — |
 
 ---
 
@@ -118,13 +119,9 @@ These three capabilities are required for the system to be useful as an interact
 
 ---
 
-### M — MLP projection (after R1–R3 stable)
+### M — MLP projection ✅ DONE (2026-06-21)
 
-**Source:** ADR 0012 deferred item. Replace linear projection (640→5×896) with a small MLP (640→1024→5×896, ~5.4M params) for more expressive episode→LM-space mapping.
-
-**Trigger:** proj_loss plateaus across 10+ sessions with linear projection, OR generation quality assessed as insufficient after R1–R3 are working and the bottleneck is clearly the projection expressivity.
-
-**ADR needed:** yes — MLP architecture choice, whether to retrain from current projection weights or cold-start.
+**ADR 0032.** Commit f9e5faa. proj_loss plateau at ~0.0007 across sessions 46–50 triggered M. 2-layer MLP (640→1024→5×896, ReLU) cold-started (architecture incompatible with old linear weights). Evaluate via `mean_proj_loss` over next 3–5 sessions. Persistent hallucination unchanged — that's L's job.
 
 ---
 
