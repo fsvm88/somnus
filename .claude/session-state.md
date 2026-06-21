@@ -3,7 +3,7 @@
 > **Last updated:** 2026-06-21
 > **Branch:** `main`
 
-## Status: Task 1 (GPU generation via qwen25_lm_fixed.onnx) and Task 2 (MLP projection ADR 0032) both complete. Next: A/B to verify proj_loss improvement with MLP, then L (LoRA, trigger-gated).
+## Status: Task 1 (GPU generation) + Task 2 (MLP projection) + dep updates all complete. Next: A/B to verify proj_loss improvement with MLP over 3–5 sessions, then L (LoRA, trigger-gated).
 
 ---
 
@@ -13,6 +13,7 @@
 |------|-------------|--------|
 | **GPU generation (Task 1)** | `qwen25_lm_fixed.onnx` exported at `[1, 1024, 896]` (no LM head); Rust extracts `hidden[seq_len-1]` and computes logits via `embed_table^T` dot. `--gpu-generation` flag gates it. ADR 0031. Commits c7f43b4, 332c7c1, 3d619ce. | Token-match A/B confirmed correctness. Timing: GPU 2.1s/token vs CPU 0.14s/token on gfx1201 (RDNA 4) — GPU is 14× slower due to immature MIGraphX support. `--gpu-generation` is opt-in; default uses CPU. ADR updated with honest timing. |
 | **MLP projection (Task 2)** | `ProjModel` updated to 2-layer MLP: fc1 [640→1024] + ReLU + fc2 [1024→4480]. `proj_weights_flat()` returns [W1\|W2]. `gain_from_episode()` updated for 2-layer forward. Old `decoder_weights.bin` incompatible — graceful cold-start with ADR 0032 log message. ADR 0032. Commit f9e5faa. | proj_loss plateau at ~0.0007 (sessions 46–50) triggered M. MLP should reduce proj_loss further; evaluate over 3–5 sessions post-deploy via `mean_proj_loss`. Persistent hallucination is not expected to change — that's L's domain. |
+| **Dep updates** | `cargo update` (100+ semver bumps); cpal 0.17→0.18 (unified `cpal::Error`, `StreamConfig` now `Copy`); rubato 0.16→3.0 (API rewrite: `Async::new_sinc` + audioadapter buffers); safetensors 0.7→0.8, tokenizers 0.21→0.23, sysinfo 0.38→0.39 (no API changes); bincode 1→2.0.1 (`serde::encode_to_vec`/`decode_from_slice` API; `bincode-next` considered and rejected). Commits 9a6121e, ac41791, 6652661. | All tests pass, clippy clean. bincode wire-format change: existing `records.bin` sidecars silently dropped on first run (graceful fallback already in place). |
 | **Completed this session (2026-06-19–20)** | ORT log suppression (a874166), live test (R1+R2+R3 generating 42 tokens, complete hallucination as expected). | — |
 
 ---
