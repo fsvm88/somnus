@@ -264,6 +264,25 @@ struct Args {
     #[arg(long, default_value = "false")]
     gpu_generation: bool,
 
+    /// Use a single linear layer (EPISODE_DIM → N_REGIONS*LM_HIDDEN) for episode projection
+    /// instead of the 2-layer MLP (ADR 0032). A/B control arm: pass to both runs, compare
+    /// mean_proj_loss. Default (MLP) is the treatment arm.
+    #[arg(long, default_value = "false")]
+    linear_proj: bool,
+
+    /// Append (episode, text) pairs to a JSONL file during each sleep cycle (ADR 0033).
+    /// Used to collect training data for offline LoRA fine-tuning. Only text-bearing
+    /// traces (those with a text_target from ASR or text-bypass) are written.
+    /// Format: {"episode":[...640 f32...], "text":"decoded text string"}
+    #[arg(long)]
+    export_training_data: Option<PathBuf>,
+
+    /// Export MLP projection weights (W1, W2) as raw f32-LE binary files for
+    /// offline LoRA training (ADR 0033). Writes <dir>/w1.bin and <dir>/w2.bin,
+    /// then exits. Requires --action (needs loaded decoder weights).
+    #[arg(long)]
+    export_proj_weights: Option<PathBuf>,
+
     /// Use LM forward-pass hidden states for language region input instead of
     /// the frozen embed-table mean-pool. Requires --action (loads qwen25_lm.onnx).
     /// Each text line runs a single non-autoregressive LM forward pass; hidden
@@ -932,6 +951,7 @@ async fn main() -> Result<()> {
             NdArrayDevice::Cpu,
             args.ort_profile_dir.as_deref(),
             args.gpu_generation,
+            args.linear_proj,
         ) {
             Ok(mut d) => {
                 // Burn's BinFileRecorder sets extension to ".bin"; pass stem path.
@@ -959,6 +979,23 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Export projection weights for offline LoRA training and exit (ADR 0033).
+    if let Some(ref export_dir) = args.export_proj_weights {
+        let dec = decoder.as_ref().expect("--export-proj-weights requires --action");
+        std::fs::create_dir_all(export_dir).expect("failed to create export dir");
+        let weights = dec.proj_weights_flat();
+        // MLP: W1=[640,1024] then W2=[1024,4480]; linear: W1=[640,4480] only.
+        let w1_len = if args.linear_proj { 640 * 4480 } else { 640 * 1024 };
+        let w1_bytes: Vec<u8> = weights[..w1_len].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let w2_bytes: Vec<u8> = weights[w1_len..].iter().flat_map(|f| f.to_le_bytes()).collect();
+        std::fs::write(export_dir.join("w1.bin"), &w1_bytes).expect("w1.bin write failed");
+        std::fs::write(export_dir.join("w2.bin"), &w2_bytes).expect("w2.bin write failed");
+        println!("exported projection weights to {}", export_dir.display());
+        println!("  w1.bin  {} f32  shape=[640,{}]", w1_len, if args.linear_proj { 4480 } else { 1024 });
+        println!("  w2.bin  {} f32  shape=[{},4480]", weights.len() - w1_len, if args.linear_proj { 0 } else { 1024 });
+        std::process::exit(0);
+    }
 
     // Move the gain ORT session to a background thread so ~54ms Qwen calls don't
     // block the tokio event loop. Only created when both --action and --action-gain are set.
@@ -1713,6 +1750,7 @@ async fn main() -> Result<()> {
                 args.growth_cooldown,
                 cooldown_remaining,
                 session_start_secs,
+                args.export_training_data.as_deref(),
             ) {
                 Ok(stats) => {
                     cooldown_remaining = stats.growth_cooldown_remaining;

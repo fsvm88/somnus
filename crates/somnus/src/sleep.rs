@@ -311,6 +311,7 @@ pub fn run_sleep_cycle(
     growth_cooldown: usize,
     cooldown_remaining: usize,
     session_start_secs: f64,
+    training_data_path: Option<&Path>,
 ) -> Result<SleepStats> {
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
@@ -393,6 +394,31 @@ pub fn run_sleep_cycle(
         distill_precompute_ms,
         "distillation targets precomputed"
     );
+
+    // Export (episode, text) pairs for offline LoRA training (ADR 0033).
+    // Appends one JSON line per text-bearing trace to the specified file.
+    if let (Some(export_path), Some(dec)) = (training_data_path, decoder.as_ref()) {
+        match std::fs::OpenOptions::new().create(true).append(true).open(export_path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                let mut exported = 0usize;
+                for (ep, _, ids, _) in raw_traces.iter() {
+                    let Some(ids) = ids else { continue };
+                    let text = match dec.decode_ids(ids) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let text_escaped = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
+                    let ep_json: String = ep.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+                    let _ = writeln!(f, "{{\"episode\":[{ep_json}],\"text\":\"{text_escaped}\"}}");
+                    exported += 1;
+                }
+                tracing::info!(exported, ?export_path, "training data exported");
+            }
+            Err(e) => tracing::warn!(?e, "failed to open training data export file"),
+        }
+    }
+
     let mut traces: Vec<TraceSnapshot> = raw_traces
         .into_iter()
         .zip(lm_hidden_targets)

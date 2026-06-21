@@ -81,6 +81,9 @@ pub struct ActionDecoder {
     /// Opt-in via --gpu-generation: on gfx1201 the fixed-1024 path is ~14× slower than
     /// CPU at typical seq_lens; re-evaluate when ROCm/MIGraphX matures for RDNA 4.
     use_gpu_gen: bool,
+    /// Use a single linear layer (EPISODE_DIM → N_REGIONS*LM_HIDDEN) instead of the
+    /// 2-layer MLP. A/B control arm for ADR 0032 validation (--linear-proj flag).
+    linear_proj: bool,
     tokenizer: Tokenizer,
     /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
     #[allow(dead_code)]
@@ -107,6 +110,7 @@ impl ActionDecoder {
         device: NdArrayDevice,
         ort_profile_dir: Option<&std::path::Path>,
         gpu_generation: bool,
+        linear_proj: bool,
     ) -> Result<Self> {
         let gain_path = models_dir.join("qwen25_gain.onnx");
         let lm_path = models_dir.join("qwen25_lm.onnx");
@@ -159,12 +163,24 @@ impl ActionDecoder {
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
 
-        let fc1 = LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
-            .with_bias(false)
-            .init::<TrainB>(&device);
-        let fc2 = LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
-            .with_bias(false)
-            .init::<TrainB>(&device);
+        let (fc1, fc2) = if linear_proj {
+            // Control arm: single linear layer EPISODE_DIM → N_REGIONS*LM_HIDDEN, fc2 unused (1→1 dummy).
+            let fc1 = LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
+                .with_bias(false)
+                .init::<TrainB>(&device);
+            let fc2 = LinearConfig::new(1, 1)
+                .with_bias(false)
+                .init::<TrainB>(&device);
+            (fc1, fc2)
+        } else {
+            let fc1 = LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
+                .with_bias(false)
+                .init::<TrainB>(&device);
+            let fc2 = LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
+                .with_bias(false)
+                .init::<TrainB>(&device);
+            (fc1, fc2)
+        };
         let model = ProjModel { fc1, fc2 };
         let optimizer: ProjOptim = AdamWConfig::new().init::<TrainB, ProjModel<TrainB>>();
 
@@ -177,6 +193,7 @@ impl ActionDecoder {
             text_hidden_session,
             use_gpu_gen: lm_fixed_session.is_some(),
             lm_fixed_session,
+            linear_proj,
             tokenizer,
             gain: [1.0; 5],
             device,
@@ -438,8 +455,12 @@ impl ActionDecoder {
         let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
 
         let model = self.model.as_ref().unwrap();
-        let h = activation::relu(model.fc1.forward(ep_t)); // [1, PROJ_HIDDEN]
-        let proj_out = model.fc2.forward(h); // [1, N_REGIONS * LM_HIDDEN]
+        let proj_out = if self.linear_proj {
+            model.fc1.forward(ep_t) // [1, N_REGIONS * LM_HIDDEN]
+        } else {
+            let h = activation::relu(model.fc1.forward(ep_t)); // [1, PROJ_HIDDEN]
+            model.fc2.forward(h) // [1, N_REGIONS * LM_HIDDEN]
+        };
         let proj_out = proj_out.reshape([N_REGIONS, LM_HIDDEN]); // [N_REGIONS, LM_HIDDEN]
         let proj_sum = proj_out.sum_dim(0); // [1, LM_HIDDEN]
         let sq_sum = proj_sum.clone().powf_scalar(2.0).sum_dim(1); // [1, 1]
@@ -569,8 +590,12 @@ impl ActionDecoder {
             Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
 
         let model = self.model.as_ref().unwrap();
-        let h = activation::relu(model.fc1.forward(ep_t)); // [N, PROJ_HIDDEN]
-        let proj_out = model.fc2.forward(h); // [N, N_REGIONS * LM_HIDDEN]
+        let proj_out = if self.linear_proj {
+            model.fc1.forward(ep_t) // [N, N_REGIONS * LM_HIDDEN]
+        } else {
+            let h = activation::relu(model.fc1.forward(ep_t)); // [N, PROJ_HIDDEN]
+            model.fc2.forward(h) // [N, N_REGIONS * LM_HIDDEN]
+        };
         let proj_out = proj_out.reshape([n, N_REGIONS, LM_HIDDEN]); // [N, N_REGIONS, LM_HIDDEN]
         let proj_sum = proj_out.sum_dim(1).reshape([n, LM_HIDDEN]); // [N, LM_HIDDEN]
         let sq_sum = proj_sum.clone().powf_scalar(2.0).sum_dim(1); // [N, 1]
@@ -617,8 +642,12 @@ impl ActionDecoder {
             Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
 
         let model = self.model.as_ref().unwrap();
-        let h = activation::relu(model.fc1.forward(ep_t)); // [N, PROJ_HIDDEN]
-        let proj_out = model.fc2.forward(h); // [N, N_REGIONS * LM_HIDDEN]
+        let proj_out = if self.linear_proj {
+            model.fc1.forward(ep_t) // [N, N_REGIONS * LM_HIDDEN]
+        } else {
+            let h = activation::relu(model.fc1.forward(ep_t)); // [N, PROJ_HIDDEN]
+            model.fc2.forward(h) // [N, N_REGIONS * LM_HIDDEN]
+        };
         let proj_out = proj_out.reshape([n, N_REGIONS, LM_HIDDEN]);
         let proj_sum = proj_out.sum_dim(1).reshape([n, LM_HIDDEN]);
         let sq_sum = proj_sum.clone().powf_scalar(2.0).sum_dim(1);
@@ -672,8 +701,12 @@ impl ActionDecoder {
     pub fn proj_weight_norm(&self) -> Result<f32> {
         let model = self.model.as_ref().unwrap();
         let w1 = model.fc1.weight.val().into_data().convert::<f32>().to_vec::<f32>().unwrap();
-        let w2 = model.fc2.weight.val().into_data().convert::<f32>().to_vec::<f32>().unwrap();
-        let norm_sq: f32 = w1.iter().chain(w2.iter()).map(|x| x * x).sum();
+        let norm_sq: f32 = if self.linear_proj {
+            w1.iter().map(|x| x * x).sum()
+        } else {
+            let w2 = model.fc2.weight.val().into_data().convert::<f32>().to_vec::<f32>().unwrap();
+            w1.iter().chain(w2.iter()).map(|x| x * x).sum()
+        };
         Ok(norm_sq.sqrt())
     }
 
@@ -685,18 +718,24 @@ impl ActionDecoder {
     pub fn create_gain_worker(&mut self) -> Option<GainWorker> {
         let sess = self.gain_session.take()?;
         let proj_w = self.proj_weights_flat();
-        Some(GainWorker::spawn(sess, proj_w))
+        Some(GainWorker::spawn(sess, proj_w, self.linear_proj))
     }
 
-    /// Snapshot MLP projection weights for GainWorker: [W1_flat | W2_flat].
-    /// W1 shape [EPISODE_DIM, PROJ_HIDDEN] (655,360 f32).
-    /// W2 shape [PROJ_HIDDEN, N_REGIONS * LM_HIDDEN] (4,587,520 f32).
-    /// gain_from_episode() reconstructs the split by known constants.
+    /// Snapshot projection weights for GainWorker.
+    ///
+    /// MLP mode (default): [W1_flat | W2_flat]
+    ///   W1: [EPISODE_DIM, PROJ_HIDDEN], W2: [PROJ_HIDDEN, N_REGIONS*LM_HIDDEN]
+    /// Linear mode (--linear-proj): [W1_flat] only
+    ///   W1: [EPISODE_DIM, N_REGIONS*LM_HIDDEN]
+    /// gain_from_episode() receives `linear_proj` separately to interpret the layout.
     pub fn proj_weights_flat(&self) -> Vec<f32> {
         let model = self.model.as_ref().unwrap();
         let w1 = model
             .fc1.weight.val().detach().into_data()
             .convert::<f32>().to_vec::<f32>().unwrap();
+        if self.linear_proj {
+            return w1;
+        }
         let w2 = model
             .fc2.weight.val().detach().into_data()
             .convert::<f32>().to_vec::<f32>().unwrap();
@@ -734,16 +773,25 @@ impl ActionDecoder {
             }
             Err(e) => {
                 // load_file consumes the model; restore a fresh one so callers remain
-                // functional after a failed weight restore. This is the expected path
-                // when loading a pre-ADR-0032 snapshot (linear projection, field name
-                // "projection") into the new MLP model (fields "fc1"/"fc2").
-                tracing::warn!("decoder weight restore failed (likely ADR 0032 architecture change — cold-starting MLP projection): {e}");
-                let fc1 = LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
-                    .with_bias(false)
-                    .init::<TrainB>(&self.device);
-                let fc2 = LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
-                    .with_bias(false)
-                    .init::<TrainB>(&self.device);
+                // functional after a failed weight restore.
+                tracing::warn!("decoder weight restore failed (cold-starting projection): {e}");
+                let (fc1, fc2) = if self.linear_proj {
+                    let fc1 = LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
+                        .with_bias(false)
+                        .init::<TrainB>(&self.device);
+                    let fc2 = LinearConfig::new(1, 1)
+                        .with_bias(false)
+                        .init::<TrainB>(&self.device);
+                    (fc1, fc2)
+                } else {
+                    let fc1 = LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
+                        .with_bias(false)
+                        .init::<TrainB>(&self.device);
+                    let fc2 = LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
+                        .with_bias(false)
+                        .init::<TrainB>(&self.device);
+                    (fc1, fc2)
+                };
                 self.model = Some(ProjModel { fc1, fc2 });
                 Err(anyhow::anyhow!("load_weights failed: {e}"))
             }
@@ -772,8 +820,12 @@ impl ActionDecoder {
         let model = self.model.as_ref().unwrap();
         let ep_data = TensorData::new(episode.to_vec(), [1, EPISODE_DIM]);
         let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
-        let h = activation::relu(model.fc1.forward(ep_t)); // [1, PROJ_HIDDEN]
-        let proj = model.fc2.forward(h); // [1, N_REGIONS * LM_HIDDEN]
+        let proj = if self.linear_proj {
+            model.fc1.forward(ep_t) // [1, N_REGIONS * LM_HIDDEN]
+        } else {
+            let h = activation::relu(model.fc1.forward(ep_t)); // [1, PROJ_HIDDEN]
+            model.fc2.forward(h) // [1, N_REGIONS * LM_HIDDEN]
+        };
         let flat = proj.into_data().convert::<f32>().to_vec::<f32>().unwrap();
         Ok(flat)
     }
@@ -810,7 +862,7 @@ pub struct GainWorker {
 
 impl GainWorker {
     /// Spawn the worker thread. Takes ownership of the gain ORT session (no duplicate load).
-    pub fn spawn(session: Session, proj_weights: Vec<f32>) -> Self {
+    pub fn spawn(session: Session, proj_weights: Vec<f32>, linear_proj: bool) -> Self {
         let (tx, req_rx) = std::sync::mpsc::sync_channel::<GainMsg>(2);
         let (resp_tx, rx) = std::sync::mpsc::sync_channel::<[f32; 5]>(2);
 
@@ -824,7 +876,7 @@ impl GainWorker {
                         GainMsg::UpdateWeights(w) => proj = w,
                         GainMsg::Compute(ep) => {
                             let gain =
-                                gain_from_episode(&mut session, &proj, &ep).unwrap_or_else(|e| {
+                                gain_from_episode(&mut session, &proj, &ep, linear_proj).unwrap_or_else(|e| {
                                     tracing::warn!(?e, "gain computation failed");
                                     [1.0f32; 5]
                                 });
@@ -856,36 +908,52 @@ impl GainWorker {
 }
 
 /// Raw gain computation: project episode → region tokens → ORT forward → norms → gain.
-/// proj_w layout (ADR 0032 MLP): [W1_flat | W2_flat]
-///   W1: [EPISODE_DIM, PROJ_HIDDEN] = 640×1024 = 655,360 f32
-///   W2: [PROJ_HIDDEN, N_REGIONS*LM_HIDDEN] = 1024×4480 = 4,587,520 f32
+///
+/// MLP layout (default): proj_w = [W1_flat | W2_flat]
+///   W1: [EPISODE_DIM, PROJ_HIDDEN], W2: [PROJ_HIDDEN, N_REGIONS*LM_HIDDEN]
+/// Linear layout (linear_proj=true): proj_w = [W1_flat]
+///   W1: [EPISODE_DIM, N_REGIONS*LM_HIDDEN]
 /// Burn stores Linear weights as [n_in, n_out], so y = x @ W (no transpose).
-fn gain_from_episode(session: &mut Session, proj_w: &[f32], episode: &[f32]) -> Result<[f32; 5]> {
-    // Two-layer MLP: h = relu(episode @ W1), proj_flat = h @ W2
-    let w1_len = EPISODE_DIM * PROJ_HIDDEN;
+fn gain_from_episode(session: &mut Session, proj_w: &[f32], episode: &[f32], linear_proj: bool) -> Result<[f32; 5]> {
     let n_out = N_REGIONS * LM_HIDDEN;
-    let w1 = &proj_w[..w1_len];
-    let w2 = &proj_w[w1_len..];
 
-    // Layer 1: h[j] = max(0, sum_i episode[i] * W1[i * PROJ_HIDDEN + j])
-    let mut h = vec![0.0f32; PROJ_HIDDEN];
-    for (i, &xi) in episode.iter().enumerate() {
-        let row = &w1[i * PROJ_HIDDEN..(i + 1) * PROJ_HIDDEN];
-        for (j, &wij) in row.iter().enumerate() {
-            h[j] += xi * wij;
+    let proj_flat = if linear_proj {
+        // Single linear layer: proj_flat[k] = sum_i episode[i] * W[i * n_out + k]
+        let mut out = vec![0.0f32; n_out];
+        for (i, &xi) in episode.iter().enumerate() {
+            let row = &proj_w[i * n_out..(i + 1) * n_out];
+            for (k, &wik) in row.iter().enumerate() {
+                out[k] += xi * wik;
+            }
         }
-    }
-    for v in &mut h { *v = v.max(0.0); } // ReLU
+        out
+    } else {
+        // Two-layer MLP: h = relu(episode @ W1), proj_flat = h @ W2
+        let w1_len = EPISODE_DIM * PROJ_HIDDEN;
+        let w1 = &proj_w[..w1_len];
+        let w2 = &proj_w[w1_len..];
 
-    // Layer 2: proj_flat[k] = sum_j h[j] * W2[j * n_out + k]
-    let mut proj_flat = vec![0.0f32; n_out];
-    for (j, &hj) in h.iter().enumerate() {
-        if hj == 0.0 { continue; } // skip dead units
-        let row = &w2[j * n_out..(j + 1) * n_out];
-        for (k, &wjk) in row.iter().enumerate() {
-            proj_flat[k] += hj * wjk;
+        // Layer 1: h[j] = max(0, sum_i episode[i] * W1[i * PROJ_HIDDEN + j])
+        let mut h = vec![0.0f32; PROJ_HIDDEN];
+        for (i, &xi) in episode.iter().enumerate() {
+            let row = &w1[i * PROJ_HIDDEN..(i + 1) * PROJ_HIDDEN];
+            for (j, &wij) in row.iter().enumerate() {
+                h[j] += xi * wij;
+            }
         }
-    }
+        for v in &mut h { *v = v.max(0.0); } // ReLU
+
+        // Layer 2: proj_flat[k] = sum_j h[j] * W2[j * n_out + k]
+        let mut out = vec![0.0f32; n_out];
+        for (j, &hj) in h.iter().enumerate() {
+            if hj == 0.0 { continue; }
+            let row = &w2[j * n_out..(j + 1) * n_out];
+            for (k, &wjk) in row.iter().enumerate() {
+                out[k] += hj * wjk;
+            }
+        }
+        out
+    };
 
     let inputs = Array3::from_shape_vec((1, N_REGIONS, LM_HIDDEN), proj_flat)
         .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
