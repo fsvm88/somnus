@@ -1653,6 +1653,13 @@ async fn main() -> Result<()> {
                             &mut prior_cosine_sums,
                             &mut prior_cosine_counts,
                         );
+                        // Inline training data export (ADR 0033): write (episode, text) pair
+                        // immediately at language ingest time, capturing every ASR/text event.
+                        if let (Some(ref export_path), Some(ref ep)) =
+                            (&args.export_training_data, &r.last_episode)
+                        {
+                            write_training_pair(export_path, ep, &text);
+                        }
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -2305,6 +2312,11 @@ async fn main() -> Result<()> {
                                 hnsw_query_n += 1;
                             }
                             accumulate_cosines(&r.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                            if let (Some(ref export_path), Some(ref ep)) =
+                                (&args.export_training_data, &r.last_episode)
+                            {
+                                write_training_pair(export_path, ep, &text);
+                            }
                         }
                     }
                     None => { lang_closed = true; }
@@ -2464,6 +2476,18 @@ fn accumulate_wakefulness_pressure(salience: f32, sal_threshold: f32, pressure: 
 /// Returns μ + 0.5·σ clamped to [0.3, 3.0] once ≥100 episodes are sampled;
 /// falls back to the cold-start prior of 0.8 before that.
 #[inline]
+/// Append one (episode, text) JSON line to the training data file (ADR 0033).
+/// Called inline at language ingest time to capture every ASR/text-bypass event.
+fn write_training_pair(path: &std::path::Path, episode: &[f32], text: &str) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let text_esc = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
+    let ep_json: String = episode.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+    let _ = writeln!(f, "{{\"episode\":[{ep_json}],\"text\":\"{text_esc}\"}}");
+}
+
 fn sal_gate(mu: f32, sigma: f32, n: u64) -> f32 {
     if n >= 100 {
         (mu + 0.5 * sigma).clamp(0.3, 3.0)
