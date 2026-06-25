@@ -3,7 +3,17 @@
 > **Last updated:** 2026-06-25
 > **Branch:** `main`
 
-## Status: LoRA pipeline complete (ADR 0033 validated). Item L closed. No queued work.
+## Status: KV-cache generation implemented (ADR 0034). 7.8× speedup. No queued work.
+
+### KV-cache generation — DONE (2026-06-25)
+
+**ADR 0034.** Two new ONNX models: `models/qwen25_lm_prefill_kv.onnx` + `models/qwen25_lm_decode_kv.onnx` (each ~1.9 GB). KV_SIZE=2048.
+**Speed:** Old path ~530ms/step → KV path 68ms/step (ORT CPU) → 7.8× speedup. 128 tokens: 68s → 8.7s.
+**Rust:** `KvCache` struct + `generate_kv()` in `action.rs`. Falls back to old path if models absent or prefix > KV_SIZE.
+**Export:** `scripts/export_kv_cache.py --kv-size 2048`. Numerical equivalence: 18/20 tokens match (PASS).
+**Key notes:** `transformers 5.12` rotary_emb is on `model.model` not per-layer; KV_SIZE=16384 is slower than no-KV on CPU (461ms/step); use `Vec<(String, ValueRef<DynValueTypeMarker>)>` for ORT dynamic inputs.
+
+### LoRA pipeline — DONE (2026-06-25)
 
 ### LoRA pipeline — DONE (2026-06-25)
 

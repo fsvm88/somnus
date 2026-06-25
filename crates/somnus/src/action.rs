@@ -20,8 +20,8 @@ use burn::{
     record::{BinFileRecorder, FullPrecisionSettings},
     tensor::{activation, Tensor, TensorData},
 };
-use ndarray::Array3;
-use ort::{session::Session, value::TensorRef};
+use ndarray::{Array2, Array3, Array4};
+use ort::{session::Session, value::{DynValueTypeMarker, TensorRef, ValueRef}};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 
@@ -40,6 +40,44 @@ const MAX_GEN_SEQ: usize = 1024;
 /// Token budget for conversation history across turns (R2).
 /// Oldest turns are evicted when the total exceeds this limit.
 const CONV_HISTORY_BUDGET: usize = 256;
+/// Static KV cache size for the split prefill/decode generation path (ADR 0034).
+/// KV_SIZE=2048 covers a 400-token prefix plus 1600 generated tokens.
+const KV_SIZE: usize = 2048;
+const N_KV_LAYERS: usize = 24;
+const N_KV_HEADS: usize = 2;
+const KV_HEAD_DIM: usize = 64;
+
+/// KV-cache state for the split prefill/decode generation path (ADR 0034).
+struct KvCache {
+    /// 24 key buffers and 24 value buffers, alternating k0,v0,k1,v1,...
+    /// Each buffer holds [N_KV_HEADS, KV_SIZE, KV_HEAD_DIM] floats in row-major order.
+    bufs: Vec<Vec<f32>>,
+    /// Attention mask [KV_SIZE + 1]: 0.0 = attend, -1e4 = masked.
+    /// Position KV_SIZE is the current token's self-attention slot (always 0.0).
+    mask: Vec<f32>,
+    /// Next write position in the cache.
+    pos: usize,
+}
+
+impl KvCache {
+    fn new() -> Self {
+        let buf_len = N_KV_HEADS * KV_SIZE * KV_HEAD_DIM;
+        let mut mask = vec![-1e4f32; KV_SIZE + 1];
+        mask[KV_SIZE] = 0.0; // self-attention slot is always valid
+        Self {
+            bufs: vec![vec![0.0f32; buf_len]; N_KV_LAYERS * 2],
+            mask,
+            pos: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        for buf in &mut self.bufs { buf.fill(0.0); }
+        self.mask.fill(-1e4);
+        self.mask[KV_SIZE] = 0.0;
+        self.pos = 0;
+    }
+}
 
 /// One (query, response) turn stored for conversation history (R2).
 struct ConvTurn {
@@ -81,6 +119,14 @@ pub struct ActionDecoder {
     /// Opt-in via --gpu-generation: on gfx1201 the fixed-1024 path is ~14× slower than
     /// CPU at typical seq_lens; re-evaluate when ROCm/MIGraphX matures for RDNA 4.
     use_gpu_gen: bool,
+    /// Prefill model for KV-cache generation: inputs_embeds [1,n,896] → logits + 48 KV tensors.
+    /// Loaded from qwen25_lm_prefill_kv.onnx when present.
+    prefill_kv_session: Option<Session>,
+    /// Single-step decode model for KV-cache generation: [1,1,896] + pos + mask + 48 KV → logits + 48 new KV.
+    /// Loaded from qwen25_lm_decode_kv.onnx when present.
+    decode_kv_session: Option<Session>,
+    /// KV cache state for generate_kv(). Reset at each generate() call.
+    kv_cache: KvCache,
     /// Use a single linear layer (EPISODE_DIM → N_REGIONS*LM_HIDDEN) instead of the
     /// 2-layer MLP. A/B control arm for ADR 0032 validation (--linear-proj flag).
     linear_proj: bool,
@@ -145,6 +191,19 @@ impl ActionDecoder {
             None
         };
 
+        let prefill_kv_path = models_dir.join("qwen25_lm_prefill_kv.onnx");
+        let decode_kv_path  = models_dir.join("qwen25_lm_decode_kv.onnx");
+        let (prefill_kv_session, decode_kv_session) = if prefill_kv_path.exists() && decode_kv_path.exists() {
+            tracing::info!("loading KV-cache models — fast generate() path active (ADR 0034)");
+            (
+                Some(crate::cpu_session(&prefill_kv_path, None)?),
+                Some(crate::cpu_session(&decode_kv_path,  None)?),
+            )
+        } else {
+            tracing::info!("KV-cache models absent — generate() using slow lm_session path");
+            (None, None)
+        };
+
         let bytes = std::fs::read(&embed_path)?;
         let st = SafeTensors::deserialize(&bytes)
             .map_err(|e| anyhow::anyhow!("safetensors load failed: {e}"))?;
@@ -193,6 +252,9 @@ impl ActionDecoder {
             text_hidden_session,
             use_gpu_gen: lm_fixed_session.is_some(),
             lm_fixed_session,
+            prefill_kv_session,
+            decode_kv_session,
+            kv_cache: KvCache::new(),
             linear_proj,
             tokenizer,
             gain: [1.0; 5],
@@ -310,7 +372,9 @@ impl ActionDecoder {
 
         let mut generated: Vec<u32> = Vec::new();
 
-        if self.use_gpu_gen {
+        if self.prefill_kv_session.is_some() && seq_len <= KV_SIZE {
+            generated = self.generate_kv(all_embeds, seq_len, max_tokens)?;
+        } else if self.use_gpu_gen {
             // GPU path: fixed [1, MAX_GEN_SEQ, LM_HIDDEN] buffer.
             // Causal attention ensures hidden[seq_len-1] is unaffected by zero-padding at
             // positions seq_len..MAX_GEN_SEQ. Logits computed on CPU via embed_table dot.
@@ -799,6 +863,154 @@ impl ActionDecoder {
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
+
+    /// KV-cache generation path (ADR 0034). Runs prefill once, then decodes token-by-token.
+    ///
+    /// `prefix_embeds`: flat [prefix_len * LM_HIDDEN] embeddings for the full prefix.
+    /// `prefix_len`: number of prefix tokens.
+    /// Returns raw generated token IDs (including EOS if hit).
+    fn generate_kv(
+        &mut self,
+        prefix_embeds: Vec<f32>,
+        prefix_len: usize,
+        max_tokens: usize,
+    ) -> Result<Vec<u32>> {
+        // ── Step 1: Prefill ──────────────────────────────────────────────────
+        // Take session out to avoid borrow conflict with kv_cache writes below.
+        let mut prefill_sess = self.prefill_kv_session.take().unwrap();
+        let (first_logits, prefill_kv): (Vec<f32>, Vec<Vec<f32>>) = {
+            let arr = Array3::from_shape_vec((1, prefix_len, LM_HIDDEN), prefix_embeds)
+                .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
+            let tensor = TensorRef::from_array_view(&arr)?;
+            let outputs = prefill_sess.run(ort::inputs!["inputs_embeds" => tensor])?;
+
+            let (_, logit_data) = outputs["logits"].try_extract_tensor::<f32>()?;
+            let logit_flat   = logit_data.to_vec();
+            let vocab        = logit_flat.len() / prefix_len;
+            let last_logits  = logit_flat[(prefix_len - 1) * vocab..].to_vec();
+
+            let mut kv: Vec<Vec<f32>> = Vec::with_capacity(N_KV_LAYERS * 2);
+            for i in 0..N_KV_LAYERS {
+                let k_name = format!("past_key_{i}");
+                let v_name = format!("past_value_{i}");
+                let (_, k) = outputs[k_name.as_str()].try_extract_tensor::<f32>()?;
+                kv.push(k.to_vec()); // [1, N_KV_HEADS, prefix_len, KV_HEAD_DIM]
+                let (_, v) = outputs[v_name.as_str()].try_extract_tensor::<f32>()?;
+                kv.push(v.to_vec());
+            }
+            (last_logits, kv)
+        };
+        self.prefill_kv_session = Some(prefill_sess);
+
+        // Scatter prefill KV (row-major [N_KV_HEADS, prefix_len, KV_HEAD_DIM])
+        // into static buffers (row-major [N_KV_HEADS, KV_SIZE, KV_HEAD_DIM]).
+        self.kv_cache.reset();
+        for i in 0..N_KV_LAYERS {
+            let k_src = &prefill_kv[2 * i];
+            let v_src = &prefill_kv[2 * i + 1];
+            for h in 0..N_KV_HEADS {
+                let src_off = h * prefix_len * KV_HEAD_DIM;
+                let dst_off = h * KV_SIZE * KV_HEAD_DIM;
+                self.kv_cache.bufs[2*i  ][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
+                    .copy_from_slice(&k_src[src_off..src_off + prefix_len * KV_HEAD_DIM]);
+                self.kv_cache.bufs[2*i+1][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
+                    .copy_from_slice(&v_src[src_off..src_off + prefix_len * KV_HEAD_DIM]);
+            }
+        }
+        // Open mask for prefix positions (once, not per-layer).
+        for p in 0..prefix_len { self.kv_cache.mask[p] = 0.0; }
+        self.kv_cache.pos = prefix_len;
+
+        // ── Step 2: Greedy decode ────────────────────────────────────────────
+        let mut generated: Vec<u32> = Vec::new();
+        {
+            let mut logits: Vec<f32> = first_logits;
+            for &id in &generated { logits[id as usize] /= 1.3; }
+            let mut next_id = argmax(&logits);
+            generated.push(next_id);
+
+            let mut decode_sess = self.decode_kv_session.take().unwrap();
+            for _ in 1..max_tokens {
+                if next_id == EOS_TOKEN_ID || self.kv_cache.pos >= KV_SIZE {
+                    break;
+                }
+                let pos = self.kv_cache.pos;
+
+                // Embed the previous token (borrows embed_table only, safe while sess is out).
+                let embed_vec = self.embed_flat(&[next_id])?;
+
+                // Clone KV buffers and mask before running ORT.
+                // Each buf is N_KV_HEADS * KV_SIZE * KV_HEAD_DIM f32s (~1 MB); total ~48 MB.
+                let k_arrs: Vec<Array4<f32>> = (0..N_KV_LAYERS)
+                    .map(|i| Array4::from_shape_vec(
+                        (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                        self.kv_cache.bufs[2*i].clone(),
+                    ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
+                    .collect::<Result<_>>()?;
+                let v_arrs: Vec<Array4<f32>> = (0..N_KV_LAYERS)
+                    .map(|i| Array4::from_shape_vec(
+                        (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                        self.kv_cache.bufs[2*i+1].clone(),
+                    ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
+                    .collect::<Result<_>>()?;
+
+                let emb_arr  = Array3::from_shape_vec((1, 1, LM_HIDDEN), embed_vec)
+                    .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
+                let pos_arr  = Array2::from_shape_vec((1, 1), vec![pos as i64])
+                    .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
+                let mask_arr = Array4::from_shape_vec((1, 1, 1, KV_SIZE + 1), self.kv_cache.mask.clone())
+                    .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
+
+                // Build dynamic input map: Vec<(String, ValueRef<DynValueTypeMarker>)>.
+                let mut feed: Vec<(String, ValueRef<'_, DynValueTypeMarker>)> =
+                    Vec::with_capacity(3 + N_KV_LAYERS * 2);
+                feed.push(("inputs_embeds".into(),  TensorRef::from_array_view(&emb_arr)?.into_dyn()));
+                feed.push(("position_ids".into(),   TensorRef::from_array_view(&pos_arr)?.into_dyn()));
+                feed.push(("attention_mask".into(), TensorRef::from_array_view(&mask_arr)?.into_dyn()));
+                for i in 0..N_KV_LAYERS {
+                    feed.push((format!("past_key_{i}"),   TensorRef::from_array_view(&k_arrs[i])?.into_dyn()));
+                    feed.push((format!("past_value_{i}"), TensorRef::from_array_view(&v_arrs[i])?.into_dyn()));
+                }
+
+                let outputs = decode_sess.run(feed)?;
+
+                // Extract logits and new KV.
+                let (_, logit_data) = outputs["logits"].try_extract_tensor::<f32>()?;
+                let mut step_logits: Vec<f32> = logit_data.to_vec();
+
+                let mut new_kv: Vec<Vec<f32>> = Vec::with_capacity(N_KV_LAYERS * 2);
+                for i in 0..N_KV_LAYERS {
+                    let (_, k) = outputs[format!("new_key_{i}").as_str()].try_extract_tensor::<f32>()?;
+                    new_kv.push(k.to_vec());
+                    let (_, v) = outputs[format!("new_value_{i}").as_str()].try_extract_tensor::<f32>()?;
+                    new_kv.push(v.to_vec());
+                }
+
+                // Write new KV into cache at position `pos`.
+                // new_key shape: [1, N_KV_HEADS, 1, KV_HEAD_DIM].
+                for i in 0..N_KV_LAYERS {
+                    let k_new = &new_kv[2*i];
+                    let v_new = &new_kv[2*i+1];
+                    for h in 0..N_KV_HEADS {
+                        let src = h * KV_HEAD_DIM;
+                        let dst = h * KV_SIZE * KV_HEAD_DIM + pos * KV_HEAD_DIM;
+                        self.kv_cache.bufs[2*i  ][dst..dst+KV_HEAD_DIM].copy_from_slice(&k_new[src..src+KV_HEAD_DIM]);
+                        self.kv_cache.bufs[2*i+1][dst..dst+KV_HEAD_DIM].copy_from_slice(&v_new[src..src+KV_HEAD_DIM]);
+                    }
+                }
+                self.kv_cache.mask[pos] = 0.0;
+                self.kv_cache.pos += 1;
+
+                // Greedy next token with repetition penalty.
+                for &id in &generated { step_logits[id as usize] /= 1.3; }
+                next_id = argmax(&step_logits);
+                generated.push(next_id);
+            }
+            self.decode_kv_session = Some(decode_sess);
+        }
+
+        Ok(generated)
+    }
 
     /// Compute logits for every vocabulary token given a single hidden-state vector.
     ///
