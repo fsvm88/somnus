@@ -1,9 +1,17 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-21
+> **Last updated:** 2026-06-25
 > **Branch:** `main`
 
-## Status: Task 1 (GPU generation) + Task 2 (MLP projection) + dep updates all complete. Next: A/B to verify proj_loss improvement with MLP over 3–5 sessions, then L (LoRA, trigger-gated).
+## Status: LoRA pipeline complete (ADR 0033 validated). Item L closed. No queued work.
+
+### LoRA pipeline — DONE (2026-06-25)
+
+**Training:** 1544 pairs, 3 epochs, loss 6.37→5.62. Adapters: `memory/lora_output/`. 
+**ONNX:** `models/qwen25_lm.onnx` (1977 MB, LoRA-merged). Backup: `models/qwen25_lm_pretrained.onnx`.
+**A/B result:** proj_loss −5.8% (control=0.002086, treatment=0.001966). PASS. Commit 396ccb1.
+
+**ONNX export note:** PyTorch 2.12 requires `dynamo=False` + `Qwen25LMWrapper` (model.model + lm_head, returns last_hidden_state AND logits). Fixed in `scripts/train_lora.py`. A/B script: `scripts/ab_lora.sh`. Symlinked control models dir: `models_lora_ab_control/` (remember to include `.onnx.data` files in symlinks).
 
 ---
 
@@ -11,10 +19,20 @@
 
 | Item | What changed | Result |
 |------|-------------|--------|
+| **MLP projection A/B** | `--linear-proj` flag added; A/B script `scripts/ab_mlp_proj.sh`; GainWorker takes `linear_proj: bool`; branched `project_flat()`, `projection_step_batch()`, `proj_weights_flat()`, `proj_weight_norm()` | A/B: avg proj_loss control=0.002160 vs treatment=0.002094 (−3.1%). INCONCLUSIVE (<5%). MLP kept as default (marginal signal in expected direction). |
+| **LoRA pipeline (ADR 0033)** | `--export-training-data`, `--export-proj-weights` flags; `write_training_pair()` inline at both language ingest call sites; `run_sleep_cycle()` gets `training_data_path`; `scripts/train_lora.py` with peft/HF; `scripts/export_models.py` ONNX re-export note | ADR 0033 written. Qwen2.5-0.5B HF checkpoint downloaded to `models/qwen25_hf/`. Python venv at `.venv/`. |
+| **Training data collection** | 3 failed attempts (NREM-only, wake-time with ASR, TEXT_RATE=20 stall); final: TEXT_RATE=0.5 with 20 sessions | **1548 pairs** in `memory/lora_training_data.jsonl` |
+
+---
+
+## Completed this session (2026-06-21, earlier)
+
+| Item | What changed | Result |
+|------|-------------|--------|
 | **GPU generation (Task 1)** | `qwen25_lm_fixed.onnx` exported at `[1, 1024, 896]` (no LM head); Rust extracts `hidden[seq_len-1]` and computes logits via `embed_table^T` dot. `--gpu-generation` flag gates it. ADR 0031. Commits c7f43b4, 332c7c1, 3d619ce. | Token-match A/B confirmed correctness. Timing: GPU 2.1s/token vs CPU 0.14s/token on gfx1201 (RDNA 4) — GPU is 14× slower due to immature MIGraphX support. `--gpu-generation` is opt-in; default uses CPU. ADR updated with honest timing. |
 | **MLP projection (Task 2)** | `ProjModel` updated to 2-layer MLP: fc1 [640→1024] + ReLU + fc2 [1024→4480]. `proj_weights_flat()` returns [W1\|W2]. `gain_from_episode()` updated for 2-layer forward. Old `decoder_weights.bin` incompatible — graceful cold-start with ADR 0032 log message. ADR 0032. Commit f9e5faa. | proj_loss plateau at ~0.0007 (sessions 46–50) triggered M. MLP should reduce proj_loss further; evaluate over 3–5 sessions post-deploy via `mean_proj_loss`. Persistent hallucination is not expected to change — that's L's domain. |
 | **Dep updates** | `cargo update` (100+ semver bumps); cpal 0.17→0.18 (unified `cpal::Error`, `StreamConfig` now `Copy`); rubato 0.16→3.0 (API rewrite: `Async::new_sinc` + audioadapter buffers); safetensors 0.7→0.8, tokenizers 0.21→0.23, sysinfo 0.38→0.39 (no API changes); bincode 1→2.0.1 (`serde::encode_to_vec`/`decode_from_slice` API; `bincode-next` considered and rejected). Commits 9a6121e, ac41791, 6652661. | All tests pass, clippy clean. bincode wire-format change: existing `records.bin` sidecars silently dropped on first run (graceful fallback already in place). |
-| **Completed this session (2026-06-19–20)** | ORT log suppression (a874166), live test (R1+R2+R3 generating 42 tokens, complete hallucination as expected). | — |
+| **Completed 2026-06-19–20** | ORT log suppression (a874166), live test (R1+R2+R3 generating 42 tokens, complete hallucination as expected). | — |
 
 ---
 
@@ -58,67 +76,7 @@ Three concrete gaps identified in the architecture review. Ordered by severity:
 
 ## Interaction capability queue (committed roadmap — 2026-06-17)
 
-These three capabilities are required for the system to be useful as an interactive agent. They are not deferred; they are the next substantive development arc after the performance gaps. Ordered by dependency.
-
-### R1 — Memory recall in generation
-
-**What:** When a query arrives, retrieve top-k semantically relevant past episodes from the warm store and include their projections in the generation context, not just the current episode.
-
-**Why this is the gap:** Currently generation only sees 5 region tokens from the *current* episode. Retrieved memories never reach the LLM. The recollection layer queries warm during wake (for reconstruction and gain), but that path is completely separate from the generation path.
-
-**Mechanism:**
-1. On stdin query, encode the query text through the language k-WTA to get a query episode vector.
-2. Query HNSW top-k (k=3–5) from warm store using that vector.
-3. For each recalled episode record, project its stored episode vector → 5 region tokens via the same `ActionDecoder` projection.
-4. Prepend all recalled token sets before the query tokens: `[recall_0_tokens | recall_1_tokens | ... | query_tokens]`.
-5. Autoregressive decode as before.
-
-**Dependencies:** Projection must be trained well enough to produce coherent region tokens (proj_loss ≤ 0.001, or empirically coherent). R1 can be implemented now and enabled once projection converges.
-
-**ADR needed:** yes — design choices around k, how to order recalled episodes, whether to include recency weighting.
-
----
-
-### R2 — Multi-turn conversation
-
-**What:** Maintain a sliding context window of recent (query, response) pairs across turns within a wake session. Prepend prior turns to each new generation call.
-
-**Why this is the gap:** Each query is currently independent. The LLM has no memory of what was said one turn ago.
-
-**Mechanism:**
-1. A ring buffer of `(query_tokens, response_tokens)` pairs, bounded by token budget (e.g. 512 tokens of conversation history).
-2. On each generation call: `[recall_tokens (R1) | conversation_history | current_query_tokens]`.
-3. Buffer clears on sleep entry (wake-local by design, matching working memory).
-4. Context budget split: ~256 tokens conversation history, ~128 tokens recall context, query gets the rest up to Qwen's context limit.
-
-**Dependencies:** Simpler than R1; no new training required. Can be implemented before R1 if desired — just requires the conversation ring and token budget tracking.
-
-**ADR needed:** yes — token budget allocation, truncation policy (oldest-first vs. summarise).
-
----
-
-### R3 — Introspection: explain what it learned
-
-**What:** Allow the system to answer questions about its own memory contents — what it has seen, what concepts it has consolidated, what it knows.
-
-**Why this is the gap:** The system builds rich warm and cold memory but has no path to *describe* that memory in language. The semantic store contains episode vectors (sparse activations) with no associated labels that can be surfaced to the LLM.
-
-**Mechanism (two-phase):**
-
-*Phase 1 — recent history narration (simpler, implement first):*
-- Maintain a text log of ASR transcripts and text-bypass lines per session (already available as `text_target` fields on EpisodeRecord).
-- On an introspective query ("what did you just hear?", "what have we been talking about?"), retrieve the N most recent `text_target` strings from hot/warm, concatenate, and include as conversation context alongside the query.
-- This gives the system access to a textual record of what it recently perceived.
-
-*Phase 2 — semantic memory narration (harder, later):*
-- During REM or on demand, sample diverse episode vectors from warm, decode each through the output heads to get reconstructed encoder inputs, then use the action decoder to generate a short description of each cluster.
-- Requires output heads that reconstruct interpretable encoder inputs — currently they reconstruct raw embeddings (not text), so this needs the recollection-to-generation bridge plus good reconstruction quality.
-
-**Dependencies:** Phase 1 depends on R2 (conversation context) and on `text_target` text being threaded into the generation prompt. Phase 2 depends on R1 and significantly better reconstruction quality.
-
-**ADR needed:** yes — at Phase 1 implementation.
-
----
+R1, R2, R3 all done (see above).
 
 ### M — MLP projection ✅ DONE (2026-06-21)
 
@@ -126,13 +84,9 @@ These three capabilities are required for the system to be useful as an interact
 
 ---
 
-### L — LoRA fine-tuning of Qwen2.5 (after M stable)
+### L — LoRA fine-tuning of Qwen2.5 ✅ DONE (2026-06-25)
 
-**Source:** ADR 0012 deferred item. Fine-tune Qwen2.5-0.5B with LoRA so the LM adapts to the episode-vector prefix distribution.
-
-**Trigger:** Generation quality is coherent but clearly limited by Qwen's pretrained prior not matching the system's learned episode representation. Concrete signal: perplexity of generated text is high for domain-specific content the system has ingested.
-
-**ADR needed:** yes — LoRA rank, which layers, ORT compatibility or switch to a different inference path.
+**ADR 0033.** 1544 training pairs, 3 epochs. A/B: proj_loss −5.8% (PASS). `qwen25_lm.onnx` deployed. Commit 396ccb1.
 
 ---
 
@@ -188,6 +142,7 @@ These three capabilities are required for the system to be useful as an interact
 - Wake schedule trigger at 602s/cycle; N_UNITS=1024, K_ACTIVE=20, D_PROJ=128, EPISODE_DIM=640
 - `qwen25_lm.onnx` runs on CPU only (dynamic seq_len blocks MIGraphX)
 - `--sae-l1-coeff 0.0` default (off); leave off — A/B showed harm
+- TEXT_RATE for wiki injection must stay ≤ 1/sec (higher rates stall the session via drain-loop starvation)
 
 ---
 

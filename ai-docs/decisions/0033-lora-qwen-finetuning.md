@@ -1,7 +1,7 @@
 # ADR 0033 — LoRA fine-tuning of Qwen2.5-0.5B on episode prefixes (ADR 0012 item L)
 
 **Date:** 2026-06-21
-**Status:** Accepted
+**Status:** Validated and deployed (2026-06-25)
 
 ## Context
 
@@ -85,6 +85,22 @@ A/B: run 3 sessions each arm from fresh memory using the same mixed_campaign cli
 **Update text_hidden and gain.onnx simultaneously:** Principled consistency. Rejected for first iteration: three GPU re-exports plus calibration; added risk surface. Do it as a follow-up if gain drift is observed after LoRA.
 
 **Train on cold archive records instead of warm:** More diverse data, larger set. Rejected for now: cold records lack `text_target` linkage at the record level (stored separately); warm records are self-contained. Revisit if warm set proves too small.
+
+## Outcome (2026-06-25)
+
+Training: 1544 pairs, 3 epochs on CPU (~20 min), cross-entropy loss 6.37 → 5.62. LoRA adapters saved to `memory/lora_output/`. Merged and exported as `models/qwen25_lm.onnx` (1977 MB); prior model backed up to `qwen25_lm_pretrained.onnx`.
+
+A/B result (3 sessions × 2 cycles, fresh memory, same mixed_campaign clips):
+
+| arm | avg mean_proj_loss |
+|---|---|
+| control (pretrained) | 0.002086 |
+| treatment (LoRA) | 0.001966 |
+| delta | **−5.8% (PASS)** |
+
+4 of 6 cycles had valid paired data; all 4 showed −5.5% to −6.2%. **PASS** (threshold: < −5%). Item L closed. `qwen25_lm.onnx` is now the LoRA-fine-tuned model.
+
+**ONNX export fix:** `torch.onnx.export` in PyTorch 2.12 requires `dynamo=False` for the legacy TorchScript path. The export must use `Qwen25LMWrapper` (wraps `model.model` + `model.lm_head`, returns both `last_hidden_state` and `logits`) — not `AutoModelForCausalLM` directly. This is now fixed in `scripts/train_lora.py`.
 
 ## Consequences
 
