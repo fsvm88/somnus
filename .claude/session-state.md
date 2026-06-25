@@ -3,23 +3,27 @@
 > **Last updated:** 2026-06-25
 > **Branch:** `main`
 
-## Status: KV-cache generation done (ADR 0034). Two generation speedup tasks queued.
+## Status: Q-A and Q-B done. Perf queue complete. No active queued work.
 
 ## Queued work (next session)
 
-### Q-A — Zero-copy ArrayView for KV decode inputs (quick win, ~2–5ms/step)
+*None — perf queue exhausted.*
 
-Currently `generate_kv()` clones 48 × ~2 MB KV buffers each decode step to build `Array4::from_shape_vec` (requires owned data). Since the session is already `.take()`n out of `self`, the borrow conflict is resolved — switch to `ndarray::ArrayView4::from_shape(shape, &self.kv_cache.bufs[i])` for zero-copy. No risk, small code change in `action.rs`.
+---
 
-### Q-B — INT8 quantization of decode model (2–3× speedup target)
+### Q-A — Zero-copy ArrayView4 for KV decode ✅ DONE (2026-06-25)
 
-Weight reads dominate decode cost (~700 MB FP32 weights/step at 50 GB/s = ~14ms). INT8 cuts to ~175 MB + enables VNNI integer math → estimated 20–30ms/step (128 tokens in 2.5–4s).
+Commit a773536. Zero-copy `ArrayView4` for 48 KV buffers per decode step.
 
-Steps:
-1. `onnxruntime.quantization.quantize_dynamic` on `qwen25_lm_decode_kv.onnx` → `qwen25_lm_decode_kv_int8.onnx`
-2. Also quantize `qwen25_lm_prefill_kv.onnx` → `_int8` variant
-3. Hook up in `action.rs` as optional fast path (load if `_int8` files present, fall back to FP32)
-4. A/B on proj_loss to verify quality (threshold: no regression > +5%)
+### Q-B — INT8 quantization of KV-cache models ✅ DONE (2026-06-25)
+
+Commit e741fa2. **1.76× decode speedup** (70ms → 40ms/step). 128-token generation: ~9s → ~5s.
+- No VNNI (Ryzen 9 5950X, AVX2 only) — gain is from bandwidth reduction (1.9GB → 0.5GB per model).
+- `reduce_range=True` required on this CPU.
+- Token-match A/B: 12/15 on real embeddings (PASS).
+- `action.rs` prefers `_int8` variants when present, falls back to FP32.
+- Script: `scripts/quantize_kv.py` (also benchmarks; `--skip-quantize` to bench-only).
+- INT8 files not in git (`.gitignore`); regenerate: `.venv/bin/python scripts/quantize_kv.py --prefill`.
 
 ---
 
