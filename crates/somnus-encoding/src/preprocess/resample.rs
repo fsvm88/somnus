@@ -1,10 +1,10 @@
 #![allow(dead_code)] // SincResampler used by binary, not the lib itself
 
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
-use rubato::audioadapter_buffers::direct::InterleavedSlice;
 
 pub struct SincResampler {
     inner: Async<f32>,
@@ -20,9 +20,8 @@ impl SincResampler {
             oversampling_factor: 256,
             window: WindowFunction::BlackmanHarris2,
         };
-        let inner =
-            Async::<f32>::new_sinc(ratio, 2.0, &params, chunk_frames, 1, FixedAsync::Input)
-                .map_err(|e| anyhow::anyhow!("rubato init: {e}"))?;
+        let inner = Async::<f32>::new_sinc(ratio, 2.0, &params, chunk_frames, 1, FixedAsync::Input)
+            .map_err(|e| anyhow::anyhow!("rubato init: {e}"))?;
         Ok(Self { inner })
     }
 

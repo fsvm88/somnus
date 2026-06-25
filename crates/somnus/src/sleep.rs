@@ -277,8 +277,13 @@ fn kmeans(points: &[Vec<f32>], k: usize, max_iter: usize) -> Vec<Vec<f32>> {
 /// Degenerate case (all norms zero): returns uniform 1/5 weights.
 fn regional_weights(ep_vec: &[f32]) -> [f32; N_EPISODE_REGIONS] {
     let d = ep_vec.len() / N_EPISODE_REGIONS;
-    let norms: [f32; N_EPISODE_REGIONS] =
-        std::array::from_fn(|i| ep_vec[i * d..(i + 1) * d].iter().map(|v| v * v).sum::<f32>().sqrt());
+    let norms: [f32; N_EPISODE_REGIONS] = std::array::from_fn(|i| {
+        ep_vec[i * d..(i + 1) * d]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt()
+    });
     let total: f32 = norms.iter().sum();
     if total == 0.0 {
         return [1.0 / N_EPISODE_REGIONS as f32; N_EPISODE_REGIONS];
@@ -398,7 +403,11 @@ pub fn run_sleep_cycle(
     // Export (episode, text) pairs for offline LoRA training (ADR 0033).
     // Appends one JSON line per text-bearing trace to the specified file.
     if let (Some(export_path), Some(dec)) = (training_data_path, decoder.as_ref()) {
-        match std::fs::OpenOptions::new().create(true).append(true).open(export_path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(export_path)
+        {
             Ok(mut f) => {
                 use std::io::Write;
                 let mut exported = 0usize;
@@ -408,8 +417,16 @@ pub fn run_sleep_cycle(
                         Ok(t) => t,
                         Err(_) => continue,
                     };
-                    let text_escaped = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
-                    let ep_json: String = ep.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+                    let text_escaped = text
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r");
+                    let ep_json: String = ep
+                        .iter()
+                        .map(|v| format!("{v:.6}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
                     let _ = writeln!(f, "{{\"episode\":[{ep_json}],\"text\":\"{text_escaped}\"}}");
                     exported += 1;
                 }
@@ -796,7 +813,11 @@ pub fn run_sleep_cycle(
                                 let p = c / total;
                                 // Guard p=1.0: log2(1.0)=0.0 exactly, so -p*log2(p)=-0.0
                                 // in IEEE 754. Return 0.0 explicitly for the pure-cluster case.
-                                if p >= 1.0 { 0.0 } else { -p * p.log2() }
+                                if p >= 1.0 {
+                                    0.0
+                                } else {
+                                    -p * p.log2()
+                                }
                             })
                             .sum();
                         Some(h)

@@ -194,7 +194,10 @@ mod tests {
             .iter()
             .filter_map(|o| o.episode.as_ref())
             .collect();
-        assert!(!episodes.is_empty(), "no episode produced after ingest sequence");
+        assert!(
+            !episodes.is_empty(),
+            "no episode produced after ingest sequence"
+        );
         for ep in &episodes {
             assert_eq!(ep.0.len(), 640, "episode dim wrong after grow");
             assert!(

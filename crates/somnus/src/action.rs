@@ -21,7 +21,10 @@ use burn::{
     tensor::{activation, Tensor, TensorData},
 };
 use ndarray::{Array2, Array3, ArrayView4};
-use ort::{session::Session, value::{DynValueTypeMarker, TensorRef, ValueRef}};
+use ort::{
+    session::Session,
+    value::{DynValueTypeMarker, TensorRef, ValueRef},
+};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 
@@ -72,7 +75,9 @@ impl KvCache {
     }
 
     fn reset(&mut self) {
-        for buf in &mut self.bufs { buf.fill(0.0); }
+        for buf in &mut self.bufs {
+            buf.fill(0.0);
+        }
         self.mask.fill(-1e4);
         self.mask[KV_SIZE] = 0.0;
         self.pos = 0;
@@ -173,31 +178,49 @@ impl ActionDecoder {
         let lm_session = crate::cpu_session(&lm_path, lm_profile_prefix.as_deref())?;
         let text_hidden_path = models_dir.join("qwen25_text_hidden.onnx");
         let text_hidden_session = if text_hidden_path.exists() {
-            tracing::info!("loading qwen25_text_hidden.onnx — GPU path active for distillation targets");
+            tracing::info!(
+                "loading qwen25_text_hidden.onnx — GPU path active for distillation targets"
+            );
             Some(crate::migraphx_session(&text_hidden_path)?)
         } else {
-            tracing::info!("qwen25_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session");
+            tracing::info!(
+                "qwen25_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session"
+            );
             None
         };
         let lm_fixed_path = models_dir.join("qwen25_lm_fixed.onnx");
         let lm_fixed_session = if gpu_generation && lm_fixed_path.exists() {
-            tracing::info!("loading qwen25_lm_fixed.onnx — GPU generation path active (--gpu-generation)");
+            tracing::info!(
+                "loading qwen25_lm_fixed.onnx — GPU generation path active (--gpu-generation)"
+            );
             Some(crate::migraphx_session(&lm_fixed_path)?)
         } else if gpu_generation {
-            tracing::info!("qwen25_lm_fixed.onnx absent — --gpu-generation ignored, using CPU lm_session");
+            tracing::info!(
+                "qwen25_lm_fixed.onnx absent — --gpu-generation ignored, using CPU lm_session"
+            );
             None
         } else {
             tracing::info!("generate() using CPU lm_session (pass --gpu-generation to use qwen25_lm_fixed.onnx)");
             None
         };
 
-        let prefill_kv_path = models_dir.join("qwen25_lm_prefill_kv.onnx");
-        let decode_kv_path  = models_dir.join("qwen25_lm_decode_kv.onnx");
-        let (prefill_kv_session, decode_kv_session) = if prefill_kv_path.exists() && decode_kv_path.exists() {
-            tracing::info!("loading KV-cache models — fast generate() path active (ADR 0034)");
+        let prefill_kv_int8 = models_dir.join("qwen25_lm_prefill_kv_int8.onnx");
+        let decode_kv_int8 = models_dir.join("qwen25_lm_decode_kv_int8.onnx");
+        let prefill_kv_fp32 = models_dir.join("qwen25_lm_prefill_kv.onnx");
+        let decode_kv_fp32 = models_dir.join("qwen25_lm_decode_kv.onnx");
+        let (prefill_kv_session, decode_kv_session) = if prefill_kv_int8.exists()
+            && decode_kv_int8.exists()
+        {
+            tracing::info!("loading KV-cache INT8 models — fast generate() path active (Q-B)");
             (
-                Some(crate::cpu_session(&prefill_kv_path, None)?),
-                Some(crate::cpu_session(&decode_kv_path,  None)?),
+                Some(crate::cpu_session(&prefill_kv_int8, None)?),
+                Some(crate::cpu_session(&decode_kv_int8, None)?),
+            )
+        } else if prefill_kv_fp32.exists() && decode_kv_fp32.exists() {
+            tracing::info!("loading KV-cache FP32 models — fast generate() path active (ADR 0034)");
+            (
+                Some(crate::cpu_session(&prefill_kv_fp32, None)?),
+                Some(crate::cpu_session(&decode_kv_fp32, None)?),
             )
         } else {
             tracing::info!("KV-cache models absent — generate() using slow lm_session path");
@@ -390,7 +413,10 @@ impl ActionDecoder {
                 // Inner block: sess + outputs borrow released before logits_from_hidden
                 // borrows self immutably. use_gpu_gen guarantees lm_fixed_session is Some.
                 let hidden = {
-                    let sess = self.lm_fixed_session.as_mut().expect("use_gpu_gen set but lm_fixed_session is None");
+                    let sess = self
+                        .lm_fixed_session
+                        .as_mut()
+                        .expect("use_gpu_gen set but lm_fixed_session is None");
                     let input =
                         Array3::from_shape_vec((1, MAX_GEN_SEQ, LM_HIDDEN), gpu_buf.clone())
                             .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
@@ -426,9 +452,8 @@ impl ActionDecoder {
             #[allow(clippy::explicit_counter_loop)]
             for _ in 0..max_tokens {
                 let next_id = {
-                    let input =
-                        Array3::from_shape_vec((1, seq_len, LM_HIDDEN), all_embeds.clone())
-                            .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
+                    let input = Array3::from_shape_vec((1, seq_len, LM_HIDDEN), all_embeds.clone())
+                        .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
                     let tensor = TensorRef::from_array_view(&input)?;
                     let outputs = self
                         .lm_session
@@ -467,7 +492,10 @@ impl ActionDecoder {
         }
         let turn_tokens = query_ids.len() + response_ids.len();
         self.conv_token_count += turn_tokens;
-        self.conversation.push_back(ConvTurn { query_ids, response_ids });
+        self.conversation.push_back(ConvTurn {
+            query_ids,
+            response_ids,
+        });
         // Evict oldest turns until within budget.
         while self.conv_token_count > CONV_HISTORY_BUDGET {
             if let Some(front) = self.conversation.pop_front() {
@@ -611,7 +639,8 @@ impl ActionDecoder {
         // L2-normalise.
         let norm = (mean.iter().map(|x| x * x).sum::<f32>() + 1e-8).sqrt();
         let result: Vec<f32> = mean.iter().map(|x| x / norm).collect();
-        self.lm_hidden_cache.insert(token_ids.to_vec(), result.clone());
+        self.lm_hidden_cache
+            .insert(token_ids.to_vec(), result.clone());
         Ok(result)
     }
 
@@ -764,11 +793,25 @@ impl ActionDecoder {
     #[allow(dead_code)]
     pub fn proj_weight_norm(&self) -> Result<f32> {
         let model = self.model.as_ref().unwrap();
-        let w1 = model.fc1.weight.val().into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let w1 = model
+            .fc1
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
         let norm_sq: f32 = if self.linear_proj {
             w1.iter().map(|x| x * x).sum()
         } else {
-            let w2 = model.fc2.weight.val().into_data().convert::<f32>().to_vec::<f32>().unwrap();
+            let w2 = model
+                .fc2
+                .weight
+                .val()
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap();
             w1.iter().chain(w2.iter()).map(|x| x * x).sum()
         };
         Ok(norm_sq.sqrt())
@@ -795,14 +838,26 @@ impl ActionDecoder {
     pub fn proj_weights_flat(&self) -> Vec<f32> {
         let model = self.model.as_ref().unwrap();
         let w1 = model
-            .fc1.weight.val().detach().into_data()
-            .convert::<f32>().to_vec::<f32>().unwrap();
+            .fc1
+            .weight
+            .val()
+            .detach()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
         if self.linear_proj {
             return w1;
         }
         let w2 = model
-            .fc2.weight.val().detach().into_data()
-            .convert::<f32>().to_vec::<f32>().unwrap();
+            .fc2
+            .weight
+            .val()
+            .detach()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
         let mut out = Vec::with_capacity(w1.len() + w2.len());
         out.extend(w1);
         out.extend(w2);
@@ -885,9 +940,9 @@ impl ActionDecoder {
             let outputs = prefill_sess.run(ort::inputs!["inputs_embeds" => tensor])?;
 
             let (_, logit_data) = outputs["logits"].try_extract_tensor::<f32>()?;
-            let logit_flat   = logit_data.to_vec();
-            let vocab        = logit_flat.len() / prefix_len;
-            let last_logits  = logit_flat[(prefix_len - 1) * vocab..].to_vec();
+            let logit_flat = logit_data.to_vec();
+            let vocab = logit_flat.len() / prefix_len;
+            let last_logits = logit_flat[(prefix_len - 1) * vocab..].to_vec();
 
             let mut kv: Vec<Vec<f32>> = Vec::with_capacity(N_KV_LAYERS * 2);
             for i in 0..N_KV_LAYERS {
@@ -911,21 +966,25 @@ impl ActionDecoder {
             for h in 0..N_KV_HEADS {
                 let src_off = h * prefix_len * KV_HEAD_DIM;
                 let dst_off = h * KV_SIZE * KV_HEAD_DIM;
-                self.kv_cache.bufs[2*i  ][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
+                self.kv_cache.bufs[2 * i][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
                     .copy_from_slice(&k_src[src_off..src_off + prefix_len * KV_HEAD_DIM]);
-                self.kv_cache.bufs[2*i+1][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
+                self.kv_cache.bufs[2 * i + 1][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
                     .copy_from_slice(&v_src[src_off..src_off + prefix_len * KV_HEAD_DIM]);
             }
         }
         // Open mask for prefix positions (once, not per-layer).
-        for p in 0..prefix_len { self.kv_cache.mask[p] = 0.0; }
+        for p in 0..prefix_len {
+            self.kv_cache.mask[p] = 0.0;
+        }
         self.kv_cache.pos = prefix_len;
 
         // ── Step 2: Greedy decode ────────────────────────────────────────────
         let mut generated: Vec<u32> = Vec::new();
         {
             let mut logits: Vec<f32> = first_logits;
-            for &id in &generated { logits[id as usize] /= 1.3; }
+            for &id in &generated {
+                logits[id as usize] /= 1.3;
+            }
             let mut next_id = argmax(&logits);
             generated.push(next_id);
 
@@ -943,21 +1002,26 @@ impl ActionDecoder {
                 // Block ensures views drop before we write back to self.kv_cache.bufs below.
                 let outputs = {
                     let k_views: Vec<ArrayView4<f32>> = (0..N_KV_LAYERS)
-                        .map(|i| ArrayView4::from_shape(
-                            (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
-                            &self.kv_cache.bufs[2*i],
-                        ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
+                        .map(|i| {
+                            ArrayView4::from_shape(
+                                (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                                &self.kv_cache.bufs[2 * i],
+                            )
+                            .map_err(|e| anyhow::anyhow!("ndarray: {e}"))
+                        })
                         .collect::<Result<_>>()?;
                     let v_views: Vec<ArrayView4<f32>> = (0..N_KV_LAYERS)
-                        .map(|i| ArrayView4::from_shape(
-                            (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
-                            &self.kv_cache.bufs[2*i+1],
-                        ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
+                        .map(|i| {
+                            ArrayView4::from_shape(
+                                (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                                &self.kv_cache.bufs[2 * i + 1],
+                            )
+                            .map_err(|e| anyhow::anyhow!("ndarray: {e}"))
+                        })
                         .collect::<Result<_>>()?;
-                    let mask_view = ArrayView4::from_shape(
-                        (1, 1, 1, KV_SIZE + 1),
-                        &self.kv_cache.mask,
-                    ).map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
+                    let mask_view =
+                        ArrayView4::from_shape((1, 1, 1, KV_SIZE + 1), &self.kv_cache.mask)
+                            .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
 
                     let emb_arr = Array3::from_shape_vec((1, 1, LM_HIDDEN), embed_vec)
                         .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
@@ -966,12 +1030,27 @@ impl ActionDecoder {
 
                     let mut feed: Vec<(String, ValueRef<'_, DynValueTypeMarker>)> =
                         Vec::with_capacity(3 + N_KV_LAYERS * 2);
-                    feed.push(("inputs_embeds".into(),  TensorRef::from_array_view(&emb_arr)?.into_dyn()));
-                    feed.push(("position_ids".into(),   TensorRef::from_array_view(&pos_arr)?.into_dyn()));
-                    feed.push(("attention_mask".into(), TensorRef::from_array_view(mask_view)?.into_dyn()));
+                    feed.push((
+                        "inputs_embeds".into(),
+                        TensorRef::from_array_view(&emb_arr)?.into_dyn(),
+                    ));
+                    feed.push((
+                        "position_ids".into(),
+                        TensorRef::from_array_view(&pos_arr)?.into_dyn(),
+                    ));
+                    feed.push((
+                        "attention_mask".into(),
+                        TensorRef::from_array_view(mask_view)?.into_dyn(),
+                    ));
                     for i in 0..N_KV_LAYERS {
-                        feed.push((format!("past_key_{i}"),   TensorRef::from_array_view(k_views[i])?.into_dyn()));
-                        feed.push((format!("past_value_{i}"), TensorRef::from_array_view(v_views[i])?.into_dyn()));
+                        feed.push((
+                            format!("past_key_{i}"),
+                            TensorRef::from_array_view(k_views[i])?.into_dyn(),
+                        ));
+                        feed.push((
+                            format!("past_value_{i}"),
+                            TensorRef::from_array_view(v_views[i])?.into_dyn(),
+                        ));
                     }
                     decode_sess.run(feed)?
                 };
@@ -982,29 +1061,35 @@ impl ActionDecoder {
 
                 let mut new_kv: Vec<Vec<f32>> = Vec::with_capacity(N_KV_LAYERS * 2);
                 for i in 0..N_KV_LAYERS {
-                    let (_, k) = outputs[format!("new_key_{i}").as_str()].try_extract_tensor::<f32>()?;
+                    let (_, k) =
+                        outputs[format!("new_key_{i}").as_str()].try_extract_tensor::<f32>()?;
                     new_kv.push(k.to_vec());
-                    let (_, v) = outputs[format!("new_value_{i}").as_str()].try_extract_tensor::<f32>()?;
+                    let (_, v) =
+                        outputs[format!("new_value_{i}").as_str()].try_extract_tensor::<f32>()?;
                     new_kv.push(v.to_vec());
                 }
 
                 // Write new KV into cache at position `pos`.
                 // new_key shape: [1, N_KV_HEADS, 1, KV_HEAD_DIM].
                 for i in 0..N_KV_LAYERS {
-                    let k_new = &new_kv[2*i];
-                    let v_new = &new_kv[2*i+1];
+                    let k_new = &new_kv[2 * i];
+                    let v_new = &new_kv[2 * i + 1];
                     for h in 0..N_KV_HEADS {
                         let src = h * KV_HEAD_DIM;
                         let dst = h * KV_SIZE * KV_HEAD_DIM + pos * KV_HEAD_DIM;
-                        self.kv_cache.bufs[2*i  ][dst..dst+KV_HEAD_DIM].copy_from_slice(&k_new[src..src+KV_HEAD_DIM]);
-                        self.kv_cache.bufs[2*i+1][dst..dst+KV_HEAD_DIM].copy_from_slice(&v_new[src..src+KV_HEAD_DIM]);
+                        self.kv_cache.bufs[2 * i][dst..dst + KV_HEAD_DIM]
+                            .copy_from_slice(&k_new[src..src + KV_HEAD_DIM]);
+                        self.kv_cache.bufs[2 * i + 1][dst..dst + KV_HEAD_DIM]
+                            .copy_from_slice(&v_new[src..src + KV_HEAD_DIM]);
                     }
                 }
                 self.kv_cache.mask[pos] = 0.0;
                 self.kv_cache.pos += 1;
 
                 // Greedy next token with repetition penalty.
-                for &id in &generated { step_logits[id as usize] /= 1.3; }
+                for &id in &generated {
+                    step_logits[id as usize] /= 1.3;
+                }
                 next_id = argmax(&step_logits);
                 generated.push(next_id);
             }
@@ -1089,8 +1174,8 @@ impl GainWorker {
                     match msg {
                         GainMsg::UpdateWeights(w) => proj = w,
                         GainMsg::Compute(ep) => {
-                            let gain =
-                                gain_from_episode(&mut session, &proj, &ep, linear_proj).unwrap_or_else(|e| {
+                            let gain = gain_from_episode(&mut session, &proj, &ep, linear_proj)
+                                .unwrap_or_else(|e| {
                                     tracing::warn!(?e, "gain computation failed");
                                     [1.0f32; 5]
                                 });
@@ -1128,7 +1213,12 @@ impl GainWorker {
 /// Linear layout (linear_proj=true): proj_w = [W1_flat]
 ///   W1: [EPISODE_DIM, N_REGIONS*LM_HIDDEN]
 /// Burn stores Linear weights as [n_in, n_out], so y = x @ W (no transpose).
-fn gain_from_episode(session: &mut Session, proj_w: &[f32], episode: &[f32], linear_proj: bool) -> Result<[f32; 5]> {
+fn gain_from_episode(
+    session: &mut Session,
+    proj_w: &[f32],
+    episode: &[f32],
+    linear_proj: bool,
+) -> Result<[f32; 5]> {
     let n_out = N_REGIONS * LM_HIDDEN;
 
     let proj_flat = if linear_proj {
@@ -1155,12 +1245,16 @@ fn gain_from_episode(session: &mut Session, proj_w: &[f32], episode: &[f32], lin
                 h[j] += xi * wij;
             }
         }
-        for v in &mut h { *v = v.max(0.0); } // ReLU
+        for v in &mut h {
+            *v = v.max(0.0);
+        } // ReLU
 
         // Layer 2: proj_flat[k] = sum_j h[j] * W2[j * n_out + k]
         let mut out = vec![0.0f32; n_out];
         for (j, &hj) in h.iter().enumerate() {
-            if hj == 0.0 { continue; }
+            if hj == 0.0 {
+                continue;
+            }
             let row = &w2[j * n_out..(j + 1) * n_out];
             for (k, &wjk) in row.iter().enumerate() {
                 out[k] += hj * wjk;

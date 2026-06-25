@@ -751,27 +751,26 @@ async fn main() -> Result<()> {
 
     // ── perception processor ──────────────────────────────────────────────────
     let mut perception = PerceptionProcessor::new(NdArrayDevice::Cpu);
-    let prior_beta_regions_static: Option<[f32; 5]> =
-        if let Some(ref s) = args.prior_beta_regions {
-            let parts: Vec<&str> = s.split(',').collect();
-            if parts.len() != 5 {
-                anyhow::bail!("--prior-beta-regions requires exactly 5 comma-separated floats");
-            }
-            let mut betas = [0.0f32; 5];
-            for (i, p) in parts.iter().enumerate() {
-                betas[i] = p.trim().parse::<f32>().with_context(|| {
-                    format!("--prior-beta-regions: cannot parse '{}' as f32", p.trim())
-                })?;
-            }
-            perception.set_prior_beta(0.0); // clear base first
-            for (i, &b) in betas.iter().enumerate() {
-                perception.set_prior_beta_region(i, b);
-            }
-            Some(betas)
-        } else {
-            perception.set_prior_beta(args.prior_beta);
-            None
-        };
+    let prior_beta_regions_static: Option<[f32; 5]> = if let Some(ref s) = args.prior_beta_regions {
+        let parts: Vec<&str> = s.split(',').collect();
+        if parts.len() != 5 {
+            anyhow::bail!("--prior-beta-regions requires exactly 5 comma-separated floats");
+        }
+        let mut betas = [0.0f32; 5];
+        for (i, p) in parts.iter().enumerate() {
+            betas[i] = p.trim().parse::<f32>().with_context(|| {
+                format!("--prior-beta-regions: cannot parse '{}' as f32", p.trim())
+            })?;
+        }
+        perception.set_prior_beta(0.0); // clear base first
+        for (i, &b) in betas.iter().enumerate() {
+            perception.set_prior_beta_region(i, b);
+        }
+        Some(betas)
+    } else {
+        perception.set_prior_beta(args.prior_beta);
+        None
+    };
     perception.set_settle_steps(args.settle_steps);
     perception.set_settle_beta(args.settle_beta);
     perception.set_settle_gate(args.settle_gate);
@@ -982,18 +981,38 @@ async fn main() -> Result<()> {
 
     // Export projection weights for offline LoRA training and exit (ADR 0033).
     if let Some(ref export_dir) = args.export_proj_weights {
-        let dec = decoder.as_ref().expect("--export-proj-weights requires --action");
+        let dec = decoder
+            .as_ref()
+            .expect("--export-proj-weights requires --action");
         std::fs::create_dir_all(export_dir).expect("failed to create export dir");
         let weights = dec.proj_weights_flat();
         // MLP: W1=[640,1024] then W2=[1024,4480]; linear: W1=[640,4480] only.
-        let w1_len = if args.linear_proj { 640 * 4480 } else { 640 * 1024 };
-        let w1_bytes: Vec<u8> = weights[..w1_len].iter().flat_map(|f| f.to_le_bytes()).collect();
-        let w2_bytes: Vec<u8> = weights[w1_len..].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let w1_len = if args.linear_proj {
+            640 * 4480
+        } else {
+            640 * 1024
+        };
+        let w1_bytes: Vec<u8> = weights[..w1_len]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let w2_bytes: Vec<u8> = weights[w1_len..]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         std::fs::write(export_dir.join("w1.bin"), &w1_bytes).expect("w1.bin write failed");
         std::fs::write(export_dir.join("w2.bin"), &w2_bytes).expect("w2.bin write failed");
         println!("exported projection weights to {}", export_dir.display());
-        println!("  w1.bin  {} f32  shape=[640,{}]", w1_len, if args.linear_proj { 4480 } else { 1024 });
-        println!("  w2.bin  {} f32  shape=[{},4480]", weights.len() - w1_len, if args.linear_proj { 0 } else { 1024 });
+        println!(
+            "  w1.bin  {} f32  shape=[640,{}]",
+            w1_len,
+            if args.linear_proj { 4480 } else { 1024 }
+        );
+        println!(
+            "  w2.bin  {} f32  shape=[{},4480]",
+            weights.len() - w1_len,
+            if args.linear_proj { 0 } else { 1024 }
+        );
         std::process::exit(0);
     }
 
@@ -1519,10 +1538,13 @@ async fn main() -> Result<()> {
                             episodic.set_last_text_target(ids);
                         }
                         let effective_query = build_query_with_history(&query, raw_targets, dec);
-                        let recalled = query_recalled_episodes(
-                            &recall, &ep, Some(last_id), args.recall_k,
+                        let recalled =
+                            query_recalled_episodes(&recall, &ep, Some(last_id), args.recall_k);
+                        tracing::info!(
+                            recall_n = recalled.len(),
+                            introspective = effective_query.len() != query.len(),
+                            "starting generation (pre-sleep)"
                         );
-                        tracing::info!(recall_n = recalled.len(), introspective = effective_query.len() != query.len(), "starting generation (pre-sleep)");
                         let ep_clone = ep.clone();
                         let max_tokens = args.action_max_tokens;
                         let result = tokio::task::block_in_place(|| {
@@ -2480,11 +2502,23 @@ fn accumulate_wakefulness_pressure(salience: f32, sal_threshold: f32, pressure: 
 /// Called inline at language ingest time to capture every ASR/text-bypass event.
 fn write_training_pair(path: &std::path::Path, episode: &[f32], text: &str) {
     use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
         return;
     };
-    let text_esc = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
-    let ep_json: String = episode.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+    let text_esc = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    let ep_json: String = episode
+        .iter()
+        .map(|v| format!("{v:.6}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let _ = writeln!(f, "{{\"episode\":[{ep_json}],\"text\":\"{text_esc}\"}}");
 }
 
