@@ -238,35 +238,47 @@ def train(args):
         export_onnx(merged, tokenizer, args.export_onnx, device)
 
 
-def export_onnx(model, tokenizer, onnx_path: str, device):
-    """Export the merged model to ONNX (dynamic seq_len, inputs_embeds interface)."""
-    try:
-        import onnx
-    except ImportError:
-        print("WARNING: onnx not installed — skipping ONNX export. Run: pip install onnx")
-        return
+class _Qwen25LMWrapper(torch.nn.Module):
+    """Mirror of Qwen25LMWrapper in export_models.py — base transformer + lm_head."""
+    def __init__(self, m):
+        super().__init__()
+        self.model = m.model
+        self.lm_head = m.lm_head
 
+    def forward(self, inputs_embeds):
+        out = self.model(inputs_embeds=inputs_embeds)
+        last_hidden = out.last_hidden_state
+        return last_hidden, self.lm_head(last_hidden)
+
+
+def export_onnx(model, tokenizer, onnx_path: str, device):
+    """Export the merged model to ONNX (dynamic seq_len, last_hidden_state + logits)."""
     print(f"Exporting ONNX to {onnx_path} ...")
 
-    # Back up existing model.
     if os.path.exists(onnx_path):
         backup = onnx_path.replace(".onnx", "_pretrained.onnx")
         os.rename(onnx_path, backup)
         print(f"  backed up existing model to {backup}")
 
-    # Dummy input: [1, 5, 896] region token embeddings.
-    dummy_embeds = torch.zeros(1, N_REGIONS, LM_HIDDEN, dtype=torch.float32, device=device)
+    wrapper = _Qwen25LMWrapper(model).to(device).eval()
+    dummy = torch.zeros(1, 4, LM_HIDDEN, dtype=torch.float32, device=device)
 
-    torch.onnx.export(
-        model,
-        {"inputs_embeds": dummy_embeds},
-        onnx_path,
-        input_names=["inputs_embeds"],
-        output_names=["last_hidden_state"],
-        dynamic_axes={"inputs_embeds": {0: "batch", 1: "seq"}, "last_hidden_state": {0: "batch", 1: "seq"}},
-        opset_version=17,
-        do_constant_folding=True,
-    )
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            onnx_path,
+            input_names=["inputs_embeds"],
+            output_names=["last_hidden_state", "logits"],
+            dynamic_axes={
+                "inputs_embeds":     {0: "batch", 1: "seq_len"},
+                "last_hidden_state": {0: "batch", 1: "seq_len"},
+                "logits":            {0: "batch", 1: "seq_len"},
+            },
+            opset_version=17,
+            do_constant_folding=True,
+            dynamo=False,
+        )
     print(f"ONNX export complete: {onnx_path}")
     print("NOTE: run scripts/export_models.py to rebuild qwen25_gain.onnx and qwen25_text_hidden.onnx")
     print("      if gain drift is observed after LoRA deployment (see ADR 0033).")
