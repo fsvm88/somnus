@@ -20,7 +20,7 @@ use burn::{
     record::{BinFileRecorder, FullPrecisionSettings},
     tensor::{activation, Tensor, TensorData},
 };
-use ndarray::{Array2, Array3, Array4};
+use ndarray::{Array2, Array3, ArrayView4};
 use ort::{session::Session, value::{DynValueTypeMarker, TensorRef, ValueRef}};
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
@@ -939,40 +939,42 @@ impl ActionDecoder {
                 // Embed the previous token (borrows embed_table only, safe while sess is out).
                 let embed_vec = self.embed_flat(&[next_id])?;
 
-                // Clone KV buffers and mask before running ORT.
-                // Each buf is N_KV_HEADS * KV_SIZE * KV_HEAD_DIM f32s (~1 MB); total ~48 MB.
-                let k_arrs: Vec<Array4<f32>> = (0..N_KV_LAYERS)
-                    .map(|i| Array4::from_shape_vec(
-                        (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
-                        self.kv_cache.bufs[2*i].clone(),
-                    ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
-                    .collect::<Result<_>>()?;
-                let v_arrs: Vec<Array4<f32>> = (0..N_KV_LAYERS)
-                    .map(|i| Array4::from_shape_vec(
-                        (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
-                        self.kv_cache.bufs[2*i+1].clone(),
-                    ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
-                    .collect::<Result<_>>()?;
+                // Zero-copy views into KV buffers — no clone needed (decode_sess already taken out).
+                // Block ensures views drop before we write back to self.kv_cache.bufs below.
+                let outputs = {
+                    let k_views: Vec<ArrayView4<f32>> = (0..N_KV_LAYERS)
+                        .map(|i| ArrayView4::from_shape(
+                            (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                            &self.kv_cache.bufs[2*i],
+                        ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
+                        .collect::<Result<_>>()?;
+                    let v_views: Vec<ArrayView4<f32>> = (0..N_KV_LAYERS)
+                        .map(|i| ArrayView4::from_shape(
+                            (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                            &self.kv_cache.bufs[2*i+1],
+                        ).map_err(|e| anyhow::anyhow!("ndarray: {e}")))
+                        .collect::<Result<_>>()?;
+                    let mask_view = ArrayView4::from_shape(
+                        (1, 1, 1, KV_SIZE + 1),
+                        &self.kv_cache.mask,
+                    ).map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
 
-                let emb_arr  = Array3::from_shape_vec((1, 1, LM_HIDDEN), embed_vec)
-                    .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
-                let pos_arr  = Array2::from_shape_vec((1, 1), vec![pos as i64])
-                    .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
-                let mask_arr = Array4::from_shape_vec((1, 1, 1, KV_SIZE + 1), self.kv_cache.mask.clone())
-                    .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
+                    let emb_arr = Array3::from_shape_vec((1, 1, LM_HIDDEN), embed_vec)
+                        .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
+                    let pos_arr = Array2::from_shape_vec((1, 1), vec![pos as i64])
+                        .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
 
-                // Build dynamic input map: Vec<(String, ValueRef<DynValueTypeMarker>)>.
-                let mut feed: Vec<(String, ValueRef<'_, DynValueTypeMarker>)> =
-                    Vec::with_capacity(3 + N_KV_LAYERS * 2);
-                feed.push(("inputs_embeds".into(),  TensorRef::from_array_view(&emb_arr)?.into_dyn()));
-                feed.push(("position_ids".into(),   TensorRef::from_array_view(&pos_arr)?.into_dyn()));
-                feed.push(("attention_mask".into(), TensorRef::from_array_view(&mask_arr)?.into_dyn()));
-                for i in 0..N_KV_LAYERS {
-                    feed.push((format!("past_key_{i}"),   TensorRef::from_array_view(&k_arrs[i])?.into_dyn()));
-                    feed.push((format!("past_value_{i}"), TensorRef::from_array_view(&v_arrs[i])?.into_dyn()));
-                }
-
-                let outputs = decode_sess.run(feed)?;
+                    let mut feed: Vec<(String, ValueRef<'_, DynValueTypeMarker>)> =
+                        Vec::with_capacity(3 + N_KV_LAYERS * 2);
+                    feed.push(("inputs_embeds".into(),  TensorRef::from_array_view(&emb_arr)?.into_dyn()));
+                    feed.push(("position_ids".into(),   TensorRef::from_array_view(&pos_arr)?.into_dyn()));
+                    feed.push(("attention_mask".into(), TensorRef::from_array_view(mask_view)?.into_dyn()));
+                    for i in 0..N_KV_LAYERS {
+                        feed.push((format!("past_key_{i}"),   TensorRef::from_array_view(k_views[i])?.into_dyn()));
+                        feed.push((format!("past_value_{i}"), TensorRef::from_array_view(v_views[i])?.into_dyn()));
+                    }
+                    decode_sess.run(feed)?
+                };
 
                 // Extract logits and new KV.
                 let (_, logit_data) = outputs["logits"].try_extract_tensor::<f32>()?;
