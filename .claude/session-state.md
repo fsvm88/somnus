@@ -1,15 +1,30 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-25
+> **Last updated:** 2026-06-26
 > **Branch:** `main`
 
-## Status: Q-A and Q-B done. Perf queue complete. No active queued work.
+## Status: Hot-loop alloc elimination done. Streaming output live. No active queued work.
 
 ## Queued work (next session)
 
-*None — perf queue exhausted.*
+*None.*
 
 ---
+
+### Q-C — Hot-loop allocation elimination + streaming output ✅ DONE (2026-06-26)
+
+Commit 6b39194. Eliminates ~80 MB of malloc/free per 128-token generation in `generate_kv()`:
+- `KvCache.logits_scratch` (vocab_size floats): `copy_from_slice` instead of `to_vec()` — no 607 KB malloc per step
+- `KvCache.new_kv_scratch` (48 × 128 floats): `copy_from_slice` + field destructuring instead of 48 Vec allocs per step
+- Static `PAST_KEY/PAST_VALUE/NEW_KEY/NEW_VALUE` `&str` arrays: eliminates 96 `format!()` + String allocs per step
+- Prefill: KV scattered directly into `kv_cache.bufs` (no 48-Vec intermediate, ~7 MB peak saved)
+- Streaming output: each token printed + flushed immediately (~40 ms first-token latency)
+- `println!()` after decode loop ends stream before JSON response
+- `--action-max-tokens` default: 128 → 25 (~1 s at 40 ms/step)
+
+**ORT API note:** `try_extract_tensor::<T>()` in ort 2.0.0-rc.12 returns `Result<(&Shape, &[T])>` — data is already a `&[T]`, use `copy_from_slice` directly. `.as_slice()` does not exist on this type.
+
+**NREM parallelism investigation:** `Module<B>: Send` confirmed. Parallelizing 5 region forward passes requires splitting `PerceptionModel` into per-region sub-models (separate `&mut` borrows needed per thread). Deferred — it's a refactor, not a quick fix.
 
 ### Q-A — Zero-copy ArrayView4 for KV decode ✅ DONE (2026-06-25)
 
