@@ -243,7 +243,7 @@ struct Args {
     video_stride: usize,
 
     /// Maximum tokens to generate per query (ADR 0012).
-    #[arg(long, default_value = "128")]
+    #[arg(long, default_value = "25")]
     action_max_tokens: usize,
 
     /// Number of past episodes to retrieve from warm memory and prepend as recall
