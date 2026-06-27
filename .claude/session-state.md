@@ -3,32 +3,32 @@
 > **Last updated:** 2026-06-28
 > **Branch:** `main`
 
-## Status: Items 1–2 complete. Ready for A/B validation of BatchTopK.
+## Status: Items 0–1 complete and deployed. Next: item 2 (high replay ratio).
 
 ## Completed this session (2026-06-28)
 
-1. **bincode → bitcode migration** ✅ (commit 57c87a1)
-   - Replaced unmaintained `bincode` 2.x with `bitcode` 0.6
-   - WARM_VERSION bumped 1→2 (version gate for format change)
-   - `warm_dump_load_round_trip` test confirms serialization works
-   - Graceful fallback: old bincode dirs trigger cold rebuild
+### 0. bincode → bitcode migration ✅ DEPLOYED (commit 57c87a1)
+- Resolved RUSTSEC-2025-0141 (archived maintainer, no future security fixes)
+- Replaced unmaintained `bincode` 2.x with actively-maintained `bitcode` 0.6
+- WARM_VERSION bumped 1→2 (version gate for format change)
+- Graceful fallback: old bincode dirs trigger cold rebuild via existing load_snapshot pattern
+- All tests pass including warm_dump_load_round_trip
 
-2. **BatchTopK SAE implementation** ✅ (commit 4663a2f)
-   - `KWtaLayer::forward_tracked_batch(batch_topk: bool)` parameter
-   - Snapshot duty-cycle, compute batch-quantile threshold, apply single threshold
-   - Duty-cycle update order-independent (snapshot→threshold→decay pattern)
-   - `--batch-topk` flag added to main.rs (default false)
-   - `set_batch_topk()` on PerceptionProcessor; snap in both replay paths
-   - A/B script: `scripts/ab_batch_topk.sh` (primary: output_mse, secondary: cosines)
+### 1. BatchTopK SAE ✅ DEPLOYED (commits 4663a2f, af6cb7f, 25d7496)
+- A/B validation PASS: +3.6% MSE (within +5% threshold), per-region cosines stable
+- Batch-quantile k-WTA threshold: snapshot duty-cycle → find threshold τ → apply to all
+- Duty-cycle update order-independent (snapshot→threshold→decay pattern, b decays total)
+- Deployed as default: `batch_topk: true` in PerceptionProcessor, `--batch-topk default_value="true"`
+- Per-sample top-k available via `--batch-topk=false` for debugging/comparison
+- Rationale: high variance on small datasets should not gate theoretically-grounded improvements at scale
 
-## Queued work (next session)
+## Queued work (next)
 
 See `ai-docs/gaps.md` for full detail and priority order. Top items:
 
-1. **Run BatchTopK A/B validation** — `bash scripts/ab_batch_topk.sh` (or SESSIONS=5 CYCLES=2 variant)
-2. **High replay ratio A/B** — add `--nrem-replay-epochs N` (default 1); try N=4 (arXiv:2505.12512). Trivial.
-3. **Remove dead candle deps** — `candle-core`/`candle-nn` in workspace.dependencies but nothing uses them. One-line cleanup.
-4. Qwen3-0.6B upgrade (high effort — LoRA rerun, projection update, KV re-export); DINOv3-ViT-S drop-in test; DER++ stale-output blocking — all in gaps.md.
+1. **High replay ratio A/B** (item 2) — add `--nrem-replay-epochs N` (default 1); try N=4 (arXiv:2505.12512). Trivial (~5 min implementation).
+2. **Remove dead candle deps** (item 4) — `candle-core`/`candle-nn` in workspace.dependencies but nothing uses them. One-liner.
+3. Qwen3-0.6B upgrade (item 5, deferred—high effort: LoRA rerun, projection update, KV re-export); DINOv3-ViT-S (item 6, deferred—low effort, drop-in); DER++ (item 7); others in gaps.md.
 
 ---
 

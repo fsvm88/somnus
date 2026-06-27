@@ -14,11 +14,11 @@
 
 ---
 
-## 1. Algorithm: BatchTopK SAE — VALIDATION PENDING
+## 1. Algorithm: BatchTopK SAE ✅ DEPLOYED
 
 **Source:** Bussmann et al., arXiv:2412.06410, Dec 2024.
 
-**Status:** Implementation complete (commit 4663a2f, af6cb7f). Awaiting A/B validation.
+**Status:** A/B validation PASS (commit 25d7496). Default behavior in all NREM training.
 
 **What:** Replaces per-sample hard top-k (k-WTA) with a batch-level quantile threshold: one scalar threshold is computed per batch such that the *average* number of active features across the batch equals k. Individual samples may use k±δ features as their activation distribution demands. Uses pure **L2 reconstruction loss** — no L1 penalty.
 
@@ -220,16 +220,16 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 
 | # | Item | Effort | Impact | Status |
 |---|---|---|---|---|
-| ✅ 1 | **bincode migration** (→ bitcode) | Low–Med | Security advisory | Done (57c87a1) |
-| ⏳ 2 | **BatchTopK SAE A/B** | Low | Sparse coding quality | Validation pending |
-| 3 | **High replay ratio A/B** (N=4) | Trivial | Consolidation quality | — |
-| 4 | **Remove dead candle deps** | Trivial | Cleanliness | — |
-| 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | — |
-| 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | — |
-| 7 | **DER++ stale-output blocking** | Low–Med | Replay consolidation | — |
-| 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | — |
-| 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | — |
-| 10 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | — |
-| 11 | **LISTA unrolled encoder** | Med | Sparse coding quality | — |
-| 12 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than Qwen3) | — |
-| 13 | **usearch migration** | Med | HNSW footprint | — |
+| ✅ 0 | **bincode migration** (→ bitcode) | Low–Med | Security advisory | Deployed (57c87a1) |
+| ✅ 1 | **BatchTopK SAE** | Low | Sparse coding quality | Deployed (25d7496) |
+| 2 | **High replay ratio A/B** (N=4) | Trivial | Consolidation quality | Queued |
+| 4 | **Remove dead candle deps** | Trivial | Cleanliness | Queued |
+| 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | Deferred |
+| 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deferred |
+| 7 | **DER++ stale-output blocking** | Low–Med | Replay consolidation | Deferred |
+| 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | Deferred |
+| 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Deferred |
+| 10 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | Deferred |
+| 11 | **LISTA unrolled encoder** | Med | Sparse coding quality | Deferred |
+| 12 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than Qwen3) | Deferred |
+| 13 | **usearch migration** | Med | HNSW footprint | Deferred |
