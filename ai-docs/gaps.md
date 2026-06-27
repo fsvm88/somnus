@@ -94,17 +94,15 @@
 
 ---
 
-## 6. Visual encoder: DINOv3-ViT-S (drop-in candidate)
+## 6. Visual encoder: DINOv3-ViT-S (drop-in candidate) ✅ INTEGRATED
 
 **Source:** Meta, August 2025, arXiv:2508.10104.
 
 **What:** Distilled from a 7B ViT teacher. ~21M params — same as DINOv2-S. Output dim: **384 — identical to current DINOv2-S/14 (true drop-in)**. ImageNet-1k linear probe: 81.40% vs DINOv2-S 81.1% (marginal improvement).
 
-**ONNX status:** Needs testing. Architecture is identical to DINOv2 family, which exports cleanly; no known blockers. Low-risk experiment.
+**Status:** ONNX export successful (commit 43be241). VideoEncoder automatically prefers dinov3_small.onnx if present, else DINOv2-S. Zero-configuration swap. A/B validation script ready: `scripts/ab_dinov3.sh`.
 
-**MIGraphX:** Likely compatible — same op set as DINOv2.
-
-**Effort:** Low if ONNX export works. Re-export, validate parity on a short campaign, A/B.
+**Next:** Run A/B campaign (5 sessions × 2 cycles control vs treatment) to validate parity before deploying to long-running campaign.
 
 **Note:** Marginal quality gain (~0.3%). Worth testing precisely because it's a true drop-in — no projection changes, no cold-start, no snapshot incompatibility.
 

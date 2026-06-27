@@ -1,13 +1,22 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 (late evening, parallel work)
+> **Last updated:** 2026-06-28 (evening, Item 6 complete)
 > **Branch:** `main`
 
-## Status: Items 0–4 complete. Item 5 (Qwen3-0.6B) and Item 7 (DER++) in progress (parallel).
+## Status: Items 0–6 complete. Item 7 (DER++) in progress. Item 5 (Qwen3-0.6B) deferred to final.
 
-## In Progress (2026-06-28, parallel work)
+## Completed this session (2026-06-28, evening)
 
-### Item 5: Qwen3-0.6B Upgrade 🔄 (High effort)
+### 6. DINOv3-ViT-S Encoder Swap ✅ INTEGRATED (commit 43be241)
+- **Exported:** DINOv3-ViT-S (facebook/dinov3-vits16-pretrain-lvd1689m) to ONNX (87 MB)
+- **Output:** 384-dim (identical to DINOv2-S) — true drop-in replacement
+- **Integration:** VideoEncoder prefers dinov3_small.onnx, falls back to dinov2_small.onnx
+- **A/B script:** scripts/ab_dinov3.sh (5 sessions × 2 cycles control vs treatment)
+- **Status:** Ready for parity validation; zero-configuration encoder swap active
+
+## In Progress (2026-06-28, post-Item-6)
+
+### Item 7: DER++ Auto-λ + Stale-output Blocking 🔄 (Low-Med effort)
 - ✅ Code preparation: Updated LM_HIDDEN (896→1024) constants across crates
   - REGION_DIMS[4]: 896 → 1024 (language region)
   - CROSS_MODAL_DIM: 2176 → 2304
@@ -30,7 +39,7 @@
   - Framework ready for Phase 2 implementation
 - ⏳ Phase 2: Compute staleness in replay loop
   - Requires refactor for borrow safety (episode inference while holding &mut perception)
-  - Implementation deferred to next session (higher priority: get Item 5 working)
+  - **Next step:** Implement stale-output detection during NREM replay loop
 - 📋 Auto-λ: Deferred to Phase 3 (build on staleness implementation)
 
 ## Completed this session (2026-06-28, late evening)
@@ -76,12 +85,11 @@
 
 ## Queued work (next)
 
-See `ai-docs/gaps.md` for full detail and priority order. Next candidates:
+See `ai-docs/gaps.md` for full detail and priority order. Reordered after Item 6:
 
-1. Qwen3-0.6B upgrade (item 5, high effort: LoRA rerun, projection update, KV re-export, training)
-2. DINOv3-ViT-S test (item 6, low effort, drop-in encoder swap, confirm parity)
-3. DER++ auto-λ + stale blocking (item 7, low–med effort)
-4. LISTA unrolled encoder (item 11, med effort, multi-step ISTA per region)
+1. DER++ auto-λ + stale blocking (item 7, low–med effort) — **IN PROGRESS**
+2. LISTA unrolled encoder (item 11, med effort, multi-step ISTA per region)
+3. Qwen3-0.6B upgrade (item 5, high effort: LoRA rerun, projection update, KV re-export, training) — **DEFERRED TO END**
 
 ---
 
