@@ -25,20 +25,42 @@ fi
 
 # Control: use qwen25_lm.onnx (base model, already in place)
 echo "Running control (Qwen2.5-0.5B base)..."
-"$REPO_ROOT/target/release/somnus" \
-    --sessions "$SESSIONS" \
-    --cycles "$CYCLES" \
-    2>&1 | tail -50
+for i in $(seq 1 "$SESSIONS"); do
+    "$REPO_ROOT/target/release/somnus" \
+        --file-loop \
+        --file clips/talking_head.mp4 \
+        --file clips/urban.mp4 \
+        --file clips/animation.mp4 \
+        --file clips/nature.mp4 \
+        --language \
+        --action \
+        --action-distill-only \
+        --lang-use-lm \
+        --session "$i" \
+        --max-sleep-cycles "$CYCLES" \
+        2>&1 | tail -10
+done
 
 # Treatment: temporarily replace with Qwen3 base model
 echo ""
 echo "Running treatment (Qwen3-0.6B base)..."
 cp "$MODELS_DIR/qwen25_lm.onnx" "$MODELS_DIR/qwen25_lm.onnx.bak"
 cp "$MODELS_DIR/qwen3_lm_base.onnx" "$MODELS_DIR/qwen25_lm.onnx"
-"$REPO_ROOT/target/release/somnus" \
-    --sessions "$SESSIONS" \
-    --cycles "$CYCLES" \
-    2>&1 | tail -50
+for i in $(seq 1 "$SESSIONS"); do
+    "$REPO_ROOT/target/release/somnus" \
+        --file-loop \
+        --file clips/talking_head.mp4 \
+        --file clips/urban.mp4 \
+        --file clips/animation.mp4 \
+        --file clips/nature.mp4 \
+        --language \
+        --action \
+        --action-distill-only \
+        --lang-use-lm \
+        --session "$((SESSIONS + i))" \
+        --max-sleep-cycles "$CYCLES" \
+        2>&1 | tail -10
+done
 mv "$MODELS_DIR/qwen25_lm.onnx.bak" "$MODELS_DIR/qwen25_lm.onnx"
 
 echo ""
