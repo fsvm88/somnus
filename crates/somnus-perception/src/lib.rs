@@ -43,7 +43,7 @@ pub(crate) struct EmaOutputHeads {
     /// Layout: [d_in × d_out] (burn stores weight as [d_in, d_out]).
     /// Updated by `sync_flat` after every EMA weight update.
     flat: [Vec<f32>; 5],
-    /// d_out for each head: [384, 512, 384, 384, 896].
+    /// d_out for each head: [384, 512, 384, 384, 1024].
     d_out: [usize; 5],
 }
 
@@ -137,11 +137,11 @@ impl EmaOutputHeads {
 }
 
 /// Per-region input dimensions. Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
-pub const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 896];
+pub const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 1024];
 
 /// Input dimension for the symbolic cross-modal projection:
 /// speech(384) + env(512) + visual(384) + language(896). Missing modalities are zero-padded.
-pub const CROSS_MODAL_DIM: usize = 384 + 512 + 384 + 896;
+pub const CROSS_MODAL_DIM: usize = 384 + 512 + 384 + 1024;
 
 /// Default prior_cosine gate for settling (ADR 0011). Exposed as --settle-gate at runtime.
 pub const SETTLE_COSINE_GATE_DEFAULT: f32 = 0.85;
@@ -210,12 +210,12 @@ impl PerceptionModel<TrainB> {
             env_layer: KWtaLayer::new(RegionId::AudioEnv, 512, device),
             visual_layer: KWtaLayer::new(RegionId::Visual, 384, device),
             symbolic_layer: KWtaLayer::new(RegionId::Symbolic, 384, device),
-            language_layer: KWtaLayer::new(RegionId::Language, 896, device),
+            language_layer: KWtaLayer::new(RegionId::Language, 1024, device),
             speech_decoder: SaeDecoder::new(RegionId::AudioSpeech, 384, device),
             env_decoder: SaeDecoder::new(RegionId::AudioEnv, 512, device),
             visual_decoder: SaeDecoder::new(RegionId::Visual, 384, device),
             symbolic_decoder: SaeDecoder::new(RegionId::Symbolic, 384, device),
-            language_decoder: SaeDecoder::new(RegionId::Language, 896, device),
+            language_decoder: SaeDecoder::new(RegionId::Language, 1024, device),
             binding: BindingArea::new(device),
             speech_head: LinearConfig::new(EPISODE_DIM, 384)
                 .with_bias(false)
@@ -229,7 +229,7 @@ impl PerceptionModel<TrainB> {
             symbolic_head: LinearConfig::new(EPISODE_DIM, 384)
                 .with_bias(false)
                 .init(device),
-            language_head: LinearConfig::new(EPISODE_DIM, 896)
+            language_head: LinearConfig::new(EPISODE_DIM, 1024)
                 .with_bias(false)
                 .init(device),
             cross_modal_proj: LinearConfig::new(CROSS_MODAL_DIM, 384)
@@ -595,7 +595,7 @@ impl PerceptionProcessor {
         })
     }
 
-    /// Ingest a 896-dim language embedding (Qwen mean-pooled token embeddings).
+    /// Ingest a 1024-dim language embedding (Qwen3-0.6B mean-pooled token embeddings).
     pub fn ingest_language(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
         let device = self.device;
         self.last_language_input = Some(values.to_vec());
@@ -692,17 +692,17 @@ impl PerceptionProcessor {
     /// Recompute the Symbolic region as a cross-modal convergence layer.
     ///
     /// Concatenates the current encoder embeddings for speech(384), env(512), visual(384),
-    /// and language(896), zero-padding any missing modality, then projects through
-    /// `cross_modal_proj` (2176→384) before running the symbolic k-WTA.  Called before
+    /// and language(1024), zero-padding any missing modality, then projects through
+    /// `cross_modal_proj` (CROSS_MODAL_DIM→384) before running the symbolic k-WTA.  Called before
     /// every `try_bind` so symbolic always reflects the most current cross-modal picture.
     ///
     /// Returns (symbolic_prior_cosine, symbolic_reconstruction_err).
     fn compute_symbolic_cross_modal(&mut self) -> (Option<f32>, f32) {
         let device = self.device;
 
-        // Build 2176-dim concat: [speech(384) | env(512) | visual(384) | language(896)]
+        // Build CROSS_MODAL_DIM-dim concat: [speech(384) | env(512) | visual(384) | language(1024)]
         let mut concat = vec![0.0f32; CROSS_MODAL_DIM];
-        let offsets = [(0, 384), (384, 512), (896, 384), (1280, 896)]; // (offset, dim) per region idx [0,1,2,4]
+        let offsets = [(0, 384), (384, 512), (896, 384), (1280, 1024)]; // (offset, dim) per region idx [0,1,2,4]
         let region_indices = [0usize, 1, 2, 4];
         for (&region_idx, &(offset, dim)) in region_indices.iter().zip(offsets.iter()) {
             if let Some(inp) = &self.latest_inputs[region_idx] {
@@ -716,7 +716,7 @@ impl PerceptionProcessor {
         // instead of going through the Autodiff<NdArray> tensor machinery.
         let projected: Vec<f32> = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
             if let Some(flat) = &self.cross_modal_proj_flat {
-                // Raw matmul: concat[2176] × flat[2176 × 384] → out[384]
+                // Raw matmul: concat[CROSS_MODAL_DIM] × flat[CROSS_MODAL_DIM × 384] → out[384]
                 let d_out = 384usize;
                 let mut out = vec![0.0f32; d_out];
                 for (i, &c) in concat.iter().enumerate() {

@@ -1,4 +1,4 @@
-/// ActionDecoder: region-token projection + frozen Qwen2.5-0.5B (ADR 0012).
+/// ActionDecoder: region-token projection + frozen Qwen3-0.6B (ADR 0012).
 ///
 /// Dual function:
 ///   1. Every episode: project episode vector → 4 region tokens → LM forward →
@@ -29,7 +29,7 @@ use ort::{
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 
-pub const LM_HIDDEN: usize = 896; // Qwen2.5-0.5B hidden dimension
+pub const LM_HIDDEN: usize = 1024; // Qwen3-0.6B hidden dimension
 pub const N_REGIONS: usize = 5;
 const EPISODE_DIM: usize = 640;
 const PROJ_LR: f64 = 1e-4;
@@ -158,15 +158,15 @@ pub struct ActionDecoder {
     optimizer: ProjOptim,
     /// Frozen embedding table: flat [vocab_size * LM_HIDDEN], row-major f32.
     embed_table: Vec<f32>,
-    /// Transformer-only (no LM head), static [1,5,896].
+    /// Transformer-only (no LM head), static [1,5,1024].
     /// Moved to GainWorker via `create_gain_worker`; None afterwards.
     gain_session: Option<Session>,
     /// Full model with LM head, dynamic seq_len — CPU fallback for generate().
     lm_session: Session,
-    /// Base model only (no LM head), static [1, MAX_TEXT_SEQ, 896] — MIGraphX-eligible.
+    /// Base model only (no LM head), static [1, MAX_TEXT_SEQ, 1024] — MIGraphX-eligible.
     /// Used by text_hidden_states() when present; falls back to lm_session on CPU if absent.
     text_hidden_session: Option<Session>,
-    /// Base model only (no LM head), static [1, MAX_GEN_SEQ, 896] — MIGraphX-eligible.
+    /// Base model only (no LM head), static [1, MAX_GEN_SEQ, 1024] — MIGraphX-eligible.
     /// GPU generation path: Rust extracts hidden[seq_len-1] and computes logits via
     /// dot(hidden, embed_table^T). Works because Qwen2.5-0.5B ties lm_head == embed_tokens.
     /// Falls back to lm_session (CPU) when absent or when use_gpu_gen is false.
@@ -175,11 +175,11 @@ pub struct ActionDecoder {
     /// Opt-in via --gpu-generation: on gfx1201 the fixed-1024 path is ~14× slower than
     /// CPU at typical seq_lens; re-evaluate when ROCm/MIGraphX matures for RDNA 4.
     use_gpu_gen: bool,
-    /// Prefill model for KV-cache generation: inputs_embeds [1,n,896] → logits + 48 KV tensors.
-    /// Loaded from qwen25_lm_prefill_kv.onnx when present.
+    /// Prefill model for KV-cache generation: inputs_embeds [1,n,1024] → logits + 48 KV tensors.
+    /// Loaded from qwen3_lm_prefill_kv.onnx when present.
     prefill_kv_session: Option<Session>,
-    /// Single-step decode model for KV-cache generation: [1,1,896] + pos + mask + 48 KV → logits + 48 new KV.
-    /// Loaded from qwen25_lm_decode_kv.onnx when present.
+    /// Single-step decode model for KV-cache generation: [1,1,1024] + pos + mask + 48 KV → logits + 48 new KV.
+    /// Loaded from qwen3_lm_decode_kv.onnx when present.
     decode_kv_session: Option<Session>,
     /// KV cache state for generate_kv(). Reset at each generate() call.
     kv_cache: KvCache,
