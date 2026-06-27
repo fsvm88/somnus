@@ -425,6 +425,11 @@ struct Args {
     #[arg(long, default_value = "0")]
     lang_oversample: usize,
 
+    /// Number of complete passes through the NREM buffer per sleep cycle (default 1).
+    /// Higher values improve consolidation quality (arXiv:2505.12512); try 4 for A/B testing.
+    #[arg(long, default_value = "1")]
+    nrem_replay_epochs: usize,
+
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen25_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.
@@ -1782,6 +1787,7 @@ async fn main() -> Result<()> {
                 args.nrem_min_traces,
                 args.nrem_salience_threshold,
                 args.lang_oversample,
+                args.nrem_replay_epochs,
                 args.max_warm_records,
                 effective_max_cold,
                 args.growth_cooldown,

@@ -311,6 +311,7 @@ pub fn run_sleep_cycle(
     nrem_min_traces: usize,
     nrem_salience_threshold: usize,
     lang_oversample: usize,
+    replay_epochs: usize,
     max_warm_records: usize,
     max_cold_records: usize,
     growth_cooldown: usize,
@@ -494,7 +495,8 @@ pub fn run_sleep_cycle(
     let t_nrem = Instant::now();
 
     let decoder_trainable_records = traces.iter().filter(|(_, _, t, _, _)| t.is_some()).count();
-    tracing::info!(decoder_trainable_records, "NREM: decoder-trainable traces");
+    let replay_epochs = replay_epochs.max(1);
+    tracing::info!(decoder_trainable_records, replay_epochs, "NREM: decoder-trainable traces");
 
     // Effective batch size: fall back to 1 (sequential) when 0 is passed.
     let batch_size = replay_batch_size.max(1);
@@ -505,8 +507,13 @@ pub fn run_sleep_cycle(
     let mut proj_us_total = 0u64;
     let mut n_batches = 0u64;
 
-    let mut batch_start = 0usize; // index into `traces` of the current batch start
-    while batch_start < n_traces {
+    // Replay epochs: each epoch is a full pass through the trace buffer.
+    // Loss EWMA carries forward across epochs for continuous LR scheduling.
+    let mut first_batch_ever = true;
+
+    for epoch_idx in 0..replay_epochs {
+        let mut batch_start = 0usize; // index into `traces` of the current batch start
+        while batch_start < n_traces {
         let salient = nrem_salience_threshold > 0
             && pending_embs.load(Ordering::Relaxed) > nrem_salience_threshold
             && batch_start >= nrem_min_traces;
@@ -548,7 +555,8 @@ pub fn run_sleep_cycle(
         let t_replay = Instant::now();
         match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
             Ok((loss, mse)) => {
-                loss_ewma = if batch_start == 0 {
+                loss_ewma = if first_batch_ever {
+                    first_batch_ever = false;
                     loss
                 } else {
                     EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
@@ -612,6 +620,10 @@ pub fn run_sleep_cycle(
         n_batches += 1;
 
         batch_start = batch_end;
+        }
+        if epoch_idx + 1 < replay_epochs {
+            tracing::info!(epoch_idx = epoch_idx + 1, "NREM: starting epoch");
+        }
     }
 
     let replay_ms_avg = replay_us_total.checked_div(n_batches).unwrap_or(0) / 1000;
