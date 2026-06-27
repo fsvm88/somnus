@@ -13,10 +13,14 @@
   - CROSS_MODAL_DIM: 2176 → 2304
   - MLP fc2 output: [1024, 4480] → [1024, 5120]
   - Commits: 6335b42
-- 🔄 ONNX export: Model download + export script running in background
-  - Script: `scripts/export_qwen3.py` (started, monitoring)
-  - Next: KV-cache re-export, LoRA retraining, A/B validation
-- ⏳ Blocked on: Model export completion (~20-30 min remaining)
+- ✅ Base model ONNX export: `models/qwen3_lm_base.onnx` (1024-dim)
+  - Qwen3-0.6B downloaded and exported successfully
+- ⏳ Remaining steps (queued for next session):
+  1. KV-cache export: `python3 scripts/export_kv_cache.py --model-id Qwen/Qwen3-0.6B --kv-size 2048`
+  2. LoRA re-training: `python3 scripts/train_lora.py` (reuse existing training_data.jsonl or recollect)
+  3. INT8 quantization: `python3 scripts/quantize_kv.py --prefill`
+  4. A/B validation: 5 sessions × 2 cycles (control: Qwen2.5-0.5B, treatment: Qwen3-0.6B)
+- 📊 Cold-start: language region, language head, projection fc2 all have incompatible dims (old weights dropped)
 
 ### Item 7: DER++ Auto-λ + Stale-output Blocking 🔄 (Low-Med effort)
 - ✅ Phase 1 Foundation: Infrastructure for stale-output detection
