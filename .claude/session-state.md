@@ -1,9 +1,19 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 (evening)
+> **Last updated:** 2026-06-28 (late evening)
 > **Branch:** `main`
 
-## Status: Items 0–4 complete. Item 2 (replay ratio) ready for A/B validation.
+## Status: Items 0–4 complete. Item 2 A/B validation PASS, hardened to default.
+
+## Completed this session (2026-06-28, late evening)
+
+### 2. High replay ratio A/B validation ✅ PASS, HARDENED (commits 2d59d65, 3b29f96)
+- A/B campaign: N=1 control vs N=4 treatment, 5 sessions × 2 cycles each
+- **Result:** treatment avg output_mse 0.159467 vs control 0.221494 = **−28.0% improvement**
+- Consistent win across all 5 sessions (−9.7% to −49.4% per session)
+- Hardened into `train_campaign.sh`: `--nrem-replay-epochs 4` now default
+- Fixed comparison script to use `mean_output_mse` (not non-existent `output_mse`)
+- Verdict: PASS — replay ratio 1→4 improves consolidation per theory
 
 ## Completed this session (2026-06-28, evening)
 
@@ -39,11 +49,10 @@
 
 See `ai-docs/gaps.md` for full detail and priority order. Next candidates:
 
-1. **Item 2 A/B run** (validate replay ratio N=4 on short campaign before hardening)
-2. Qwen3-0.6B upgrade (item 5, high effort: LoRA rerun, projection update, KV re-export, training)
-3. DINOv3-ViT-S test (item 6, low effort, drop-in encoder swap, confirm parity)
-4. DER++ auto-λ + stale blocking (item 7, low–med effort)
-5. LISTA unrolled encoder (item 11, med effort, multi-step ISTA per region)
+1. Qwen3-0.6B upgrade (item 5, high effort: LoRA rerun, projection update, KV re-export, training)
+2. DINOv3-ViT-S test (item 6, low effort, drop-in encoder swap, confirm parity)
+3. DER++ auto-λ + stale blocking (item 7, low–med effort)
+4. LISTA unrolled encoder (item 11, med effort, multi-step ISTA per region)
 
 ---
 
