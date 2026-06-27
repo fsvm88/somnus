@@ -7,7 +7,7 @@
 
 ## In Progress (2026-06-28, late evening)
 
-### Item 5: Qwen3-0.6B Upgrade 🔄 (Full LoRA pipeline in progress)
+### Item 5: Qwen3-0.6B Upgrade 🔄 (Base-model A/B validation running)
 - ✅ Code infrastructure: Scripts created for Qwen3 (commit 4817e33)
   - All constants updated: LM_HIDDEN 896→1024, N_LAYERS 24→28, N_HEADS 14→16, N_KV_HEADS 2→8
 - ✅ Base model ONNX export: qwen3_lm_base.onnx (2.3 GB)
@@ -15,16 +15,19 @@
   - w1.bin: 640×1024 (2.5 MB)
   - w2.bin: 1024×5120 (20 MB) — correct dimensions for Qwen3
   - Stored in memory/proj_weights_qwen3/
-- ⏳ LoRA fine-tuning: Training in progress (3 epochs, 1548 pairs, batch=4)
-  - Expected duration: ~15–30 min (depends on hardware)
-  - Command: `python3 scripts/train_lora_qwen3.py --export-onnx models/qwen3_lm.onnx`
-  - Will produce qwen3_lm.onnx (LoRA-merged, ready for deployment)
-- ⏳ A/B validation: After LoRA training completes
-  - Command: `bash scripts/ab_qwen3.sh [SESSIONS=5 CYCLES=2]`
-  - Control: Qwen2.5-0.5B (base+LoRA), Treatment: Qwen3-0.6B (base+LoRA)
+- ❌ LoRA fine-tuning: Blocked (hung during dataset loading on CPU)
+  - Attempted: 3 epochs batch=4 (failed after 4h), then 1 epoch batch=2 (hung)
+  - Root cause: PyTorch/HF compatibility issue with Qwen3-0.6B on CPU
+  - Workaround: Proceeding with base-model A/B (still validates architecture)
+- ⏳ A/B validation: NOW RUNNING (base models, commit 7199019)
+  - Control: Qwen2.5-0.5B (base, 3 sessions × 1 cycle)
+  - Treatment: Qwen3-0.6B (base, 3 sessions × 1 cycle)
+  - Expected duration: ~30–45 min
+  - Command: `bash scripts/ab_qwen3.sh SESSIONS=3 CYCLES=1`
+  - Monitor: `tail -f ab_qwen3_results.log`
 - ⏳ KV-cache export: Deferred (optional optimization, base model works without it)
 
-**Progress:** LoRA training running; awaiting ONNX export completion before A/B begins.
+**Progress:** Base-model A/B validation running in background; awaiting metrics completion.
 
 ## Completed this session (2026-06-28, evening)
 
