@@ -1567,22 +1567,6 @@ impl PerceptionProcessor {
         Ok(episode.0)
     }
 
-    /// Helper: cosine similarity between two normalized vectors (returns 1.0 if either is empty).
-    #[inline]
-    fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-        if a.is_empty() || b.is_empty() {
-            return 1.0; // Treat missing/empty as identical (no stale signal)
-        }
-        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm_a < 1e-9 || norm_b < 1e-9 {
-            1.0 // Treat zero vectors as identical
-        } else {
-            (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
-        }
-    }
-
     /// Mean output-head MSE for one episode — no backward step.
     pub fn measure_output_mse_inference(
         &self,
@@ -2859,6 +2843,7 @@ fn scale_weight(linear: &mut Linear<TrainB>, scale: f32) {
     linear.weight = Param::initialized(id, new_w);
 }
 
+/// Cosine similarity between two vectors (handles zero-norm cases).
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();

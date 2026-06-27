@@ -622,7 +622,7 @@ impl LangEmbedder {
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
         let vocab = embed_table.len() / LANG_DIM;
-        let model_name = if embed_path.file_stem().map_or(false, |n| n.to_string_lossy().starts_with("qwen3")) {
+        let model_name = if embed_path.file_stem().is_some_and(|n| n.to_string_lossy().starts_with("qwen3")) {
             "Qwen3-0.6B"
         } else {
             "Qwen2.5-0.5B"
