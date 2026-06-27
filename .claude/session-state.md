@@ -1,9 +1,33 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 (late evening)
+> **Last updated:** 2026-06-28 (late evening, parallel work)
 > **Branch:** `main`
 
-## Status: Items 0–4 complete. Item 2 A/B validation PASS, hardened to default.
+## Status: Items 0–4 complete. Item 5 (Qwen3-0.6B) and Item 7 (DER++) in progress (parallel).
+
+## In Progress (2026-06-28, parallel work)
+
+### Item 5: Qwen3-0.6B Upgrade 🔄 (High effort)
+- ✅ Code preparation: Updated LM_HIDDEN (896→1024) constants across crates
+  - REGION_DIMS[4]: 896 → 1024 (language region)
+  - CROSS_MODAL_DIM: 2176 → 2304
+  - MLP fc2 output: [1024, 4480] → [1024, 5120]
+  - Commits: 6335b42
+- 🔄 ONNX export: Model download + export script running in background
+  - Script: `scripts/export_qwen3.py` (started, monitoring)
+  - Next: KV-cache re-export, LoRA retraining, A/B validation
+- ⏳ Blocked on: Model export completion (~20-30 min remaining)
+
+### Item 7: DER++ Auto-λ + Stale-output Blocking 🔄 (Low-Med effort)
+- ✅ Phase 1 Foundation: Infrastructure for stale-output detection
+  - Cosine similarity helper: `cosine_sim(a, b) → f32` (commit: 1cac096)
+  - DER++ constant: `STALE_COSINE_THRESHOLD = 0.90` (commit: 4c1114e)
+  - SleepStats tracking: `stale_traces_skipped: usize` field added
+  - Framework ready for Phase 2 implementation
+- ⏳ Phase 2: Compute staleness in replay loop
+  - Requires refactor for borrow safety (episode inference while holding &mut perception)
+  - Implementation deferred to next session (higher priority: get Item 5 working)
+- 📋 Auto-λ: Deferred to Phase 3 (build on staleness implementation)
 
 ## Completed this session (2026-06-28, late evening)
 
