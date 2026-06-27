@@ -585,7 +585,7 @@ impl AudioProcessor {
 
 // ── language embedder ─────────────────────────────────────────────────────────
 
-const LANG_DIM: usize = 896; // Qwen2.5 hidden / embedding dimension
+const LANG_DIM: usize = 1024; // LM hidden dimension (Qwen3-0.6B / future upgrades)
 
 struct LangEmbedder {
     tokenizer: Tokenizer,
@@ -595,8 +595,19 @@ struct LangEmbedder {
 
 impl LangEmbedder {
     fn new(models_dir: &std::path::Path) -> Result<Self> {
-        let embed_path = models_dir.join("qwen25_embed_table.safetensors");
-        let tok_path = models_dir.join("qwen25_tokenizer.json");
+        // Try Qwen3 first (Item 5 upgrade), fall back to Qwen2.5.
+        // Determines which embed table to load based on what's available.
+        let (embed_path, tok_path) = {
+            let qwen3_embed = models_dir.join("qwen3_embed_table.safetensors");
+            let qwen3_tok = models_dir.join("qwen3_tokenizer.json");
+            if qwen3_embed.exists() && qwen3_tok.exists() {
+                (qwen3_embed, qwen3_tok)
+            } else {
+                (models_dir.join("qwen25_embed_table.safetensors"),
+                 models_dir.join("qwen25_tokenizer.json"))
+            }
+        };
+
         let bytes = std::fs::read(&embed_path)?;
         let st = SafeTensors::deserialize(&bytes)
             .map_err(|e| anyhow::anyhow!("safetensors load failed: {e}"))?;
@@ -611,14 +622,19 @@ impl LangEmbedder {
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
         let vocab = embed_table.len() / LANG_DIM;
-        info!(vocab, "language embedder ready");
+        let model_name = if embed_path.file_stem().map_or(false, |n| n.to_string_lossy().starts_with("qwen3")) {
+            "Qwen3-0.6B"
+        } else {
+            "Qwen2.5-0.5B"
+        };
+        info!(vocab, model = model_name, "language embedder ready");
         Ok(Self {
             tokenizer,
             embed_table,
         })
     }
 
-    /// Tokenize `text` → mean-pool token embeddings → 896-dim Vec<f32>.
+    /// Tokenize `text` → mean-pool token embeddings → 1024-dim Vec<f32>.
     /// Empty or all-whitespace input returns a zero vector (filtered upstream).
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let enc = self

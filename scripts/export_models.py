@@ -37,6 +37,8 @@ REVISIONS = {
     "dinov3":  ("facebook/dinov3-vits16-pretrain-lvd1689m", None),  # ViT-S, 384-dim (drop-in replacement for DINOv2-S)
     # Qwen2.5-0.5B: revision should be pinned after first export; None = current main.
     "qwen25":  ("Qwen/Qwen2.5-0.5B", "060db6499f32faf8b98477b0a26969ef7d8b9987"),
+    # Qwen3-0.6B: Item 5 upgrade (hidden_size=1024, vs Qwen2.5's 896)
+    "qwen3":   ("Qwen/Qwen3-0.6B", None),
 }
 
 
@@ -447,6 +449,43 @@ def export_qwen25() -> None:
         print(f"  {tok_out.stat().st_size / 1e6:.2f} MB")
 
 
+def export_qwen3() -> None:
+    """Export Qwen3-0.6B embed table (base model already exported to qwen3_lm_base.onnx)."""
+    embed_out = MODELS_DIR / "qwen3_embed_table.safetensors"
+    tok_out = MODELS_DIR / "qwen3_tokenizer.json"
+
+    if embed_out.exists() and tok_out.exists():
+        print(f"  skip: qwen3 artifacts already present")
+        return
+
+    from transformers import Qwen2ForCausalLM, AutoTokenizer
+    import safetensors.torch as st
+
+    repo, rev = REVISIONS["qwen3"]
+    print(f"  loading {repo} @ {rev or 'main'}…")
+    model = Qwen2ForCausalLM.from_pretrained(repo, revision=rev, torch_dtype=torch.float32).eval()
+    tokenizer = AutoTokenizer.from_pretrained(repo, revision=rev)
+
+    assert model.config.tie_word_embeddings, (
+        "qwen3_lm base model requires tied embeddings (lm_head == embed_tokens) "
+        "so Rust can compute logits using the already-loaded embed_table."
+    )
+
+    hidden_size = model.config.hidden_size  # 1024 for Qwen3-0.6B
+
+    if not embed_out.exists():
+        print(f"  saving qwen3_embed_table.safetensors…")
+        embed_weight = model.model.embed_tokens.weight.detach().float()
+        st.save_file({"embed_tokens.weight": embed_weight}, str(embed_out))
+        print(f"  {embed_out.stat().st_size / 1e6:.1f} MB  "
+              f"shape={list(embed_weight.shape)}")
+
+    if not tok_out.exists():
+        print(f"  saving qwen3_tokenizer.json…")
+        tokenizer.backend_tokenizer.save(str(tok_out))
+        print(f"  {tok_out.stat().st_size / 1e6:.2f} MB")
+
+
 # ── main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -469,6 +508,9 @@ if __name__ == "__main__":
 
     print("=== Qwen2.5-0.5B (action decoder) ===")
     export_qwen25()
+
+    print("=== Qwen3-0.6B (action decoder, Item 5) ===")
+    export_qwen3()
 
     print("\nAll exports complete:")
     for f in sorted(MODELS_DIR.glob("*.onnx")):
