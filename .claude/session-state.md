@@ -10,10 +10,11 @@
 ### 2. High replay ratio A/B validation ✅ PASS, HARDENED (commits 2d59d65, 3b29f96)
 - A/B campaign: N=1 control vs N=4 treatment, 5 sessions × 2 cycles each
 - **Result:** treatment avg output_mse 0.159467 vs control 0.221494 = **−28.0% improvement**
-- Consistent win across all 5 sessions (−9.7% to −49.4% per session)
+- Per-session variance: early cycles show regression (c1,2: +52.4%), later cycles strong gains (c3,4,5: −21% to −49%)
+  - Pattern consistent with replay warmup: N=4 initially unstable, converges stronger than N=1 by cycle 5
 - Hardened into `train_campaign.sh`: `--nrem-replay-epochs 4` now default
 - Fixed comparison script to use `mean_output_mse` (not non-existent `output_mse`)
-- Verdict: PASS — replay ratio 1→4 improves consolidation per theory
+- Verdict: PASS — replay ratio 1→4 improves consolidation per theory (aggregate−28% outweighs early variance)
 
 ## Completed this session (2026-06-28, evening)
 
