@@ -1616,6 +1616,33 @@ impl PerceptionProcessor {
         Ok(if n > 0 { total / n as f32 } else { 0.0 })
     }
 
+    /// Infer predicted outputs (regional embeddings) from an episode vector (DER++ stale detection).
+    /// Returns [Vec<f32>; 5] with one prediction per region. Empty regions get empty vectors.
+    /// Used to detect staleness: compare predicted vs stored outputs via cosine similarity.
+    pub fn infer_episode_outputs(&self, episode: &[f32]) -> PerceptionResult<[Vec<f32>; 5]> {
+        let device = self.device;
+        let ep_t: Tensor<TrainB, 2> =
+            Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
+        let model = self.model.as_ref().unwrap();
+
+        let mut outputs: [Vec<f32>; 5] = Default::default();
+        let heads: [&Linear<TrainB>; 5] = [
+            &model.speech_head,
+            &model.env_head,
+            &model.visual_head,
+            &model.symbolic_head,
+            &model.language_head,
+        ];
+
+        for (i, head) in heads.iter().enumerate() {
+            let pred: Tensor<TrainB, 2> = head.forward(ep_t.clone());
+            let pred_vec: Vec<f32> = pred.into_data().convert::<f32>().to_vec()
+                .map_err(|e| PerceptionError::Burn(format!("tensor extraction: {}", e)))?;
+            outputs[i] = pred_vec;
+        }
+        Ok(outputs)
+    }
+
     // ── Homeostasis ──────────────────────────────────────────────────────────
 
     /// Apply global weight decay to all trainable Linear weights.

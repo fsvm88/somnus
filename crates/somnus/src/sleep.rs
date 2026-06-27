@@ -340,6 +340,7 @@ pub fn run_sleep_cycle(
     let mut total_proj_loss = 0.0f32;
     let mut proj_loss_n = 0usize;
     let mut proj_loss_max = 0.0f32;
+    let mut stale_traces_skipped = 0usize;  // DER++ Phase 2: staleness detection
 
     // Snapshot warm size before spill so REM can detect cross-cycle entries.
     let pre_spill_warm_len = recall.warm.len();
@@ -540,12 +541,66 @@ pub fn run_sleep_cycle(
         let batch_end = (batch_start + batch_size).min(n_traces);
         let batch = &traces[batch_start..batch_end];
 
+        // ── DER++ stale-output detection (Phase 2) ────────────────────────────
+        // Filter out samples whose stored outputs (regionals) have drifted too far under distribution shift.
+        // Each trace: (ep: Vec<f32>, stored_regionals: [Vec<f32>; 5], ids: Option<Vec<u32>>, sal: f32, lm_h: Option<Vec<f32>>)
+        let mut filtered_indices: Vec<usize> = Vec::new();
+        for (i, (ep, stored_regionals, _ids, _salience, _lm_h)) in batch.iter().enumerate() {
+            // Infer current model's predictions for this episode
+            match perception.infer_episode_outputs(ep) {
+                Ok(predicted_regionals) => {
+                    // Check staleness: mean cosine sim across regions
+                    let mut cosines = Vec::new();
+                    for region_idx in 0..5 {
+                        let stored = &stored_regionals[region_idx];
+                        let predicted = &predicted_regionals[region_idx];
+                        if !stored.is_empty() && !predicted.is_empty() {
+                            // cosine_sim is a static helper — call it via the method
+                            let dot: f32 = stored.iter().zip(predicted.iter()).map(|(x, y)| x * y).sum();
+                            let norm_stored: f32 = stored.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            let norm_pred: f32 = predicted.iter().map(|x| x * x).sum::<f32>().sqrt();
+                            let sim = if norm_stored < 1e-9 || norm_pred < 1e-9 {
+                                1.0
+                            } else {
+                                (dot / (norm_stored * norm_pred)).clamp(-1.0, 1.0)
+                            };
+                            cosines.push(sim);
+                        }
+                    }
+                    let mean_cosine = if cosines.is_empty() {
+                        1.0  // No stored outputs to check
+                    } else {
+                        cosines.iter().sum::<f32>() / cosines.len() as f32
+                    };
+
+                    // Keep sample if not stale (cosine above threshold)
+                    if mean_cosine >= STALE_COSINE_THRESHOLD {
+                        filtered_indices.push(i);
+                    } else {
+                        stale_traces_skipped += 1;
+                        tracing::debug!(mean_cosine, "skipping stale trace (cosine below {:.2})", STALE_COSINE_THRESHOLD);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "staleness inference failed — keeping sample");
+                    filtered_indices.push(i);
+                }
+            }
+        }
+
+        // Skip training if all samples were filtered (stale)
+        if filtered_indices.is_empty() {
+            tracing::debug!("batch fully filtered — skipping training step");
+            batch_start = batch_end;
+            continue;
+        }
+
         // Neuromodulated lr: use step index at batch start (cosine schedule is slow).
-        // Salience = mean warm-recall L2 of the batch (sentinel f32::MAX excluded from mean).
+        // Salience = mean warm-recall L2 of the non-stale batch (sentinel f32::MAX excluded from mean).
         let prev_ewma = loss_ewma;
-        let non_sentinel: Vec<f32> = batch
+        let non_sentinel: Vec<f32> = filtered_indices
             .iter()
-            .map(|(_, _, _, s, _)| *s)
+            .map(|&i| batch[i].3)  // salience is the 4th element (index 3)
             .filter(|&s| s < f32::MAX / 2.0)
             .collect();
         let batch_salience = if non_sentinel.is_empty() {
@@ -557,8 +612,9 @@ pub fn run_sleep_cycle(
         perception.set_learning_rate(lr);
 
         // ── Fused SAE replay + output-head training (single backward) ───────
-        let regionals: Vec<&[Vec<f32>; 5]> = batch.iter().map(|(_, r, _, _, _)| r).collect();
-        let ep_slices: Vec<&[f32]> = batch.iter().map(|(ep, _, _, _, _)| ep.as_slice()).collect();
+        // Extract regionals and episodes from non-stale samples
+        let regionals: Vec<&[Vec<f32>; 5]> = filtered_indices.iter().map(|&i| &batch[i].1).collect();
+        let ep_slices: Vec<&[f32]> = filtered_indices.iter().map(|&i| batch[i].0.as_slice()).collect();
         let t_replay = Instant::now();
         match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
             Ok((loss, mse)) => {
@@ -568,8 +624,8 @@ pub fn run_sleep_cycle(
                 } else {
                     EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
                 };
-                total_train_loss += loss * batch.len() as f32;
-                traces_replayed += batch.len();
+                total_train_loss += loss * filtered_indices.len() as f32;
+                traces_replayed += filtered_indices.len();
                 total_output_mse += mse;
                 output_mse_n += 1;
             }
@@ -603,9 +659,10 @@ pub fn run_sleep_cycle(
         // ── Projection distillation: LM hidden-state targets (Gap 6) ────────────
         let t_proj = Instant::now();
         if let Some(ref mut dec) = decoder {
-            let distill_pairs: Vec<(&[f32], &[f32])> = batch
+            let distill_pairs: Vec<(&[f32], &[f32])> = filtered_indices
                 .iter()
-                .filter_map(|(ep, _, _, _, lm_h)| {
+                .filter_map(|&i| {
+                    let (ep, _, _, _, lm_h) = &batch[i];
                     lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
                 })
                 .collect();
@@ -1304,7 +1361,7 @@ pub fn run_sleep_cycle(
         nrem_budget_traces: n_traces,
         nrem_unique_traces,
         growth_cooldown_remaining,
-        stale_traces_skipped: 0, // DER++: populated when staleness detection is implemented
+        stale_traces_skipped,  // DER++ Phase 2: staleness detection counter
     })
 }
 
