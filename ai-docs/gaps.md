@@ -49,14 +49,22 @@
 **Source:** Kobayashi 2025, arXiv:2504.20932, published Frontiers in AI 2026.
 
 **What:** Two additions to replay-based consolidation:
-1. **Auto-λ:** auto-adapts the loss weight λ between the MSE-on-past-outputs term and the current-task loss term using a running variance estimate — eliminates hand-tuning λ.
-2. **Stale-output blocking:** detects when a buffered sample's stored output has become stale under distribution shift (cosine divergence check) and skips replaying it, preventing cases where replaying outdated targets hurts consolidation.
+1. **Stale-output blocking:** ✅ IMPLEMENTED (commit 65ceaf7)
+   - Detects when buffered sample's stored outputs have drifted under distribution shift
+   - Per-batch inference + cosine similarity check (threshold: 0.90)
+   - Skips stale samples before training, preventing outdated targets from hurting consolidation
+   - Tracked in SleepStats.stale_traces_skipped for monitoring
+
+2. **Auto-λ:** ⏳ DEFERRED TO PHASE 3
+   - Auto-adapts loss weight λ using running variance estimate
+   - Build on Phase 2 staleness implementation
+   - Eliminates hand-tuning λ between MSE-on-past-outputs and current-task loss
 
 **Which part of somnus:** NREM consolidation replay loop.
 
-**Constraints:** Pure Rust math (array indexing, scalar statistics, cosine distance). No external deps needed.
+**Phase 2 Implementation:** `PerceptionProcessor.infer_episode_outputs()` infers current model predictions; NREM batch loop compares vs stored regionals via cosine. Filtered batch trained and projected.
 
-**Effort:** Low–Medium. Auto-λ is a running variance update (~10 lines); stale blocking is a cosine check per buffered sample before replay (~15 lines).
+**Phase 3 effort:** Low–Medium. Auto-λ is a running variance update (~10 lines) — implement once Phase 2 validated via campaign.
 
 ---
 

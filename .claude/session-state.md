@@ -1,9 +1,9 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 (evening, Item 6 complete)
+> **Last updated:** 2026-06-28 (late evening, Item 7 Phase 2 complete)
 > **Branch:** `main`
 
-## Status: Items 0–6 complete. Item 7 (DER++) in progress. Item 5 (Qwen3-0.6B) deferred to final.
+## Status: Items 0–6 complete + Item 7 Phase 2 complete. Item 7 Phase 3 queued. Item 5 (Qwen3-0.6B) deferred to final.
 
 ## Completed this session (2026-06-28, evening)
 
@@ -31,16 +31,19 @@
   4. A/B validation: 5 sessions × 2 cycles (control: Qwen2.5-0.5B, treatment: Qwen3-0.6B)
 - 📊 Cold-start: language region, language head, projection fc2 all have incompatible dims (old weights dropped)
 
-### Item 7: DER++ Auto-λ + Stale-output Blocking 🔄 (Low-Med effort)
-- ✅ Phase 1 Foundation: Infrastructure for stale-output detection
-  - Cosine similarity helper: `cosine_sim(a, b) → f32` (commit: 1cac096)
-  - DER++ constant: `STALE_COSINE_THRESHOLD = 0.90` (commit: 4c1114e)
-  - SleepStats tracking: `stale_traces_skipped: usize` field added
-  - Framework ready for Phase 2 implementation
-- ⏳ Phase 2: Compute staleness in replay loop
-  - Requires refactor for borrow safety (episode inference while holding &mut perception)
-  - **Next step:** Implement stale-output detection during NREM replay loop
-- 📋 Auto-λ: Deferred to Phase 3 (build on staleness implementation)
+### Item 7: DER++ Auto-λ + Stale-output Blocking (Low-Med effort)
+- ✅ Phase 1 Foundation: Infrastructure for stale-output detection (commits: 1cac096, 4c1114e)
+  - Cosine similarity helper
+  - DER++ constant: `STALE_COSINE_THRESHOLD = 0.90`
+  - SleepStats tracking: `stale_traces_skipped: usize` field
+- ✅ Phase 2: Stale-output detection in NREM replay (commit: 65ceaf7)
+  - `PerceptionProcessor.infer_episode_outputs()` method added
+  - Per-batch staleness detection: infer current model predictions, compare with stored outputs via cosine sim
+  - Skip replaying samples where mean cosine < threshold
+  - Filter both training and projection distillation batches
+- ⏳ Phase 3: Auto-λ adaptive loss weighting (deferred)
+  - Build on Phase 2 staleness implementation
+  - Implement running variance estimate for MSE/DER++ loss reweighting
 
 ## Completed this session (2026-06-28, late evening)
 
