@@ -301,6 +301,10 @@ pub struct PerceptionProcessor {
     /// L1 sparsity penalty coefficient added to the SAE reconstruction loss during NREM.
     /// 0.0 (default) = off; positive values encourage sparser codes.
     sae_l1_coeff: f32,
+
+    /// Use batch-quantile k-WTA threshold instead of per-sample top-k during NREM training.
+    /// false (default) = per-sample top-k; true = batch-quantile threshold.
+    batch_topk: bool,
 }
 
 impl PerceptionProcessor {
@@ -336,6 +340,7 @@ impl PerceptionProcessor {
             ort_session: None,
             cross_modal_proj_flat: None,
             sae_l1_coeff: 0.0,
+            batch_topk: false,
         }
     }
 
@@ -999,6 +1004,7 @@ impl PerceptionProcessor {
             return Ok(0.0);
         }
         let device = self.device;
+        let batch_topk = self.batch_topk;
         let mut total_loss: Option<Tensor<TrainB, 1>> = None;
         let mut n_terms = 0usize;
 
@@ -1031,19 +1037,19 @@ impl PerceptionProcessor {
                 let (z_batch, flat_masks) = match region_idx {
                     0 => model
                         .speech_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     1 => model
                         .env_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     2 => model
                         .visual_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     3 => model
                         .symbolic_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     4 => model
                         .language_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     _ => unreachable!(),
                 };
 
@@ -1188,6 +1194,7 @@ impl PerceptionProcessor {
 
         // ── Phase 1: SAE replay losses (needs &mut model for duty-cycle updates) ──
         let sae_l1_coeff = self.sae_l1_coeff;
+        let batch_topk = self.batch_topk;
         let mut sae_loss: Option<Tensor<TrainB, 1>> = None;
         let mut sae_n_terms = 0usize;
         {
@@ -1217,19 +1224,19 @@ impl PerceptionProcessor {
                 let (z_batch, flat_masks) = match region_idx {
                     0 => model
                         .speech_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     1 => model
                         .env_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     2 => model
                         .visual_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     3 => model
                         .symbolic_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     4 => model
                         .language_layer
-                        .forward_tracked_batch(input_batch.clone(), b),
+                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
                     _ => unreachable!(),
                 };
 
@@ -2118,6 +2125,10 @@ impl PerceptionProcessor {
 
     pub fn set_sae_l1_coeff(&mut self, coeff: f32) {
         self.sae_l1_coeff = coeff;
+    }
+
+    pub fn set_batch_topk(&mut self, enabled: bool) {
+        self.batch_topk = enabled;
     }
 
     // ── Save / Load ──────────────────────────────────────────────────────────

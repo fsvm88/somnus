@@ -232,6 +232,7 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
         &mut self,
         input_batch: Tensor<B, 2>,
         b: usize,
+        batch_topk: bool,
     ) -> (Tensor<B, 2>, Vec<f32>) {
         let z_batch: Tensor<B, 2> = self.linear.forward(input_batch); // [B, n_units]
 
@@ -245,27 +246,71 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
 
         let n = self.n_units;
         let mut flat_masks = vec![0.0f32; b * n];
+        let target_dc = K_ACTIVE as f32 / n as f32;
 
-        for (si, z_row) in z_vals.chunks(n).enumerate() {
-            let target_dc = K_ACTIVE as f32 / n as f32;
-            let mut boosted: Vec<f32> = z_row.to_vec();
-            for (i, dc) in self.duty_cycle.iter().enumerate() {
-                boosted[i] += BOOST_STRENGTH * (target_dc - dc);
-            }
-            let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
-            let split = n - K_ACTIVE;
+        if batch_topk {
+            // BatchTopK: compute one threshold over the entire batch
+            // Snapshot duty-cycle and compute boosted values
+            let boosted_snapshot: Vec<f32> = z_vals
+                .iter()
+                .enumerate()
+                .map(|(idx, &z)| {
+                    let dc = self.duty_cycle[idx % n];
+                    z + BOOST_STRENGTH * (target_dc - dc)
+                })
+                .collect();
+
+            // Find threshold τ such that top (b * K_ACTIVE) values exceed it
+            let target_k = b * K_ACTIVE;
+            let mut indexed: Vec<(usize, f32)> = boosted_snapshot
+                .iter()
+                .copied()
+                .enumerate()
+                .collect();
+            let split = boosted_snapshot.len() - target_k;
             indexed.select_nth_unstable_by(split, |a, b| {
                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
             });
-            let top_k = &indexed[split..];
+            let threshold = indexed[split].1;
 
-            // Decay all duty cycles, then boost active units and set mask bits.
-            for dc in self.duty_cycle.iter_mut() {
-                *dc *= 1.0 - DUTY_CYCLE_ALPHA;
+            // Apply threshold: set mask for all activations >= threshold
+            for (idx, &boosted) in boosted_snapshot.iter().enumerate() {
+                if boosted >= threshold {
+                    flat_masks[idx] = 1.0;
+                }
             }
-            for &(i, _) in top_k.iter() {
-                self.duty_cycle[i] += DUTY_CYCLE_ALPHA;
-                flat_masks[si * n + i] = 1.0;
+
+            // Now update duty cycles: decay all once per sample, boost actives
+            for sample_idx in 0..b {
+                for unit_idx in 0..n {
+                    self.duty_cycle[unit_idx] *= 1.0 - DUTY_CYCLE_ALPHA;
+                    if flat_masks[sample_idx * n + unit_idx] > 0.0 {
+                        self.duty_cycle[unit_idx] += DUTY_CYCLE_ALPHA;
+                    }
+                }
+            }
+        } else {
+            // Per-sample top-k: original behavior
+            for (si, z_row) in z_vals.chunks(n).enumerate() {
+                let mut boosted: Vec<f32> = z_row.to_vec();
+                for (i, dc) in self.duty_cycle.iter().enumerate() {
+                    boosted[i] += BOOST_STRENGTH * (target_dc - dc);
+                }
+                let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
+                let split = n - K_ACTIVE;
+                indexed.select_nth_unstable_by(split, |a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top_k = &indexed[split..];
+
+                // Decay all duty cycles, then boost active units and set mask bits.
+                for dc in self.duty_cycle.iter_mut() {
+                    *dc *= 1.0 - DUTY_CYCLE_ALPHA;
+                }
+                for &(i, _) in top_k.iter() {
+                    self.duty_cycle[i] += DUTY_CYCLE_ALPHA;
+                    flat_masks[si * n + i] = 1.0;
+                }
             }
         }
 

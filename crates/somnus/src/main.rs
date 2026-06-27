@@ -299,6 +299,12 @@ struct Args {
     #[arg(long, default_value = "0.0")]
     sae_l1_coeff: f32,
 
+    /// Use batch-quantile k-WTA threshold instead of per-sample top-k during NREM.
+    /// false (default) = per-sample top-k; true = batch-level quantile threshold.
+    /// Changes duty-cycle update semantics (order-independent). A/B via output_mse.
+    #[arg(long, default_value = "false")]
+    batch_topk: bool,
+
     /// Loop the input file indefinitely. Restarts from the beginning each time
     /// the file ends, keeping warm memory alive across iterations. Useful for
     /// calibration runs where a single file is too short to trigger multiple
@@ -777,12 +783,14 @@ async fn main() -> Result<()> {
     perception.set_settle_every(args.settle_every);
     perception.set_wm_size(args.working_memory_size);
     perception.set_sae_l1_coeff(args.sae_l1_coeff);
+    perception.set_batch_topk(args.batch_topk);
     info!(
         prior_beta = args.prior_beta,
         prior_beta_regions = ?prior_beta_regions_static,
         settle_steps = args.settle_steps,
         settle_beta = args.settle_beta,
         working_memory_size = args.working_memory_size,
+        batch_topk = args.batch_topk,
         "perception processor initialised (n=1024, k=20, cpu)"
     );
 
