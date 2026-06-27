@@ -10,7 +10,7 @@ use crate::{
 };
 
 pub struct VideoEmbedding {
-    pub values: Vec<f32>, // 384-dim, DINOv2 mean-pooled patch tokens
+    pub values: Vec<f32>, // 384-dim, DINOv2/DINOv3 mean-pooled patch tokens
     pub timestamp: Timestamp,
     /// Wall time for this encode call (resize + normalise + ORT inference), in milliseconds.
     pub encode_ms: u64,
@@ -22,7 +22,14 @@ pub struct VideoEncoder {
 
 impl VideoEncoder {
     pub fn new(models_dir: &Path) -> EncodingResult<Self> {
-        let session = session_with_migraphx(&models_dir.join("dinov2_small.onnx"))?;
+        // Prefer DINOv3 if available (drop-in replacement with same 384-dim output), else fall back to DINOv2.
+        let dinov3_path = models_dir.join("dinov3_small.onnx");
+        let model_path = if dinov3_path.exists() {
+            dinov3_path
+        } else {
+            models_dir.join("dinov2_small.onnx")
+        };
+        let session = session_with_migraphx(&model_path)?;
         Ok(Self { session })
     }
 

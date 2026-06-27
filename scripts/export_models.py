@@ -34,6 +34,7 @@ REVISIONS = {
     "whisper": ("openai/whisper-tiny", "169d4a4341b33bc18d8881c4b69c2e104e1cc0af"),
     "clap":    ("laion/clap-htsat-unfused", "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"),
     "dinov2":  ("facebook/dinov2-small",    "ed25f3a31f01632728cabb09d1542f84ab7b0056"),
+    "dinov3":  ("facebook/dinov3-vits16-pretrain-lvd1689m", None),  # ViT-S, 384-dim (drop-in replacement for DINOv2-S)
     # Qwen2.5-0.5B: revision should be pinned after first export; None = current main.
     "qwen25":  ("Qwen/Qwen2.5-0.5B", "060db6499f32faf8b98477b0a26969ef7d8b9987"),
 }
@@ -160,6 +161,33 @@ def export_dinov2() -> None:
     repo, rev = REVISIONS["dinov2"]
     print(f"  loading {repo} @ {rev[:12]}…")
     model = Dinov2Model.from_pretrained(repo, revision=rev)
+    wrapper = Dinov2Wrapper(model).eval()
+
+    dummy = torch.zeros(1, 3, 224, 224)
+    print(f"  exporting…")
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            dummy,
+            str(out),
+            input_names=["pixel_values"],
+            output_names=["last_hidden_state"],
+            dynamic_axes={"pixel_values": {0: "batch"}, "last_hidden_state": {0: "batch"}},
+            opset_version=17,
+        )
+    report(out)
+
+
+def export_dinov3() -> None:
+    out = MODELS_DIR / "dinov3_small.onnx"
+    if out.exists():
+        print(f"  skip: {out.name} already present")
+        return
+
+    from transformers import AutoModel
+    repo, rev = REVISIONS["dinov3"]
+    print(f"  loading {repo} @ {rev or 'main'}…")
+    model = AutoModel.from_pretrained(repo, revision=rev)
     wrapper = Dinov2Wrapper(model).eval()
 
     dummy = torch.zeros(1, 3, 224, 224)
@@ -432,6 +460,9 @@ if __name__ == "__main__":
 
     print("=== DINOv2-ViT-S/14 ===")
     export_dinov2()
+
+    print("=== DINOv3-ViT-S (Item 6 test) ===")
+    export_dinov3()
 
     print("=== Whisper-tiny decoder (ASR, ADR 0013) ===")
     export_whisper_decoder()
