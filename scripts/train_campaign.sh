@@ -129,6 +129,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
+            --nrem-replay-epochs 4 \
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
             --recall-ef 16 \
@@ -154,6 +155,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
+            --nrem-replay-epochs 4 \
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
             --recall-ef 16 \
