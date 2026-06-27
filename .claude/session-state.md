@@ -1,9 +1,25 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 (late evening, Item 7 Phase 2 complete)
+> **Last updated:** 2026-06-28 (late evening, Item 5 partial)
 > **Branch:** `main`
 
-## Status: Items 0–6 complete + Item 7 Phase 2 complete. Item 7 Phase 3 queued. Item 5 (Qwen3-0.6B) deferred to final.
+## Status: Items 0–6 complete + Item 7 Phase 2 complete. Item 5 (Qwen3-0.6B) partial: scripts ready, blockers documented. Item 7 Phase 3 deferred.
+
+## In Progress (2026-06-28, late evening)
+
+### Item 5: Qwen3-0.6B Upgrade 🔄 (Partial — blockers documented)
+- ✅ Code infrastructure: Scripts created for Qwen3 (export_kv_cache_qwen3.py, train_lora_qwen3.py, ab_qwen3.sh)
+  - All constants updated: LM_HIDDEN 896→1024, N_LAYERS 24→28, N_HEADS 14→16, N_KV_HEADS 2→8
+- ✅ Base model ONNX export: qwen3_lm_base.onnx (2.3 GB, ready to use)
+- ⏳ KV-cache export: torch.export shape inference blocker (deferred; can use base model without optimization)
+- ⏳ LoRA fine-tuning: Projection weights dimension mismatch (4480 vs 5120)
+  - Solution path: Regenerate projection weights from Qwen3 model (requires campaign run)
+  - Workaround: Use base models for A/B (skip LoRA, test architecture upgrade only)
+- ⏳ INT8 quantization: Deferred pending KV-cache export
+- ⏳ A/B validation: Ready to run with base models (commit 8298973)
+  - Command: `bash scripts/ab_qwen3.sh [SESSIONS=N CYCLES=M]`
+
+**Next decision:** Run base-model A/B now (faster validation), or pause to regenerate projection weights for LoRA?
 
 ## Completed this session (2026-06-28, evening)
 
