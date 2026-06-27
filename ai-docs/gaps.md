@@ -82,23 +82,27 @@
 
 ---
 
-## 5. LLM: Qwen3-0.6B
+## 5. LLM: Qwen3-0.6B 🔄 PARTIAL (infrastructure ready, blockers documented)
 
-**Source:** Qwen team, April 2025. HF ONNX: `onnx-community/Qwen3-0.6B-ONNX` (confirmed working, used in Transformers.js WebGPU demos).
+**Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`.
 
 **What:** 600M parameter LM. MMLU 70.0 vs Qwen2.5-0.5B ~47 — large quality gap. Outperforms Qwen2.5 base models ≤7B on over half of benchmarks, especially STEM and reasoning.
 
-**Dimension change:** hidden_size 1024 (up from 896). This cascades:
-- MLP projection output changes: 640→1024→5×**1024** (currently 5×896)
-- Language region k-WTA input changes: 1024 (from 896)
-- KV-cache ONNX models need re-export (`scripts/export_kv_cache.py`)
-- LoRA fine-tuning (ADR 0033) needs to be re-run on Qwen3 architecture
+**Architecture:** hidden_size 1024 (up from 896), num_layers 28 (up from 24), num_attention_heads 16 (up from 14), num_key_value_heads 8 (up from 2).
 
-**GPU path:** CPU only (same constraint as Qwen2.5 — dynamic seq_len blocks MIGraphX). GPU generation path remains 14× slower on RDNA4, so default stays CPU.
+**Implementation status (commit 8298973):**
+- ✅ Base model exported: `qwen3_lm_base.onnx` (2.3 GB, ready to use)
+- ✅ Infrastructure scripts created: `export_kv_cache_qwen3.py`, `train_lora_qwen3.py`, `ab_qwen3.sh`
+- ⚠️ **KV-cache export blocked:** torch.export shape inference fails on static KV shapes (deferred; base model works without optimization)
+- ⚠️ **LoRA training blocked:** Projection weights from Qwen2.5 don't match Qwen3 dims (4480 vs 5120)
+  - Solution: Regenerate projection weights from Qwen3 model (requires campaign run)
+  - Workaround: Use base model for A/B (skips LoRA fine-tuning, tests architecture only)
 
-**MIGraphX for generation:** Risky. KV-cache generation commonly introduces ScatterElements for KV scatter — inspect exported graph before committing to GPU path.
+**Workaround for A/B validation:** Run base-model test now (`bash scripts/ab_qwen3.sh`)—no LoRA, no KV-cache, just model swap. Validates architecture upgrade independently.
 
-**Effort:** High (projection update, LoRA rerun, KV re-export, A/B). Best treated as a cohesive "LM upgrade cycle" rather than a quick swap.
+**Cold-start impact:** Language region, language head, MLP projection all have incompatible dims (old weights dropped on first run).
+
+**Effort to completion:** Medium (regenerate proj weights, optionally KV-cache). A/B validation ready to run with base models.
 
 ---
 
