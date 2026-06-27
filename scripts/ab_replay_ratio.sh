@@ -62,13 +62,13 @@ print(f"\n{'s':>3} {'c':>2}  {'ctrl_mse':>12} {'trt_mse':>12}  {'delta':>8}")
 print("-" * 50)
 for a, b in zip(ctrl, treat):
     s, c = a['session'], a['cycle']
-    cm = a.get('output_mse') or 0.0
-    tm = b.get('output_mse') or 0.0
+    cm = a.get('mean_output_mse') or 0.0
+    tm = b.get('mean_output_mse') or 0.0
     delta = (tm - cm) / max(cm, 1e-9) * 100
     print(f"{s:3d} {c:2d}  {cm:12.6f} {tm:12.6f}  {delta:+8.1f}%")
 
-ctrl_mse  = [r['output_mse'] for r in ctrl  if r.get('output_mse')]
-treat_mse = [r['output_mse'] for r in treat if r.get('output_mse')]
+ctrl_mse  = [r['mean_output_mse'] for r in ctrl  if r.get('mean_output_mse')]
+treat_mse = [r['mean_output_mse'] for r in treat if r.get('mean_output_mse')]
 if ctrl_mse and treat_mse:
     avg_c = sum(ctrl_mse) / len(ctrl_mse)
     avg_t = sum(treat_mse) / len(treat_mse)
