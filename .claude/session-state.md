@@ -1,11 +1,24 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28
+> **Last updated:** 2026-06-28 (evening)
 > **Branch:** `main`
 
-## Status: Items 0–1 complete and deployed. Next: item 2 (high replay ratio).
+## Status: Items 0–4 complete. Item 2 (replay ratio) ready for A/B validation.
 
-## Completed this session (2026-06-28)
+## Completed this session (2026-06-28, evening)
+
+### 2. High replay ratio A/B ✅ IMPLEMENTED (commits 63b95f3, 28c8e9e)
+- Added `--nrem-replay-epochs N` flag (default 1) in main.rs and sleep.rs
+- Wrapped batch loop in epoch-based loop; loss EWMA carries across epochs for continuous LR scheduling
+- Created `scripts/ab_replay_ratio.sh` for N=1 (control) vs N=4 (treatment) A/B validation
+- Reference: arXiv:2505.12512 (replay ratio 4–8× improves consolidation at matched sparsity)
+- Ready for A/B campaign: `bash scripts/ab_replay_ratio.sh [SESSIONS=N CYCLES=M]`
+
+### 4. Remove dead candle deps ✅ DEPLOYED (commit 28c8e9e)
+- Removed unused `candle-core` and `candle-nn` from workspace.dependencies
+- No in-tree usage found; clean-up only
+
+## Completed this session (2026-06-28, earlier)
 
 ### 0. bincode → bitcode migration ✅ DEPLOYED (commit 57c87a1)
 - Resolved RUSTSEC-2025-0141 (archived maintainer, no future security fixes)
@@ -24,11 +37,13 @@
 
 ## Queued work (next)
 
-See `ai-docs/gaps.md` for full detail and priority order. Top items:
+See `ai-docs/gaps.md` for full detail and priority order. Next candidates:
 
-1. **High replay ratio A/B** (item 2) — add `--nrem-replay-epochs N` (default 1); try N=4 (arXiv:2505.12512). Trivial (~5 min implementation).
-2. **Remove dead candle deps** (item 4) — `candle-core`/`candle-nn` in workspace.dependencies but nothing uses them. One-liner.
-3. Qwen3-0.6B upgrade (item 5, deferred—high effort: LoRA rerun, projection update, KV re-export); DINOv3-ViT-S (item 6, deferred—low effort, drop-in); DER++ (item 7); others in gaps.md.
+1. **Item 2 A/B run** (validate replay ratio N=4 on short campaign before hardening)
+2. Qwen3-0.6B upgrade (item 5, high effort: LoRA rerun, projection update, KV re-export, training)
+3. DINOv3-ViT-S test (item 6, low effort, drop-in encoder swap, confirm parity)
+4. DER++ auto-λ + stale blocking (item 7, low–med effort)
+5. LISTA unrolled encoder (item 11, med effort, multi-step ISTA per region)
 
 ---
 
