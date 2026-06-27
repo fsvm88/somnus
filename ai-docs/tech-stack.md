@@ -25,7 +25,7 @@ Order of preference when the ecosystem has a gap:
 
 Candidates not adopted:
 
-- `candle` — originally planned for cognitive-layer training; `burn` chosen instead.
+- `candle` — originally planned for cognitive-layer training; `burn` chosen instead. `candle-core`/`candle-nn` remain declared in `[workspace.dependencies]` but no crate depends on them — dead declarations, safe to remove when convenient.
 - `tch-rs` — full libtorch; fallback if `burn` can't support a needed op.
 - `dfdx` — pure-Rust autograd; slower-moving.
 
@@ -69,6 +69,8 @@ Three-tier hierarchy is architecturally committed (`architecture.md`); crate cho
 
 Embedded KV (`redb`, `fjall`, `sled`) and SQL (`rusqlite`, `sqlx`) are candidates only if the cold-tier format outgrows hand-rolled serialization.
 
+**Serialization:** `bitcode` — **[committed]** for warm-tier HNSW sidecar (`warm/records.bin`). Replaced unmaintained `bincode` 2.x (RUSTSEC-2025-0141); migration in commit 57c87a1, WARM_VERSION bumped 1→2 for version gating (graceful cold rebuild on format change).
+
 ## Concurrency / runtime
 
 - **`tokio`** — **[committed]** async runtime in the binary (Phase 1). `features = ["full"]` for signals, timers, and task scheduling.
@@ -89,6 +91,13 @@ Embedded KV (`redb`, `fjall`, `sled`) and SQL (`rusqlite`, `sqlx`) are candidate
 - `criterion` — benches when we have a latency target to hit.
 - `proptest` — property tests for stateful logic (memory, learning rules).
 - `clap` — candidate for CLI argument parsing in the binary (Phase 1; alternative: manual `std::env::args` parse).
+
+## Python tooling (committed)
+
+A Python venv lives at `.venv/` — used only for model export and fine-tuning scripts, not for runtime inference.
+
+- **`peft`** + **`transformers`** + **`torch`** — LoRA fine-tuning of Qwen2.5-0.5B (ADR 0033). `scripts/train_lora.py`, `scripts/export_models.py`.
+- **`onnxruntime`** — KV-cache model quantization to INT8. `scripts/quantize_kv.py`, `scripts/export_kv_cache.py`.
 
 ## Things we will *not* do (yet)
 
