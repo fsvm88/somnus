@@ -1,13 +1,34 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-26
+> **Last updated:** 2026-06-28
 > **Branch:** `main`
 
-## Status: Hot-loop alloc elimination done. Streaming output live. No active queued work.
+## Status: Items 1–2 complete. Ready for A/B validation of BatchTopK.
+
+## Completed this session (2026-06-28)
+
+1. **bincode → bitcode migration** ✅ (commit 57c87a1)
+   - Replaced unmaintained `bincode` 2.x with `bitcode` 0.6
+   - WARM_VERSION bumped 1→2 (version gate for format change)
+   - `warm_dump_load_round_trip` test confirms serialization works
+   - Graceful fallback: old bincode dirs trigger cold rebuild
+
+2. **BatchTopK SAE implementation** ✅ (commit 4663a2f)
+   - `KWtaLayer::forward_tracked_batch(batch_topk: bool)` parameter
+   - Snapshot duty-cycle, compute batch-quantile threshold, apply single threshold
+   - Duty-cycle update order-independent (snapshot→threshold→decay pattern)
+   - `--batch-topk` flag added to main.rs (default false)
+   - `set_batch_topk()` on PerceptionProcessor; snap in both replay paths
+   - A/B script: `scripts/ab_batch_topk.sh` (primary: output_mse, secondary: cosines)
 
 ## Queued work (next session)
 
-*None.*
+See `ai-docs/gaps.md` for full detail and priority order. Top items:
+
+1. **Run BatchTopK A/B validation** — `bash scripts/ab_batch_topk.sh` (or SESSIONS=5 CYCLES=2 variant)
+2. **High replay ratio A/B** — add `--nrem-replay-epochs N` (default 1); try N=4 (arXiv:2505.12512). Trivial.
+3. **Remove dead candle deps** — `candle-core`/`candle-nn` in workspace.dependencies but nothing uses them. One-line cleanup.
+4. Qwen3-0.6B upgrade (high effort — LoRA rerun, projection update, KV re-export); DINOv3-ViT-S drop-in test; DER++ stale-output blocking — all in gaps.md.
 
 ---
 
