@@ -82,7 +82,7 @@
 
 ---
 
-## 5. LLM: Qwen3-0.6B 🔄 IN PROGRESS (base-model A/B validation running)
+## 5. LLM: Qwen3-0.6B 🔄 INFRASTRUCTURE READY (A/B blocked by language region crash)
 
 **Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`.
 
@@ -90,21 +90,24 @@
 
 **Architecture:** hidden_size 1024 (up from 896), num_layers 28 (up from 24), num_attention_heads 16 (up from 14), num_key_value_heads 8 (up from 2).
 
-**Implementation status (commit 46a8164):**
+**Implementation status (commit d0f92c5):**
 - ✅ Base model exported: `qwen3_lm_base.onnx` (2.3 GB, ready to use)
 - ✅ Infrastructure scripts created and tested: `export_kv_cache_qwen3.py`, `train_lora_qwen3.py`, `ab_qwen3.sh`
 - ✅ Projection weights regenerated: w1.bin (2.5MB, 640×1024), w2.bin (20MB, 1024×5120) — correct dims for Qwen3
 - ⚠️ **LoRA training blocked:** PyTorch/HF CPU compatibility issue (hung during dataset loading after model load)
   - Attempted: 3 epochs batch=4 (4h+ timeout), then 1 epoch batch=2 (hung)
-  - Workaround: Base-model A/B validation (tests architecture without fine-tuning)
-- ⏳ **Base-model A/B validation: NOW RUNNING** (3 sessions × 1 cycle each)
-  - Control: Qwen2.5-0.5B base, Treatment: Qwen3-0.6B base
-  - Expected: 30-45 min completion
-  - If promising: can retry LoRA fine-tuning later
+  - Workaround: Base-model A/B planned (tests architecture without fine-tuning)
+- ❌ **Base-model A/B blocked:** Pre-existing language region crash (matmul dimension mismatch in language k-WTA or SAE decoder)
+  - Crash occurs after ASR ingestion: "language ingest (69 chars)" → matmul panic
+  - Affects both Qwen2.5 and Qwen3 equally (not a Qwen3-specific issue)
+  - Blocks A/B validation and requires separate investigation/fix
 
 **Cold-start impact:** Language region, language head, MLP projection all have incompatible dims (old weights dropped on first run).
 
-**Effort to completion:** Low (A/B running). Medium (debug LoRA if base model promising). Optional (KV-cache, add LoRA fine-tuning).
+**Effort to completion:** 
+- Immediate: Language region crash investigation + fix (blocks all models)
+- Then: Retry base-model A/B (5 min per setup)
+- Optional: LoRA fine-tuning, KV-cache optimization
 
 ---
 
