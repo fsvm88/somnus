@@ -82,7 +82,7 @@
 
 ---
 
-## 5. LLM: Qwen3-0.6B 🔄 PARTIAL (infrastructure ready, blockers documented)
+## 5. LLM: Qwen3-0.6B 🔄 IN PROGRESS (base-model A/B validation running)
 
 **Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`.
 
@@ -90,19 +90,21 @@
 
 **Architecture:** hidden_size 1024 (up from 896), num_layers 28 (up from 24), num_attention_heads 16 (up from 14), num_key_value_heads 8 (up from 2).
 
-**Implementation status (commit 8298973):**
+**Implementation status (commit 46a8164):**
 - ✅ Base model exported: `qwen3_lm_base.onnx` (2.3 GB, ready to use)
-- ✅ Infrastructure scripts created: `export_kv_cache_qwen3.py`, `train_lora_qwen3.py`, `ab_qwen3.sh`
-- ⚠️ **KV-cache export blocked:** torch.export shape inference fails on static KV shapes (deferred; base model works without optimization)
-- ⚠️ **LoRA training blocked:** Projection weights from Qwen2.5 don't match Qwen3 dims (4480 vs 5120)
-  - Solution: Regenerate projection weights from Qwen3 model (requires campaign run)
-  - Workaround: Use base model for A/B (skips LoRA fine-tuning, tests architecture only)
-
-**Workaround for A/B validation:** Run base-model test now (`bash scripts/ab_qwen3.sh`)—no LoRA, no KV-cache, just model swap. Validates architecture upgrade independently.
+- ✅ Infrastructure scripts created and tested: `export_kv_cache_qwen3.py`, `train_lora_qwen3.py`, `ab_qwen3.sh`
+- ✅ Projection weights regenerated: w1.bin (2.5MB, 640×1024), w2.bin (20MB, 1024×5120) — correct dims for Qwen3
+- ⚠️ **LoRA training blocked:** PyTorch/HF CPU compatibility issue (hung during dataset loading after model load)
+  - Attempted: 3 epochs batch=4 (4h+ timeout), then 1 epoch batch=2 (hung)
+  - Workaround: Base-model A/B validation (tests architecture without fine-tuning)
+- ⏳ **Base-model A/B validation: NOW RUNNING** (3 sessions × 1 cycle each)
+  - Control: Qwen2.5-0.5B base, Treatment: Qwen3-0.6B base
+  - Expected: 30-45 min completion
+  - If promising: can retry LoRA fine-tuning later
 
 **Cold-start impact:** Language region, language head, MLP projection all have incompatible dims (old weights dropped on first run).
 
-**Effort to completion:** Medium (regenerate proj weights, optionally KV-cache). A/B validation ready to run with base models.
+**Effort to completion:** Low (A/B running). Medium (debug LoRA if base model promising). Optional (KV-cache, add LoRA fine-tuning).
 
 ---
 
