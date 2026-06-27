@@ -27,7 +27,7 @@ safetensors        = "0.8"
 hnsw_rs            = "0.3"
 memmap2            = "0.9"
 serde              = { version = "1", features = ["derive"] }
-bincode            = { version = "2", features = ["serde"] }
+bitcode            = { version = "0.6", features = ["serde"] }
 
 # Profile for flamegraph: release-optimised but with debug symbols intact so
 # perf/flamegraph can map addresses back to source.

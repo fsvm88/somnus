@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bincode   = { workspace = true }
+bitcode   = { workspace = true }
 hnsw_rs   = { workspace = true }
 log       = "0.4"
 memmap2   = { workspace = true }

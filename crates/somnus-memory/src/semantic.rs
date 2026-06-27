@@ -10,7 +10,7 @@ use crate::episode::EpisodeRecord;
 
 const WARM_MAGIC: &[u8; 4] = b"SMNW";
 // Bump when HNSW_M, HNSW_MAX_LAYERS, or the sidecar format changes.
-const WARM_VERSION: u16 = 1;
+const WARM_VERSION: u16 = 2;
 
 const HNSW_M: usize = 16;
 const HNSW_MAX_ELEM: usize = 100_000;
@@ -191,7 +191,7 @@ impl SemanticStore {
     /// Writes three files:
     ///   `version`      — 6-byte magic + u16 version tag
     ///   `index.hnsw.data` / `index.hnsw.graph` — hnsw_rs graph dump
-    ///   `records.bin`  — bincode-encoded HashMap<usize, EpisodeRecord>
+    ///   `records.bin`  — bitcode-encoded HashMap<usize, EpisodeRecord>
     pub fn dump(&self, warm_dir: &Path) -> Result<(), std::io::Error> {
         fs::create_dir_all(warm_dir)?;
 
@@ -207,7 +207,7 @@ impl SemanticStore {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Sidecar
-        let encoded = bincode::serde::encode_to_vec(&self.records, bincode::config::standard())
+        let encoded = bitcode::serialize(&self.records)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         fs::write(warm_dir.join("records.bin"), encoded)?;
 
@@ -244,9 +244,7 @@ impl SemanticStore {
         // Sidecar records
         let sidecar_bytes = fs::read(&sidecar_path).ok()?;
         let records: HashMap<usize, EpisodeRecord> =
-            bincode::serde::decode_from_slice(&sidecar_bytes, bincode::config::standard())
-                .ok()
-                .map(|(v, _)| v)?;
+            bitcode::deserialize(&sidecar_bytes).ok()?;
 
         // HNSW — leak HnswIo so the returned Hnsw<'static, ...> is valid
         let io = Box::new(HnswIo::new(warm_dir, "index"));
