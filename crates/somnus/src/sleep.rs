@@ -27,6 +27,11 @@ const GROWTH_THRESHOLD: f32 = 0.1;
 const GROWTH_MIN_SAMPLES: usize = 16;
 const GROWTH_BATCH: usize = 64;
 
+/// DER++ stale-output detection (ADR TBD): skip replaying traces whose stored
+/// episode vector has drifted too far from the current model's predictions,
+/// indicating the stored target is no longer trustworthy (staleness threshold).
+const STALE_COSINE_THRESHOLD: f32 = 0.90;
+
 /// Mean warm-recall L2 above this threshold supplements the MSE growth signal.
 /// Only applied when warm had pre-spill entries (i.e., cross-cycle/cross-session data).
 /// Kept for the warm_recall_poor log field but no longer gates growth directly —
@@ -139,6 +144,8 @@ pub struct SleepStats {
     /// Excludes prior-session embeddings that may have drifted due to NREM weight updates.
     /// None when the within-session warm subset is below GIST_MIN_WARM (typical for cycle 1).
     pub within_session_gist_rate: Option<f32>,
+    /// DER++ stale-output blocking: number of traces skipped due to diverged stored targets.
+    pub stale_traces_skipped: usize,
     /// Regions that had grown units pruned during REM (12c).
     pub regions_pruned: Vec<RegionId>,
     /// Total grown units removed across all pruned regions.
@@ -1297,6 +1304,7 @@ pub fn run_sleep_cycle(
         nrem_budget_traces: n_traces,
         nrem_unique_traces,
         growth_cooldown_remaining,
+        stale_traces_skipped: 0, // DER++: populated when staleness detection is implemented
     })
 }
 
