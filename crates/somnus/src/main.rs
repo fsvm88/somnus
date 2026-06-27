@@ -300,9 +300,9 @@ struct Args {
     sae_l1_coeff: f32,
 
     /// Use batch-quantile k-WTA threshold instead of per-sample top-k during NREM.
-    /// false (default) = per-sample top-k; true = batch-level quantile threshold.
-    /// Changes duty-cycle update semantics (order-independent). A/B via output_mse.
-    #[arg(long, default_value = "false")]
+    /// true (default) = batch-level quantile threshold; false = per-sample top-k.
+    /// Changes duty-cycle update semantics (order-independent). Deployed via A/B validation.
+    #[arg(long, default_value = "true")]
     batch_topk: bool,
 
     /// Loop the input file indefinitely. Restarts from the beginning each time

@@ -340,7 +340,7 @@ impl PerceptionProcessor {
             ort_session: None,
             cross_modal_proj_flat: None,
             sae_l1_coeff: 0.0,
-            batch_topk: false,
+            batch_topk: true,
         }
     }
 
