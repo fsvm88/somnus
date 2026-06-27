@@ -82,7 +82,7 @@
 
 ---
 
-## 5. LLM: Qwen3-0.6B 🔄 INFRASTRUCTURE READY (A/B blocked by language region crash)
+## 5. LLM: Qwen3-0.6B ✅ A/B VALIDATION IN PROGRESS
 
 **Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`.
 
@@ -90,24 +90,32 @@
 
 **Architecture:** hidden_size 1024 (up from 896), num_layers 28 (up from 24), num_attention_heads 16 (up from 14), num_key_value_heads 8 (up from 2).
 
-**Implementation status (commit d0f92c5):**
-- ✅ Base model exported: `qwen3_lm_base.onnx` (2.3 GB, ready to use)
-- ✅ Infrastructure scripts created and tested: `export_kv_cache_qwen3.py`, `train_lora_qwen3.py`, `ab_qwen3.sh`
-- ✅ Projection weights regenerated: w1.bin (2.5MB, 640×1024), w2.bin (20MB, 1024×5120) — correct dims for Qwen3
-- ⚠️ **LoRA training blocked:** PyTorch/HF CPU compatibility issue (hung during dataset loading after model load)
-  - Attempted: 3 epochs batch=4 (4h+ timeout), then 1 epoch batch=2 (hung)
-  - Workaround: Base-model A/B planned (tests architecture without fine-tuning)
-- ❌ **Base-model A/B blocked:** Pre-existing language region crash (matmul dimension mismatch in language k-WTA or SAE decoder)
-  - Crash occurs after ASR ingestion: "language ingest (69 chars)" → matmul panic
-  - Affects both Qwen2.5 and Qwen3 equally (not a Qwen3-specific issue)
-  - Blocks A/B validation and requires separate investigation/fix
+**Completed (commits d0f92c5 → bcf1480):**
+- ✅ Base model exported: `qwen3_lm_base.onnx` (2.3 GB)
+- ✅ Projection weights: w1.bin (2.5MB, 640×1024), w2.bin (20MB, 1024×5120)
+- ✅ Qwen3 embed table: `qwen3_embed_table.safetensors` (622.3 MB, 151k vocab × 1024-dim)
+- ✅ Qwen3 tokenizer: `qwen3_tokenizer.json` (11.4 MB)
+- ✅ Infrastructure scripts: `export_kv_cache_qwen3.py`, `train_lora_qwen3.py`, `ab_qwen3.sh`
+- ✅ **CRITICAL FIX:** Language region matmul dimension mismatch
+  - Root cause: `LANG_DIM` hardcoded to 896 (Qwen2.5), k-WTA expected 1024
+  - Fix: Updated `LANG_DIM: 896 → 1024`, exported Qwen3 embed table
+  - Verification: Text ingestion tested and working (no panic)
+- ✅ **A/B Validation:** NOW RUNNING (base models, 5 control + 5 treatment sessions)
+  - Session 2/5 (Control/Qwen2.5) active
+  - Expected completion: ~2 hours
 
-**Cold-start impact:** Language region, language head, MLP projection all have incompatible dims (old weights dropped on first run).
+**Remaining (non-critical):**
+- ⚠️ LoRA training: Blocked on CPU (PyTorch/HF compatibility)
+  - Base-model A/B sufficient for architecture validation
+  - Can retry with GPU or alternative backend if needed
+- ⚠️ KV-cache export: Optional optimization
+  - Base model functional without it
 
-**Effort to completion:** 
-- Immediate: Language region crash investigation + fix (blocks all models)
-- Then: Retry base-model A/B (5 min per setup)
-- Optional: LoRA fine-tuning, KV-cache optimization
+**Metrics being collected (per cycle):**
+- `output_mse` — reconstruction error
+- `p_lang` — language region activation probability  
+- `proj_loss` — action decoder projection loss
+- Regional activation stats, episode counts
 
 ---
 

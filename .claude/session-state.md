@@ -1,9 +1,9 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 (language crash fixed, A/B ready)
+> **Last updated:** 2026-06-28 (23:17, A/B validation in progress)
 > **Branch:** `main`
 
-## Status: Items 5, 6, 7 complete. Language region matmul fixed. A/B validation ready.
+## Status: Items 5, 6, 7 complete. Language region matmul FIXED ✅. A/B validation RUNNING (Session 2/5 Control).
 
 ---
 
@@ -64,25 +64,25 @@ echo "hello world" | ./target/release/somnus --language --lang-use-lm ...
    - Base model functional without it
    - Estimated 7.8× speedup (if needed)
 
-#### Next: A/B Validation Ready
-```bash
-bash scripts/ab_qwen3.sh SESSIONS=5 CYCLES=2
-```
-- Control: Qwen2.5-0.5B base
-- Treatment: Qwen3-0.6B base
-- Expected: 30-45 minutes per run
-- Metrics: output_mse, p_lang, proj_loss
+#### A/B Validation: NOW RUNNING
+- **Configuration:** Base models (no LoRA), language+action regions only
+- **Control:** Qwen2.5-0.5B × 5 sessions × 2 cycles
+- **Treatment:** Qwen3-0.6B × 5 sessions × 2 cycles
+- **Progress:** Session 2/5 (Control) active
+- **Metrics:** output_mse, p_lang, proj_loss, regional activation stats
+- **ETA:** ~2-2.5 hours total (~23:30-00:45)
 
 ---
 
 ## Complete Session Stats
 
-**Total Commits:** 12
+**Total Commits:** 14
 - Item 6 (DINOv3): 1 commit
 - Item 7 (DER++): 1 commit  
 - Item 5 (Qwen3 infrastructure): 7 commits
-- Documentation: 2 commits
 - Language region fix: 1 commit
+- Documentation: 2 commits
+- A/B validation: 2 commits
 
 **Files Modified:**
 - crates/somnus/src/main.rs: LANG_DIM fix + LangEmbedder upgrade
