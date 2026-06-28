@@ -1,8 +1,8 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 01:22 UTC (A/B validation paused at 90% complete)
+> **Last updated:** 2026-06-28 13:47 UTC (A/B validation restarted, DINOv3 workaround)
 > **Branch:** `main`
-> **Status:** A/B validation PAUSED FOR SHUTDOWN (safe to resume)
+> **Status:** A/B validation IN PROGRESS (Qwen2.5 vs Qwen3, DINOv2 fallback)
 
 ---
 
@@ -136,4 +136,23 @@ When ready to resume:
 
 ---
 
-**Status: All critical work saved. Safe to shutdown. Ready to resume when needed.**
+---
+
+## 🔧 Issues Discovered & Workarounds
+
+### DINOv3 MIGraphX Incompatibility (2026-06-28 13:44)
+**Issue:** DINOv3-ViT-S ONNX model fails at MIGraphX execution with "Failed to call function" error.
+- Error: `Non-zero status code returned while running MGXKernel_graph_main_graph_...`
+- Root cause: ORT/MIGraphX CPU backend cannot execute DINOv3's graph (likely unsupported op)
+- Impact: A/B validation blocked (requires video input)
+
+**Workaround:** Disabled DINOv3 (moved to `.disabled`), fallback to DINOv2-S
+- DINOv2 works perfectly (82-85ms encoding time)
+- Qwen3 language model validation proceeds unaffected
+- DINOv3 A/B deferred to future session (needs GPU/different backend)
+
+**Cold archive corruption:** Previous A/B runs hit corrupted `memory/episodes.cold` 
+- Cleaned and re-created with fresh directories
+- Script fixed to use `--memory-dir` separation (control vs treatment)
+
+**Status: All critical work saved. A/B validation restarted with workarounds. Ready to continue.**

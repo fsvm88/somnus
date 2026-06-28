@@ -36,6 +36,7 @@ for i in $(seq 1 "$SESSIONS"); do
         --action \
         --action-distill-only \
         --lang-use-lm \
+        --memory-dir "$REPO_ROOT/memory/qwen25_ab_control" \
         --session "$i" \
         --max-sleep-cycles "$CYCLES" \
         2>&1 | tail -10
@@ -57,7 +58,8 @@ for i in $(seq 1 "$SESSIONS"); do
         --action \
         --action-distill-only \
         --lang-use-lm \
-        --session "$((SESSIONS + i))" \
+        --memory-dir "$REPO_ROOT/memory/qwen3_ab_treatment" \
+        --session "$i" \
         --max-sleep-cycles "$CYCLES" \
         2>&1 | tail -10
 done
