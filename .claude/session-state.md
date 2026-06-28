@@ -43,6 +43,13 @@ Three options based on -9.6% memory retrieval regression:
 - Re-run once DINOv3 issue resolved
 - **Effort:** Medium | **Blocker:** GPU access
 
+**Option D: Test Qwen2.5-0.5B-Instruct (NEW - not yet attempted)**
+- Instruction-tuned version of proven base model
+- Available on HuggingFace (Qwen/Qwen2.5-0.5B-Instruct)
+- May improve language quality without Qwen3 regression risk
+- Effort: Low | Impact: Potential quality improvement
+- Note: Qwen3-0.6B-Instruct not yet released
+
 ---
 
 ## 📊 CURRENT A/B STATE
