@@ -100,9 +100,11 @@
   - Root cause: `LANG_DIM` hardcoded to 896 (Qwen2.5), k-WTA expected 1024
   - Fix: Updated `LANG_DIM: 896 → 1024`, exported Qwen3 embed table
   - Verification: Text ingestion tested and working (no panic)
-- ✅ **A/B Validation:** NOW RUNNING (base models, 5 control + 5 treatment sessions)
-  - Session 2/5 (Control/Qwen2.5) active
-  - Expected completion: ~2 hours
+- ✅ **A/B Validation:** COMPLETE (2026-06-28)
+  - Result: Qwen3 **underperforms** on warm_recall_l2 (-9.6%)
+  - Metric: 0.550 (Qwen2.5) vs 0.498 (Qwen3)
+  - Analysis: `ai-docs/a_b_qwen3_findings.md`
+  - Status: **Action needed** — investigate convergence, longer cycles, or defer to LoRA phase
 
 **Remaining (non-critical):**
 - ⚠️ LoRA training: Blocked on CPU (PyTorch/HF compatibility)
@@ -119,17 +121,30 @@
 
 ---
 
-## 6. Visual encoder: DINOv3-ViT-S (drop-in candidate) ✅ INTEGRATED
+## 6. Visual encoder: DINOv3-ViT-S (drop-in candidate) ⏸️ BLOCKED
 
 **Source:** Meta, August 2025, arXiv:2508.10104.
 
 **What:** Distilled from a 7B ViT teacher. ~21M params — same as DINOv2-S. Output dim: **384 — identical to current DINOv2-S/14 (true drop-in)**. ImageNet-1k linear probe: 81.40% vs DINOv2-S 81.1% (marginal improvement).
 
-**Status:** ONNX export successful (commit 43be241). VideoEncoder automatically prefers dinov3_small.onnx if present, else DINOv2-S. Zero-configuration swap. A/B validation script ready: `scripts/ab_dinov3.sh`.
+**Status:** ONNX export successful; **GPU-only** (ORT/MIGraphX CPU backend fails at graph execution).
+- Export: ✅ Complete (dinov3_small.onnx + .data file, 122 KB + 83 MB)
+- CPU inference: ❌ MIGraphX fails with "Non-zero status code returned while running MGXKernel_..."
+- Fallback: DINOv2-S (82–85 ms encode time, stable)
+- Workaround: Disabled DINOv3, using DINOv2 for all validation
 
-**Next:** Run A/B campaign (5 sessions × 2 cycles control vs treatment) to validate parity before deploying to long-running campaign.
+**Root cause:** MIGraphX CPU backend cannot compile/execute DINOv3's ViT attention graph. Likely requires:
+- GPU execution (CUDA/ROCm backend, not available in test environment)
+- Alternative ONNX backend (fallback CPU ops insufficient)
+- Graph rewrite/operator fusion for CPU compatibility
 
-**Note:** Marginal quality gain (~0.3%). Worth testing precisely because it's a true drop-in — no projection changes, no cold-start, no snapshot incompatibility.
+**Recommendation:**
+- **Short term:** Keep DINOv2 fallback; flag as architecture limitation
+- **Medium term:** Test on GPU system if available; document GPU requirement
+- **Deferred:** Post-Phase 2; escalate to ORT/MIGraphX team if GPU unavailable
+- **Alternative:** Item K (SigLIP2, not yet implemented) may have better CPU compatibility
+
+**Note:** This is **not** a model quality issue; it's a CPU inference compatibility issue specific to this ORT/MIGraphX deployment.
 
 ---
 
