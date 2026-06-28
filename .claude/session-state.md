@@ -1,108 +1,139 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 00:34 UTC (A/B validation in progress, 60% complete)
+> **Last updated:** 2026-06-28 01:22 UTC (A/B validation paused at 90% complete)
 > **Branch:** `main`
-> **Status:** A/B validation PAUSED (can resume when user returns)
+> **Status:** A/B validation PAUSED FOR SHUTDOWN (safe to resume)
 
 ---
 
-## CURRENT STATE: A/B Validation In Progress (60% Complete)
+## 🛑 PAUSED STATE: A/B Validation at 90% Complete
 
-**Control Phase:** ✅ **COMPLETE**
-- Sessions 1-5 (Qwen2.5-0.5B) — all finished
-- Duration: ~1.5 hours (22:53 → 00:01)
-- Memory: `memory/qwen25_ab_control/`
+**Pause Time:** 01:22 UTC (2026-06-28)  
+**Pause Point:** Session 5/5 (Treatment/Qwen3) killed mid-run  
+**Progress:** 9/10 sessions complete (90%)
 
-**Treatment Phase:** ⏳ **IN PROGRESS (40% remaining)**
-- Session 1: ✅ Complete
-- Session 2: ⏳ **ACTIVE** (started ~00:01, running at checkpoint)
-- Sessions 3-5: Queued
+### Sessions Completed ✅
+- Control (Qwen2.5): Sessions 1-5 (100% complete)
+- Treatment (Qwen3): Sessions 1-4 (100% complete)
+- **Total: 9/10 sessions**
 
-**Overall Progress:** 6/10 sessions (60%)
-
-**ETA if resumed:** ~01:10-01:45 UTC (~36-70 min remaining)
+### Session Stopped ⏹️
+- **Treatment Session 5/5 (Qwen3)** — killed at 01:22 UTC
+- Status: Partially complete (mid-run)
+- Memory state: `memory/qwen3_ab_treatment/` (partial)
 
 ---
 
-## How to Resume
+## ⏱️ HOW TO RESUME
 
-When user returns, simply check A/B status:
-```bash
-ps aux | grep "somnus.*--language" | grep -v grep | grep -v file-loop
-```
+### Option 1: Resume from Session 5 (Recommended)
+The incomplete Session 5 will restart and run fresh (memory directory is independent):
 
-If process still running: **Continue monitoring** (no action needed)
-If process stopped: **Restart** with:
 ```bash
+# Simply run the A/B script again — it will continue with remaining sessions
 bash scripts/ab_qwen3.sh SESSIONS=5 CYCLES=2
 ```
-Will resume treatment sessions 2-5 (session 1 already complete)
+
+**Note:** Session 5 will run again (was killed mid-run). Sessions 1-4 are safe in `memory/qwen3_ab_treatment/`.
+
+### Option 2: Manual Session 5 Only
+If you want to run just the final session:
+
+```bash
+./target/release/somnus \
+  --language \
+  --action \
+  --action-distill-only \
+  --lang-use-lm \
+  --memory-dir memory/qwen3_ab_treatment \
+  --session 5 \
+  --max-sleep-cycles 2
+```
 
 ---
 
-## Session Summary
+## 📊 CURRENT A/B STATE
 
-### Items Completed This Session
-1. ✅ **Item 6 (DINOv3):** INTEGRATED
-2. ✅ **Item 7 (DER++):** INTEGRATED  
-3. ✅ **Item 5 (Qwen3):** INFRASTRUCTURE READY + A/B RUNNING
+### Control Results ✅
+- **Location:** `memory/qwen25_ab_control/`
+- **Status:** Complete (5 sessions, 2 cycles each)
+- **Metrics ready:** output_mse, p_lang, proj_loss, etc.
 
-### Critical Fix Applied
-- ✅ **Language region matmul crash:** FIXED (LANG_DIM: 896→1024)
-- ✅ **Qwen3 embed table:** Exported (622.3 MB)
-- ✅ **Smart embed loader:** Detects qwen3 vs qwen25
+### Treatment Results (Partial) ⏳
+- **Location:** `memory/qwen3_ab_treatment/`
+- **Status:** 4/5 sessions complete
+- **Session 5:** Killed, needs re-run
 
-### Code Cleanups Applied
-- ✅ Deleted backup file (saved 2.3 GB)
-- ✅ Removed unused cosine_sim duplicate
-- ✅ Fixed clippy warning (map_or → is_some_and)
-- ✅ Archived old experiment logs
-- ✅ Compiler warnings: 0
+### Expected Results (when Session 5 completes)
+```
+Qwen2.5 vs Qwen3 comparison:
+├─ output_mse         (reconstruction error)
+├─ p_lang            (language activation prob)
+├─ proj_loss         (projection head loss)
+├─ episode_produced  (success rate)
+└─ per-region stats  (visual, audio, language, etc.)
+```
+
+---
+
+## 📝 SESSION SUMMARY
+
+### Work Completed
+1. ✅ **Items 5, 6, 7:** Infrastructure complete
+2. ✅ **Language crash:** Fixed (LANG_DIM: 896→1024)
+3. ✅ **Qwen3 setup:** Full pipeline ready
+4. ✅ **Project cleanup:** 2.3 GB freed, 0 warnings
+5. ✅ **A/B validation:** 90% complete (9/10 sessions)
 
 ### Commits This Session
-- 17 total commits
-- Items 5, 6, 7: Complete infrastructure
-- Language region crash: Fixed
-- Project cleanup: Applied
-- A/B validation: Running
+- 18 total commits
+- All changes durable and committed
+- Code quality: Clean
+- Documentation: Updated
 
----
-
-## Files to Monitor
-
-**A/B Results (when complete):**
-- `memory/qwen25_ab_control/` — Control metrics
-- `memory/qwen3_ab_treatment/` — Treatment metrics
-- `ab_validation.log` — Full run log
-
-**Key Documentation:**
+### Key Files
 - `CLEANUP_ANALYSIS.md` — Project health report
-- `ai-docs/gaps.md` — Item 5 status
+- `ai-docs/gaps.md` — Item 5 complete status
 - `ai-docs/architecture.md` — Implementation state
+- `memory/qwen{25,3}_ab_*` — A/B results (partial)
 
 ---
 
-## Next Session Checklist
+## 🚀 NEXT SESSION STEPS
 
-- [ ] Check A/B status (ps aux grep somnus)
-- [ ] If running: monitor until completion
-- [ ] If stopped: restart with `bash scripts/ab_qwen3.sh`
-- [ ] When complete: analyze metrics in `memory/qwen*/`
-- [ ] Optional: retry LoRA training with GPU (if needed)
-- [ ] Optional: implement KV-cache optimization (deferred)
+When ready to resume:
+
+1. **Check if process stopped:**
+   ```bash
+   ps aux | grep "somnus.*--language" | grep -v grep
+   ```
+   (Should show nothing)
+
+2. **Re-run A/B to complete Session 5:**
+   ```bash
+   bash scripts/ab_qwen3.sh SESSIONS=5 CYCLES=2
+   ```
+   Takes ~10-15 min to finish
+
+3. **Analyze complete results:**
+   ```bash
+   ls -lh memory/qwen{25,3}_ab_*/
+   ```
+
+4. **Optional: Extract metrics for comparison**
+   - Compare output_mse, p_lang, proj_loss
+   - Analyze per-region activation
+   - Document findings in `ai-docs/`
 
 ---
 
-## Project Health
+## 📌 IMPORTANT NOTES
 
-| Metric | Status |
-|--------|--------|
-| Code quality | ✅ Clean (0 warnings) |
-| Disk space | ✅ Cleaned (2.3 GB freed) |
-| Documentation | ✅ Complete |
-| Tests | ✅ Infrastructure ready |
-| Technical debt | ✅ Minimal |
+- **Session 5 is safe to re-run:** Independent memory dir, can restart fresh
+- **Control phase is complete:** 5 sessions fully processed
+- **Data is durable:** All results committed to git
+- **No data loss:** Partial treatment results in `memory/qwen3_ab_treatment/`
 
 ---
 
-**All critical work committed. System stable. Safe to pause and resume.**
+**Status: All critical work saved. Safe to shutdown. Ready to resume when needed.**
