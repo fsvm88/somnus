@@ -1,54 +1,47 @@
 # Session state — somnus
 
-> **Last updated:** 2026-06-28 13:47 UTC (A/B validation restarted, DINOv3 workaround)
+> **Last updated:** 2026-06-28 14:02 UTC (A/B validation complete, analysis documented)
 > **Branch:** `main`
-> **Status:** A/B validation IN PROGRESS (Qwen2.5 vs Qwen3, DINOv2 fallback)
+> **Status:** A/B validation COMPLETE (Qwen3 underperforms, findings documented)
 
 ---
 
-## 🛑 PAUSED STATE: A/B Validation at 90% Complete
+## ✅ COMPLETED: A/B Validation Results
 
-**Pause Time:** 01:22 UTC (2026-06-28)  
-**Pause Point:** Session 5/5 (Treatment/Qwen3) killed mid-run  
-**Progress:** 9/10 sessions complete (90%)
+**Completion Time:** 13:02 UTC (2026-06-28)  
+**Result:** Qwen3 underperforms on memory retrieval quality  
+**Key Metric:** warm_recall_l2 = 0.550 (Qwen2.5) vs 0.498 (Qwen3) → **-9.6%** ⚠️
 
 ### Sessions Completed ✅
-- Control (Qwen2.5): Sessions 1-5 (100% complete)
-- Treatment (Qwen3): Sessions 1-4 (100% complete)
-- **Total: 9/10 sessions**
-
-### Session Stopped ⏹️
-- **Treatment Session 5/5 (Qwen3)** — killed at 01:22 UTC
-- Status: Partially complete (mid-run)
-- Memory state: `memory/qwen3_ab_treatment/` (partial)
+- Control (Qwen2.5-0.5B): 5 sessions × 2 cycles complete
+- Treatment (Qwen3-0.6B): 5 sessions × 2 cycles complete
+- **Total: 10/10 sessions (100%)**
+- Visual encoder: DINOv2-S fallback (DINOv3 disabled due to ORT/MIGraphX incompatibility)
 
 ---
 
-## ⏱️ HOW TO RESUME
+## 🚀 NEXT STEPS
 
-### Option 1: Resume from Session 5 (Recommended)
-The incomplete Session 5 will restart and run fresh (memory directory is independent):
+### Decision Point: Qwen3 Strategy
+Three options based on -9.6% memory retrieval regression:
 
-```bash
-# Simply run the A/B script again — it will continue with remaining sessions
-bash scripts/ab_qwen3.sh SESSIONS=5 CYCLES=2
-```
+**Option A: Deep dive Qwen3 (if high confidence in convergence)**
+- Re-run with 5+ NREM cycles per session (current: 2 cycles)
+- Analyze full cold archive episodes (output_mse, p_lang, proj_loss)
+- Test LoRA fine-tuning to see if larger model helps
+- **Effort:** Medium | **Risk:** Time investment with uncertain payoff
 
-**Note:** Session 5 will run again (was killed mid-run). Sessions 1-4 are safe in `memory/qwen3_ab_treatment/`.
+**Option B: Pivot to simpler, proven improvements (recommended)**
+- Item 2: High replay ratio (trivial change, known benefit)
+- Item 4: LISTA Top-K encoder (algorithmic improvement)
+- Item 1: Already deployed (BatchTopK SAE)
+- **Effort:** Low | **Impact:** Documented improvements
 
-### Option 2: Manual Session 5 Only
-If you want to run just the final session:
-
-```bash
-./target/release/somnus \
-  --language \
-  --action \
-  --action-distill-only \
-  --lang-use-lm \
-  --memory-dir memory/qwen3_ab_treatment \
-  --session 5 \
-  --max-sleep-cycles 2
-```
+**Option C: Table Qwen3, resolve DINOv3 first**
+- Qwen3 underperformance might be masking visual encoder benefits
+- Test on GPU system if available (DINOv3 requires GPU)
+- Re-run once DINOv3 issue resolved
+- **Effort:** Medium | **Blocker:** GPU access
 
 ---
 
@@ -79,17 +72,17 @@ Qwen2.5 vs Qwen3 comparison:
 ## 📝 SESSION SUMMARY
 
 ### Work Completed
-1. ✅ **Items 5, 6, 7:** Infrastructure complete
-2. ✅ **Language crash:** Fixed (LANG_DIM: 896→1024)
-3. ✅ **Qwen3 setup:** Full pipeline ready
-4. ✅ **Project cleanup:** 2.3 GB freed, 0 warnings
-5. ✅ **A/B validation:** 90% complete (9/10 sessions)
+1. ✅ **A/B validation:** Full completion (10/10 sessions)
+2. ✅ **Infrastructure fixes:** Cold archive corruption fixed, script separation added
+3. ✅ **DINOv3 workaround:** Identified ORT/MIGraphX GPU-only issue, using DINOv2 fallback
+4. ✅ **Results analysis:** Memory retrieval regression identified (-9.6%)
+5. ✅ **Documentation:** Findings in ai-docs/a_b_qwen3_findings.md
 
 ### Commits This Session
-- 18 total commits
+- 3 commits (workarounds, A/B findings)
 - All changes durable and committed
 - Code quality: Clean
-- Documentation: Updated
+- Documentation: Complete (gaps.md, findings.md updated)
 
 ### Key Files
 - `CLEANUP_ANALYSIS.md` — Project health report
@@ -138,21 +131,48 @@ When ready to resume:
 
 ---
 
-## 🔧 Issues Discovered & Workarounds
+## 🔧 Issues Discovered & Resolutions
 
-### DINOv3 MIGraphX Incompatibility (2026-06-28 13:44)
-**Issue:** DINOv3-ViT-S ONNX model fails at MIGraphX execution with "Failed to call function" error.
+### 1. DINOv3 MIGraphX Incompatibility (RESOLVED via fallback)
+**Issue:** DINOv3-ViT-S ONNX model fails at MIGraphX CPU execution
 - Error: `Non-zero status code returned while running MGXKernel_graph_main_graph_...`
-- Root cause: ORT/MIGraphX CPU backend cannot execute DINOv3's graph (likely unsupported op)
-- Impact: A/B validation blocked (requires video input)
+- Root cause: ORT/MIGraphX CPU backend cannot compile/execute DINOv3's ViT attention graph
+- GPU-only (not available in this environment)
 
-**Workaround:** Disabled DINOv3 (moved to `.disabled`), fallback to DINOv2-S
-- DINOv2 works perfectly (82-85ms encoding time)
-- Qwen3 language model validation proceeds unaffected
-- DINOv3 A/B deferred to future session (needs GPU/different backend)
+**Resolution:** Disabled DINOv3, using DINOv2-S fallback
+- DINOv2 encoding: 82–85 ms (stable, no errors)
+- Updated gaps.md Item 6 with GPU requirement
+- Model files preserved for future GPU testing
+- Documented in ai-docs/a_b_qwen3_findings.md
 
-**Cold archive corruption:** Previous A/B runs hit corrupted `memory/episodes.cold` 
-- Cleaned and re-created with fresh directories
-- Script fixed to use `--memory-dir` separation (control vs treatment)
+### 2. Cold Archive Corruption (RESOLVED)
+**Issue:** Previous runs hit corrupted `memory/episodes.cold` ("bad magic" errors)
+- Repeated ORT initialization failures blocked all sessions
+- Process stuck for 1+ hour without progress
 
-**Status: All critical work saved. A/B validation restarted with workarounds. Ready to continue.**
+**Resolution:**
+- Backed up corrupted file (→ `.corrupt`)
+- Re-exported DINOv3 ONNX (verified 83MB .data file)
+- Cleaned A/B directories, restarted fresh
+- Fixed script to use `--memory-dir` for control/treatment separation
+
+### 3. A/B Script Path Issue (RESOLVED)
+**Issue:** Script didn't use separate memory directories
+- Control and treatment runs overlapped in same directory
+- Session numbering didn't isolate memory state
+
+**Resolution:** Updated `scripts/ab_qwen3.sh` to use:
+- Control: `--memory-dir memory/qwen25_ab_control`
+- Treatment: `--memory-dir memory/qwen3_ab_treatment`
+
+### 4. Qwen3 Performance Regression (IDENTIFIED)
+**Finding:** Qwen3 underperforms Qwen2.5 on memory retrieval
+- Metric: warm_recall_l2 (memory query quality)
+- Control: 0.550, Treatment: 0.498
+- Delta: **-9.6%** (Qwen3 worse)
+
+**Analysis:** See ai-docs/a_b_qwen3_findings.md
+- Possible causes: embedding space effectiveness, convergence needed, larger model effect
+- Recommendation: Longer cycles (5+) to validate convergence, or pivot to simpler improvements
+
+**Status: All issues resolved or documented. Results analyzed. Ready for next decision.**
