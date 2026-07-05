@@ -66,10 +66,10 @@
   <text x="378" y="178" text-anchor="middle" font-size="10" fill="#665">384-dim visual</text>
   <text x="378" y="190" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX (frozen)</text>
 
-  <!-- Qwen2.5 embed -->
+  <!-- Qwen3 embed -->
   <rect x="456" y="145" width="128" height="48" rx="6" fill="#f0e8f8" stroke="#775599" stroke-width="1.5"/>
-  <text x="520" y="163" text-anchor="middle" font-weight="bold" fill="#442266">Qwen2.5 embed</text>
-  <text x="520" y="178" text-anchor="middle" font-size="10" fill="#554">896-dim mean-pool</text>
+  <text x="520" y="163" text-anchor="middle" font-weight="bold" fill="#442266">Qwen3 embed</text>
+  <text x="520" y="178" text-anchor="middle" font-size="10" fill="#554">1024-dim mean-pool</text>
   <text x="520" y="190" text-anchor="middle" font-size="9" fill="#888">+ LM hidden state (--lang-use-lm)</text>
 
   <!-- Encoding crate label -->
@@ -162,7 +162,7 @@
   <text x="210" y="601" text-anchor="middle" font-weight="bold" fill="#553300">NREM (consolidation)</text>
   <text x="210" y="615" text-anchor="middle" font-size="10" fill="#553300">replay → k-WTA + SAE (AdamW, cosine LR)</text>
   <text x="210" y="628" text-anchor="middle" font-size="10" fill="#553300">homeostatic decay · hot→cold spill · warm dump</text>
-  <text x="210" y="641" text-anchor="middle" font-size="10" fill="#553300">projection training (640→5×896, cosine loss, CPU/Qwen)</text>
+  <text x="210" y="641" text-anchor="middle" font-size="10" fill="#553300">projection training (640→5×1024, cosine loss, CPU/Qwen)</text>
 
   <!-- REM -->
   <rect x="400" y="586" width="390" height="62" rx="6" fill="#f8f0ff" stroke="#775599" stroke-width="1.5"/>
@@ -219,8 +219,8 @@
   ══════════════════════════════════════ -->
   <rect x="820" y="370" width="250" height="130" rx="8" fill="#fff0f8" stroke="#993366" stroke-width="2"/>
   <text x="945" y="390" text-anchor="middle" font-weight="bold" fill="#551133">ActionDecoder</text>
-  <text x="945" y="407" text-anchor="middle" font-size="10" fill="#551133">linear 640→5×896 (projection)</text>
-  <text x="945" y="421" text-anchor="middle" font-size="10" fill="#551133">frozen Qwen2.5-0.5B (CPU only)</text>
+  <text x="945" y="407" text-anchor="middle" font-size="10" fill="#551133">linear 640→5×1024 (projection)</text>
+  <text x="945" y="421" text-anchor="middle" font-size="10" fill="#551133">frozen Qwen3-0.6B (CPU only)</text>
   <text x="945" y="435" text-anchor="middle" font-size="10" fill="#551133">attn weights → per-region gain</text>
   <text x="945" y="449" text-anchor="middle" font-size="10" fill="#551133">autoregressive decode on stdin query</text>
   <text x="945" y="463" text-anchor="middle" font-size="10" fill="#551133">→ stdout JSON</text>

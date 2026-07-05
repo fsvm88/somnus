@@ -7,13 +7,6 @@ edition = "2021"
 name = "somnus"
 path = "src/main.rs"
 
-[features]
-# Build against Qwen3-0.6B (hidden_size=1024) instead of the default Qwen2.5-0.5B (896).
-# Compile-time architecture choice (LM_HIDDEN cascades into projection/output-head shapes),
-# not a runtime toggle — see ai-docs/a_b_qwen3_findings.md. Pair with
-# --action-model-prefix qwen3 (the CLI default flips to match) and cold-started weights.
-qwen3 = ["somnus-perception/qwen3_hidden"]
-
 [dependencies]
 somnus-sensory        = { path = "../somnus-sensory" }
 somnus-encoding       = { path = "../somnus-encoding" }

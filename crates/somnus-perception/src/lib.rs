@@ -137,12 +137,8 @@ impl EmaOutputHeads {
 }
 
 /// LM hidden dimension for the language region — must match the action-decoder LM_HIDDEN
-/// in crates/somnus/src/action.rs and be built with the matching `qwen3_hidden` feature state
-/// (896 = Qwen2.5-0.5B control, 1024 = Qwen3-0.6B treatment). This is a compile-time choice,
-/// not a runtime one: cold-started projection/output-head weights are shape-locked to it.
-#[cfg(not(feature = "qwen3_hidden"))]
-pub const LANG_HIDDEN: usize = 896;
-#[cfg(feature = "qwen3_hidden")]
+/// in crates/somnus/src/action.rs (Qwen3-0.6B, ADR 0035). Cold-started projection/output-head
+/// weights are shape-locked to it.
 pub const LANG_HIDDEN: usize = 1024;
 
 /// Per-region input dimensions. Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
@@ -1044,21 +1040,29 @@ impl PerceptionProcessor {
                     Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
 
                 let (z_batch, flat_masks) = match region_idx {
-                    0 => model
-                        .speech_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
+                    0 => {
+                        model
+                            .speech_layer
+                            .forward_tracked_batch(input_batch.clone(), b, batch_topk)
+                    }
                     1 => model
                         .env_layer
                         .forward_tracked_batch(input_batch.clone(), b, batch_topk),
-                    2 => model
-                        .visual_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
-                    3 => model
-                        .symbolic_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
-                    4 => model
-                        .language_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
+                    2 => {
+                        model
+                            .visual_layer
+                            .forward_tracked_batch(input_batch.clone(), b, batch_topk)
+                    }
+                    3 => model.symbolic_layer.forward_tracked_batch(
+                        input_batch.clone(),
+                        b,
+                        batch_topk,
+                    ),
+                    4 => model.language_layer.forward_tracked_batch(
+                        input_batch.clone(),
+                        b,
+                        batch_topk,
+                    ),
                     _ => unreachable!(),
                 };
 
@@ -1231,21 +1235,29 @@ impl PerceptionProcessor {
                     Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
 
                 let (z_batch, flat_masks) = match region_idx {
-                    0 => model
-                        .speech_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
+                    0 => {
+                        model
+                            .speech_layer
+                            .forward_tracked_batch(input_batch.clone(), b, batch_topk)
+                    }
                     1 => model
                         .env_layer
                         .forward_tracked_batch(input_batch.clone(), b, batch_topk),
-                    2 => model
-                        .visual_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
-                    3 => model
-                        .symbolic_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
-                    4 => model
-                        .language_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
+                    2 => {
+                        model
+                            .visual_layer
+                            .forward_tracked_batch(input_batch.clone(), b, batch_topk)
+                    }
+                    3 => model.symbolic_layer.forward_tracked_batch(
+                        input_batch.clone(),
+                        b,
+                        batch_topk,
+                    ),
+                    4 => model.language_layer.forward_tracked_batch(
+                        input_batch.clone(),
+                        b,
+                        batch_topk,
+                    ),
                     _ => unreachable!(),
                 };
 
@@ -1629,7 +1641,10 @@ impl PerceptionProcessor {
 
         for (i, head) in heads.iter().enumerate() {
             let pred: Tensor<TrainB, 2> = head.forward(ep_t.clone());
-            let pred_vec: Vec<f32> = pred.into_data().convert::<f32>().to_vec()
+            let pred_vec: Vec<f32> = pred
+                .into_data()
+                .convert::<f32>()
+                .to_vec()
                 .map_err(|e| PerceptionError::Burn(format!("tensor extraction: {}", e)))?;
             outputs[i] = pred_vec;
         }
@@ -2456,7 +2471,12 @@ impl PerceptionProcessor {
 
         // cross_modal_proj → symbolic encoder input
         let mut concat = vec![0.0f32; CROSS_MODAL_DIM];
-        let offsets = [(0usize, 384usize), (384, 512), (896, 384), (1280, LANG_HIDDEN)];
+        let offsets = [
+            (0usize, 384usize),
+            (384, 512),
+            (896, 384),
+            (1280, LANG_HIDDEN),
+        ];
         let srcs: [&[f32]; 4] = [speech, env, visual, lang];
         for (src, (off, dim)) in srcs.iter().zip(offsets.iter()) {
             let len = src.len().min(*dim);

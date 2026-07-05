@@ -1,7 +1,9 @@
 # ADR 0035 — LM hidden size (Qwen2.5 vs Qwen3) is a compile-time choice, not runtime
 
 **Date:** 2026-07-05
-**Status:** Implemented
+**Status:** Superseded by [ADR 0036](0036-adopt-qwen3-drop-qwen25.md) — the A/B this feature flag
+existed to run concluded in Qwen3's favor, so the flag was removed in favor of a single hardcoded
+build. This document remains the historical record of the infra work and the A/B methodology.
 
 ## Context
 

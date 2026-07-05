@@ -82,7 +82,7 @@
 
 ---
 
-## 5. LLM: Qwen3-0.6B — pipeline fixed, A/B inconclusive (needs a richer speech corpus)
+## 5. LLM: Qwen3-0.6B ✅ ADOPTED (2026-07-05, ADR 0036) — Qwen2.5 dropped
 
 **Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`.
 
@@ -151,9 +151,22 @@
     ~3/5 treatment) — still no data loss (20/20 cycles present both arms), still unrelated to this
     work, but now more worth fixing given how often it's showing up.
 
+- ✅ **Adopted (2026-07-05, ADR 0036):** on the strength of the take-2 result, Qwen3-0.6B is now
+  the *only* action-decoder LM — the `qwen3`/`qwen3_hidden` Cargo features were removed, `LM_HIDDEN`/
+  `LANG_HIDDEN`/`LANG_DIM`/`EOS_TOKEN_ID` are hardcoded to Qwen3's values, and `--action-model-prefix`
+  defaults unconditionally to `"qwen3"`. Qwen2.5 support (and the floated Qwen2.5-0.5B-Instruct
+  "Option D") is dropped. Cross-modal projection input dimension is now fixed at 2304 (was a
+  2176/2304 toggle) — `ai-docs/architecture.md`/`.svg` updated to match.
+- ✅ **Take 3 — direct generation-quality confirmation (2026-07-05):** compared real `generate()`
+  output between the two arms (each on its take-2 trained memory dir, via a `git worktree` at the
+  last commit with both Cargo features). Qwen3 produces coherent, grammatical, on-topic English;
+  Qwen2.5 produces incoherent mixed-script token garbage — consistently, across all test prompts.
+  Confirms the take-2 `mean_proj_loss` gap reflects real generation quality, not just a lower
+  surrogate loss. Full writeup: `ai-docs/a_b_qwen3_findings.md` ("Take 3").
+
 **Remaining (non-critical):**
 - ⚠️ LoRA training: Blocked on CPU (PyTorch/HF compatibility)
-  - Not worth pursuing until the A/B redo above establishes a real base-model signal
+  - Not worth pursuing until it's clear the base model needs more than distillation training
 - ⚠️ KV-cache export: Optional optimization
   - Base model functional without it
 
@@ -298,7 +311,7 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | ✅ 1 | **BatchTopK SAE** | Low | Sparse coding quality | Deployed (25d7496) |
 | 2 | **High replay ratio A/B** (N=4) | Trivial | Consolidation quality | Queued |
 | 4 | **Remove dead candle deps** | Trivial | Cleanliness | Queued |
-| 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | A/B favors Qwen3 on proj_loss (clips/long redo, 2026-07-05) — worth adopting, confirm w/ longer run |
+| 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | ✅ Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
 | ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
 | 7 | **DER++ stale-output blocking** | Low–Med | Replay consolidation | Deferred |
 | 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | Deferred |

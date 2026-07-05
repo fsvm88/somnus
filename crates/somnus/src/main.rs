@@ -218,7 +218,7 @@ struct Args {
     max_cold_records: usize,
 
     /// Enable ActionDecoder: per-episode LM forward for gain modulation + stdin generation (ADR 0012).
-    /// Requires qwen25_lm.onnx, qwen25_embed_table.safetensors, qwen25_tokenizer.json in --models-dir.
+    /// Requires qwen3_lm.onnx, qwen3_embed_table.safetensors, qwen3_tokenizer.json in --models-dir.
     #[arg(long, default_value = "true")]
     action: bool,
 
@@ -257,8 +257,8 @@ struct Args {
     #[arg(long, default_value = "false")]
     action_distill_only: bool,
 
-    /// Use qwen25_lm_fixed.onnx (GPU, fixed seq_len=1024) for autoregressive generation
-    /// instead of the default CPU path (qwen25_lm.onnx, dynamic seq_len).
+    /// Use qwen3_lm_fixed.onnx (GPU, fixed seq_len=1024) for autoregressive generation
+    /// instead of the default CPU path (qwen3_lm.onnx, dynamic seq_len).
     /// NOTE: on gfx1201 (RDNA 4) the GPU path is ~14× slower than CPU at typical seq_lens
     /// due to immature MIGraphX support. Re-evaluate when ROCm matures for RDNA 4.
     #[arg(long, default_value = "false")]
@@ -274,15 +274,10 @@ struct Args {
     /// (expects `{prefix}_gain.onnx`, `{prefix}_lm.onnx`, `{prefix}_embed_table.safetensors`,
     /// `{prefix}_tokenizer.json`, plus optional `{prefix}_text_hidden.onnx` /
     /// `{prefix}_lm_fixed.onnx` / `{prefix}_lm_{prefill,decode}_kv*.onnx`).
-    /// LM_HIDDEN is a compile-time constant, so a given build only works with one
-    /// hidden_size family of files — use this to point at "qwen25" (896-dim) or
-    /// "qwen3" (1024-dim) without risking the cross-contamination that a manual
-    /// file-swap caused during the original Qwen3 A/B. Defaults to the prefix matching
-    /// this binary's compile-time hidden_size (see the `qwen3` Cargo feature).
-    #[cfg(not(feature = "qwen3"))]
-    #[arg(long, default_value = "qwen25")]
-    action_model_prefix: String,
-    #[cfg(feature = "qwen3")]
+    /// LM_HIDDEN is a compile-time constant (1024, Qwen3-0.6B), so a given build only
+    /// works with a matching hidden_size family of files. Kept parameterized so a future
+    /// model swap can't repeat the cross-contamination that a manual file-swap caused
+    /// during the original Qwen3 A/B (see ai-docs/a_b_qwen3_findings.md).
     #[arg(long, default_value = "qwen3")]
     action_model_prefix: String,
 
@@ -300,9 +295,9 @@ struct Args {
     export_proj_weights: Option<PathBuf>,
 
     /// Use LM forward-pass hidden states for language region input instead of
-    /// the frozen embed-table mean-pool. Requires --action (loads qwen25_lm.onnx).
+    /// the frozen embed-table mean-pool. Requires --action (loads qwen3_lm.onnx).
     /// Each text line runs a single non-autoregressive LM forward pass; hidden
-    /// states are mean-pooled and L2-normalised to produce the 896-dim embedding.
+    /// states are mean-pooled and L2-normalised to produce the 1024-dim embedding.
     /// A/B flag: compare p_lang vs embed-table baseline to confirm representation
     /// quality is the bottleneck before hardening.
     #[arg(long, default_value = "false")]
@@ -331,7 +326,7 @@ struct Args {
     /// Enable language region (ADR 0013, Stage A). Reads text from stdin; each
     /// line is tokenized via Qwen2.5 BPE, mean-pooled through the frozen embed
     /// table, and ingested into the language k-WTA region.
-    /// Requires qwen25_embed_table.safetensors and qwen25_tokenizer.json in
+    /// Requires qwen3_embed_table.safetensors and qwen3_tokenizer.json in
     /// --models-dir. When combined with --action, the same stdin line is also
     /// routed to the query channel for generation.
     #[arg(long, default_value = "true")]
@@ -447,7 +442,7 @@ struct Args {
     nrem_replay_epochs: usize,
 
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
-    /// Writes `<dir>/qwen25_lm_<timestamp>.json` — open in https://ui.perfetto.dev
+    /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.
     /// GPU sessions (Whisper encoder, CLAP, DINOv2, Qwen gain) are covered by
     /// rocprof instead; see scripts/profile.sh.
@@ -601,11 +596,8 @@ impl AudioProcessor {
 
 // ── language embedder ─────────────────────────────────────────────────────────
 
-// Must match action::LM_HIDDEN — same compile-time `qwen3` feature choice.
-#[cfg(not(feature = "qwen3"))]
-const LANG_DIM: usize = 896; // Qwen2.5-0.5B hidden dimension
-#[cfg(feature = "qwen3")]
-const LANG_DIM: usize = 1024; // Qwen3-0.6B hidden dimension
+// Must match action::LM_HIDDEN (Qwen3-0.6B, ADR 0035).
+const LANG_DIM: usize = 1024;
 
 struct LangEmbedder {
     tokenizer: Tokenizer,
@@ -617,7 +609,7 @@ impl LangEmbedder {
     /// `model_prefix`: same prefix passed to ActionDecoder::new (--action-model-prefix) —
     /// the two must always load the same model family, so this takes no auto-detect
     /// fallback (a prior "prefer qwen3 if present" heuristic caused a silent LANG_DIM
-    /// mismatch when both qwen25 and qwen3 files coexisted on disk).
+    /// mismatch when both model families coexisted on disk).
     fn new(models_dir: &std::path::Path, model_prefix: &str) -> Result<Self> {
         let embed_path = models_dir.join(format!("{model_prefix}_embed_table.safetensors"));
         let tok_path = models_dir.join(format!("{model_prefix}_tokenizer.json"));
@@ -770,8 +762,10 @@ async fn main() -> Result<()> {
     }
 
     if args.language {
-        for name in &["qwen25_embed_table.safetensors", "qwen25_tokenizer.json"] {
-            let p = args.models_dir.join(name);
+        for suffix in &["_embed_table.safetensors", "_tokenizer.json"] {
+            let p = args
+                .models_dir
+                .join(format!("{}{suffix}", args.action_model_prefix));
             if !p.exists() {
                 anyhow::bail!("language model file not found: {}", p.display());
             }
@@ -2645,7 +2639,7 @@ fn ingest_language_line(
     let Some(le) = lang_embedder else { return None };
     let emb = if lang_use_lm {
         // Use LM forward-pass hidden states (contextualized, richer than embed-table).
-        // Reuses the ActionDecoder's already-loaded qwen25_lm.onnx session; no extra load.
+        // Reuses the ActionDecoder's already-loaded qwen3_lm.onnx session; no extra load.
         // Falls back to embed-table if decoder is unavailable.
         let lm_result = decoder.as_mut().and_then(|dec| {
             dec.tokenize(text)

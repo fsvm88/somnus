@@ -187,6 +187,56 @@ Still unrelated to the Qwen3 work (`whisper_asr.rs`, not `action.rs`/`somnus-per
 
 ---
 
+## Take 3 (2026-07-05): direct generation-quality test — confirms take 2
+
+Take 2 measured `mean_proj_loss`, a surrogate for grounding quality, not the actual thing users
+would see. This test drops `--action-distill-only` and compares real `generate()` output between
+the two arms, using each arm's take-2 *trained* memory dir (`qwen25_ab_control_longclips` /
+`qwen3_ab_treatment_longclips`, copied to scratch dirs so the originals stay untouched) — this
+matters because the frozen LM is only half the pipeline; the episode→region-token projection MLP
+(tuned by NREM distillation) is the other half, and a cold-start comparison would mostly measure
+"is Qwen3 a better base model," which published benchmarks (MMLU 70 vs 47) already answer.
+
+**Method:** by the time this ADR 0036 adoption work started, both Cargo features had been removed
+from the working tree, so a `git worktree` at the last commit with both features (`c86cfdf`) built
+`somnus-qwen25-control` (default) and `somnus-qwen3-treatment` (`--features qwen3`) — a cleaner
+comparison than working-tree-Qwen3 vs a different commit's Qwen2.5, since the model choice is the
+only variable. Each binary ran against `clips/talking_head.mp4` (`--file-loop`, so the process
+doesn't exit before a query can be answered) with the same three prompts fed via delayed stdin,
+timed to land after at least one fresh episode had formed.
+
+**Result: Qwen3 generates coherent, on-topic English; Qwen2.5 generates incoherent token salad.**
+Representative outputs, same prompts, same recall-k=3:
+
+- Qwen2.5 control: `" is6958当中之中 CONST { /1: Blanch3674同的儿子中式 [09动授"`,
+  `" gradient695861当中 Blanch {之中:7304的儿子同 /授s958动"` — mixed CJK/Latin token garbage,
+  no grammatical structure, consistent across all three prompts and multiple runs.
+- Qwen3 treatment: `" I need to write a summary of the lecture on gradient descent. The user is
+  asking for me to summarize it, but they"`, `" I need to write a response in Chinese. The user is
+  asking for me to summarize it..."` — grammatical, on-topic English every time, though it tends to
+  paraphrase/meta-comment on the prompt rather than directly answer it (short 25-token budget,
+  and the projection is trained on hidden-state distillation, not instruction-following).
+
+This isn't a rigorous multi-sample eval (3 prompts, 1 clip, qualitative read only), but the gap is
+large and consistent enough — coherent grammar vs. no grammar at all — that it isn't noise. Note:
+a 0.5B model producing *zero* grammatical structure is more than typical quality loss for
+Qwen2.5-base (normally fluent) — the qwen25 arm's soft-prompt/projection path may be compounding
+the gap on top of a genuine model-quality difference. Doesn't change the direction of the result,
+just don't read the absolute severity as "Qwen2.5-0.5B can't produce English" in general.
+**Confirms take 2's `mean_proj_loss` gap corresponds to a real, user-visible generation quality
+difference**, not just a lower surrogate-loss number. Combined with take 2, this closes out the
+"confirm before/after adoption" recommendation from ADR 0036 — Qwen3-0.6B was adopted as the sole
+action-decoder LM on the strength of this and the take-2 result.
+
+**Caveat found along the way:** `--file` (without `--file-loop`) decodes the whole clip as fast as
+the CPU can, not in realtime — `talking_head.mp4` (70s of real content) finishes in ~50s wall-clock
+regardless of clip length, and episodes only start forming near the very end of that window
+(apparently in a burst, not streamed). A query sent before that burst gets `{"error":"no episode
+yet"}` — not a code bug, just a property of file-mode ingestion worth knowing before trying to
+script a similar comparison again.
+
+---
+
 ## Original run (2026-06-28) — kept for methodology/historical record
 
 > **⚠️ INVALIDATED (2026-07-05):** the results below do not reflect real Qwen3 vs Qwen2.5

@@ -1,11 +1,11 @@
 # Architecture
 
-> **Contents:** High-level system structure — encoders, 5 regional concept areas (audio-speech, audio-env, visual, symbolic, language), binding area (cross-attention + GRU), 3-tier memory (hot/warm/cold), sleep cycle (NREM+REM), action decoder (Qwen2.5). Implementation state as of 2026-06-07 included inline.  
+> **Contents:** High-level system structure — encoders, 5 regional concept areas (audio-speech, audio-env, visual, symbolic, language), binding area (cross-attention + GRU), 3-tier memory (hot/warm/cold), sleep cycle (NREM+REM), action decoder (Qwen3-0.6B). Implementation state as of 2026-06-07 included inline.  
 > **When to read:** Understanding how subsystems connect; checking which open architectural questions are resolved vs. open.
 >
 > **Status:** working sketch. Reflects decisions through the vision discussion (Q1/Q2/Q3 + sub-Q1). Subject to further change as research matures. Update this doc when subsystem boundaries shift; record the *why* in an ADR.
 >
-> **Implementation state (2026-07-05):** Phases 1–14 + architectural roundup + gap fixes + Item 6 (DINOv3-ViT-S, deployed) + Item 7 Phase 2 (DER++ stale blocking) + Item 5 (Qwen3 A/B) complete. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv3-ViT-S (384-dim, active; DINOv2-S/14 fallback) via ORT. `crates/somnus-perception` runs five k-WTA layers (n=1024, k=20) — audio-speech, audio-env, visual, symbolic, language (`LANG_HIDDEN`-dim: 896 default/Qwen2.5, 1024 with the `qwen3` Cargo feature/Qwen3 — a compile-time choice, not runtime) — plus 4-head cross-attention binding area with GRU temporal context (GRU_HIDDEN=256) → 640-dim episode vectors + SAE decoders for reconstruction error. (A 2026-06-27 commit had made `LANG_DIM`/`LM_HIDDEN` a single hardcoded 1024 constant regardless of which embed table was actually loaded — a real corruption bug, not a fix; found and corrected 2026-07-05, see `ai-docs/a_b_qwen3_findings.md`.) `crates/somnus-memory` implements the three-tier memory hierarchy: `EpisodicBuffer` (bounded ring, hot), `SemanticStore` (hnsw_rs HNSW over episode vectors, warm), `ColdArchive` (INT8-quantised append-only binary, cold), `RecollectionLayer` (warm query + cold→warm promotion). The `somnus` binary wires all crates end-to-end with a full sleep cycle (NREM + REM, DER++ stale-output detection), text bypass, auto-grounding, action decoder (Qwen2.5-0.5B default or Qwen3-0.6B via `--features qwen3` + `--action-model-prefix qwen3`, two separate release binaries) and eval harness. A/B on a speech-dense corpus favors Qwen3 on proj_loss (~22% lower, consistent across a 5-session campaign) — recommended for adoption pending a longer confirmation run; default build is still Qwen2.5.
+> **Implementation state (2026-07-05):** Phases 1–14 + architectural roundup + gap fixes + Item 6 (DINOv3-ViT-S, deployed) + Item 7 Phase 2 (DER++ stale blocking) + Item 5 (Qwen3 adopted, ADR 0036) complete. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv3-ViT-S (384-dim, active; DINOv2-S/14 fallback) via ORT. `crates/somnus-perception` runs five k-WTA layers (n=1024, k=20) — audio-speech, audio-env, visual, symbolic, language (`LANG_HIDDEN`=1024, Qwen3-0.6B) — plus 4-head cross-attention binding area with GRU temporal context (GRU_HIDDEN=256) → 640-dim episode vectors + SAE decoders for reconstruction error. `crates/somnus-memory` implements the three-tier memory hierarchy: `EpisodicBuffer` (bounded ring, hot), `SemanticStore` (hnsw_rs HNSW over episode vectors, warm), `ColdArchive` (INT8-quantised append-only binary, cold), `RecollectionLayer` (warm query + cold→warm promotion). The `somnus` binary wires all crates end-to-end with a full sleep cycle (NREM + REM, DER++ stale-output detection), text bypass, auto-grounding, action decoder (Qwen3-0.6B, single build) and eval harness. A/B on a speech-dense corpus favored Qwen3 over Qwen2.5 on proj_loss (~22% lower, consistent across a 5-session campaign); adopted as the sole LM 2026-07-05 (ADR 0036) — Qwen2.5 support removed. Confirmed the same day with a direct `generate()` quality comparison: Qwen3 produces coherent English, Qwen2.5 incoherent token garbage.
 
 somnus is decomposed by **function**, in loose correspondence with brain systems. Four shaping commitments:
 
@@ -69,8 +69,8 @@ The carve-up is revisable; what matters is that subsystems are *replaceable* and
 
                   ┌──────────────────────────────────────┐
                   │  ActionDecoder                        │
-                  │  projection (640 → 5×896) +           │
-                  │  frozen Qwen2.5-0.5B                 │
+                  │  projection (640 → 5×1024) +          │
+                  │  frozen Qwen3-0.6B                    │
                   │                                      │
                   │  every episode: attn weights →        │
                   │    per-region gain (k-WTA input)      │
@@ -105,7 +105,7 @@ Initial regions (revisable, see open questions):
 - **audio-env** — concepts grounded in environmental sound (objects, events).
 - **visual** — concepts grounded in visual experience.
 - **symbolic** — concepts that are linguistically *named*, regardless of which sense brought them in. Receives input from audio-speech and from text bypass.
-- **language** — continuous embedding of text tokens via the Qwen2.5 embed table (896-dim mean-pooled). Fed from stdin text and Whisper ASR transcripts. Provides a training signal for the action decoder projection during NREM.
+- **language** — continuous embedding of text tokens via the Qwen3 embed table (1024-dim mean-pooled). Fed from stdin text and Whisper ASR transcripts. Provides a training signal for the action decoder projection during NREM.
 
 Discretization (e.g., a VQ-style codebook layer over continuous embeddings, or an emergent symbolic-discrete sub-region) is **out of scope for early phases**. It can be added later when reasoning over abstract concepts becomes a research target — biology and modern ML both suggest discrete symbols emerge from continuous representations, not the other way around.
 
@@ -195,13 +195,13 @@ Sleep is **interruptible by high-salience external events** (loud novel sound, m
 
 Tracked here so they don't get lost. Resolutions become ADRs.
 
-- ~~**Initial regional set.**~~ Resolved in ADR 0005: four regions from Phase 3 (audio-speech, audio-env, visual, symbolic). Phase 6 (ADR 0013) added the language region (index 4, 896-dim Qwen2.5 embed). Five regions total.
+- ~~**Initial regional set.**~~ Resolved in ADR 0005: four regions from Phase 3 (audio-speech, audio-env, visual, symbolic). Phase 6 (ADR 0013) added the language region (index 4, 1024-dim Qwen3 embed, originally 896-dim Qwen2.5 — see ADR 0036). Five regions total.
 - ~~**Encoder specifics.**~~ Resolved in ADR 0003: Whisper-tiny (speech, 384-dim) + CLAP-HTSAT-unfused (env, 512-dim) + DINOv2-S/14 or DINOv3-ViT-S (visual, 384-dim, swappable via model file).
 - **Growth mechanism.** Cascade-Correlation-style unit addition? At what granularity (single unit, group, sub-cluster)? How do new units integrate with sparse codes?
 - ~~**Recollection-layer implementation.**~~ Resolved in ADR 0006: `hnsw_rs` HNSW (L2 distance) for warm tier; cold→warm promotion stubbed for Phase 5.
 - **Compression strategy.** Quantization, structured pruning, knowledge distillation, or layered combination? When is content moved cold vs. dropped?
 - ~~**Sparse-coding scheme.**~~ Resolved in ADR 0005: k-WTA with per-unit duty-cycle boosting, n=1024, k=20 (2% sparsity). Per-region weights; shared hyperparameters.
 - **Sleep-cycle time budget.** How to split a sleep cycle between NREM-like work (replay, homeostatic downscaling, compression) and REM-like work (generative replay, self-probe, growth, future creative recombination), and how to schedule within each stage.
-- ~~**Action loop.**~~ Resolved in ADR 0012: region-token projection (640→5×896 for Qwen2.5, or 640→5×1024 for Qwen3) + frozen Qwen2.5-0.5B or Qwen3-0.6B — a compile-time choice (`qwen3` Cargo feature, two release binaries), not a runtime toggle. Per-episode LLM attention weights drive per-region gain modulation; full autoregressive decode on stdin query. NREM projection training uses LM contextualised hidden-state distillation targets (ADR 0012 amendment). Item 5 A/B (2026-07-05) favors Qwen3 on proj_loss; default build is still Qwen2.5 pending confirmation (`ai-docs/a_b_qwen3_findings.md`).
+- ~~**Action loop.**~~ Resolved in ADR 0012: region-token projection (640→5×1024) + frozen Qwen3-0.6B (adopted over Qwen2.5-0.5B, ADR 0036, following the ADR 0035 compile-time-choice A/B infrastructure). Per-episode LLM attention weights drive per-region gain modulation; full autoregressive decode on stdin query. NREM projection training uses LM contextualised hidden-state distillation targets (ADR 0012 amendment). A/B favored Qwen3 on proj_loss (~22% lower, 2026-07-05), confirmed with a direct generation-quality comparison the same day (`ai-docs/a_b_qwen3_findings.md`).
 - **Scheduling.** Async tasks, dedicated threads, event loop? How do real-time wake constraints coexist with batch sleep work?
 - **Tensor representation.** Single shared tensor type across subsystems, or each subsystem picks its own?

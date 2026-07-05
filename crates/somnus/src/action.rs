@@ -8,7 +8,6 @@
 /// Training (NREM): surrogate MSE loss between mean(proj_tokens) and
 /// mean(text_target_embeddings) from text-bypass queries.
 use anyhow::{bail, Result};
-use std::io::Write as _; // for stdout().flush() in streaming generation
 use burn::{
     backend::{
         ndarray::{NdArray, NdArrayDevice},
@@ -27,28 +26,21 @@ use ort::{
     value::{DynValueTypeMarker, TensorRef, ValueRef},
 };
 use safetensors::SafeTensors;
+use std::io::Write as _; // for stdout().flush() in streaming generation
 use tokenizers::Tokenizer;
 
-/// LM hidden dimension — compile-time choice, not a runtime one (see the `qwen3` feature
-/// in Cargo.toml and ai-docs/a_b_qwen3_findings.md). Must match the model files loaded
+/// LM hidden dimension for Qwen3-0.6B (ADR 0035). Must match the model files loaded
 /// via --action-model-prefix and somnus-perception's LANG_HIDDEN/REGION_DIMS.
-#[cfg(not(feature = "qwen3"))]
-pub const LM_HIDDEN: usize = 896; // Qwen2.5-0.5B hidden dimension
-#[cfg(feature = "qwen3")]
-pub const LM_HIDDEN: usize = 1024; // Qwen3-0.6B hidden dimension
+pub const LM_HIDDEN: usize = 1024;
 pub const N_REGIONS: usize = 5;
 const EPISODE_DIM: usize = 640;
 const PROJ_LR: f64 = 1e-4;
-// Qwen2.5 base and Qwen3 base use different EOS token ids (verified against each
-// tokenizer's eos_token_id): Qwen2.5 stops on <|endoftext|>, Qwen3 on <|im_end|>.
-#[cfg(not(feature = "qwen3"))]
-const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
-#[cfg(feature = "qwen3")]
-const EOS_TOKEN_ID: u32 = 151645; // Qwen3 base EOS (<|im_end|>)
-/// Fixed sequence length for the GPU text-hidden-state path (qwen25_text_hidden.onnx).
+// Qwen3 base stops on <|im_end|> (verified against its tokenizer's eos_token_id).
+const EOS_TOKEN_ID: u32 = 151645;
+/// Fixed sequence length for the GPU text-hidden-state path (qwen3_text_hidden.onnx).
 /// Must match MAX_TEXT_SEQ in scripts/export_models.py.
 const MAX_TEXT_SEQ: usize = 128;
-/// Fixed sequence length for the GPU generation path (qwen25_lm_fixed.onnx).
+/// Fixed sequence length for the GPU generation path (qwen3_lm_fixed.onnx).
 /// Covers recalled (3×5) + current (5) + history (256) + query (~50) + generated (200) ≈ 526.
 /// Must match MAX_GEN_SEQ in scripts/export_models.py.
 const MAX_GEN_SEQ: usize = 1024;
@@ -64,36 +56,108 @@ const KV_HEAD_DIM: usize = 64;
 
 // Pre-computed ORT key name slices — eliminates format!() heap allocs in the decode hot loop.
 static PAST_KEY_NAMES: [&str; N_KV_LAYERS] = [
-    "past_key_0",  "past_key_1",  "past_key_2",  "past_key_3",
-    "past_key_4",  "past_key_5",  "past_key_6",  "past_key_7",
-    "past_key_8",  "past_key_9",  "past_key_10", "past_key_11",
-    "past_key_12", "past_key_13", "past_key_14", "past_key_15",
-    "past_key_16", "past_key_17", "past_key_18", "past_key_19",
-    "past_key_20", "past_key_21", "past_key_22", "past_key_23",
+    "past_key_0",
+    "past_key_1",
+    "past_key_2",
+    "past_key_3",
+    "past_key_4",
+    "past_key_5",
+    "past_key_6",
+    "past_key_7",
+    "past_key_8",
+    "past_key_9",
+    "past_key_10",
+    "past_key_11",
+    "past_key_12",
+    "past_key_13",
+    "past_key_14",
+    "past_key_15",
+    "past_key_16",
+    "past_key_17",
+    "past_key_18",
+    "past_key_19",
+    "past_key_20",
+    "past_key_21",
+    "past_key_22",
+    "past_key_23",
 ];
 static PAST_VALUE_NAMES: [&str; N_KV_LAYERS] = [
-    "past_value_0",  "past_value_1",  "past_value_2",  "past_value_3",
-    "past_value_4",  "past_value_5",  "past_value_6",  "past_value_7",
-    "past_value_8",  "past_value_9",  "past_value_10", "past_value_11",
-    "past_value_12", "past_value_13", "past_value_14", "past_value_15",
-    "past_value_16", "past_value_17", "past_value_18", "past_value_19",
-    "past_value_20", "past_value_21", "past_value_22", "past_value_23",
+    "past_value_0",
+    "past_value_1",
+    "past_value_2",
+    "past_value_3",
+    "past_value_4",
+    "past_value_5",
+    "past_value_6",
+    "past_value_7",
+    "past_value_8",
+    "past_value_9",
+    "past_value_10",
+    "past_value_11",
+    "past_value_12",
+    "past_value_13",
+    "past_value_14",
+    "past_value_15",
+    "past_value_16",
+    "past_value_17",
+    "past_value_18",
+    "past_value_19",
+    "past_value_20",
+    "past_value_21",
+    "past_value_22",
+    "past_value_23",
 ];
 static NEW_KEY_NAMES: [&str; N_KV_LAYERS] = [
-    "new_key_0",  "new_key_1",  "new_key_2",  "new_key_3",
-    "new_key_4",  "new_key_5",  "new_key_6",  "new_key_7",
-    "new_key_8",  "new_key_9",  "new_key_10", "new_key_11",
-    "new_key_12", "new_key_13", "new_key_14", "new_key_15",
-    "new_key_16", "new_key_17", "new_key_18", "new_key_19",
-    "new_key_20", "new_key_21", "new_key_22", "new_key_23",
+    "new_key_0",
+    "new_key_1",
+    "new_key_2",
+    "new_key_3",
+    "new_key_4",
+    "new_key_5",
+    "new_key_6",
+    "new_key_7",
+    "new_key_8",
+    "new_key_9",
+    "new_key_10",
+    "new_key_11",
+    "new_key_12",
+    "new_key_13",
+    "new_key_14",
+    "new_key_15",
+    "new_key_16",
+    "new_key_17",
+    "new_key_18",
+    "new_key_19",
+    "new_key_20",
+    "new_key_21",
+    "new_key_22",
+    "new_key_23",
 ];
 static NEW_VALUE_NAMES: [&str; N_KV_LAYERS] = [
-    "new_value_0",  "new_value_1",  "new_value_2",  "new_value_3",
-    "new_value_4",  "new_value_5",  "new_value_6",  "new_value_7",
-    "new_value_8",  "new_value_9",  "new_value_10", "new_value_11",
-    "new_value_12", "new_value_13", "new_value_14", "new_value_15",
-    "new_value_16", "new_value_17", "new_value_18", "new_value_19",
-    "new_value_20", "new_value_21", "new_value_22", "new_value_23",
+    "new_value_0",
+    "new_value_1",
+    "new_value_2",
+    "new_value_3",
+    "new_value_4",
+    "new_value_5",
+    "new_value_6",
+    "new_value_7",
+    "new_value_8",
+    "new_value_9",
+    "new_value_10",
+    "new_value_11",
+    "new_value_12",
+    "new_value_13",
+    "new_value_14",
+    "new_value_15",
+    "new_value_16",
+    "new_value_17",
+    "new_value_18",
+    "new_value_19",
+    "new_value_20",
+    "new_value_21",
+    "new_value_22",
+    "new_value_23",
 ];
 
 /// KV-cache state for the split prefill/decode generation path (ADR 0034).
@@ -130,10 +194,7 @@ impl KvCache {
     /// Allocate scratch buffers. Called once after vocab_size is known.
     fn init_scratch(&mut self, vocab_size: usize) {
         self.logits_scratch = vec![0.0f32; vocab_size];
-        self.new_kv_scratch = vec![
-            vec![0.0f32; N_KV_HEADS * KV_HEAD_DIM];
-            N_KV_LAYERS * 2
-        ];
+        self.new_kv_scratch = vec![vec![0.0f32; N_KV_HEADS * KV_HEAD_DIM]; N_KV_LAYERS * 2];
     }
 
     fn reset(&mut self) {
@@ -220,9 +281,9 @@ impl ActionDecoder {
     /// lm_session (CPU). Call `end_profiling()` before process exit to flush.
     ///
     /// `model_prefix`: filename prefix for all action-decoder model artifacts
-    /// (e.g. "qwen25" or "qwen3") — control and treatment A/B arms must use
-    /// distinct prefixes so their files can never cross-contaminate each other
-    /// (see the ai-docs/a_b_qwen3_findings.md file-swap incident this replaces).
+    /// (normally "qwen3") — kept parameterized so future model swaps can never
+    /// cross-contaminate files the way the qwen3 A/B file-swap incident once did
+    /// (see ai-docs/a_b_qwen3_findings.md).
     pub fn new(
         models_dir: &std::path::Path,
         device: NdArrayDevice,
@@ -652,12 +713,12 @@ impl ActionDecoder {
 
     /// Compute L2-normalised mean LM hidden state for a token sequence.
     ///
-    /// GPU path (qwen25_text_hidden.onnx, MIGraphX): pads to MAX_TEXT_SEQ, runs the base
+    /// GPU path (qwen3_text_hidden.onnx, MIGraphX): pads to MAX_TEXT_SEQ, runs the base
     /// transformer without LM head, mean-pools the first `n` real positions. Causal attention
     /// guarantees end-padding positions do not affect hidden states at real positions, so no
     /// attention_mask is needed. Sequences longer than MAX_TEXT_SEQ are truncated.
     ///
-    /// CPU fallback (qwen25_lm.onnx): original dynamic-seq-len path, used when the GPU model
+    /// CPU fallback (qwen3_lm.onnx): original dynamic-seq-len path, used when the GPU model
     /// is absent.
     pub fn text_hidden_states(&mut self, token_ids: &[u32]) -> Result<Vec<f32>> {
         if token_ids.is_empty() {
