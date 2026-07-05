@@ -20,7 +20,20 @@ models/*.onnx.data
 
 # Python venv for export scripts
 scripts/.venv/
+.venv/
 experiments/**/.claude/
+
+# Raw HuggingFace checkouts used as export sources (see scripts/export_models.py) —
+# regenerate via `huggingface-cli download`, don't commit. (models/qwen25_hf/ was
+# accidentally committed 2026-06 and removed 2026-07-05.)
+models/*_hf/
+
+# Scratch symlink farms some A/B scripts point --models-dir at (e.g. models_control/,
+# models_lora_ab_control/) — just symlinks into models/, never meant to be tracked.
+/models_*/
+
+# Root-level ad hoc session/run logs (ai-docs/ holds the durable write-ups)
+/*.log
 
 # Experiment build byproducts (source is tracked; binaries are not)
 experiments/*/target/
