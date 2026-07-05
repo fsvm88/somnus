@@ -94,6 +94,23 @@ fn main() -> anyhow::Result<()> {
         println!("  output shape: {:?}  OK", dims);
     }
 
+    // ── DINOv3-ViT-S ─────────────────────────────────────────────────────────
+    println!("=== dinov3_small ===");
+    {
+        let mut session = migraphx_session(models.join("dinov3_small.onnx"))?;
+        for i in session.inputs()  { println!("  in  {:?} {:?}", i.name(), i.dtype()); }
+        for o in session.outputs() { println!("  out {:?} {:?}", o.name(), o.dtype()); }
+
+        let input: Array4<f32> = Array4::zeros((1, 3, 224, 224));
+        let input_ref = TensorRef::from_array_view(&input)?;
+        let outputs = session.run(ort::inputs!["pixel_values" => input_ref])?;
+        let (shape, _) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+        let dims: Vec<i64> = shape.iter().copied().collect();
+        // CLS + 4 register tokens + 196 patches (16x16 @ patch16) — see modeling_dinov3_vit.py
+        assert_eq!(dims, vec![1, 201, 384], "dinov3 shape mismatch");
+        println!("  output shape: {:?}  OK", dims);
+    }
+
     // ── Qwen2.5-0.5B LM (action-loop decoder, currently CPU-only in production) ─
     println!("=== qwen25_lm ===");
     {

@@ -3,6 +3,12 @@ name    = "somnus-perception"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Language region hidden dim = 1024 (Qwen3-0.6B) instead of the default 896 (Qwen2.5-0.5B).
+# Compile-time only — must match crates/somnus's own `qwen3_hidden` feature and the
+# --action-model-prefix used at runtime, or region shapes silently mismatch the model files.
+qwen3_hidden = []
+
 [dependencies]
 burn         = { workspace = true }
 burn-ndarray = { workspace = true }

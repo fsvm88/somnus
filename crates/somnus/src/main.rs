@@ -270,6 +270,22 @@ struct Args {
     #[arg(long, default_value = "false")]
     linear_proj: bool,
 
+    /// Filename prefix for action-decoder model artifacts in --models-dir
+    /// (expects `{prefix}_gain.onnx`, `{prefix}_lm.onnx`, `{prefix}_embed_table.safetensors`,
+    /// `{prefix}_tokenizer.json`, plus optional `{prefix}_text_hidden.onnx` /
+    /// `{prefix}_lm_fixed.onnx` / `{prefix}_lm_{prefill,decode}_kv*.onnx`).
+    /// LM_HIDDEN is a compile-time constant, so a given build only works with one
+    /// hidden_size family of files — use this to point at "qwen25" (896-dim) or
+    /// "qwen3" (1024-dim) without risking the cross-contamination that a manual
+    /// file-swap caused during the original Qwen3 A/B. Defaults to the prefix matching
+    /// this binary's compile-time hidden_size (see the `qwen3` Cargo feature).
+    #[cfg(not(feature = "qwen3"))]
+    #[arg(long, default_value = "qwen25")]
+    action_model_prefix: String,
+    #[cfg(feature = "qwen3")]
+    #[arg(long, default_value = "qwen3")]
+    action_model_prefix: String,
+
     /// Append (episode, text) pairs to a JSONL file during each sleep cycle (ADR 0033).
     /// Used to collect training data for offline LoRA fine-tuning. Only text-bearing
     /// traces (those with a text_target from ASR or text-bypass) are written.
@@ -585,7 +601,11 @@ impl AudioProcessor {
 
 // ── language embedder ─────────────────────────────────────────────────────────
 
-const LANG_DIM: usize = 1024; // LM hidden dimension (Qwen3-0.6B / future upgrades)
+// Must match action::LM_HIDDEN — same compile-time `qwen3` feature choice.
+#[cfg(not(feature = "qwen3"))]
+const LANG_DIM: usize = 896; // Qwen2.5-0.5B hidden dimension
+#[cfg(feature = "qwen3")]
+const LANG_DIM: usize = 1024; // Qwen3-0.6B hidden dimension
 
 struct LangEmbedder {
     tokenizer: Tokenizer,
@@ -594,19 +614,13 @@ struct LangEmbedder {
 }
 
 impl LangEmbedder {
-    fn new(models_dir: &std::path::Path) -> Result<Self> {
-        // Try Qwen3 first (Item 5 upgrade), fall back to Qwen2.5.
-        // Determines which embed table to load based on what's available.
-        let (embed_path, tok_path) = {
-            let qwen3_embed = models_dir.join("qwen3_embed_table.safetensors");
-            let qwen3_tok = models_dir.join("qwen3_tokenizer.json");
-            if qwen3_embed.exists() && qwen3_tok.exists() {
-                (qwen3_embed, qwen3_tok)
-            } else {
-                (models_dir.join("qwen25_embed_table.safetensors"),
-                 models_dir.join("qwen25_tokenizer.json"))
-            }
-        };
+    /// `model_prefix`: same prefix passed to ActionDecoder::new (--action-model-prefix) —
+    /// the two must always load the same model family, so this takes no auto-detect
+    /// fallback (a prior "prefer qwen3 if present" heuristic caused a silent LANG_DIM
+    /// mismatch when both qwen25 and qwen3 files coexisted on disk).
+    fn new(models_dir: &std::path::Path, model_prefix: &str) -> Result<Self> {
+        let embed_path = models_dir.join(format!("{model_prefix}_embed_table.safetensors"));
+        let tok_path = models_dir.join(format!("{model_prefix}_tokenizer.json"));
 
         let bytes = std::fs::read(&embed_path)?;
         let st = SafeTensors::deserialize(&bytes)
@@ -622,11 +636,7 @@ impl LangEmbedder {
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
         let vocab = embed_table.len() / LANG_DIM;
-        let model_name = if embed_path.file_stem().is_some_and(|n| n.to_string_lossy().starts_with("qwen3")) {
-            "Qwen3-0.6B"
-        } else {
-            "Qwen2.5-0.5B"
-        };
+        let model_name = model_prefix;
         info!(vocab, model = model_name, "language embedder ready");
         Ok(Self {
             tokenizer,
@@ -980,6 +990,7 @@ async fn main() -> Result<()> {
             args.ort_profile_dir.as_deref(),
             args.gpu_generation,
             args.linear_proj,
+            &args.action_model_prefix,
         ) {
             Ok(mut d) => {
                 // Burn's BinFileRecorder sets extension to ".bin"; pass stem path.
@@ -1067,7 +1078,7 @@ async fn main() -> Result<()> {
 
     // ── language embedder ─────────────────────────────────────────────────────
     let lang_embedder: Option<LangEmbedder> = if args.language {
-        match LangEmbedder::new(&args.models_dir) {
+        match LangEmbedder::new(&args.models_dir, &args.action_model_prefix) {
             Ok(le) => Some(le),
             Err(e) => anyhow::bail!("language embedder init failed: {e}"),
         }

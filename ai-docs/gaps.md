@@ -82,7 +82,7 @@
 
 ---
 
-## 5. LLM: Qwen3-0.6B ✅ A/B VALIDATION IN PROGRESS
+## 5. LLM: Qwen3-0.6B — pipeline fixed, A/B inconclusive (needs a richer speech corpus)
 
 **Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`.
 
@@ -100,16 +100,60 @@
   - Root cause: `LANG_DIM` hardcoded to 896 (Qwen2.5), k-WTA expected 1024
   - Fix: Updated `LANG_DIM: 896 → 1024`, exported Qwen3 embed table
   - Verification: Text ingestion tested and working (no panic)
-- ✅ **A/B Validation:** COMPLETE (2026-06-28)
-  - Result: Qwen3 **underperforms** on warm_recall_l2 (-9.6%)
-  - Metric: 0.550 (Qwen2.5) vs 0.498 (Qwen3)
-  - Analysis: `ai-docs/a_b_qwen3_findings.md`
-  - Status: **Action needed** — investigate convergence, longer cycles, or defer to LoRA phase
+- ⚠️ **A/B Validation:** ran 2026-06-28, but found INVALID on 2026-07-05.
+  - Reported result: Qwen3 "underperforms" on warm_recall_l2 (0.550 → 0.498, -9.6%)
+  - **This number is not trustworthy.** Root cause found 2026-07-05: `LM_HIDDEN` was bumped
+    896→1024 (commit `6335b42`, the day before this A/B ran) but `ActionDecoder::new` always
+    loads `qwen25_embed_table.safetensors` (896-wide) by hardcoded filename. `embed_flat()`
+    (`action.rs:1207`) slices that table at stride `LM_HIDDEN=1024` — every token embedding for
+    *both* arms was silently misaligned/corrupted, not a fair test of either architecture.
+    Qwen3 also never got matching GPU-path exports (gain/text_hidden/lm_fixed), so it ran on
+    the CPU fallback via `ab_qwen3.sh`'s file-swap trick, whose "restore" step also silently
+    failed — `qwen25_lm.onnx` on disk is still, right now, actually the Qwen3 model.
+  - Analysis (superseded conclusion, corrected root-cause note added): `ai-docs/a_b_qwen3_findings.md`
+  - Full incident writeup: `.claude/session-state.md`
+- ✅ **Redo (2026-07-05):** pipeline fully fixed — genuine Qwen2.5 baseline restored, Qwen3 given
+  a complete matching export (via the correct `Qwen3ForCausalLM`, not `Qwen2ForCausalLM`), model-file
+  prefix parameterized (no more hardcoded `qwen25_*`/auto-detect footguns), `LM_HIDDEN`/`LANG_DIM`/
+  `EOS_TOKEN_ID` made real compile-time choices via a `qwen3` Cargo feature (two release binaries:
+  `somnus-qwen25-control`, `somnus-qwen3-treatment`). Found and fixed a third real bug along the way: ~6
+  more hardcoded 896/1024 literals scattered through `somnus-perception` for the language region.
+  - **A/B result: inconclusive, not "Qwen3 loses."** Ran 10 sessions × 5 cycles/arm cold-started on
+    the standard 4-clip corpus. Language-region MSE is statistically indistinguishable between arms
+    (0.0011 vs 0.0010) and `mean_proj_loss` has almost no samples (0/50 vs 1/50) — the stock clips
+    have too little actual speech for ASR/lang-ingest to fire more than ~once per 5-cycle session.
+    Large gaps in aggregate `mean_output_mse`/`warm_recall_l2` are noise from independently-seeded
+    non-LM regions (speech/env/visual/symbolic), not a Qwen3 effect — see per-region breakdown in
+    `ai-docs/a_b_qwen3_findings.md`.
+  - Full results + recommended next corpus (`clips/long/` or direct generation-quality test):
+    `ai-docs/a_b_qwen3_findings.md`.
+  - Aside: found an unrelated, pre-existing intermittent panic in `WhisperDecoder::decode_greedy`
+    (ORT "GetElementType is not implemented" escalating past its usual caught-WARN path) — not
+    fixed, flagged for separate triage.
+  - Status: **Infra done. Comparison needs a speech-heavy corpus or a direct generation-quality
+    test to actually answer the Qwen3-vs-Qwen2.5 question** — not queued as blocked, just not the
+    next automatic step.
+- ✅ **Redo take 2 (2026-07-05):** re-ran on a speech-dense `clips/long/` corpus (6 lecture/podcast
+  clips, `scripts/ab_qwen3_longclips.sh`) instead of the sparse-speech 4-clip set. Same 5 sessions
+  × 4 cycles/arm. This time both arms got identical exposure (73 `lang_ingest` events, ~40
+  `decoder_trainable` events each) and `mean_proj_loss` had 12/20 non-null samples per arm — a real
+  comparison this time.
+  - **Result: Qwen3 wins on `mean_proj_loss`, consistently.** Treatment sits below control at every
+    comparable point across the whole campaign (session 1: 0.00190 vs 0.00223 → session 5: 0.00120
+    vs 0.00155, a ~22% final gap), no reversals. `per_region_mse[language]` is directionally
+    consistent (0.0010 vs 0.0011). `warm_recall_l2` came back close this time (0.48 vs 0.47),
+    supporting take 1's read that its earlier gap there was seed noise, not signal.
+  - **Verdict: worth adopting Qwen3-0.6B** for the action-decoder LM, on the strength of this result
+    — recommend confirming with a longer run and/or a direct generation-quality test (drop
+    `--action-distill-only`) before flipping the default build. Full writeup:
+    `ai-docs/a_b_qwen3_findings.md`.
+  - The Whisper ASR panic recurred more often on this denser corpus (~1 crash/5 sessions control,
+    ~3/5 treatment) — still no data loss (20/20 cycles present both arms), still unrelated to this
+    work, but now more worth fixing given how often it's showing up.
 
 **Remaining (non-critical):**
 - ⚠️ LoRA training: Blocked on CPU (PyTorch/HF compatibility)
-  - Base-model A/B sufficient for architecture validation
-  - Can retry with GPU or alternative backend if needed
+  - Not worth pursuing until the A/B redo above establishes a real base-model signal
 - ⚠️ KV-cache export: Optional optimization
   - Base model functional without it
 
@@ -121,30 +165,22 @@
 
 ---
 
-## 6. Visual encoder: DINOv3-ViT-S (drop-in candidate) ⏸️ BLOCKED
+## 6. Visual encoder: DINOv3-ViT-S (drop-in candidate) ✅ VALIDATED & ADOPTED (2026-07-05)
 
 **Source:** Meta, August 2025, arXiv:2508.10104.
 
 **What:** Distilled from a 7B ViT teacher. ~21M params — same as DINOv2-S. Output dim: **384 — identical to current DINOv2-S/14 (true drop-in)**. ImageNet-1k linear probe: 81.40% vs DINOv2-S 81.1% (marginal improvement).
 
-**Status:** ONNX export successful; **GPU-only** (ORT/MIGraphX CPU backend fails at graph execution).
-- Export: ✅ Complete (dinov3_small.onnx + .data file, 122 KB + 83 MB)
-- CPU inference: ❌ MIGraphX fails with "Non-zero status code returned while running MGXKernel_..."
-- Fallback: DINOv2-S (82–85 ms encode time, stable)
-- Workaround: Disabled DINOv3, using DINOv2 for all validation
+**Status:** Working on the MIGraphX GPU EP (AMD RX 9070 XT / gfx1201). The earlier "GPU-only, MIGraphX CPU backend can't compile DINOv3's attention graph" conclusion (2026-06-28) was **wrong** — that write-up was based on a misread error. Root cause and fix:
 
-**Root cause:** MIGraphX CPU backend cannot compile/execute DINOv3's ViT attention graph. Likely requires:
-- GPU execution (CUDA/ROCm backend, not available in test environment)
-- Alternative ONNX backend (fallback CPU ops insufficient)
-- Graph rewrite/operator fusion for CPU compatibility
+- `torch.onnx.export` wrote `dinov3_small.onnx` in external-data format (weights in a sibling `.data` file), unlike `dinov2_small.onnx` which embeds weights inline. Nothing in the export code explains the difference; not investigated further since the fix below makes it moot.
+- The MIGraphX EP resolves that external-data reference relative to the **process's CWD**, not the model file's directory. Running from anywhere except `models/` produced `generic_read_file: Failure opening file: dinov3_small.onnx.data`, surfaced by ORT as the more opaque `MGXKernel_graph_main_graph_..." Failed to call function`.
+- Confirmed live: `experiments/ort-smoke` loaded and ran DINOv3 correctly on MIGraphX from `models/` as CWD, and failed with the exact error above from any other CWD.
+- **Fix:** `scripts/export_models.py`'s `export_dinov3()` now re-packs the model with `onnx.load(..., load_external_data=True)` / `onnx.save(..., save_as_external_data=False)`, embedding all weights into the single `.onnx` file (matching DINOv2's layout) so there's no CWD dependency.
 
-**Recommendation:**
-- **Short term:** Keep DINOv2 fallback; flag as architecture limitation
-- **Medium term:** Test on GPU system if available; document GPU requirement
-- **Deferred:** Post-Phase 2; escalate to ORT/MIGraphX team if GPU unavailable
-- **Alternative:** Item K (SigLIP2, not yet implemented) may have better CPU compatibility
+**Separate real finding (not a bug, a shape difference):** DINOv3-ViT-S/16 outputs `[1, 201, 384]` — CLS + 4 register tokens + 196 patches (14×14 @ patch16) — vs DINOv2-S/14's `[1, 257, 384]` (CLS + 256 patches, 16×16 @ patch14). Token order is `[CLS, register×4, patch...]` (`transformers/models/dinov3_vit/modeling_dinov3_vit.py`, `torch.cat([cls_token, register_tokens, patch_embeddings])`). `crates/somnus-encoding/src/video.rs` (`VideoEncoder`) now tracks `prefix_tokens`/`total_tokens` per model and skips the correct prefix before mean-pooling — previously it hardcoded "skip 1 token, pool 256," which is DINOv2-only.
 
-**Note:** This is **not** a model quality issue; it's a CPU inference compatibility issue specific to this ORT/MIGraphX deployment.
+**Status now:** DINOv3 is a real drop-in (identical 384-dim output). The A/B run in `ai-docs/a_b_qwen3_findings.md` used DINOv2 for both arms due to this now-fixed bug. A proper DINOv3-vs-DINOv2 A/B was run 2026-07-05 (`ai-docs/a_b_dinov3_findings.md`): visual-region reconstruction MSE dropped ~95.6% (2.183 → 0.097) and memory retrieval quality (warm_recall_l2) improved +61.5%, with no change to unrelated regions (speech/env/language) — a clean, large, correctly-localized win. DINOv3 is already the active encoder (`VideoEncoder::new` prefers it whenever present); no further rollout action needed.
 
 ---
 
@@ -262,8 +298,8 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | ✅ 1 | **BatchTopK SAE** | Low | Sparse coding quality | Deployed (25d7496) |
 | 2 | **High replay ratio A/B** (N=4) | Trivial | Consolidation quality | Queued |
 | 4 | **Remove dead candle deps** | Trivial | Cleanliness | Queued |
-| 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | Deferred |
-| 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deferred |
+| 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | A/B favors Qwen3 on proj_loss (clips/long redo, 2026-07-05) — worth adopting, confirm w/ longer run |
+| ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
 | 7 | **DER++ stale-output blocking** | Low–Med | Replay consolidation | Deferred |
 | 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | Deferred |
 | 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Deferred |

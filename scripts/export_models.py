@@ -204,6 +204,20 @@ def export_dinov3() -> None:
             dynamic_axes={"pixel_values": {0: "batch"}, "last_hidden_state": {0: "batch"}},
             opset_version=17,
         )
+
+    # torch.onnx.export writes this one as external-data (unlike dinov2, despite
+    # similar size); the MIGraphX EP resolves that external-data path relative to
+    # the process CWD rather than the model file's directory, so it fails to load
+    # unless the process happens to be running from models/. Re-pack as a single
+    # self-contained file to remove that fragility.
+    import onnx
+
+    model_proto = onnx.load(str(out), load_external_data=True)
+    onnx.save(model_proto, str(out), save_as_external_data=False)
+    data_file = out.with_name(out.name + ".data")
+    if data_file.exists():
+        data_file.unlink()
+
     report(out)
 
 
@@ -450,28 +464,105 @@ def export_qwen25() -> None:
 
 
 def export_qwen3() -> None:
-    """Export Qwen3-0.6B embed table (base model already exported to qwen3_lm_base.onnx)."""
+    """Export Qwen3-0.6B with the same GPU-path completeness as export_qwen25():
+    qwen3_gain.onnx, qwen3_text_hidden.onnx, qwen3_lm.onnx (dynamic, CPU generation
+    path), qwen3_lm_fixed.onnx, embed table, tokenizer.
+
+    Uses Qwen3ForCausalLM (not Qwen2ForCausalLM — Qwen3 has QK-norm layers Qwen2
+    doesn't, so loading its weights into a Qwen2 architecture silently drops them).
+    """
+    gain_out = MODELS_DIR / "qwen3_gain.onnx"
+    lm_out = MODELS_DIR / "qwen3_lm.onnx"
+    lm_fixed_out = MODELS_DIR / "qwen3_lm_fixed.onnx"
+    text_hidden_out = MODELS_DIR / "qwen3_text_hidden.onnx"
     embed_out = MODELS_DIR / "qwen3_embed_table.safetensors"
     tok_out = MODELS_DIR / "qwen3_tokenizer.json"
 
-    if embed_out.exists() and tok_out.exists():
+    if (gain_out.exists() and lm_out.exists() and lm_fixed_out.exists()
+            and text_hidden_out.exists() and embed_out.exists() and tok_out.exists()):
         print(f"  skip: qwen3 artifacts already present")
         return
 
-    from transformers import Qwen2ForCausalLM, AutoTokenizer
+    from transformers import Qwen3ForCausalLM, AutoTokenizer
     import safetensors.torch as st
 
     repo, rev = REVISIONS["qwen3"]
     print(f"  loading {repo} @ {rev or 'main'}…")
-    model = Qwen2ForCausalLM.from_pretrained(repo, revision=rev, torch_dtype=torch.float32).eval()
+    model = Qwen3ForCausalLM.from_pretrained(repo, revision=rev, torch_dtype=torch.float32).eval()
     tokenizer = AutoTokenizer.from_pretrained(repo, revision=rev)
 
     assert model.config.tie_word_embeddings, (
-        "qwen3_lm base model requires tied embeddings (lm_head == embed_tokens) "
+        "qwen3_lm_fixed GPU path requires tied embeddings (lm_head == embed_tokens) "
         "so Rust can compute logits using the already-loaded embed_table."
     )
 
     hidden_size = model.config.hidden_size  # 1024 for Qwen3-0.6B
+
+    n_regions = 5  # must match N_REGIONS in crates/somnus/src/action.rs
+    if not gain_out.exists():
+        gain_wrapper = Qwen25GainWrapper(model).eval()
+        dummy_gain = torch.zeros(1, n_regions, hidden_size)
+        print(f"  exporting qwen3_gain.onnx (static [1,{n_regions},{hidden_size}], no LM head)…")
+        with torch.no_grad():
+            torch.onnx.export(
+                gain_wrapper,
+                dummy_gain,
+                str(gain_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state"],
+                opset_version=17,
+            )
+        report(gain_out)
+
+    if not text_hidden_out.exists():
+        text_hidden_wrapper = Qwen25GainWrapper(model).eval()
+        dummy_text = torch.zeros(1, MAX_TEXT_SEQ, hidden_size)
+        print(f"  exporting qwen3_text_hidden.onnx (static [1,{MAX_TEXT_SEQ},{hidden_size}], no LM head)…")
+        with torch.no_grad():
+            torch.onnx.export(
+                text_hidden_wrapper,
+                dummy_text,
+                str(text_hidden_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state"],
+                opset_version=17,
+            )
+        report(text_hidden_out)
+
+    if not lm_out.exists():
+        wrapper = Qwen25LMWrapper(model).eval()
+        dummy = torch.zeros(1, 4, hidden_size)
+        print(f"  exporting qwen3_lm.onnx (hidden_size={hidden_size})…")
+        with torch.no_grad():
+            torch.onnx.export(
+                wrapper,
+                dummy,
+                str(lm_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state", "logits"],
+                dynamic_axes={
+                    "inputs_embeds":      {0: "batch", 1: "seq_len"},
+                    "last_hidden_state":  {0: "batch", 1: "seq_len"},
+                    "logits":             {0: "batch", 1: "seq_len"},
+                },
+                opset_version=17,
+            )
+        report(lm_out)
+
+    if not lm_fixed_out.exists():
+        lm_fixed_wrapper = Qwen25GainWrapper(model).eval()
+        dummy_lm_fixed = torch.zeros(1, MAX_GEN_SEQ, hidden_size)
+        print(f"  exporting qwen3_lm_fixed.onnx (static [1,{MAX_GEN_SEQ},{hidden_size}], no LM head)…")
+        with torch.no_grad():
+            torch.onnx.export(
+                lm_fixed_wrapper,
+                dummy_lm_fixed,
+                str(lm_fixed_out),
+                input_names=["inputs_embeds"],
+                output_names=["last_hidden_state"],
+                opset_version=17,
+            )
+        report(lm_fixed_out)
 
     if not embed_out.exists():
         print(f"  saving qwen3_embed_table.safetensors…")

@@ -29,11 +29,22 @@ use ort::{
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 
+/// LM hidden dimension — compile-time choice, not a runtime one (see the `qwen3` feature
+/// in Cargo.toml and ai-docs/a_b_qwen3_findings.md). Must match the model files loaded
+/// via --action-model-prefix and somnus-perception's LANG_HIDDEN/REGION_DIMS.
+#[cfg(not(feature = "qwen3"))]
+pub const LM_HIDDEN: usize = 896; // Qwen2.5-0.5B hidden dimension
+#[cfg(feature = "qwen3")]
 pub const LM_HIDDEN: usize = 1024; // Qwen3-0.6B hidden dimension
 pub const N_REGIONS: usize = 5;
 const EPISODE_DIM: usize = 640;
 const PROJ_LR: f64 = 1e-4;
+// Qwen2.5 base and Qwen3 base use different EOS token ids (verified against each
+// tokenizer's eos_token_id): Qwen2.5 stops on <|endoftext|>, Qwen3 on <|im_end|>.
+#[cfg(not(feature = "qwen3"))]
 const EOS_TOKEN_ID: u32 = 151643; // Qwen2.5 base EOS (<|endoftext|>)
+#[cfg(feature = "qwen3")]
+const EOS_TOKEN_ID: u32 = 151645; // Qwen3 base EOS (<|im_end|>)
 /// Fixed sequence length for the GPU text-hidden-state path (qwen25_text_hidden.onnx).
 /// Must match MAX_TEXT_SEQ in scripts/export_models.py.
 const MAX_TEXT_SEQ: usize = 128;
@@ -207,17 +218,23 @@ impl ActionDecoder {
     ///
     /// `ort_profile_dir`: when `Some`, enables ORT Chrome-trace profiling for
     /// lm_session (CPU). Call `end_profiling()` before process exit to flush.
+    ///
+    /// `model_prefix`: filename prefix for all action-decoder model artifacts
+    /// (e.g. "qwen25" or "qwen3") — control and treatment A/B arms must use
+    /// distinct prefixes so their files can never cross-contaminate each other
+    /// (see the ai-docs/a_b_qwen3_findings.md file-swap incident this replaces).
     pub fn new(
         models_dir: &std::path::Path,
         device: NdArrayDevice,
         ort_profile_dir: Option<&std::path::Path>,
         gpu_generation: bool,
         linear_proj: bool,
+        model_prefix: &str,
     ) -> Result<Self> {
-        let gain_path = models_dir.join("qwen25_gain.onnx");
-        let lm_path = models_dir.join("qwen25_lm.onnx");
-        let embed_path = models_dir.join("qwen25_embed_table.safetensors");
-        let tok_path = models_dir.join("qwen25_tokenizer.json");
+        let gain_path = models_dir.join(format!("{model_prefix}_gain.onnx"));
+        let lm_path = models_dir.join(format!("{model_prefix}_lm.onnx"));
+        let embed_path = models_dir.join(format!("{model_prefix}_embed_table.safetensors"));
+        let tok_path = models_dir.join(format!("{model_prefix}_tokenizer.json"));
         for p in [&gain_path, &lm_path, &embed_path, &tok_path] {
             if !p.exists() {
                 bail!("action decoder model file not found: {}", p.display());
@@ -225,40 +242,40 @@ impl ActionDecoder {
         }
 
         let gain_session = Some(crate::migraphx_session(&gain_path)?);
-        let lm_profile_prefix = ort_profile_dir.map(|d| d.join("qwen25_lm"));
+        let lm_profile_prefix = ort_profile_dir.map(|d| d.join(format!("{model_prefix}_lm")));
         let lm_session = crate::cpu_session(&lm_path, lm_profile_prefix.as_deref())?;
-        let text_hidden_path = models_dir.join("qwen25_text_hidden.onnx");
+        let text_hidden_path = models_dir.join(format!("{model_prefix}_text_hidden.onnx"));
         let text_hidden_session = if text_hidden_path.exists() {
             tracing::info!(
-                "loading qwen25_text_hidden.onnx — GPU path active for distillation targets"
+                "loading {model_prefix}_text_hidden.onnx — GPU path active for distillation targets"
             );
             Some(crate::migraphx_session(&text_hidden_path)?)
         } else {
             tracing::info!(
-                "qwen25_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session"
+                "{model_prefix}_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session"
             );
             None
         };
-        let lm_fixed_path = models_dir.join("qwen25_lm_fixed.onnx");
+        let lm_fixed_path = models_dir.join(format!("{model_prefix}_lm_fixed.onnx"));
         let lm_fixed_session = if gpu_generation && lm_fixed_path.exists() {
             tracing::info!(
-                "loading qwen25_lm_fixed.onnx — GPU generation path active (--gpu-generation)"
+                "loading {model_prefix}_lm_fixed.onnx — GPU generation path active (--gpu-generation)"
             );
             Some(crate::migraphx_session(&lm_fixed_path)?)
         } else if gpu_generation {
             tracing::info!(
-                "qwen25_lm_fixed.onnx absent — --gpu-generation ignored, using CPU lm_session"
+                "{model_prefix}_lm_fixed.onnx absent — --gpu-generation ignored, using CPU lm_session"
             );
             None
         } else {
-            tracing::info!("generate() using CPU lm_session (pass --gpu-generation to use qwen25_lm_fixed.onnx)");
+            tracing::info!("generate() using CPU lm_session (pass --gpu-generation to use {model_prefix}_lm_fixed.onnx)");
             None
         };
 
-        let prefill_kv_int8 = models_dir.join("qwen25_lm_prefill_kv_int8.onnx");
-        let decode_kv_int8 = models_dir.join("qwen25_lm_decode_kv_int8.onnx");
-        let prefill_kv_fp32 = models_dir.join("qwen25_lm_prefill_kv.onnx");
-        let decode_kv_fp32 = models_dir.join("qwen25_lm_decode_kv.onnx");
+        let prefill_kv_int8 = models_dir.join(format!("{model_prefix}_lm_prefill_kv_int8.onnx"));
+        let decode_kv_int8 = models_dir.join(format!("{model_prefix}_lm_decode_kv_int8.onnx"));
+        let prefill_kv_fp32 = models_dir.join(format!("{model_prefix}_lm_prefill_kv.onnx"));
+        let decode_kv_fp32 = models_dir.join(format!("{model_prefix}_lm_decode_kv.onnx"));
         let (prefill_kv_session, decode_kv_session) = if prefill_kv_int8.exists()
             && decode_kv_int8.exists()
         {

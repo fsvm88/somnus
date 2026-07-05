@@ -75,3 +75,15 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0021](0021-cross-modal-gist-entropy.md) | Cross-modal gist entropy: ingest_source and concept probe | accepted |
 | [0022](0022-instrumentation-metrics-expansion.md) | Instrumentation and metrics expansion: salience, blend, modality, NREM coverage | accepted |
 | [0023](0023-gpu-unification.md) | GPU unification: ORT/MIGraphX for perception inference | proposed |
+| [0024](0024-neuromodulatory-self-regulation.md) | Neuromodulatory self-regulation: derived signals replace fixed thresholds | accepted |
+| [0025](0025-sae-l1-coding-loss.md) | SAE L1 coding loss | closed — not adopted |
+| [0026](0026-pruning-ab-distribution-shift.md) | A/B: magnitude pruning safety under distribution shift | closed — FAIL, pruning disabled by default |
+| [0027](0027-per-region-prior-beta.md) | Per-region prior beta (Item G) | closed — FAIL (gist regression) |
+| [0028](0028-memory-recall-in-generation.md) | Memory recall in generation (R1) | accepted |
+| [0029](0029-multi-turn-conversation.md) | Multi-turn conversation (R2) | accepted |
+| [0030](0030-r3-introspection-text-history.md) | R3 Phase 1: introspection via recent text history | accepted |
+| [0031](0031-gpu-generation-fixed-shape-lm.md) | GPU generation via fixed-shape LM (qwen25_lm_fixed.onnx) | accepted |
+| [0032](0032-mlp-projection.md) | MLP projection (640→1024→5×896, ADR 0012 item M) | accepted |
+| [0033](0033-lora-qwen-finetuning.md) | LoRA fine-tuning of Qwen2.5-0.5B on episode prefixes (ADR 0012 item L) | validated and deployed |
+| [0034](0034-kv-cache-generation.md) | KV-cache split prefill/decode generation (generation speedup) | implemented |
+| [0035](0035-qwen3-hidden-size-compile-time.md) | LM hidden size (Qwen2.5 vs Qwen3) is a compile-time choice, not runtime | implemented |

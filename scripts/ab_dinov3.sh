@@ -10,10 +10,13 @@ MODELS_DIR="$REPO_ROOT/models"
 SESSIONS="${SESSIONS:-5}"
 CYCLES="${CYCLES:-2}"
 
-echo "=== DINOv3-ViT-S A/B Validation ==="
+CONTROL_DIR="$REPO_ROOT/memory/dinov3_ab_control"
+TREATMENT_DIR="$REPO_ROOT/memory/dinov3_ab_treatment"
+
+echo "=== DINOv3-ViT-S A/B Validation (Item 6) ==="
 echo ""
 echo "Setup: Control=DINOv2-S, Treatment=DINOv3-ViT-S"
-echo "Sessions: $SESSIONS × $CYCLES cycles"
+echo "Sessions: $SESSIONS × $CYCLES cycles each"
 echo ""
 
 if [ ! -f "$MODELS_DIR/dinov3_small.onnx" ]; then
@@ -21,27 +24,54 @@ if [ ! -f "$MODELS_DIR/dinov3_small.onnx" ]; then
     exit 1
 fi
 
-# Control: temporarily hide dinov3
+mkdir -p "$CONTROL_DIR" "$TREATMENT_DIR"
+
+# VideoEncoder::new() prefers dinov3_small.onnx when present (crates/somnus-encoding/src/video.rs),
+# so the control run temporarily hides it to force the DINOv2 fallback path.
 echo "Running control (DINOv2-S)..."
 mv "$MODELS_DIR/dinov3_small.onnx" "$MODELS_DIR/.dinov3_small.onnx.bak"
-"$REPO_ROOT/target/release/somnus" \
-    --sessions "$SESSIONS" \
-    --cycles "$CYCLES" \
-    2>&1 | tail -50
-
-# Restore dinov3 and hide dinov2
+for i in $(seq 1 "$SESSIONS"); do
+    "$REPO_ROOT/target/release/somnus" \
+        --file-loop \
+        --file clips/talking_head.mp4 \
+        --file clips/urban.mp4 \
+        --file clips/animation.mp4 \
+        --file clips/nature.mp4 \
+        --language \
+        --action \
+        --action-distill-only \
+        --lang-use-lm \
+        --memory-dir "$CONTROL_DIR" \
+        --session "$i" \
+        --max-sleep-cycles "$CYCLES" \
+        --metrics-file "$CONTROL_DIR/metrics.jsonl" \
+        2>&1 | tail -10
+done
 mv "$MODELS_DIR/.dinov3_small.onnx.bak" "$MODELS_DIR/dinov3_small.onnx"
-mv "$MODELS_DIR/dinov2_small.onnx" "$MODELS_DIR/.dinov2_small.onnx.bak"
 
 echo ""
 echo "Running treatment (DINOv3-ViT-S)..."
-"$REPO_ROOT/target/release/somnus" \
-    --sessions "$SESSIONS" \
-    --cycles "$CYCLES" \
-    2>&1 | tail -50
-
-# Restore dinov2
-mv "$MODELS_DIR/.dinov2_small.onnx.bak" "$MODELS_DIR/dinov2_small.onnx"
+for i in $(seq 1 "$SESSIONS"); do
+    "$REPO_ROOT/target/release/somnus" \
+        --file-loop \
+        --file clips/talking_head.mp4 \
+        --file clips/urban.mp4 \
+        --file clips/animation.mp4 \
+        --file clips/nature.mp4 \
+        --language \
+        --action \
+        --action-distill-only \
+        --lang-use-lm \
+        --memory-dir "$TREATMENT_DIR" \
+        --session "$i" \
+        --max-sleep-cycles "$CYCLES" \
+        --metrics-file "$TREATMENT_DIR/metrics.jsonl" \
+        2>&1 | tail -10
+done
 
 echo ""
-echo "✓ Complete — compare memory/{control,treatment} logs for parity"
+echo "=== Results ==="
+echo "Control (DINOv2-S):   $CONTROL_DIR/metrics.jsonl"
+echo "Treatment (DINOv3-S): $TREATMENT_DIR/metrics.jsonl"
+echo ""
+echo "✓ A/B complete. Compare warm_recall_l2, mean_output_mse across cycles."
