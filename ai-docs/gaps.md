@@ -169,6 +169,14 @@
   - Not worth pursuing until it's clear the base model needs more than distillation training
 - ⚠️ KV-cache export: Optional optimization
   - Base model functional without it
+- ✅ Whisper `decode_greedy` intermittent ORT panic ("GetElementType is not implemented") — mitigated
+  2026-07-05: the ASR background thread (`crates/somnus/src/main.rs`) now wraps the `decode_greedy`
+  call in `std::panic::catch_unwind`, so a panic no longer silently kills the whole ASR thread for
+  the rest of the session. **Unverified caveat:** if the underlying ORT panic leaves the `Session`
+  itself poisoned, every subsequent call on that same session could panic too — in which case this
+  fix degrades "ASR dies silently forever" to "ASR logs a WARN and drops every cycle," not full
+  recovery. Only reproducing the intermittent panic would confirm which case it is; not done here.
+  The underlying ORT bug (why the panic happens at all) is still not diagnosed.
 
 **Metrics being collected (per cycle):**
 - `output_mse` — reconstruction error

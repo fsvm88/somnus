@@ -1423,20 +1423,29 @@ async fn main() -> Result<()> {
             std::thread::spawn(move || {
                 let mut dec = dec;
                 while let Ok(hidden) = rx.recv() {
-                    match dec.decode_greedy(&hidden, 200) {
-                        Ok(text) if text.len() >= asr_min_chars.max(1) => {
+                    // ORT's Whisper decoder occasionally panics instead of returning Err
+                    // (e.g. "GetElementType is not implemented") — an intermittent, unfixed
+                    // ORT-side issue (see ai-docs/a_b_qwen3_findings.md). catch_unwind stops
+                    // that from silently killing this thread and ending ASR for the rest of
+                    // the session; we just drop the one bad cycle and keep decoding.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        dec.decode_greedy(&hidden, 200)
+                    }));
+                    match result {
+                        Ok(Ok(text)) if text.len() >= asr_min_chars.max(1) => {
                             tracing::info!(chars = text.len(), "whisper ASR");
                             asr_cnt.fetch_add(1, Ordering::Relaxed);
                             let _ = lang_tx_asr.blocking_send(text);
                         }
-                        Ok(text) if !text.is_empty() => {
+                        Ok(Ok(text)) if !text.is_empty() => {
                             tracing::debug!(
                                 chars = text.len(),
                                 "whisper ASR filtered (below min_chars)"
                             );
                         }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(?e, "whisper ASR failed"),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(?e, "whisper ASR failed"),
+                        Err(_) => tracing::warn!("whisper ASR panicked — dropping this cycle"),
                     }
                 }
             });
