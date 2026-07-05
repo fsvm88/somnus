@@ -1,15 +1,35 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-05 (Qwen3 A/B redo take 2: Qwen3 wins on proj_loss, consistently)
+> **Last updated:** 2026-07-05 (Qwen3 adopted as sole LM, Qwen2.5 dropped; gen-quality confirmed;
+> Whisper ASR panic mitigated)
 > **Branch:** `main`
-> **Status:** DINOv3 done. Qwen3 pipeline fully fixed (3 real bugs found+fixed). Take 1 of the
-> real A/B (standard 4-clip corpus) was inconclusive — too little speech. Take 2, on a
-> speech-dense `clips/long/` lecture/podcast corpus, gave a real, fair comparison: Qwen3 shows
-> a consistent ~22% lower `mean_proj_loss` than Qwen2.5 by the end of a 5-session campaign, no
-> reversals. Recommend adopting Qwen3-0.6B for the action-decoder LM, pending a longer
-> confirmation run or a direct generation-quality test. Full results:
-> `ai-docs/a_b_qwen3_findings.md`. Nothing queued; next step is user-driven (confirm-and-adopt,
-> or move to a different backlog item).
+> **Status:** DINOv3 done (validated, already active). Qwen3 A/B done in three takes (take 1
+> inconclusive, take 2 speech-dense corpus favored Qwen3 on proj_loss, take 3 direct
+> generation-quality test confirmed it — coherent English vs. Qwen2.5's incoherent token salad).
+> **Adopted Qwen3-0.6B as the only action-decoder LM (ADR 0036) — Qwen2.5 support fully removed**
+> (`qwen3`/`qwen3_hidden` Cargo features deleted, `LM_HIDDEN`/`LANG_HIDDEN`/`LANG_DIM`/
+> `EOS_TOKEN_ID` hardcoded to Qwen3's values, `--action-model-prefix` defaults to `"qwen3"`).
+> Also fixed a latent bug (hardcoded `qwen25_*` filenames in the `--language` startup check,
+> inconsistent with every other model-loading call site) and mitigated the intermittent Whisper
+> `decode_greedy` ORT panic (`catch_unwind` around the decode call — stops it from silently
+> killing the whole ASR thread; unverified whether it fully recovers or just downgrades to a
+> per-cycle WARN, see caveat in `ai-docs/gaps.md` §5). All docs in sync: `ai-docs/architecture.md`
+> + `.svg` (cross-modal dim 1280+1024=2304, was a 2176/2304 toggle), `ai-docs/gaps.md` §5,
+> ADR 0035 (superseded) + new ADR 0036. Full results in `ai-docs/a_b_qwen3_findings.md`
+> ("Take 3" section is the newest).
+>
+> **Working tree has uncommitted changes from this session** — not committed yet (user hasn't
+> asked). Touches: `crates/somnus/{Cargo.toml,src/action.rs,src/main.rs}`,
+> `crates/somnus-perception/{Cargo.toml,src/lib.rs}`, `ai-docs/{architecture.md,architecture.svg,
+> gaps.md,a_b_qwen3_findings.md,decisions/0035-*.md}`, new `ai-docs/decisions/0036-*.md`. Build/
+> clippy/tests all pass (`cargo build/clippy/test --release -p somnus -p somnus-perception`), smoke
+> session verified clean.
+>
+> **Queue this session, in order — all resolved:** 1. adopt Qwen3 + drop Qwen2.5 ✅ done.
+> 2. longer confirmation campaign — **skipped, user-confirmed** (premise changed: take 3 already
+> confirms the decision, Qwen2.5 no longer exists in the tree to re-A/B against). 3. direct
+> generation-quality test ✅ done (take 3, this session). 4. fix Whisper `decode_greedy` panic
+> ✅ mitigated (not root-caused — see caveat above). **Queue is empty. Nothing pending.**
 
 ---
 
@@ -138,59 +158,63 @@ which it now is) — **no rollout action needed, this A/B validates what's alrea
 
 ---
 
-## 🚧 QUEUED: Qwen3 — original A/B was invalid, needs a proper redo (not started)
+## ✅ DONE: the above redo plan — fully executed, then graduated to adoption (2026-07-05)
 
-**The 2026-06-28 "-9.6%" finding (`ai-docs/a_b_qwen3_findings.md`) does not mean what it says.**
-Discovered 2026-07-05 while investigating unrelated ort-smoke test output: the language-embedding
-pipeline has been silently corrupted since commit `6335b42` (2026-06-27, "prepare for
-Qwen3-0.6B"), which bumped `LM_HIDDEN` in `crates/somnus/src/action.rs` from 896 → 1024 as a global
-constant. `embed_flat()` (`action.rs:1207`) slices `self.embed_table` at stride `LM_HIDDEN`, but
-`self.embed_table` is *always* loaded from `qwen25_embed_table.safetensors`
-(`action.rs:219`, hardcoded), which is Qwen2.5's real 896-wide table. 1024-stride reads into an
-896-wide table are misaligned for every token — silent, not a crash (vocab is large enough that
-this rarely goes out of bounds). **Both arms of the original A/B were fed corrupted embeddings**;
-neither result reflects the real architectures. On top of that, Qwen3 never got matching GPU-path
-exports (`qwen3_gain.onnx` / `qwen3_text_hidden.onnx` / `qwen3_lm_fixed.onnx` don't exist — only a
-bare `qwen3_lm_base.onnx`), so it was piggybacking on `ab_qwen3.sh`'s file-swap trick the whole
-time. That swap's "restore" step also silently failed: `models/qwen25_lm.onnx` on disk right now
-**is** the Qwen3 model (confirmed: byte-identical size to `qwen3_lm_base.onnx`/`.data`, declares an
-`input_ids`/1024-dim interface, not Qwen2.5's `inputs_embeds`/896-dim one). This currently breaks
-real (non-`--action-distill-only`) generation on `main`.
+The five-step redo plan that used to live in this section (restore Qwen2.5 integrity, give Qwen3 a
+complete export, parameterize the model-file prefix, build two separate release binaries, cold-start
+and compare) is exactly what the "DONE: Qwen3 redo" section above records, in takes 1 and 2. It's
+kept here only as a one-line pointer since the detailed plan is now historical: see
+`ai-docs/a_b_qwen3_findings.md` and ADR 0035 for what actually happened.
 
-Neither the original Qwen3 A/B nor this session's DINOv3 A/B visibly hit errors from this, because
-both used `--action-distill-only` (skips `generate()`, the one path that calls the broken
-`lm_session` directly) and `--lang-use-lm` prefers the separate, untouched, still-correct
-`qwen25_text_hidden.onnx` for embedding text. **The DINOv3 finding is unaffected** — visual-region
-MSE and warm_recall_l2 gains are orthogonal to this bug. The Qwen3 comparison is the only casualty.
+**This session (continuing from take 2) went one step further and closed the loop:**
 
-**Decision (2026-07-05): worth a real, valid test** — this isn't "Qwen3 was tried and lost," it's
-"Qwen3 was never actually tested." Queued fix + redo plan, not started, roughly in order:
+1. **Adopted Qwen3-0.6B as the sole action-decoder LM, dropped Qwen2.5 (ADR 0036).** Removed the
+   `qwen3` (somnus) / `qwen3_hidden` (somnus-perception) Cargo features entirely — CLAUDE.md's "don't use
+   feature flags when you can just change the code" plus no backward-compat requirement made this
+   the right call once the A/B question was answered, rather than flipping a default and keeping
+   Qwen2.5 as a dead option. `LM_HIDDEN`/`LANG_HIDDEN`/`LANG_DIM`/`EOS_TOKEN_ID` are now hardcoded
+   to Qwen3's values (1024, 151645). `--action-model-prefix` defaults unconditionally to `"qwen3"`.
+   Found and fixed one latent bug while de-cfg'ing: the `--language` startup file-existence check in
+   `main.rs` had hardcoded `qwen25_*` filenames regardless of `--action-model-prefix`, unlike every
+   other model-loading call site — now derives from `args.action_model_prefix` like the rest.
+   Left the two cumulative cross-modal offset tables in `somnus-perception/src/lib.rs` untouched (the
+   `896` there is `384+512`, a coincidental collision with the old LM hidden dim, not a reference to
+   it) — this was exactly the kind of literal a careless find-replace would have broken.
+   `ai-docs/architecture.md`/`.svg` updated (cross-modal dim 1280+1024=2304, was a 2176/2304
+   feature-gated toggle). Verified: `cargo build/clippy/test --release -p somnus -p somnus-perception`
+   all clean, plus a live smoke session (`--action-distill-only`, ~50s) and a `generate()` smoke
+   test — no dimension-mismatch panics either way.
 
-1. **Restore integrity first:** re-export a genuine Qwen2.5 `qwen25_lm.onnx` (currently mislabeled
-   Qwen3 weights) so there's a trustworthy baseline again.
-2. **Give Qwen3 a complete export**, matching Qwen2.5's GPU-path completeness: `qwen3_gain.onnx`,
-   `qwen3_text_hidden.onnx`, `qwen3_lm_fixed.onnx` (mirror `export_qwen25()` in
-   `scripts/export_models.py`, parameterized for Qwen3's hidden_size=1024). Reuse existing
-   `qwen3_embed_table.safetensors` / `qwen3_tokenizer.json` if still valid, else regenerate.
-3. **Stop hardcoding `qwen25_*` filenames** in `ActionDecoder::new` (`action.rs:217-220`) —
-   parameterize the model-file prefix (CLI flag or constructor arg) so control/treatment runs
-   can never cross-contaminate each other's files the way the file-swap trick did.
-4. **Two separate release builds, not a runtime toggle.** `LM_HIDDEN` (896 vs 1024) cascades into
-   `REGION_DIMS`/`CROSS_MODAL_DIM`/projection-layer shapes in both `somnus` and `somnus-perception` —
-   this is a compile-time architecture choice and a cold-start for the projection/SAE weights
-   either way (already true per the original commit message), not something to hot-swap. Build one
-   binary at `LM_HIDDEN=896` against real Qwen2.5 files (control), one at `1024` against real
-   Qwen3 files (treatment).
-5. **Cold-start both and let them actually converge** before comparing — the invalidated run only
-   used 2 NREM cycles per session, likely too short to fairly judge a bigger model. Plan for a
-   longer run than the original A/B.
+2. **Direct generation-quality confirmation ("take 3"), same day.** Since both Cargo features were
+   gone from the working tree, used a `git worktree` at the last commit that still had both
+   (`c86cfdf`) to build one `somnus-qwen25-control` and one `somnus-qwen3-treatment` binary — cleaner than
+   comparing working-tree-Qwen3 against a different commit's Qwen2.5, since the LM choice stays the
+   only variable. Ran both against `clips/talking_head.mp4` (`--file-loop`, needed because
+   non-looping `--file` mode decodes faster than realtime and the process exits before episodes
+   finish forming — a real gotcha worth remembering for future ad hoc comparisons), each pointed at
+   its own take-2 trained memory dir (`qwen25_ab_control_longclips` / `qwen3_ab_treatment_longclips`,
+   copied to scratch first so originals are untouched), same three prompts via delayed stdin.
+   **Result: Qwen3 generates coherent, grammatical, on-topic English; Qwen2.5 generates incoherent
+   mixed-script token garbage — consistently, across every prompt and repeat run.** Confirms take
+   2's `mean_proj_loss` gap reflects real, user-visible generation quality, not just a lower
+   surrogate loss. Full transcript-level detail: `ai-docs/a_b_qwen3_findings.md` ("Take 3").
+   Cleanup done: worktree removed, temp binaries/memory dirs deleted.
 
-Also still on the table once this is done: **Option D, Qwen2.5-0.5B-Instruct** — cheap,
-same 896-dim architecture as the (correctly restored) Qwen2.5 baseline, no cold-start needed. Can
-run this independently of the Qwen3 redo above, on whichever build has real Qwen2.5 weights.
+3. **Mitigated the intermittent Whisper `decode_greedy` ORT panic** flagged (not fixed) in take 2.
+   The ASR background thread in `main.rs` now wraps `decode_greedy` in `std::panic::catch_unwind`,
+   so a panic no longer silently kills the whole ASR thread for the rest of the session — it logs a
+   WARN and the loop continues. **Unverified caveat:** if the underlying ORT panic leaves the
+   `Session` itself poisoned, every subsequent call on that session could panic too, in which case
+   this degrades "ASR dies silently forever" to "ASR logs a WARN and drops every cycle" rather than
+   full recovery — only reproducing the intermittent panic would tell, and that wasn't attempted.
+   The root cause of the panic itself is still undiagnosed.
 
-Not pursuing right now: deep-diving Qwen3 via LoRA before the above is fixed (Option A from the
-2026-06-28 notes) — no point tuning on top of a broken embedding pipeline.
+**Item 2 (longer confirmation campaign): explicitly skipped, user-confirmed 2026-07-05.** Its
+premise changed over the course of this session — take 3 already satisfies "confirm
+before/after adoption," and Qwen2.5 no longer exists in the tree, so a longer *A/B* would have
+meant rebuilding a dropped arm via worktree just to re-confirm an already-settled, twice-confirmed
+result. Asked the user directly (skip / single-arm Qwen3 soak test / rebuild-and-rerun A/B) — they
+chose skip. Not queued; no soak test pending unless raised again later.
 
 ---
 
