@@ -296,7 +296,8 @@ One extractable idea: a scalar learned gate per modality per GRU step (pure sigm
 ## 13. Crate hygiene
 
 ### Remove dead deps
-`candle-core = "0.10"` and `candle-nn = "0.10"` are declared in `[workspace.dependencies]` but no crate depends on them. Safe to remove the workspace declarations.
+✅ Done — `candle-core`/`candle-nn` are no longer in `[workspace.dependencies]` (removed prior to
+2026-07-05; this line was stale, the item had already been resolved).
 
 ### HNSW alternative: usearch
 `usearch 2.25.3` (Unum Cloud, May 2026, actively maintained). Key advantage over `hnsw_rs`: built-in INT8/INT4 vector quantization inside the index — warm-tier episode embeddings could be stored compressed without a separate quantization pass. Also: AVX-512/AVX2/NEON SIMD, thread-safe concurrent insertions, user-defined distance metrics.
@@ -318,7 +319,7 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | ✅ 0 | **bincode migration** (→ bitcode) | Low–Med | Security advisory | Deployed (57c87a1) |
 | ✅ 1 | **BatchTopK SAE** | Low | Sparse coding quality | Deployed (25d7496) |
 | 2 | **High replay ratio A/B** (N=4) | Trivial | Consolidation quality | Queued |
-| 4 | **Remove dead candle deps** | Trivial | Cleanliness | Queued |
+| ✅ 4 | **Remove dead candle deps** | Trivial | Cleanliness | Already done (stale entry, corrected 2026-07-05) |
 | 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | ✅ Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
 | ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
 | 7 | **DER++ stale-output blocking** | Low–Med | Replay consolidation | Deferred |
