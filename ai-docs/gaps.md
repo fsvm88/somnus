@@ -69,16 +69,30 @@ Real diminishing returns: N=1→2 buys 49% of the total error reduction for well
    - Skips stale samples before training, preventing outdated targets from hurting consolidation
    - Tracked in SleepStats.stale_traces_skipped for monitoring
 
-2. **Auto-λ:** ⏳ DEFERRED TO PHASE 3
-   - Auto-adapts loss weight λ using running variance estimate
-   - Build on Phase 2 staleness implementation
-   - Eliminates hand-tuning λ between MSE-on-past-outputs and current-task loss
+2. **Auto-λ:** ✅ IMPLEMENTED (2026-07-06), not yet A/B'd
+   - `PerceptionProcessor.fused_replay_wake_step_batch` (`crates/somnus-perception/src/lib.rs`)
+     combined `sae_loss` (current-batch SAE reconstruction) and `wake_loss` (output-head MSE
+     against stale stored outputs) as an unweighted sum — an implicit, hand-tuned λ=1.
+   - New opt-in behavior (`--der-auto-lambda`, default `false`): tracks a running EWMA mean and
+     mean-square of `wake_loss` (α=0.05), derives its variance, and weights `wake_loss` by
+     `1/variance` (clamped to `[0.1, 10.0]`) before summing — homoscedastic uncertainty
+     weighting, so a noisy/unstable `wake_loss` term contributes less to the combined gradient
+     without a hand-picked constant.
+   - Seeded from the first observed `wake_loss` sample (no zero-init artifact on cold start),
+     mirroring the `first_batch_ever` EWMA-seeding pattern already used in `sleep.rs`'s NREM
+     loss tracking.
+   - Unit test `der_auto_lambda_stays_finite_and_loss_decreases`
+     (`crates/somnus-perception/tests/phase5_smoke.rs`) confirms the weighted path stays finite
+     and loss still decreases over repeated passes, mirroring the existing unweighted test.
+   - **Not yet validated on a real campaign** — turning it on and comparing against the
+     unweighted default (this item's own recommended next step) is unstarted.
 
-**Which part of somnus:** NREM consolidation replay loop.
+**Which part of somnus:** NREM consolidation replay loop (`crates/somnus/src/sleep.rs` calls into
+`PerceptionProcessor::fused_replay_wake_step_batch`, `crates/somnus-perception/src/lib.rs`).
 
 **Phase 2 Implementation:** `PerceptionProcessor.infer_episode_outputs()` infers current model predictions; NREM batch loop compares vs stored regionals via cosine. Filtered batch trained and projected.
 
-**Phase 3 effort:** Low–Medium. Auto-λ is a running variance update (~10 lines) — implement once Phase 2 validated via campaign.
+**Phase 3 effort:** Low–Medium, actually ~30 lines (struct fields + setter + weighting logic + CLI flag + unit test) rather than the ~10 originally estimated, once CLI wiring and test coverage are counted — implement once Phase 2 validated via campaign.
 
 ---
 
@@ -333,7 +347,7 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | ✅ 4 | **Remove dead candle deps** | Trivial | Cleanliness | Already done (stale entry, corrected 2026-07-05) |
 | 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | ✅ Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
 | ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
-| 7 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Queued 2026-07-06 (stale-output blocking already shipped, §3) |
+| 7 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Implemented 2026-07-06 (`--der-auto-lambda`, default off) — not yet A/B'd, §3 |
 | 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | Queued 2026-07-06 |
 | 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Deferred |
 | 10 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | Deferred |

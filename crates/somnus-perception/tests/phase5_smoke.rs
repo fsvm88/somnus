@@ -142,6 +142,42 @@ mod tests {
         );
     }
 
+    /// DER++ Phase 3 auto-λ (ai-docs/gaps.md item 7): with der_auto_lambda enabled, repeated
+    /// fused_replay_wake_step_batch calls stay finite and loss still decreases, i.e. the
+    /// variance-weighted wake_loss term doesn't destabilise training or produce NaN/Inf.
+    #[test]
+    fn der_auto_lambda_stays_finite_and_loss_decreases() {
+        let mut proc = make_proc();
+        proc.set_der_auto_lambda(true);
+        let regional: [Vec<f32>; 5] = std::array::from_fn(|i| {
+            (0..REGION_DIMS[i])
+                .map(|j| ((i + j) as f32 * 0.1).sin())
+                .collect()
+        });
+        let ep: Vec<f32> = (0..EPISODE_DIM).map(|j| (j as f32 * 0.01).cos()).collect();
+
+        const N_PASSES: usize = 20;
+        let mut losses = Vec::with_capacity(N_PASSES);
+        for i in 0..N_PASSES {
+            let (loss, mse) = proc
+                .fused_replay_wake_step_batch(&[&regional], &[ep.as_slice()])
+                .unwrap();
+            assert!(loss.is_finite(), "loss at pass {i} is not finite: {loss}");
+            assert!(mse.is_finite(), "mse at pass {i} is not finite: {mse}");
+            losses.push(loss);
+        }
+        let first = losses[0];
+        let last = losses[N_PASSES - 1];
+        assert!(
+            first > 0.0,
+            "initial loss should be non-zero on a fresh model"
+        );
+        assert!(
+            last < first,
+            "loss should decrease with auto-λ enabled (first={first:.4}, last={last:.4})"
+        );
+    }
+
     /// wake_reconstruct_step returns finite non-negative MSE.
     #[test]
     fn wake_reconstruct_step_is_finite() {

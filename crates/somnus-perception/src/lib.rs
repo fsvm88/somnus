@@ -310,6 +310,13 @@ pub struct PerceptionProcessor {
     /// Use batch-quantile k-WTA threshold instead of per-sample top-k during NREM training.
     /// false (default) = per-sample top-k; true = batch-quantile threshold.
     batch_topk: bool,
+
+    /// DER++ Phase 3: auto-adapt the weight on `wake_loss` (MSE against stale stored
+    /// outputs) instead of a fixed implicit λ=1. false (default) = off, unweighted sum.
+    der_auto_lambda: bool,
+    /// Running mean/mean-square of `wake_loss` (Welford-lite EWMA) used to derive λ =
+    /// 1/variance when `der_auto_lambda` is on. `None` until the first sample is seen.
+    der_lambda_stats: Option<(f32, f32)>,
 }
 
 impl PerceptionProcessor {
@@ -346,6 +353,8 @@ impl PerceptionProcessor {
             cross_modal_proj_flat: None,
             sae_l1_coeff: 0.0,
             batch_topk: true,
+            der_auto_lambda: false,
+            der_lambda_stats: None,
         }
     }
 
@@ -1361,10 +1370,27 @@ impl PerceptionProcessor {
             .map(|l| l.clone().into_scalar() / wake_n_terms.max(1) as f32)
             .unwrap_or(0.0);
 
+        // DER++ Phase 3: auto-λ. Weight wake_loss (MSE against stale stored outputs) by the
+        // inverse of its own running variance instead of a hand-tuned constant, so a noisy
+        // wake_loss term contributes less to the combined gradient (homoscedastic uncertainty
+        // weighting; ai-docs/gaps.md item 7).
+        let der_lambda: f32 = if self.der_auto_lambda && wake_n_terms > 0 {
+            const EWMA_ALPHA: f32 = 0.05;
+            let (mean, msq) = self
+                .der_lambda_stats
+                .unwrap_or((wake_val, wake_val * wake_val));
+            let mean = EWMA_ALPHA * wake_val + (1.0 - EWMA_ALPHA) * mean;
+            let msq = EWMA_ALPHA * wake_val * wake_val + (1.0 - EWMA_ALPHA) * msq;
+            self.der_lambda_stats = Some((mean, msq));
+            (1.0 / (msq - mean * mean).max(1e-6)).clamp(0.1, 10.0)
+        } else {
+            1.0
+        };
+
         let combined = match (sae_loss, wake_loss) {
-            (Some(sl), Some(wl)) => Some(sl + wl),
+            (Some(sl), Some(wl)) => Some(sl + wl.mul_scalar(der_lambda)),
             (Some(sl), None) => Some(sl),
-            (None, Some(wl)) => Some(wl),
+            (None, Some(wl)) => Some(wl.mul_scalar(der_lambda)),
             (None, None) => None,
         };
         if let Some(loss) = combined {
@@ -2180,6 +2206,10 @@ impl PerceptionProcessor {
 
     pub fn set_batch_topk(&mut self, enabled: bool) {
         self.batch_topk = enabled;
+    }
+
+    pub fn set_der_auto_lambda(&mut self, enabled: bool) {
+        self.der_auto_lambda = enabled;
     }
 
     // ── Save / Load ──────────────────────────────────────────────────────────

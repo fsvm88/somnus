@@ -1,54 +1,46 @@
 # Session state — somnus
 
 > **Last updated:** 2026-07-06
-> **Branch:** `main`. All work this session committed: change-gated video encoder (`9bba42b`),
-> SVD null-result (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4
-> replay-ratio adopted as default (`f0fa9c6`). Only `ai-docs/gaps.md` has an uncommitted edit
-> queuing items 7/8 (see below) — commit that before starting either.
-> **Status: brain-scale-comparison survey closed out; gaps.md item 2 adopted at N=4. Two items queued.**
+> **Branch:** `main`. Committed: change-gated video encoder (`9bba42b`), SVD null-result
+> (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4 replay-ratio default
+> (`f0fa9c6`), items 7/8 queued (`709442b`). DER++ auto-λ implementation (item 7, this section) is
+> done but **not yet committed** — see file list below.
+> **Status: item 7 (DER++ auto-λ) implemented, unvalidated. Item 8 (EfficientAT-mn10) still queued.**
 
 ## Just completed (2026-07-06)
 
 Both action items from `ai-docs/research/brain-scale-comparison.md`'s "Summary judgment" are done
-(`9bba42b` change-gated video encoder, `b410ad7` SVD null result).
+(`9bba42b` change-gated video encoder, `b410ad7` SVD null result). High replay ratio (item 2)
+validated and adopted at N=4 (`d5ce2ab`, `f0fa9c6`) — see `ai-docs/gaps.md` §2 for the N=1/2/4
+comparison table.
 
-**gaps.md item 2, high replay ratio — validated and adopted (`d5ce2ab`, `f0fa9c6`).** Found and
-fixed a real bug first: `scripts/train_campaign.sh` (shared by every A/B script) hardcoded
-`--nrem-replay-epochs 4` unconditionally, so the existing stale run (2026-06-27, renamed
-`memory/ab_replay_ratio_stale_20260627_buggy_n4_both_arms/`) actually compared N=4 vs N=4 —
-meaningless. Fixed by parameterizing `REPLAY_EPOCHS` (env var) and having `ab_replay_ratio.sh` set
-it explicitly per arm. Reran fresh at N=1/N=2/N=4 (three arms; also needed since the old data
-predates DINOv3/Qwen3 adoption):
+**gaps.md item 7, DER++ auto-λ Phase 3 — implemented, not yet committed.** Stale-output blocking
+(Phase 2) was already shipped (commit 65ceaf7); this adds the auto-λ half.
+`fused_replay_wake_step_batch` (`crates/somnus-perception/src/lib.rs`) previously combined
+`sae_loss`+`wake_loss` as an unweighted sum. New opt-in behavior (`--der-auto-lambda`, default
+`false`): tracks a running EWMA mean/mean-square of `wake_loss` (α=0.05, seeded from the first
+sample to avoid a cold-start zero artifact), derives its variance, and weights `wake_loss` by
+`1/variance` (clamped `[0.1, 10.0]`) — homoscedastic uncertainty weighting instead of a hand-tuned
+constant. New unit test `der_auto_lambda_stays_finite_and_loss_decreases`
+(`crates/somnus-perception/tests/phase5_smoke.rs`) confirms the weighted path stays finite and loss
+still decreases over repeated passes. Build/clippy/test all pass; manually smoke-tested via CLI
+(`--der-auto-lambda`, no crash). Full writeup: `ai-docs/gaps.md` §3.
 
-| N | avg `mean_output_mse` | Δ vs N=1 | total wall-clock Δ |
-|---|---|---|---|
-| 1 | 0.2379 | — | — |
-| 2 | 0.1211 | -49.1% | +7.6% |
-| 4 | 0.0693 | -70.9% | +16.6% |
-
-All 5 regions improve monotonically at every N, no reversals. N=2 was the more cost-efficient
-point, but the user chose **N=4 as the adopted default** — the absolute wall-clock tax is still
-small and the extra quality is worth it, on the view that ~17% is recoverable elsewhere. CLI
-default (`crates/somnus/src/main.rs::nrem_replay_epochs`) and `train_campaign.sh`'s `REPLAY_EPOCHS`
-default both flipped 1→4. Full writeup: `ai-docs/gaps.md` §2.
-`memory/ab_replay_ratio/{control,n2,treatment}/` holds the fresh three-arm run (gitignored).
+**Not yet done: an actual A/B** comparing `--der-auto-lambda` on vs. off (the default/unweighted
+behavior) on a real campaign — this was flagged as the item's own recommended next step, not
+completed here. Files not yet committed: `crates/somnus-perception/src/lib.rs`,
+`crates/somnus/src/main.rs`, `crates/somnus-perception/tests/phase5_smoke.rs`, `ai-docs/gaps.md`,
+this file.
 
 ## Queued for next session
 
-User explicitly queued two items from `ai-docs/gaps.md`'s priority table (not yet started):
-
-- **Item 7 — DER++ auto-λ (Phase 3).** Stale-output blocking (Phase 2) already shipped
-  (commit 65ceaf7). Remaining work is small: an auto-adapting loss weight λ via a running
-  variance estimate, eliminating hand-tuned λ between MSE-on-past-outputs and current-task loss.
-  Full spec: `ai-docs/gaps.md` §3 ("Phase 3"). Effort: Low–Med, ~10 lines per the doc's own estimate.
-- **Item 8 — EfficientAT-mn10 ONNX export test.** Low-risk MobileNetV3 audio-env encoder
-  alternative (~5–20M params, pure CNN, no attention/ScatterElements ops — should export to ONNX
-  trivially). Full spec: `ai-docs/gaps.md` §9. Effort: Low (export + A/B vs current CLAP-HTSAT).
-  Verify actual penultimate-feature dim (doc estimates ~960, unconfirmed) before wiring up the
-  region-input projection change.
-
-No stated order between the two; ask the user which to start with, or do 8 first per the doc's
-own note that it's lower-risk/effort than the M2D-CLAP alternative it was queued alongside.
+- **Item 8 — EfficientAT-mn10 ONNX export test** (still queued, untouched this session). Low-risk
+  MobileNetV3 audio-env encoder alternative (~5–20M params, pure CNN, no attention/ScatterElements
+  ops — should export to ONNX trivially). Full spec: `ai-docs/gaps.md` §9. Effort: Low (export +
+  A/B vs current CLAP-HTSAT). Verify actual penultimate-feature dim (doc estimates ~960,
+  unconfirmed) before wiring up the region-input projection change.
+- Optionally circle back to **item 7's own A/B** (auto-λ on vs. off) before moving to item 8,
+  since the implementation is otherwise unvalidated — ask the user which they want first.
 
 ## Current state
 

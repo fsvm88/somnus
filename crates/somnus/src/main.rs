@@ -329,6 +329,12 @@ struct Args {
     #[arg(long, default_value = "true")]
     batch_topk: bool,
 
+    /// DER++ Phase 3 (ai-docs/gaps.md item 7): auto-adapt the weight on the output-head
+    /// wake_loss term (MSE against stale stored outputs) via a running-variance estimate,
+    /// instead of the implicit λ=1 unweighted sum. false (default) = off. Not yet A/B'd.
+    #[arg(long, default_value = "false")]
+    der_auto_lambda: bool,
+
     /// Loop the input file indefinitely. Restarts from the beginning each time
     /// the file ends, keeping warm memory alive across iterations. Useful for
     /// calibration runs where a single file is too short to trigger multiple
@@ -823,6 +829,7 @@ async fn main() -> Result<()> {
     perception.set_wm_size(args.working_memory_size);
     perception.set_sae_l1_coeff(args.sae_l1_coeff);
     perception.set_batch_topk(args.batch_topk);
+    perception.set_der_auto_lambda(args.der_auto_lambda);
     info!(
         prior_beta = args.prior_beta,
         prior_beta_regions = ?prior_beta_regions_static,
@@ -830,6 +837,7 @@ async fn main() -> Result<()> {
         settle_beta = args.settle_beta,
         working_memory_size = args.working_memory_size,
         batch_topk = args.batch_topk,
+        der_auto_lambda = args.der_auto_lambda,
         "perception processor initialised (n=1024, k=20, cpu)"
     );
 
