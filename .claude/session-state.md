@@ -2,42 +2,35 @@
 
 > **Last updated:** 2026-07-06
 > **Branch:** `main`. Change-gated video encoder work is committed (`9bba42b`); SVD check work
-> (this section) not yet committed — see "Just completed" below for the file list.
-> **Status: both action items from the brain-scale-comparison survey are done. No queue.**
+> committed (`b410ad7`); high-replay-ratio A/B work (this section) not yet committed.
+> **Status: brain-scale-comparison survey fully closed out; gaps.md item 2 (replay ratio) validated.**
 
 ## Just completed (2026-07-06)
 
-Both action items from `ai-docs/research/brain-scale-comparison.md`'s "Summary judgment" are done:
+Both action items from `ai-docs/research/brain-scale-comparison.md`'s "Summary judgment" are done
+(see prior entries in git log for details: `9bba42b` change-gated video encoder, `b410ad7` SVD
+null result).
 
-1. **Change-gated video encoder inference** (committed `9bba42b`). `VideoFrame::mean_abs_diff`
-   (`crates/somnus-sensory/src/frame.rs`) skips `enc.encode()` in the video encoder task
-   (`crates/somnus/src/main.rs`) when a stride-selected frame's byte-level diff from the last
-   *encoded* frame is below `--video-change-threshold` (default 0.0 = disabled, opt-in only).
-   `--video-change-max-skip` (default 30) forces a periodic re-encode so a fully static scene
-   doesn't stop emitting embeddings. Audio (Whisper/CLAP) left ungated (different, less contained
-   problem). Details: `ai-docs/gaps.md` §13. **Not yet done:** an A/B measuring actual wake-path
-   CPU savings/skip rate on a real capture session — deployed and tested, unmeasured in practice.
-
-2. **Post-training SVD check on region/binding weights** — **null result, not committed yet**.
-   New standalone bin `cargo run --release -p somnus-perception --bin svd_rank_check --
-   <memory_dir> <out_dir>` loads a trained checkpoint and dumps its 21 own region/binding weight
-   matrices (k-WTA encoders, cross-modal proj, binding region projections, attention Q/K/V, GRU
-   gates, temporal proj — not the frozen encoders/LM) as raw f32 + manifest.
-   `scripts/svd_rank_check.py` (numpy) computes effective rank per matrix. Checked against
-   `memory/qwen3_ab_treatment/` (most-trained checkpoint on disk): all 21 matrices are
-   near-full-rank (mean r95/full_rank = 0.772) — **low-rank factorization is not free, not
-   pursued.** Full numbers and caveats: `ai-docs/gaps.md` §14. Files not yet committed:
-   `crates/somnus-perception/src/bin/svd_rank_check.rs`, `crates/somnus-perception/Cargo.toml` (new
-   `[[bin]]` entry), `scripts/svd_rank_check.py`, plus this file/`gaps.md`/the research note.
+**gaps.md item 2, high replay ratio A/B — validated, not yet committed.** Found and fixed a real
+bug first: `scripts/train_campaign.sh` (shared by every A/B script) hardcoded
+`--nrem-replay-epochs 4` unconditionally, so the existing stale run (2026-06-27, now renamed
+`memory/ab_replay_ratio_stale_20260627_buggy_n4_both_arms/`) actually compared N=4 vs N=4 —
+meaningless. Fixed by parameterizing `REPLAY_EPOCHS` (env var, default 1) and having
+`ab_replay_ratio.sh` set it explicitly per arm. Reran fresh (also needed since the old data
+predates DINOv3/Qwen3 adoption): **-70.9% mean_output_mse** (control 0.2379 → treatment 0.0693),
+consistent across every cycle with valid data, -83% to -88% per-cycle where directly comparable,
+all 5 regions improve monotonically with no reversals. Full writeup: `ai-docs/gaps.md` §2.
+**Open question, not decided:** whether to flip the CLI default from N=1 to N=4 — real tradeoff
+(4× NREM wall-clock per sleep cycle), not a free win, so flagged rather than silently changed.
+Files not yet committed: `scripts/train_campaign.sh`, `scripts/ab_replay_ratio.sh`, `gaps.md`,
+this file. `memory/ab_replay_ratio/{control,treatment}/` holds the fresh run (gitignored).
 
 ## Queued for next session
 
-Empty. Both flagged-actionable items from the brain-scale survey are resolved (one shipped, one
-a documented null result). Everything else in that doc (MoE routing, weight sharing, spiking/
-event-driven hardware, adaptive computation time, local attention, multi-timescale processing)
-stays speculative/deferred until region count or binding complexity grows past current design.
-Otherwise fall back to `ai-docs/gaps.md`'s priority table for what's next (e.g. item 2, high
-replay ratio A/B — trivial effort, still queued).
+Empty. Open question above (flip the default?) is the only unresolved thread — needs a user
+decision, not more investigation. Otherwise fall back to `ai-docs/gaps.md`'s priority table:
+items 7–13 (DER++ auto-λ, EfficientAT/M2D-CLAP/SigLIP2 encoder swaps, LISTA, Gemma 3, usearch
+migration) are all explicitly deferred, not queued.
 
 ## Current state
 

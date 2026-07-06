@@ -19,6 +19,7 @@
 #                    Writes/reads perception_encoder.onnx + perception_binding.onnx here.
 #                    Do NOT also pass --onnx-models-dir in EXTRA_ARGS.
 #   ONNX_SCRIPT      Override path to export_perception_graph.py (optional)
+#   REPLAY_EPOCHS    NREM replay passes per sleep cycle (default: 1, matches somnus's own default)
 #   EXTRA_ARGS       Extra args passed to somnus   (default: none)
 #
 # Example:
@@ -46,6 +47,11 @@ TEXT_RATE="${TEXT_RATE:-5}"      # chunks per second fed to --language stdin
 # Small non-zero base so prior cosines are always measured; S4 scales up to 0.05
 # when predictions mature (ADR 0024). Set higher to override S4.
 PRIOR_BETA="${PRIOR_BETA:-0.01}"
+# NREM replay passes per sleep cycle (arXiv:2505.12512, ai-docs/gaps.md item 2). Matches the
+# somnus CLI's own default of 1; override per-campaign, not by appending --nrem-replay-epochs to
+# EXTRA_ARGS (clap keeps the last occurrence of a repeated flag, so a hardcoded value here would
+# silently win over anything in EXTRA_ARGS and make control/treatment identical).
+REPLAY_EPOCHS="${REPLAY_EPOCHS:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 # When set, enables ORT encoder+binding sessions (Phase 1 + 1.5).
 # Maps to --onnx-models-dir; writes ONNX graphs relative to MEMORY_DIR by default.
@@ -73,6 +79,7 @@ MEMORY_DIR=${MEMORY_DIR}
 ONNX_MODELS_DIR=${ONNX_MODELS_DIR}
 ONNX_SCRIPT=${ONNX_SCRIPT}
 PRIOR_BETA=${PRIOR_BETA}
+REPLAY_EPOCHS=${REPLAY_EPOCHS}
 EXTRA_ARGS=${EXTRA_ARGS}
 started=$(date -Iseconds)
 EOF
@@ -129,7 +136,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
-            --nrem-replay-epochs 4 \
+            --nrem-replay-epochs "$REPLAY_EPOCHS" \
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
             --recall-ef 16 \
@@ -155,7 +162,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
             --replay-batch-size 128 \
-            --nrem-replay-epochs 4 \
+            --nrem-replay-epochs "$REPLAY_EPOCHS" \
             --wake-reconstruct-interval 5 \
             --video-stride 2 \
             --recall-ef 16 \

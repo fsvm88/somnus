@@ -30,17 +30,21 @@
 
 ---
 
-## 2. Algorithm: High replay ratio
+## 2. Algorithm: High replay ratio ✅ VALIDATED (2026-07-06) — recommend flipping default
 
 **Source:** "Scalable Strategies for Continual Learning with Replay," arXiv:2505.12512, May 2025.
 
 **What:** Increasing the replay ratio (buffered episodes replayed per new episode seen) to 4–8× improves consolidation quality with no degradation, orthogonal to buffer selection strategy. If NREM currently does one pass through all episodes in the buffer per sleep cycle, doing 4 passes is the change.
 
-**Which part of somnus:** NREM replay loop in `sleep.rs`.
+**Which part of somnus:** NREM replay loop in `sleep.rs`. `--nrem-replay-epochs N` (default 1) already existed as a flag before this A/B.
 
-**Constraints:** Hyperparameter only. No model or ONNX changes.
+**Bug found and fixed first:** `scripts/train_campaign.sh` (the shared harness behind every A/B script, including this one) hardcoded `--nrem-replay-epochs 4` unconditionally, regardless of `EXTRA_ARGS`. A prior run of this exact A/B (dated 2026-06-27, `memory/ab_replay_ratio_stale_20260627_buggy_n4_both_arms/`) therefore compared N=4 against N=4, not N=1 vs N=4 — meaningless, which is presumably why item 2 was never marked resolved despite a script existing. Fixed by parameterizing `REPLAY_EPOCHS` (env var, default 1, matching the CLI's own default) in `train_campaign.sh`, and having `ab_replay_ratio.sh` set it explicitly per arm instead of via `EXTRA_ARGS` (avoids relying on clap's last-occurrence-wins behavior for a repeated flag). That old stale data also predates the DINOv3/Qwen3 adoption, so it wouldn't have been usable regardless.
 
-**Effort:** Trivial (one multiplier). Add `--nrem-replay-epochs N` (default 1) flag. A/B with N=4 on a short campaign.
+**Result: real, decisive PASS.** 5 sessions × 2 cycles, fresh memory both arms, h3h3/shorts clip corpus (`scripts/ab_replay_ratio.sh`). `mean_output_mse`: control avg 0.2379, treatment avg 0.0693 (**-70.9%**), consistent across every session with valid data (a few control cycles logged `mean_output_mse=0.0` — an artifact of the training-step-skip path when a batch is fully filtered as stale/empty, not a real zero, correctly excluded by the analysis). Per-cycle deltas where both arms have real data: **-83% to -88%**, no reversals. Per-region MSE breakdown confirms it's not one region compensating for another — all 5 regions improve monotonically across the campaign in both arms, treatment strictly below control at every point (language region is already near-floor in both, ~0.00097, as expected — nothing left to improve there).
+
+**Effort:** Trivial (one multiplier), already implemented. A/B: `scripts/ab_replay_ratio.sh`.
+
+**Open question, not yet decided:** whether to flip the CLI default from 1→4, or to 4 in `train_campaign.sh`'s `REPLAY_EPOCHS` default specifically. N=4 costs ~4× NREM wall-clock per sleep cycle — real tradeoff against session throughput for future campaigns, not free. Recommend adopting for future runs at minimum; whether to change the *default* (silently making every future campaign 4× slower in the sleep phase) is worth a deliberate call rather than a silent flip.
 
 ---
 
@@ -315,7 +319,7 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 |---|---|---|---|---|
 | ✅ 0 | **bincode migration** (→ bitcode) | Low–Med | Security advisory | Deployed (57c87a1) |
 | ✅ 1 | **BatchTopK SAE** | Low | Sparse coding quality | Deployed (25d7496) |
-| 2 | **High replay ratio A/B** (N=4) | Trivial | Consolidation quality | Queued |
+| ✅ 2 | **High replay ratio A/B** (N=4) | Trivial | Consolidation quality | Validated 2026-07-06 — -70.9% output_mse, no reversals; recommend adopting, default-flip undecided |
 | ✅ 4 | **Remove dead candle deps** | Trivial | Cleanliness | Already done (stale entry, corrected 2026-07-05) |
 | 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | ✅ Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
 | ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |

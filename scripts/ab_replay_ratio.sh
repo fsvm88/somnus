@@ -29,6 +29,7 @@ SESSIONS=$SESSIONS CYCLES=$CYCLES CAPACITY=$CAPACITY \
     CLIPS="$CLIPS" \
     MEMORY_DIR=memory/ab_replay_ratio/control \
     CAMPAIGN_DIR=memory/ab_replay_ratio/control/campaign \
+    REPLAY_EPOCHS=1 \
     bash scripts/train_campaign.sh
 
 echo ""
@@ -37,7 +38,7 @@ SESSIONS=$SESSIONS CYCLES=$CYCLES CAPACITY=$CAPACITY \
     CLIPS="$CLIPS" \
     MEMORY_DIR=memory/ab_replay_ratio/treatment \
     CAMPAIGN_DIR=memory/ab_replay_ratio/treatment/campaign \
-    EXTRA_ARGS="--nrem-replay-epochs 4" \
+    REPLAY_EPOCHS=4 \
     bash scripts/train_campaign.sh
 
 echo ""
