@@ -1,19 +1,20 @@
 # Session state — somnus
 
 > **Last updated:** 2026-07-06
-> **Branch:** `main`. Change-gated video encoder (`9bba42b`) and SVD null-result (`b410ad7`)
-> committed; high-replay-ratio work (this section) not yet committed.
-> **Status: brain-scale-comparison survey closed out; gaps.md item 2 (replay ratio) adopted at N=4.**
+> **Branch:** `main`. All work this session committed: change-gated video encoder (`9bba42b`),
+> SVD null-result (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4
+> replay-ratio adopted as default (`f0fa9c6`). Only `ai-docs/gaps.md` has an uncommitted edit
+> queuing items 7/8 (see below) — commit that before starting either.
+> **Status: brain-scale-comparison survey closed out; gaps.md item 2 adopted at N=4. Two items queued.**
 
 ## Just completed (2026-07-06)
 
 Both action items from `ai-docs/research/brain-scale-comparison.md`'s "Summary judgment" are done
-(see prior entries in git log for details: `9bba42b` change-gated video encoder, `b410ad7` SVD
-null result).
+(`9bba42b` change-gated video encoder, `b410ad7` SVD null result).
 
-**gaps.md item 2, high replay ratio — validated and adopted, not yet committed.** Found and fixed
-a real bug first: `scripts/train_campaign.sh` (shared by every A/B script) hardcoded
-`--nrem-replay-epochs 4` unconditionally, so the existing stale run (2026-06-27, now renamed
+**gaps.md item 2, high replay ratio — validated and adopted (`d5ce2ab`, `f0fa9c6`).** Found and
+fixed a real bug first: `scripts/train_campaign.sh` (shared by every A/B script) hardcoded
+`--nrem-replay-epochs 4` unconditionally, so the existing stale run (2026-06-27, renamed
 `memory/ab_replay_ratio_stale_20260627_buggy_n4_both_arms/`) actually compared N=4 vs N=4 —
 meaningless. Fixed by parameterizing `REPLAY_EPOCHS` (env var) and having `ab_replay_ratio.sh` set
 it explicitly per arm. Reran fresh at N=1/N=2/N=4 (three arms; also needed since the old data
@@ -29,17 +30,25 @@ All 5 regions improve monotonically at every N, no reversals. N=2 was the more c
 point, but the user chose **N=4 as the adopted default** — the absolute wall-clock tax is still
 small and the extra quality is worth it, on the view that ~17% is recoverable elsewhere. CLI
 default (`crates/somnus/src/main.rs::nrem_replay_epochs`) and `train_campaign.sh`'s `REPLAY_EPOCHS`
-default both flipped 1→4; `build/clippy` pass. Full writeup: `ai-docs/gaps.md` §2. Files not yet
-committed: `crates/somnus/src/main.rs`, `scripts/train_campaign.sh`, `scripts/ab_replay_ratio.sh`
-(unaffected by the default flip — sets `REPLAY_EPOCHS` explicitly per arm already), `gaps.md`,
-this file. `memory/ab_replay_ratio/{control,n2,treatment}/` holds the fresh three-arm run
-(gitignored).
+default both flipped 1→4. Full writeup: `ai-docs/gaps.md` §2.
+`memory/ab_replay_ratio/{control,n2,treatment}/` holds the fresh three-arm run (gitignored).
 
 ## Queued for next session
 
-Empty. Nothing outstanding from this session. Fall back to `ai-docs/gaps.md`'s priority table:
-items 7–13 (DER++ auto-λ, EfficientAT/M2D-CLAP/SigLIP2 encoder swaps, LISTA, Gemma 3, usearch
-migration) are all explicitly deferred, not queued.
+User explicitly queued two items from `ai-docs/gaps.md`'s priority table (not yet started):
+
+- **Item 7 — DER++ auto-λ (Phase 3).** Stale-output blocking (Phase 2) already shipped
+  (commit 65ceaf7). Remaining work is small: an auto-adapting loss weight λ via a running
+  variance estimate, eliminating hand-tuned λ between MSE-on-past-outputs and current-task loss.
+  Full spec: `ai-docs/gaps.md` §3 ("Phase 3"). Effort: Low–Med, ~10 lines per the doc's own estimate.
+- **Item 8 — EfficientAT-mn10 ONNX export test.** Low-risk MobileNetV3 audio-env encoder
+  alternative (~5–20M params, pure CNN, no attention/ScatterElements ops — should export to ONNX
+  trivially). Full spec: `ai-docs/gaps.md` §9. Effort: Low (export + A/B vs current CLAP-HTSAT).
+  Verify actual penultimate-feature dim (doc estimates ~960, unconfirmed) before wiring up the
+  region-input projection change.
+
+No stated order between the two; ask the user which to start with, or do 8 first per the doc's
+own note that it's lower-risk/effort than the M2D-CLAP alternative it was queued alongside.
 
 ## Current state
 

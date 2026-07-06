@@ -333,8 +333,8 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | ✅ 4 | **Remove dead candle deps** | Trivial | Cleanliness | Already done (stale entry, corrected 2026-07-05) |
 | 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | ✅ Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
 | ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
-| 7 | **DER++ stale-output blocking** | Low–Med | Replay consolidation | Deferred |
-| 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | Deferred |
+| 7 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Queued 2026-07-06 (stale-output blocking already shipped, §3) |
+| 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | Queued 2026-07-06 |
 | 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Deferred |
 | 10 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | Deferred |
 | 11 | **LISTA unrolled encoder** | Med | Sparse coding quality | Deferred |
