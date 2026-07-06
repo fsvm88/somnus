@@ -257,7 +257,40 @@ speedup.
 
 ---
 
-## 14. Crate hygiene
+## 14. Null result: low-rank (SVD) factorization of region/binding weights (2026-07-06)
+
+Item 2 of `ai-docs/research/brain-scale-comparison.md`'s capacity-efficiency survey: checked
+whether somnus's own growable region/binding weight matrices (k-WTA region encoders, cross-modal
+projection, binding-area region projections, attention Q/K/V, GRU gates, temporal projection —
+21 matrices total, none of the frozen encoders/LM) have learned a low effective rank, which would
+make LoRA-style factorization near-free compression.
+
+**Method:** new standalone bin `cargo run --release -p somnus-perception --bin svd_rank_check --
+<memory_dir> <out_dir>` pre-grows a fresh `PerceptionProcessor` to a saved checkpoint's region
+sizes, loads its trained `weights.bin`, and dumps every 2-D weight matrix as raw f32 + a JSON
+manifest (reuses the existing `export_weights_for_onnx` path). `scripts/svd_rank_check.py`
+(numpy, no scipy/torch needed) then runs `np.linalg.svd` per matrix and reports the rank needed
+to capture 90/95/99% of singular-value energy. Checked against `memory/qwen3_ab_treatment/`, the
+most-trained checkpoint on disk (grown to `[1664,1600,1600,1600,1600]` from a Qwen3 A/B campaign).
+
+**Result: null. No matrix showed fast singular-value decay.** Rank needed for 95% of energy
+(`r95`) sits at 60–82% of full rank across all 21 matrices (mean `r95/full_rank` = 0.772); the
+"compression" a rank-`r95` factorization (`U·Vᵀ`, `(n+m)·r` params) would give is ≈1.0x or worse
+versus the dense matrix, because `r95` is too close to `min(n, m)` for the `(n+m)·r` low-rank
+parameterization to undercut `n·m`. These weights are effectively full-rank at their current
+size/training. **Low-rank factorization is not free here — do not pursue it.**
+
+**Caveats:** single checkpoint, one point in the growth/training arc — a matrix could still
+become effectively low-rank as regions grow much larger relative to `EPISODE_DIM`/`D_PROJ`
+(rank is capped at `min(n, m)`, and several of these matrices have one dimension fixed at 128/256/
+384/640 regardless of region growth), so re-check if that ratio changes substantially. Not
+re-verified against a second checkpoint, but the near-full-rank result was consistent enough
+across all 21 matrices (no outliers) that a second checkpoint is unlikely to change the
+conclusion.
+
+---
+
+## 15. Crate hygiene
 
 ### Remove dead deps
 ✅ Done — `candle-core`/`candle-nn` are no longer in `[workspace.dependencies]` (removed prior to
@@ -294,3 +327,4 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | 12 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than Qwen3) | Deferred |
 | 13 | **usearch migration** | Med | HNSW footprint | Deferred |
 | ✅ 14 | **Change-gated video encoder** | Low | Wake-path compute (unmeasured savings) | Deployed 2026-07-06, opt-in via `--video-change-threshold` |
+| ❌ 15 | **SVD low-rank check (region/binding weights)** | Low | Capacity efficiency | Null result 2026-07-06 — near-full-rank, not pursued |

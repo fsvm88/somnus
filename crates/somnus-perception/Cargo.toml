@@ -25,3 +25,7 @@ path = "src/bin/bench_wake_percep.rs"
 [[bin]]
 name = "onnx_validate_prepare"
 path = "src/bin/onnx_validate_prepare.rs"
+
+[[bin]]
+name = "svd_rank_check"
+path = "src/bin/svd_rank_check.rs"

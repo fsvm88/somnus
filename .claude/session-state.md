@@ -1,35 +1,43 @@
 # Session state — somnus
 
 > **Last updated:** 2026-07-06
-> **Branch:** `main`, working tree has uncommitted changes (this file, `ai-docs/gaps.md`,
-> `ai-docs/research/brain-scale-comparison.md`, `ai-docs/research/README.md`,
-> `crates/somnus/src/main.rs`, `crates/somnus-sensory/src/frame.rs`).
-> **Status: change-gated video encoder inference implemented; SVD check still queued.**
+> **Branch:** `main`. Change-gated video encoder work is committed (`9bba42b`); SVD check work
+> (this section) not yet committed — see "Just completed" below for the file list.
+> **Status: both action items from the brain-scale-comparison survey are done. No queue.**
 
 ## Just completed (2026-07-06)
 
-Implemented item 1 of the brain-scale-comparison capacity-efficiency survey (see
-`ai-docs/research/brain-scale-comparison.md` "Summary judgment"): **change-gated video encoder
-inference**. `VideoFrame::mean_abs_diff` (`crates/somnus-sensory/src/frame.rs`) skips
-`enc.encode()` in the video encoder task (`crates/somnus/src/main.rs`) when a stride-selected frame's
-byte-level diff from the last *encoded* frame is below `--video-change-threshold` (default 0.0 =
-disabled, opt-in only). `--video-change-max-skip` (default 30) forces a periodic re-encode so a
-fully static scene doesn't stop emitting embeddings. Audio (Whisper/CLAP) left ungated — silence
-detection is a different, less contained problem, out of scope for this pass. Build/clippy/tests
-pass (new unit tests on `mean_abs_diff` in `frame.rs`). Details: `ai-docs/gaps.md` §13.
+Both action items from `ai-docs/research/brain-scale-comparison.md`'s "Summary judgment" are done:
 
-**Not yet done:** an A/B measuring actual wake-path CPU savings and skip rate on a real capture
-session — the mechanism is deployed and tested but unmeasured in practice.
+1. **Change-gated video encoder inference** (committed `9bba42b`). `VideoFrame::mean_abs_diff`
+   (`crates/somnus-sensory/src/frame.rs`) skips `enc.encode()` in the video encoder task
+   (`crates/somnus/src/main.rs`) when a stride-selected frame's byte-level diff from the last
+   *encoded* frame is below `--video-change-threshold` (default 0.0 = disabled, opt-in only).
+   `--video-change-max-skip` (default 30) forces a periodic re-encode so a fully static scene
+   doesn't stop emitting embeddings. Audio (Whisper/CLAP) left ungated (different, less contained
+   problem). Details: `ai-docs/gaps.md` §13. **Not yet done:** an A/B measuring actual wake-path
+   CPU savings/skip rate on a real capture session — deployed and tested, unmeasured in practice.
+
+2. **Post-training SVD check on region/binding weights** — **null result, not committed yet**.
+   New standalone bin `cargo run --release -p somnus-perception --bin svd_rank_check --
+   <memory_dir> <out_dir>` loads a trained checkpoint and dumps its 21 own region/binding weight
+   matrices (k-WTA encoders, cross-modal proj, binding region projections, attention Q/K/V, GRU
+   gates, temporal proj — not the frozen encoders/LM) as raw f32 + manifest.
+   `scripts/svd_rank_check.py` (numpy) computes effective rank per matrix. Checked against
+   `memory/qwen3_ab_treatment/` (most-trained checkpoint on disk): all 21 matrices are
+   near-full-rank (mean r95/full_rank = 0.772) — **low-rank factorization is not free, not
+   pursued.** Full numbers and caveats: `ai-docs/gaps.md` §14. Files not yet committed:
+   `crates/somnus-perception/src/bin/svd_rank_check.rs`, `crates/somnus-perception/Cargo.toml` (new
+   `[[bin]]` entry), `scripts/svd_rank_check.py`, plus this file/`gaps.md`/the research note.
 
 ## Queued for next session
 
-Item 2 of the same survey: **post-training SVD check on region/binding weights** (half-day
-experiment — SVD somnus's existing region encoder/decoder matrices post-training, check singular
-value decay; if it falls off fast, low-rank reparameterization is close to free). Resume by
-reading `ai-docs/research/brain-scale-comparison.md` "Summary judgment" section. Everything else
-in that doc (MoE routing, weight sharing, spiking/event-driven hardware, adaptive computation time,
-local attention, multi-timescale processing) stays speculative/deferred until region count or
-binding complexity grows past current design.
+Empty. Both flagged-actionable items from the brain-scale survey are resolved (one shipped, one
+a documented null result). Everything else in that doc (MoE routing, weight sharing, spiking/
+event-driven hardware, adaptive computation time, local attention, multi-timescale processing)
+stays speculative/deferred until region count or binding complexity grows past current design.
+Otherwise fall back to `ai-docs/gaps.md`'s priority table for what's next (e.g. item 2, high
+replay ratio A/B — trivial effort, still queued).
 
 ## Current state
 
