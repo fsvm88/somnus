@@ -242,6 +242,19 @@ struct Args {
     #[arg(long, default_value = "1")]
     video_stride: usize,
 
+    /// Skip video encoder inference when a frame's mean absolute byte
+    /// difference from the last *encoded* frame falls below this threshold
+    /// (range 0.0-1.0). 0.0 (default) disables gating — every stride-selected
+    /// frame is encoded, matching prior behavior. Applied after `--video-stride`.
+    #[arg(long, default_value = "0.0")]
+    video_change_threshold: f32,
+
+    /// Force a video encode at least every N stride-selected frames even if
+    /// `--video-change-threshold` keeps reporting no change, so a fully static
+    /// scene still produces periodic embeddings instead of none at all.
+    #[arg(long, default_value = "30")]
+    video_change_max_skip: usize,
+
     /// Maximum tokens to generate per query (ADR 0012).
     #[arg(long, default_value = "25")]
     action_max_tokens: usize,
@@ -1496,6 +1509,8 @@ async fn main() -> Result<()> {
         let mut video_rx = video_rx;
         let pending = Arc::clone(&pending_embs);
         let video_stride = args.video_stride.max(1);
+        let video_change_threshold = args.video_change_threshold;
+        let video_change_max_skip = args.video_change_max_skip.max(1);
         tokio::task::spawn_blocking(move || {
             let mut enc = match VideoEncoder::new(&models_dir) {
                 Ok(e) => e,
@@ -1508,10 +1523,25 @@ async fn main() -> Result<()> {
             let mut frames_this_sec: u32 = 0;
             let mut total_ms_this_sec: u128 = 0;
             let mut frame_counter: usize = 0;
+            let mut skipped_this_sec: u32 = 0;
+            let mut last_encoded_frame: Option<VideoFrame> = None;
+            let mut change_skip_streak: usize = 0;
             while let Some(frame) = video_rx.blocking_recv() {
                 frame_counter += 1;
                 if !frame_counter.is_multiple_of(video_stride) {
                     continue;
+                }
+                if video_change_threshold > 0.0 {
+                    if let Some(prev) = &last_encoded_frame {
+                        if frame.mean_abs_diff(prev) < video_change_threshold
+                            && change_skip_streak < video_change_max_skip
+                        {
+                            change_skip_streak += 1;
+                            skipped_this_sec += 1;
+                            continue;
+                        }
+                    }
+                    change_skip_streak = 0;
                 }
                 let start = std::time::Instant::now();
                 match enc.encode(&frame) {
@@ -1524,6 +1554,7 @@ async fn main() -> Result<()> {
                             let avg_ms = total_ms_this_sec / frames_this_sec.max(1) as u128;
                             tracing::info!(
                                 frames = frames_this_sec,
+                                skipped = skipped_this_sec,
                                 dim = emb.values.len(),
                                 avg_encode_ms = avg_ms,
                                 "video embeddings/s"
@@ -1531,6 +1562,10 @@ async fn main() -> Result<()> {
                             last_log = std::time::Instant::now();
                             frames_this_sec = 0;
                             total_ms_this_sec = 0;
+                            skipped_this_sec = 0;
+                        }
+                        if video_change_threshold > 0.0 {
+                            last_encoded_frame = Some(frame);
                         }
                         if video_emb_tx.blocking_send(emb).is_ok() {
                             pending.fetch_add(1, Ordering::Relaxed);

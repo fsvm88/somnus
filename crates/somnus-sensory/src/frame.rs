@@ -78,6 +78,26 @@ impl VideoFrame {
             PixelFormat::Mjpeg => 0,
         }
     }
+
+    /// Mean absolute per-byte difference against `other`, normalised to `[0, 1]`.
+    ///
+    /// Cheap proxy for "how much did the scene change" — used to gate encoder
+    /// inference on near-static input. Compressed/variable-length frames
+    /// (`Mjpeg`, or a length mismatch e.g. after a resolution change) can't be
+    /// compared byte-for-byte, so this returns `1.0` ("fully changed") for
+    /// those, which safely disables gating rather than under-reporting change.
+    pub fn mean_abs_diff(&self, other: &VideoFrame) -> f32 {
+        if self.data.len() != other.data.len() || self.data.is_empty() {
+            return 1.0;
+        }
+        let sum: u64 = self
+            .data
+            .iter()
+            .zip(other.data.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64)
+            .sum();
+        sum as f32 / (self.data.len() as f32 * 255.0)
+    }
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -121,6 +141,44 @@ mod tests {
         let f = make_audio(88200, 2, 44100);
         let d = f.duration_secs();
         assert!((d - 1.0).abs() < 1e-9, "expected ~1.0 s, got {d}");
+    }
+
+    fn make_video(data: Vec<u8>, format: PixelFormat) -> VideoFrame {
+        VideoFrame {
+            data,
+            width: 2,
+            height: 2,
+            format,
+            timestamp: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn mean_abs_diff_identical_is_zero() {
+        let a = make_video(vec![10, 20, 30, 40], PixelFormat::Rgb8);
+        let b = a.clone();
+        assert_eq!(a.mean_abs_diff(&b), 0.0);
+    }
+
+    #[test]
+    fn mean_abs_diff_max_is_one() {
+        let a = make_video(vec![0, 0, 0, 0], PixelFormat::Rgb8);
+        let b = make_video(vec![255, 255, 255, 255], PixelFormat::Rgb8);
+        assert_eq!(a.mean_abs_diff(&b), 1.0);
+    }
+
+    #[test]
+    fn mean_abs_diff_length_mismatch_is_one() {
+        let a = make_video(vec![0, 0], PixelFormat::Mjpeg);
+        let b = make_video(vec![0, 0, 0], PixelFormat::Mjpeg);
+        assert_eq!(a.mean_abs_diff(&b), 1.0);
+    }
+
+    #[test]
+    fn mean_abs_diff_empty_is_one() {
+        let a = make_video(vec![], PixelFormat::Rgb8);
+        let b = make_video(vec![], PixelFormat::Rgb8);
+        assert_eq!(a.mean_abs_diff(&b), 1.0);
     }
 
     #[test]

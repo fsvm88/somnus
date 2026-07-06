@@ -20,6 +20,7 @@ Topic-organized research notes that inform design decisions.
 ## Current notes
 
 ### Theory / design rationale
+- [`brain-scale-comparison.md`](brain-scale-comparison.md) — quantitative neuron/synapse comparison (brain vs. somnus), compute-speed-vs-scale tradeoff, survey of capacity-efficiency techniques (MoE routing, weight sharing, low-rank factorization, event-driven computation, adaptive computation time, local attention, multi-timescale processing).
 - [`continuous-learning.md`](continuous-learning.md) — CL families (replay, regularization, growth, CLS), where somnus sits, + hardware budget tradeoffs.
 - [`sleep-and-consolidation.md`](sleep-and-consolidation.md) — NREM/REM biology, mapping to somnus's two-stage cycle, + sleep time/memory budget estimates.
 - [`predictive-coding.md`](predictive-coding.md) — Friston FEP / PC framework; partial adoption rationale; what it costs to implement fully vs. what somnus already borrows.

@@ -84,105 +84,42 @@
 
 ## 5. LLM: Qwen3-0.6B ✅ ADOPTED (2026-07-05, ADR 0036) — Qwen2.5 dropped
 
-**Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`.
+**Source:** Qwen team, April 2025. HF repo: `Qwen/Qwen3-0.6B`. 600M params, hidden_size 1024
+(Qwen2.5-0.5B: 896), MMLU 70.0 vs ~47.
 
-**What:** 600M parameter LM. MMLU 70.0 vs Qwen2.5-0.5B ~47 — large quality gap. Outperforms Qwen2.5 base models ≤7B on over half of benchmarks, especially STEM and reasoning.
+**Outcome:** Qwen3-0.6B is now the sole action-decoder LM; Qwen2.5 support (and the floated
+"Option D" Qwen2.5-0.5B-Instruct) is dropped. `LM_HIDDEN`/`LANG_HIDDEN`/`LANG_DIM`/`EOS_TOKEN_ID`
+hardcoded to Qwen3's values; cross-modal projection input fixed at 2304 (was a 2176/2304 toggle).
+Full evidence trail: `ai-docs/a_b_qwen3_findings.md`, ADR 0036.
 
-**Architecture:** hidden_size 1024 (up from 896), num_layers 28 (up from 24), num_attention_heads 16 (up from 14), num_key_value_heads 8 (up from 2).
+**Path to adoption (2026-06-28 → 2026-07-05):** an initial A/B (2026-06-28) was later found
+invalid — a hardcoded 896-wide embed table was sliced at stride 1024, corrupting token embeddings
+in both arms. Fixing that surfaced two more real bugs (Qwen3 loaded into the wrong model class;
+~6 more hardcoded language-region dims in `somnus-perception` disagreeing with each other). Once fixed
+and re-run on the stock 4-clip corpus, the result was inconclusive (too little speech for
+lang-ingest to fire more than ~once/session) — not "Qwen3 loses." Re-run on the speech-dense
+`clips/long/` corpus with identical exposure both arms: Qwen3 beat Qwen2.5 on `mean_proj_loss` by
+~22%, consistently, no reversals across the campaign. A direct `generate()` comparison confirmed
+this is real, user-visible: Qwen3 produced coherent English, Qwen2.5 incoherent token garbage.
+Adopted on the strength of both results. Full blow-by-blow (useful mainly as an A/B-methodology
+reference) in `ai-docs/a_b_qwen3_findings.md`.
 
-**Completed (commits d0f92c5 → bcf1480):**
-- ✅ Base model exported: `qwen3_lm_base.onnx` (2.3 GB)
-- ✅ Projection weights: w1.bin (2.5MB, 640×1024), w2.bin (20MB, 1024×5120)
-- ✅ Qwen3 embed table: `qwen3_embed_table.safetensors` (622.3 MB, 151k vocab × 1024-dim)
-- ✅ Qwen3 tokenizer: `qwen3_tokenizer.json` (11.4 MB)
-- ✅ Infrastructure scripts: `export_kv_cache_qwen3.py`, `train_lora_qwen3.py`, `ab_qwen3.sh`
-- ✅ **CRITICAL FIX:** Language region matmul dimension mismatch
-  - Root cause: `LANG_DIM` hardcoded to 896 (Qwen2.5), k-WTA expected 1024
-  - Fix: Updated `LANG_DIM: 896 → 1024`, exported Qwen3 embed table
-  - Verification: Text ingestion tested and working (no panic)
-- ⚠️ **A/B Validation:** ran 2026-06-28, but found INVALID on 2026-07-05.
-  - Reported result: Qwen3 "underperforms" on warm_recall_l2 (0.550 → 0.498, -9.6%)
-  - **This number is not trustworthy.** Root cause found 2026-07-05: `LM_HIDDEN` was bumped
-    896→1024 (commit `6335b42`, the day before this A/B ran) but `ActionDecoder::new` always
-    loads `qwen25_embed_table.safetensors` (896-wide) by hardcoded filename. `embed_flat()`
-    (`action.rs:1207`) slices that table at stride `LM_HIDDEN=1024` — every token embedding for
-    *both* arms was silently misaligned/corrupted, not a fair test of either architecture.
-    Qwen3 also never got matching GPU-path exports (gain/text_hidden/lm_fixed), so it ran on
-    the CPU fallback via `ab_qwen3.sh`'s file-swap trick, whose "restore" step also silently
-    failed — `qwen25_lm.onnx` on disk is still, right now, actually the Qwen3 model.
-  - Analysis (superseded conclusion, corrected root-cause note added): `ai-docs/a_b_qwen3_findings.md`
-  - Full incident writeup: `.claude/session-state.md`
-- ✅ **Redo (2026-07-05):** pipeline fully fixed — genuine Qwen2.5 baseline restored, Qwen3 given
-  a complete matching export (via the correct `Qwen3ForCausalLM`, not `Qwen2ForCausalLM`), model-file
-  prefix parameterized (no more hardcoded `qwen25_*`/auto-detect footguns), `LM_HIDDEN`/`LANG_DIM`/
-  `EOS_TOKEN_ID` made real compile-time choices via a `qwen3` Cargo feature (two release binaries:
-  `somnus-qwen25-control`, `somnus-qwen3-treatment`). Found and fixed a third real bug along the way: ~6
-  more hardcoded 896/1024 literals scattered through `somnus-perception` for the language region.
-  - **A/B result: inconclusive, not "Qwen3 loses."** Ran 10 sessions × 5 cycles/arm cold-started on
-    the standard 4-clip corpus. Language-region MSE is statistically indistinguishable between arms
-    (0.0011 vs 0.0010) and `mean_proj_loss` has almost no samples (0/50 vs 1/50) — the stock clips
-    have too little actual speech for ASR/lang-ingest to fire more than ~once per 5-cycle session.
-    Large gaps in aggregate `mean_output_mse`/`warm_recall_l2` are noise from independently-seeded
-    non-LM regions (speech/env/visual/symbolic), not a Qwen3 effect — see per-region breakdown in
-    `ai-docs/a_b_qwen3_findings.md`.
-  - Full results + recommended next corpus (`clips/long/` or direct generation-quality test):
-    `ai-docs/a_b_qwen3_findings.md`.
-  - Aside: found an unrelated, pre-existing intermittent panic in `WhisperDecoder::decode_greedy`
-    (ORT "GetElementType is not implemented" escalating past its usual caught-WARN path) — not
-    fixed, flagged for separate triage.
-  - Status: **Infra done. Comparison needs a speech-heavy corpus or a direct generation-quality
-    test to actually answer the Qwen3-vs-Qwen2.5 question** — not queued as blocked, just not the
-    next automatic step.
-- ✅ **Redo take 2 (2026-07-05):** re-ran on a speech-dense `clips/long/` corpus (6 lecture/podcast
-  clips, `scripts/ab_qwen3_longclips.sh`) instead of the sparse-speech 4-clip set. Same 5 sessions
-  × 4 cycles/arm. This time both arms got identical exposure (73 `lang_ingest` events, ~40
-  `decoder_trainable` events each) and `mean_proj_loss` had 12/20 non-null samples per arm — a real
-  comparison this time.
-  - **Result: Qwen3 wins on `mean_proj_loss`, consistently.** Treatment sits below control at every
-    comparable point across the whole campaign (session 1: 0.00190 vs 0.00223 → session 5: 0.00120
-    vs 0.00155, a ~22% final gap), no reversals. `per_region_mse[language]` is directionally
-    consistent (0.0010 vs 0.0011). `warm_recall_l2` came back close this time (0.48 vs 0.47),
-    supporting take 1's read that its earlier gap there was seed noise, not signal.
-  - **Verdict: worth adopting Qwen3-0.6B** for the action-decoder LM, on the strength of this result
-    — recommend confirming with a longer run and/or a direct generation-quality test (drop
-    `--action-distill-only`) before flipping the default build. Full writeup:
-    `ai-docs/a_b_qwen3_findings.md`.
-  - The Whisper ASR panic recurred more often on this denser corpus (~1 crash/5 sessions control,
-    ~3/5 treatment) — still no data loss (20/20 cycles present both arms), still unrelated to this
-    work, but now more worth fixing given how often it's showing up.
-
-- ✅ **Adopted (2026-07-05, ADR 0036):** on the strength of the take-2 result, Qwen3-0.6B is now
-  the *only* action-decoder LM — the `qwen3`/`qwen3_hidden` Cargo features were removed, `LM_HIDDEN`/
-  `LANG_HIDDEN`/`LANG_DIM`/`EOS_TOKEN_ID` are hardcoded to Qwen3's values, and `--action-model-prefix`
-  defaults unconditionally to `"qwen3"`. Qwen2.5 support (and the floated Qwen2.5-0.5B-Instruct
-  "Option D") is dropped. Cross-modal projection input dimension is now fixed at 2304 (was a
-  2176/2304 toggle) — `ai-docs/architecture.md`/`.svg` updated to match.
-- ✅ **Take 3 — direct generation-quality confirmation (2026-07-05):** compared real `generate()`
-  output between the two arms (each on its take-2 trained memory dir, via a `git worktree` at the
-  last commit with both Cargo features). Qwen3 produces coherent, grammatical, on-topic English;
-  Qwen2.5 produces incoherent mixed-script token garbage — consistently, across all test prompts.
-  Confirms the take-2 `mean_proj_loss` gap reflects real generation quality, not just a lower
-  surrogate loss. Full writeup: `ai-docs/a_b_qwen3_findings.md` ("Take 3").
+**Aside, found not fixed:** an intermittent `WhisperDecoder::decode_greedy` ORT panic
+("GetElementType is not implemented"), unrelated to this work — see the Whisper item below.
 
 **Remaining (non-critical):**
-- ⚠️ LoRA training: Blocked on CPU (PyTorch/HF compatibility)
-  - Not worth pursuing until it's clear the base model needs more than distillation training
-- ⚠️ KV-cache export: Optional optimization
-  - Base model functional without it
-- ✅ Whisper `decode_greedy` intermittent ORT panic ("GetElementType is not implemented") — mitigated
-  2026-07-05: the ASR background thread (`crates/somnus/src/main.rs`) now wraps the `decode_greedy`
-  call in `std::panic::catch_unwind`, so a panic no longer silently kills the whole ASR thread for
-  the rest of the session. **Unverified caveat:** if the underlying ORT panic leaves the `Session`
-  itself poisoned, every subsequent call on that same session could panic too — in which case this
-  fix degrades "ASR dies silently forever" to "ASR logs a WARN and drops every cycle," not full
-  recovery. Only reproducing the intermittent panic would confirm which case it is; not done here.
-  The underlying ORT bug (why the panic happens at all) is still not diagnosed.
+- LoRA training: blocked on CPU (PyTorch/HF compatibility). Not worth pursuing unless distillation
+  training proves insufficient.
+- KV-cache export: optional optimization, base model functional without it.
+- Whisper `decode_greedy` intermittent ORT panic — ✅ mitigated 2026-07-05: the ASR thread
+  (`crates/somnus/src/main.rs`) wraps the call in `catch_unwind` so it no longer kills the whole
+  thread. **Unverified:** if the underlying ORT panic poisons the `Session`, every later call on
+  it may also panic — degrading to "logs a WARN and drops every cycle" rather than full recovery.
+  Root cause still undiagnosed.
 
-**Metrics being collected (per cycle):**
-- `output_mse` — reconstruction error
-- `p_lang` — language region activation probability  
-- `proj_loss` — action decoder projection loss
-- Regional activation stats, episode counts
+**Metrics collected per cycle:** `output_mse` (reconstruction error), `p_lang` (language region
+activation probability), `proj_loss` (action decoder projection loss), regional activation stats,
+episode counts.
 
 ---
 
@@ -293,7 +230,34 @@ One extractable idea: a scalar learned gate per modality per GRU step (pure sigm
 
 ---
 
-## 13. Crate hygiene
+## 13. Change-gated video encoder inference ✅ DEPLOYED (2026-07-06)
+
+Grew out of `ai-docs/research/brain-scale-comparison.md`'s capacity-efficiency survey: skip
+encoder inference on near-static input rather than running it on a fixed clock, mirroring the
+biggest efficiency mechanism real neural tissue uses (spikes only on change).
+
+**Implementation:** `VideoFrame::mean_abs_diff` (`crates/somnus-sensory/src/frame.rs`) computes mean
+absolute per-byte difference between consecutive candidate frames, normalized to `[0, 1]`;
+returns `1.0` (treated as changed) on length mismatch (covers `Mjpeg`/resolution changes, where
+byte-level comparison isn't meaningful). The video encoder task
+(`crates/somnus/src/main.rs`, video encoder `spawn_blocking`) compares each stride-selected frame
+against the last *encoded* frame and skips `enc.encode()` (no embedding emitted, same as the
+existing stride-skip path) when the diff falls below `--video-change-threshold`. A
+`--video-change-max-skip` heartbeat (default 30) forces a re-encode periodically so a fully static
+scene doesn't stop emitting embeddings entirely. Default threshold is `0.0` (disabled) —
+opt-in, preserves prior behavior exactly.
+
+Audio encoders (Whisper/CLAP) were left ungated — silence detection is a different, less
+contained problem (VAD-style, not a simple byte diff) and wasn't in scope for this pass.
+
+Not yet A/B'd for wake-path CPU savings on a real capture session — the mechanism is deployed and
+tested (unit tests on `mean_abs_diff`, full `cargo test`/`clippy` pass) but the actual skip rate
+and any downstream effect on temporal binding quality is unmeasured. Do this before assuming a
+speedup.
+
+---
+
+## 14. Crate hygiene
 
 ### Remove dead deps
 ✅ Done — `candle-core`/`candle-nn` are no longer in `[workspace.dependencies]` (removed prior to
@@ -329,3 +293,4 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | 11 | **LISTA unrolled encoder** | Med | Sparse coding quality | Deferred |
 | 12 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than Qwen3) | Deferred |
 | 13 | **usearch migration** | Med | HNSW footprint | Deferred |
+| ✅ 14 | **Change-gated video encoder** | Low | Wake-path compute (unmeasured savings) | Deployed 2026-07-06, opt-in via `--video-change-threshold` |
