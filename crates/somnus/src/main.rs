@@ -449,9 +449,10 @@ struct Args {
     #[arg(long, default_value = "0")]
     lang_oversample: usize,
 
-    /// Number of complete passes through the NREM buffer per sleep cycle (default 1).
-    /// Higher values improve consolidation quality (arXiv:2505.12512); try 4 for A/B testing.
-    #[arg(long, default_value = "1")]
+    /// Number of complete passes through the NREM buffer per sleep cycle (default 4).
+    /// arXiv:2505.12512; validated on somnus 2026-07-06 (ai-docs/gaps.md item 2): -70.9%
+    /// mean_output_mse vs N=1 for +16.6% total wall-clock, no reversals across 5 regions.
+    #[arg(long, default_value = "4")]
     nrem_replay_epochs: usize,
 
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).

@@ -1,9 +1,9 @@
 # Session state — somnus
 
 > **Last updated:** 2026-07-06
-> **Branch:** `main`. Change-gated video encoder work is committed (`9bba42b`); SVD check work
-> committed (`b410ad7`); high-replay-ratio A/B work (this section) not yet committed.
-> **Status: brain-scale-comparison survey fully closed out; gaps.md item 2 (replay ratio) validated.**
+> **Branch:** `main`. Change-gated video encoder (`9bba42b`) and SVD null-result (`b410ad7`)
+> committed; high-replay-ratio work (this section) not yet committed.
+> **Status: brain-scale-comparison survey closed out; gaps.md item 2 (replay ratio) adopted at N=4.**
 
 ## Just completed (2026-07-06)
 
@@ -11,24 +11,33 @@ Both action items from `ai-docs/research/brain-scale-comparison.md`'s "Summary j
 (see prior entries in git log for details: `9bba42b` change-gated video encoder, `b410ad7` SVD
 null result).
 
-**gaps.md item 2, high replay ratio A/B — validated, not yet committed.** Found and fixed a real
-bug first: `scripts/train_campaign.sh` (shared by every A/B script) hardcoded
+**gaps.md item 2, high replay ratio — validated and adopted, not yet committed.** Found and fixed
+a real bug first: `scripts/train_campaign.sh` (shared by every A/B script) hardcoded
 `--nrem-replay-epochs 4` unconditionally, so the existing stale run (2026-06-27, now renamed
 `memory/ab_replay_ratio_stale_20260627_buggy_n4_both_arms/`) actually compared N=4 vs N=4 —
-meaningless. Fixed by parameterizing `REPLAY_EPOCHS` (env var, default 1) and having
-`ab_replay_ratio.sh` set it explicitly per arm. Reran fresh (also needed since the old data
-predates DINOv3/Qwen3 adoption): **-70.9% mean_output_mse** (control 0.2379 → treatment 0.0693),
-consistent across every cycle with valid data, -83% to -88% per-cycle where directly comparable,
-all 5 regions improve monotonically with no reversals. Full writeup: `ai-docs/gaps.md` §2.
-**Open question, not decided:** whether to flip the CLI default from N=1 to N=4 — real tradeoff
-(4× NREM wall-clock per sleep cycle), not a free win, so flagged rather than silently changed.
-Files not yet committed: `scripts/train_campaign.sh`, `scripts/ab_replay_ratio.sh`, `gaps.md`,
-this file. `memory/ab_replay_ratio/{control,treatment}/` holds the fresh run (gitignored).
+meaningless. Fixed by parameterizing `REPLAY_EPOCHS` (env var) and having `ab_replay_ratio.sh` set
+it explicitly per arm. Reran fresh at N=1/N=2/N=4 (three arms; also needed since the old data
+predates DINOv3/Qwen3 adoption):
+
+| N | avg `mean_output_mse` | Δ vs N=1 | total wall-clock Δ |
+|---|---|---|---|
+| 1 | 0.2379 | — | — |
+| 2 | 0.1211 | -49.1% | +7.6% |
+| 4 | 0.0693 | -70.9% | +16.6% |
+
+All 5 regions improve monotonically at every N, no reversals. N=2 was the more cost-efficient
+point, but the user chose **N=4 as the adopted default** — the absolute wall-clock tax is still
+small and the extra quality is worth it, on the view that ~17% is recoverable elsewhere. CLI
+default (`crates/somnus/src/main.rs::nrem_replay_epochs`) and `train_campaign.sh`'s `REPLAY_EPOCHS`
+default both flipped 1→4; `build/clippy` pass. Full writeup: `ai-docs/gaps.md` §2. Files not yet
+committed: `crates/somnus/src/main.rs`, `scripts/train_campaign.sh`, `scripts/ab_replay_ratio.sh`
+(unaffected by the default flip — sets `REPLAY_EPOCHS` explicitly per arm already), `gaps.md`,
+this file. `memory/ab_replay_ratio/{control,n2,treatment}/` holds the fresh three-arm run
+(gitignored).
 
 ## Queued for next session
 
-Empty. Open question above (flip the default?) is the only unresolved thread — needs a user
-decision, not more investigation. Otherwise fall back to `ai-docs/gaps.md`'s priority table:
+Empty. Nothing outstanding from this session. Fall back to `ai-docs/gaps.md`'s priority table:
 items 7–13 (DER++ auto-λ, EfficientAT/M2D-CLAP/SigLIP2 encoder swaps, LISTA, Gemma 3, usearch
 migration) are all explicitly deferred, not queued.
 
