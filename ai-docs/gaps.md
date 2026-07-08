@@ -69,30 +69,32 @@ Real diminishing returns: N=1→2 buys 49% of the total error reduction for well
    - Skips stale samples before training, preventing outdated targets from hurting consolidation
    - Tracked in SleepStats.stale_traces_skipped for monitoring
 
-2. **Auto-λ:** ✅ IMPLEMENTED (2026-07-06), not yet A/B'd
+2. **Auto-λ:** ❌ REJECTED (2026-07-08, A/B FAIL) — kept as opt-in-only, off by default
    - `PerceptionProcessor.fused_replay_wake_step_batch` (`crates/somnus-perception/src/lib.rs`)
      combined `sae_loss` (current-batch SAE reconstruction) and `wake_loss` (output-head MSE
      against stale stored outputs) as an unweighted sum — an implicit, hand-tuned λ=1.
-   - New opt-in behavior (`--der-auto-lambda`, default `false`): tracks a running EWMA mean and
-     mean-square of `wake_loss` (α=0.05), derives its variance, and weights `wake_loss` by
-     `1/variance` (clamped to `[0.1, 10.0]`) before summing — homoscedastic uncertainty
-     weighting, so a noisy/unstable `wake_loss` term contributes less to the combined gradient
-     without a hand-picked constant.
-   - Seeded from the first observed `wake_loss` sample (no zero-init artifact on cold start),
-     mirroring the `first_batch_ever` EWMA-seeding pattern already used in `sleep.rs`'s NREM
-     loss tracking.
-   - Unit test `der_auto_lambda_stays_finite_and_loss_decreases`
-     (`crates/somnus-perception/tests/phase5_smoke.rs`) confirms the weighted path stays finite
-     and loss still decreases over repeated passes, mirroring the existing unweighted test.
-   - **Not yet validated on a real campaign** — turning it on and comparing against the
-     unweighted default (this item's own recommended next step) is unstarted.
+     Implemented (2026-07-06, commit `f2fd185`) an opt-in `--der-auto-lambda` alternative:
+     tracks a running EWMA mean/mean-square of `wake_loss` (α=0.05, seeded from the first
+     sample), derives its variance, and weights `wake_loss` by `1/variance` (clamped
+     `[0.1, 10.0]`) — homoscedastic uncertainty weighting instead of the hand-tuned constant.
+   - **A/B result (2026-07-08, `scripts/ab_der_auto_lambda.sh`):** 5 sessions × 2 cycles,
+     fresh memory both arms, h3h3/shorts corpus. `mean_output_mse`: control (unweighted) avg
+     0.0487, treatment (`--der-auto-lambda`) avg 0.0847 (**+73.8%**, worse). Regression held
+     in all 10/10 cycles, no reversals (range +16% to +937% per cycle) — a consistent, decisive
+     failure, not noise. Likely cause: the EWMA variance estimate is too small/noisy early in
+     a cycle, producing large `1/variance` weight spikes that destabilize consolidation instead
+     of damping a noisy term as intended.
+   - **Decision:** do not adopt. `--der-auto-lambda` remains an opt-in flag defaulting to
+     `false`; no code revert needed. Unit test `der_auto_lambda_stays_finite_and_loss_decreases`
+     (`crates/somnus-perception/tests/phase5_smoke.rs`) stays as a finite/does-not-diverge guard
+     on the code path, not an endorsement of using it.
+   - Not planned to revisit unless a different variance estimator (e.g. windowed instead of
+     EWMA, or a floor on the sample count before weighting kicks in) is proposed.
 
 **Which part of somnus:** NREM consolidation replay loop (`crates/somnus/src/sleep.rs` calls into
 `PerceptionProcessor::fused_replay_wake_step_batch`, `crates/somnus-perception/src/lib.rs`).
 
 **Phase 2 Implementation:** `PerceptionProcessor.infer_episode_outputs()` infers current model predictions; NREM batch loop compares vs stored regionals via cosine. Filtered batch trained and projected.
-
-**Phase 3 effort:** Low–Medium, actually ~30 lines (struct fields + setter + weighting logic + CLI flag + unit test) rather than the ~10 originally estimated, once CLI wiring and test coverage are counted — implement once Phase 2 validated via campaign.
 
 ---
 

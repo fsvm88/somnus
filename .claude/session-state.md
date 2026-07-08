@@ -1,11 +1,32 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-06
+> **Last updated:** 2026-07-08
 > **Branch:** `main`. Committed: change-gated video encoder (`9bba42b`), SVD null-result
 > (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4 replay-ratio default
-> (`f0fa9c6`), items 7/8 queued (`709442b`). DER++ auto-λ implementation (item 7, this section) is
-> done but **not yet committed** — see file list below.
-> **Status: item 7 (DER++ auto-λ) implemented, unvalidated. Item 8 (EfficientAT-mn10) still queued.**
+> (`f0fa9c6`), items queued (`709442b`), DER++ auto-λ implementation (`f2fd185`, gaps.md §3).
+> **Status: gaps.md §3 (DER++ auto-λ) A/B'd and REJECTED — FAIL, +73.8% mean_output_mse, 10/10
+> cycles regressed, no reversals. Stays off by default, no code revert needed. gaps.md §9
+> (EfficientAT-mn10) is next up, still queued/untouched.**
+
+## Just completed (2026-07-08)
+
+Ran the A/B that gaps.md §3 flagged as its own next step: `--der-auto-lambda` (EWMA
+1/variance weighting) vs. default unweighted (λ=1) sum in `fused_replay_wake_step_batch`. New
+script `scripts/ab_der_auto_lambda.sh` (mirrors `ab_replay_ratio.sh`: 5 sessions × 2 cycles, fresh
+memory per arm, h3h3/shorts corpus, control then treatment). **Result: FAIL.** `mean_output_mse`
+control avg 0.0487 vs. treatment avg 0.0847 (**+73.8%**, worse), regressed in all 10/10 cycles
+(range +16% to +937%), no reversals — decisive, not noise. Likely cause: EWMA variance estimate
+too small/noisy early, causing large `1/variance` weight spikes that destabilize training rather
+than damp a noisy term. Decision: do not adopt; `--der-auto-lambda` remains opt-in, defaults to
+`false`, no code changes needed. Full writeup: `ai-docs/gaps.md` §3.
+
+Note for next session: while the A/B ran, a first attempt (backgrounded via `nohup ... &`) didn't
+actually die when its launching shell exited as expected — it kept running and collided with a
+second, cleanly-restarted attempt writing to the same `memory/ab_der_auto_lambda/control` path
+before the stale one was caught and killed. The result above is from the clean single-process run
+only (verified no PID collision before trusting the numbers). Lesson: prefer the Bash tool's own
+`run_in_background` over manual `nohup ... &`, and always verify only one process is writing to a
+given output path before trusting metrics from a backgrounded training run.
 
 ## Just completed (2026-07-06)
 
@@ -14,8 +35,8 @@ Both action items from `ai-docs/research/brain-scale-comparison.md`'s "Summary j
 validated and adopted at N=4 (`d5ce2ab`, `f0fa9c6`) — see `ai-docs/gaps.md` §2 for the N=1/2/4
 comparison table.
 
-**gaps.md item 7, DER++ auto-λ Phase 3 — implemented, not yet committed.** Stale-output blocking
-(Phase 2) was already shipped (commit 65ceaf7); this adds the auto-λ half.
+**gaps.md §3, DER++ auto-λ Phase 3 — implemented and committed (`f2fd185`).** Stale-output
+blocking (Phase 2) was already shipped (commit 65ceaf7); this adds the auto-λ half.
 `fused_replay_wake_step_batch` (`crates/somnus-perception/src/lib.rs`) previously combined
 `sae_loss`+`wake_loss` as an unweighted sum. New opt-in behavior (`--der-auto-lambda`, default
 `false`): tracks a running EWMA mean/mean-square of `wake_loss` (α=0.05, seeded from the first
@@ -24,23 +45,17 @@ sample to avoid a cold-start zero artifact), derives its variance, and weights `
 constant. New unit test `der_auto_lambda_stays_finite_and_loss_decreases`
 (`crates/somnus-perception/tests/phase5_smoke.rs`) confirms the weighted path stays finite and loss
 still decreases over repeated passes. Build/clippy/test all pass; manually smoke-tested via CLI
-(`--der-auto-lambda`, no crash). Full writeup: `ai-docs/gaps.md` §3.
-
-**Not yet done: an actual A/B** comparing `--der-auto-lambda` on vs. off (the default/unweighted
-behavior) on a real campaign — this was flagged as the item's own recommended next step, not
-completed here. Files not yet committed: `crates/somnus-perception/src/lib.rs`,
-`crates/somnus/src/main.rs`, `crates/somnus-perception/tests/phase5_smoke.rs`, `ai-docs/gaps.md`,
-this file.
+(`--der-auto-lambda`, no crash).
 
 ## Queued for next session
 
-- **Item 8 — EfficientAT-mn10 ONNX export test** (still queued, untouched this session). Low-risk
+- **gaps.md §9 — EfficientAT-mn10 ONNX export test** (still queued, untouched). Low-risk
   MobileNetV3 audio-env encoder alternative (~5–20M params, pure CNN, no attention/ScatterElements
   ops — should export to ONNX trivially). Full spec: `ai-docs/gaps.md` §9. Effort: Low (export +
   A/B vs current CLAP-HTSAT). Verify actual penultimate-feature dim (doc estimates ~960,
   unconfirmed) before wiring up the region-input projection change.
-- Optionally circle back to **item 7's own A/B** (auto-λ on vs. off) before moving to item 8,
-  since the implementation is otherwise unvalidated — ask the user which they want first.
+- Read the §3 auto-λ A/B result (above) once it completes; update gaps.md/commit either way
+  (adopt-as-default, keep opt-in, or revert) before starting §9.
 
 ## Current state
 
