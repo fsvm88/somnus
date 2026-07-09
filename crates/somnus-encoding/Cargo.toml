@@ -3,6 +3,12 @@ name    = "somnus-encoding"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# A/B candidate (gaps.md item 9): EfficientAT mn10 env encoder (960-dim, mel done in Rust
+# via Mn10Mel) instead of CLAP-HTSAT (512-dim, default). Must match somnus-perception's
+# mn10_env feature (REGION_DIMS[1]) — cold-start required, not runtime-selectable.
+mn10_env = []
+
 [dependencies]
 anyhow      = { workspace = true }
 somnus-sensory = { path = "../somnus-sensory" }

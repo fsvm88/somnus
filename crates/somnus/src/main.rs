@@ -492,18 +492,27 @@ struct Args {
 
 const AUDIO_CHUNK: usize = 4096;
 const WHISPER_SAMPLES: usize = 480_000;
-const CLAP_SAMPLES: usize = 480_000;
+// Env encoder window: CLAP-HTSAT is 10s @ 48kHz (default); EfficientAT mn10 is 10s @ 32kHz
+// (gaps.md item 9 A/B, `--features mn10_env`, matches Mn10Mel's expected input).
+#[cfg(not(feature = "mn10_env"))]
+const ENV_SAMPLE_RATE: u32 = 48_000;
+#[cfg(not(feature = "mn10_env"))]
+const ENV_SAMPLES: usize = 480_000;
+#[cfg(feature = "mn10_env")]
+const ENV_SAMPLE_RATE: u32 = 32_000;
+#[cfg(feature = "mn10_env")]
+const ENV_SAMPLES: usize = 320_000;
 
 struct AudioProcessor {
     encoder: AudioEncoder,
     r16k: Option<SincResampler>,
-    r48k: Option<SincResampler>,
+    r_env: Option<SincResampler>,
     in_rate: Option<u32>,
     src_buf: Vec<f32>,
     buf_16k: Vec<f32>,
-    buf_48k: Vec<f32>,
+    buf_env: Vec<f32>,
     ts_16k: Option<Timestamp>,
-    ts_48k: Option<Timestamp>,
+    ts_env: Option<Timestamp>,
     /// Sends encoder hidden states to the dedicated ASR background thread (ADR 0013).
     /// Non-blocking (try_send): drops the chunk if the decoder is still busy.
     asr_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
@@ -517,13 +526,13 @@ impl AudioProcessor {
         Ok(Self {
             encoder: AudioEncoder::new(models_dir)?,
             r16k: None,
-            r48k: None,
+            r_env: None,
             in_rate: None,
             src_buf: Vec::new(),
             buf_16k: Vec::new(),
-            buf_48k: Vec::new(),
+            buf_env: Vec::new(),
             ts_16k: None,
-            ts_48k: None,
+            ts_env: None,
             asr_tx,
         })
     }
@@ -552,7 +561,7 @@ impl AudioProcessor {
         if self.in_rate.is_none() {
             let rate = frame.sample_rate;
             self.r16k = Some(SincResampler::new(rate, 16_000, AUDIO_CHUNK)?);
-            self.r48k = Some(SincResampler::new(rate, 48_000, AUDIO_CHUNK)?);
+            self.r_env = Some(SincResampler::new(rate, ENV_SAMPLE_RATE, AUDIO_CHUNK)?);
             self.in_rate = Some(rate);
             info!(in_rate = rate, "audio resamplers initialised");
         }
@@ -560,8 +569,8 @@ impl AudioProcessor {
         if self.ts_16k.is_none() {
             self.ts_16k = Some(frame.timestamp.clone());
         }
-        if self.ts_48k.is_none() {
-            self.ts_48k = Some(frame.timestamp.clone());
+        if self.ts_env.is_none() {
+            self.ts_env = Some(frame.timestamp.clone());
         }
 
         self.src_buf.extend_from_slice(&mono);
@@ -571,8 +580,8 @@ impl AudioProcessor {
             self.src_buf.drain(..AUDIO_CHUNK);
             self.buf_16k
                 .extend_from_slice(&self.r16k.as_mut().unwrap().process(&chunk)?);
-            self.buf_48k
-                .extend_from_slice(&self.r48k.as_mut().unwrap().process(&chunk)?);
+            self.buf_env
+                .extend_from_slice(&self.r_env.as_mut().unwrap().process(&chunk)?);
         }
 
         let mut embs = Vec::new();
@@ -597,9 +606,9 @@ impl AudioProcessor {
             embs.push(emb);
         }
 
-        if self.buf_48k.len() >= CLAP_SAMPLES {
-            let pcm: Vec<f32> = self.buf_48k.drain(..CLAP_SAMPLES).collect();
-            let ts = self.ts_48k.take().unwrap();
+        if self.buf_env.len() >= ENV_SAMPLES {
+            let pcm: Vec<f32> = self.buf_env.drain(..ENV_SAMPLES).collect();
+            let ts = self.ts_env.take().unwrap();
             let start = std::time::Instant::now();
             let emb = self.encoder.encode_env(&pcm, ts)?;
             tracing::info!(
@@ -769,9 +778,13 @@ async fn main() -> Result<()> {
 
     // Audio/visual model files are only needed when a media file is provided.
     if !args.file.is_empty() {
+        #[cfg(not(feature = "mn10_env"))]
+        let env_encoder_name = "clap_audio_encoder.onnx";
+        #[cfg(feature = "mn10_env")]
+        let env_encoder_name = "efficientat_mn10_encoder_fp16.onnx";
         for name in &[
             "whisper_tiny_encoder.onnx",
-            "clap_audio_encoder.onnx",
+            env_encoder_name,
             "dinov2_small.onnx",
         ] {
             let p = args.models_dir.join(name);

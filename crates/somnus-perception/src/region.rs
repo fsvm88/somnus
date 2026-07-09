@@ -262,11 +262,8 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
 
             // Find threshold τ such that top (b * K_ACTIVE) values exceed it
             let target_k = b * K_ACTIVE;
-            let mut indexed: Vec<(usize, f32)> = boosted_snapshot
-                .iter()
-                .copied()
-                .enumerate()
-                .collect();
+            let mut indexed: Vec<(usize, f32)> =
+                boosted_snapshot.iter().copied().enumerate().collect();
             let split = boosted_snapshot.len() - target_k;
             indexed.select_nth_unstable_by(split, |a, b| {
                 a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)

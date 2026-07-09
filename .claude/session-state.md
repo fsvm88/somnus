@@ -1,12 +1,83 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-08
+> **Last updated:** 2026-07-09
 > **Branch:** `main`. Committed: change-gated video encoder (`9bba42b`), SVD null-result
 > (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4 replay-ratio default
-> (`f0fa9c6`), items queued (`709442b`), DER++ auto-λ implementation (`f2fd185`, gaps.md §3).
-> **Status: gaps.md §3 (DER++ auto-λ) A/B'd and REJECTED — FAIL, +73.8% mean_output_mse, 10/10
-> cycles regressed, no reversals. Stays off by default, no code revert needed. gaps.md §9
-> (EfficientAT-mn10) is next up, still queued/untouched.**
+> (`f0fa9c6`), items queued (`709442b`), DER++ auto-λ implementation (`f2fd185`, gaps.md §3),
+> DER++ auto-λ A/B reject (`72d1503`). EfficientAT-mn10 implementation + A/B result committed
+> this session (gaps.md §9) — see below.
+> **Status: gaps.md §3 and §9 both resolved (both REJECTED). Queue empty — see "Queued for
+> next session" below.**
+
+## Just completed (2026-07-09) — EfficientAT mn10 (gaps.md item 9) — ❌ REJECTED
+
+Resumed the A/B campaign left mid-run at the end of the previous session (implementation was
+already complete and smoke-tested). Ran clean (`rm -rf memory/ab_efficientat_mn10` first, then
+`bash scripts/ab_efficientat_mn10.sh`, 5 sessions × 2 cycles per arm, fresh memory both arms,
+h3h3/shorts corpus).
+
+**Result: FAIL.** Verdict is based on the mean MSE of the four regions with identical
+architecture in both arms (speech/visual/symbolic — region-1/env excluded, see script header
+for why CLAP vs. mn10 env-MSE isn't a valid cross-arm comparison): control (CLAP-HTSAT) avg
+0.011966 vs. treatment (mn10) avg 0.030588, **+155.6%, worse**, regressed in 9/10 cycles, no
+reversals. `warm_recall_l2`/`gist_recall_rate` moved in mn10's favor but don't override a 2.5×
+MSE regression on the shared representation — likely a scale-distortion artifact rather than a
+genuine improvement.
+
+**Decision:** reject: default env encoder stays CLAP-HTSAT. Implementation kept as an opt-in,
+off-by-default Cargo feature (`mn10_env`) rather than deleted — it's clean and parity-tested,
+and may be worth revisiting for a different reason (e.g. deployment-size constraints) later.
+Full writeup: `ai-docs/gaps.md` §9. Build/clippy/test pass clean both with and without the
+feature; committed together with the implementation in one shot (was never committed before
+since the A/B hadn't concluded).
+
+## Queued for next session
+
+Nothing queued. Both A/B items on deck (`gaps.md` §3 DER++ auto-λ, §9 EfficientAT-mn10) are
+now resolved (both rejected, kept opt-in-only). Remaining `gaps.md` priority-table items are
+all either ✅ done or explicitly Deferred (M2D-CLAP #9, SigLIP2 #10, LISTA #11, Gemma 3 #12,
+usearch #13) — none are queued as an immediate next step. Next step is user-driven; see
+`ai-docs/gaps.md`'s priority table for deferred candidates if the user wants to pick one up.
+
+## Historical: EfficientAT mn10 implementation notes (2026-07-08, now committed and A/B'd — see above)
+
+**What was implemented:**
+- `crates/somnus-encoding/src/preprocess/mel.rs`: new `Mn10Mel` — EfficientAT's `AugmentMelSTFT`
+  mel frontend (pre-emphasis, centered/padded Hann window, Kaldi-style mel filterbank —
+  genuinely different triangle construction from the existing HTK/Slaney code, not a
+  parameter variant, see `kaldi_mel_filterbank_f64`'s doc comment) ported to Rust and
+  parity-tested against the PyTorch reference (`crates/somnus-encoding/tests/mel_parity.rs`,
+  `mn10_zeros_parity`/`mn10_sine440_parity`, both pass at 1e-4 tolerance). Fixture files in
+  `crates/somnus-encoding/tests/fixtures/mn10_*` are new, untracked, need `git add`.
+- `scripts/export_efficientat.py`: exports the MobileNetV3 backbone only (no mel frontend —
+  deliberately, baking `AugmentMelSTFT` in works numerically but reintroduces an STFT op,
+  defeating mn10's whole MIGraphX-compat rationale; see script docstring). Verified
+  numerically against PyTorch (rel L2 ~9e-7) and confirmed zero STFT/DFT ops in the graph.
+  Needs its own venv (`scripts/.venv-efficientat/`, gitignored, torch 2.13/torchvision 0.28 —
+  incompatible with `scripts/.venv`'s pinned torch 2.11.0, so it's isolated rather than
+  risking the shared venv). Exported model already on disk:
+  `models/efficientat_mn10_encoder{,_fp16}.onnx` (gitignored, not committed, regenerable via
+  `scripts/.venv-efficientat/bin/python scripts/export_efficientat.py &&
+  scripts/.venv-efficientat/bin/python scripts/convert_fp16.py`).
+- New Cargo feature `mn10_env` (in `somnus-encoding`, `somnus-perception`, forwarded by `somnus`):
+  swaps `REGION_DIMS[1]` 512→960, `AudioEncoder`'s env session/mel/sample-rate (CLAP 48kHz
+  vs mn10 32kHz), and all the cross-modal-concat offset math in
+  `crates/somnus-perception/src/lib.rs` (now derived from `ENV_DIM`/`CM_OFF_*` consts instead of
+  hardcoded 512/896/1280 literals). Builds, tests, and clippy pass clean **both** with and
+  without the feature. End-to-end smoke-tested manually (single session, small capacity,
+  `--features mn10_env` binary) — ran a full sleep cycle with `env embedding dim=960`, no
+  crashes, log confirms correct dim.
+- `scripts/train_campaign.sh` gained an additive `SKIP_BUILD` env var (default `0`, no effect
+  on any other script) so the A/B script can build each arm itself (with/without
+  `--features mn10_env`) without the campaign script's own unconditional `cargo build`
+  clobbering it.
+- `scripts/ab_efficientat_mn10.sh`: the A/B harness. **Important asymmetry vs. every prior
+  A/B in this repo:** region-1 (env) MSE is NOT a valid comparison between arms — CLAP and
+  mn10 have different target distributions (contrastive/unit-norm vs. raw pooled-conv
+  log-mel-scale), so `per_region_mse[1]` moving is a scale artifact, not a quality signal.
+  The verdict is computed from the mean of the OTHER four regions' MSE (indices 0,2,3,4 —
+  identical architecture both arms, genuinely comparable) plus `warm_recall_l2` /
+  `gist_recall_rate`. Region-1 MSE is still printed for reference only.
 
 ## Just completed (2026-07-08)
 
@@ -49,13 +120,12 @@ still decreases over repeated passes. Build/clippy/test all pass; manually smoke
 
 ## Queued for next session
 
-- **gaps.md §9 — EfficientAT-mn10 ONNX export test** (still queued, untouched). Low-risk
-  MobileNetV3 audio-env encoder alternative (~5–20M params, pure CNN, no attention/ScatterElements
-  ops — should export to ONNX trivially). Full spec: `ai-docs/gaps.md` §9. Effort: Low (export +
-  A/B vs current CLAP-HTSAT). Verify actual penultimate-feature dim (doc estimates ~960,
-  unconfirmed) before wiring up the region-input projection change.
-- Read the §3 auto-λ A/B result (above) once it completes; update gaps.md/commit either way
-  (adopt-as-default, keep opt-in, or revert) before starting §9.
+- **gaps.md §9 — EfficientAT-mn10, resume the A/B.** Implementation is done (see "In
+  progress" section above for full detail) — this is a resume, not a fresh start. Exact
+  steps: `rm -rf memory/ab_efficientat_mn10` then `bash scripts/ab_efficientat_mn10.sh`,
+  then document + commit. Was going to be "Low effort" per the original gaps.md estimate;
+  turned out Medium (cold-start region-dim change, new Rust mel port, isolated venv) — same
+  pattern as §3 before it. Effort actually spent is sunk; only the A/B run + writeup remain.
 
 ## Current state
 

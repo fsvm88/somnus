@@ -3,6 +3,11 @@ name    = "somnus-perception"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# A/B candidate (gaps.md item 9): EfficientAT mn10 env encoder (960-dim) instead of
+# CLAP-HTSAT (512-dim, default). Cold-start required — not runtime-selectable.
+mn10_env = []
+
 [dependencies]
 burn         = { workspace = true }
 burn-ndarray = { workspace = true }

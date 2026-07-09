@@ -58,6 +58,9 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 # Maps to --onnx-models-dir; writes ONNX graphs relative to MEMORY_DIR by default.
 ONNX_MODELS_DIR="${ONNX_MODELS_DIR:-}"
 ONNX_SCRIPT="${ONNX_SCRIPT:-}"       # override path to export_perception_graph.py
+# Skip the build step below — for callers that pre-build target/release/somnus themselves
+# (e.g. with non-default --features, which this script's own `cargo build` doesn't pass).
+SKIP_BUILD="${SKIP_BUILD:-0}"
 
 METRICS_FILE="${CAMPAIGN_DIR}/metrics.jsonl"
 LOG_DIR="${CAMPAIGN_DIR}/logs"
@@ -65,8 +68,10 @@ LOG_DIR="${CAMPAIGN_DIR}/logs"
 mkdir -p "$CAMPAIGN_DIR" "$LOG_DIR"
 
 # ── Build once ────────────────────────────────────────────────────────────────
-echo "[campaign] building somnus (release)…"
-cargo build --release -p somnus 2>&1
+if [ "$SKIP_BUILD" != "1" ]; then
+    echo "[campaign] building somnus (release)…"
+    cargo build --release -p somnus 2>&1
+fi
 SOMNUS="$REPO_ROOT/target/release/somnus"
 
 # ── Record campaign parameters ────────────────────────────────────────────────

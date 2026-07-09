@@ -4,14 +4,15 @@ use somnus_sensory::Timestamp;
 use ndarray::{Array3, Array4};
 use ort::{session::Session, value::TensorRef};
 
-use crate::{
-    preprocess::mel::{ClapMel, WhisperMel},
-    session_with_migraphx, EncodingError, EncodingResult,
-};
+#[cfg(not(feature = "mn10_env"))]
+use crate::preprocess::mel::ClapMel;
+#[cfg(feature = "mn10_env")]
+use crate::preprocess::mel::Mn10Mel;
+use crate::{preprocess::mel::WhisperMel, session_with_migraphx, EncodingError, EncodingResult};
 
 pub struct AudioEmbedding {
     pub source: AudioEncoderSource,
-    pub values: Vec<f32>, // 384 (Speech) or 512 (Env)
+    pub values: Vec<f32>, // 384 (Speech) or ENV_DIM (Env: 512 CLAP / 960 mn10)
     pub timestamp: Timestamp,
     /// Wall time for this encode call (mel computation + ORT inference), in milliseconds.
     pub encode_ms: u64,
@@ -21,29 +22,51 @@ pub struct AudioEmbedding {
 pub enum AudioEncoderSource {
     /// Whisper-tiny encoder, 384-dim, speech content.
     Speech,
-    /// CLAP-HTSAT-unfused encoder, 512-dim, environmental sound.
+    /// Environmental sound encoder — CLAP-HTSAT-unfused (512-dim, default) or EfficientAT
+    /// mn10 (960-dim, `--features mn10_env`, gaps.md item 9).
     Env,
 }
+
+#[cfg(not(feature = "mn10_env"))]
+type EnvMel = ClapMel;
+#[cfg(feature = "mn10_env")]
+type EnvMel = Mn10Mel;
 
 pub struct AudioEncoder {
     speech_session: Session,
     env_session: Session,
     speech_mel: WhisperMel,
-    env_mel: ClapMel,
+    env_mel: EnvMel,
 }
 
 const WHISPER_SAMPLES: usize = 480_000; // 30 s @ 16 kHz
-const CLAP_SAMPLES: usize = 480_000; // 10 s @ 48 kHz
+                                        // 10 s of env audio: 480 000 @ 48 kHz (CLAP) or 320 000 @ 32 kHz (mn10).
+#[cfg(not(feature = "mn10_env"))]
+const ENV_SAMPLES: usize = 480_000;
+#[cfg(feature = "mn10_env")]
+const ENV_SAMPLES: usize = 320_000;
+#[cfg(not(feature = "mn10_env"))]
+const ENV_ONNX_FILE: &str = "clap_audio_encoder_fp16.onnx";
+#[cfg(feature = "mn10_env")]
+const ENV_ONNX_FILE: &str = "efficientat_mn10_encoder_fp16.onnx";
+#[cfg(not(feature = "mn10_env"))]
+const ENV_DIM: i64 = 512;
+#[cfg(feature = "mn10_env")]
+const ENV_DIM: i64 = 960;
+#[cfg(not(feature = "mn10_env"))]
+const ENV_OUTPUT_NAME: &str = "audio_embeds";
+#[cfg(feature = "mn10_env")]
+const ENV_OUTPUT_NAME: &str = "env_embedding";
 
 impl AudioEncoder {
     pub fn new(models_dir: &Path) -> EncodingResult<Self> {
         let speech_session = session_with_migraphx(&models_dir.join("whisper_tiny_encoder.onnx"))?;
-        let env_session = session_with_migraphx(&models_dir.join("clap_audio_encoder_fp16.onnx"))?;
+        let env_session = session_with_migraphx(&models_dir.join(ENV_ONNX_FILE))?;
         Ok(Self {
             speech_session,
             env_session,
             speech_mel: WhisperMel::new(),
-            env_mel: ClapMel::new(),
+            env_mel: EnvMel::new(),
         })
     }
 
@@ -96,31 +119,37 @@ impl AudioEncoder {
         ))
     }
 
-    /// Encode 480 000 f32 samples @ 48 kHz → 512-dim env embedding.
-    pub fn encode_env(&mut self, pcm_48k: &[f32], ts: Timestamp) -> EncodingResult<AudioEmbedding> {
+    /// Encode `ENV_SAMPLES` f32 samples → `ENV_DIM`-dim env embedding (CLAP: 480 000 @
+    /// 48 kHz → 512-dim; mn10: 320 000 @ 32 kHz → 960-dim).
+    pub fn encode_env(&mut self, pcm_env: &[f32], ts: Timestamp) -> EncodingResult<AudioEmbedding> {
         let t0 = std::time::Instant::now();
-        debug_assert_eq!(pcm_48k.len(), CLAP_SAMPLES);
-        if pcm_48k.len() != CLAP_SAMPLES {
+        debug_assert_eq!(pcm_env.len(), ENV_SAMPLES);
+        if pcm_env.len() != ENV_SAMPLES {
             return Err(EncodingError::WrongLength {
-                expected: CLAP_SAMPLES,
-                got: pcm_48k.len(),
+                expected: ENV_SAMPLES,
+                got: pcm_env.len(),
             });
         }
 
-        let mel_flat = self.env_mel.compute(pcm_48k);
-        // Shape: (1, 1, 1001, 64)
-        let mel_arr = Array4::from_shape_vec((1, 1, 1001, 64), mel_flat)
+        let mel_flat = self.env_mel.compute(pcm_env);
+        #[cfg(not(feature = "mn10_env"))]
+        let mel_shape = (1, 1, 1001, 64);
+        #[cfg(feature = "mn10_env")]
+        let mel_shape = (1, 1, 128, 1000);
+        let mel_arr = Array4::from_shape_vec(mel_shape, mel_flat)
             .map_err(|e| EncodingError::Image(e.to_string()))?;
         let tensor = TensorRef::from_array_view(&mel_arr)?;
 
-        let outputs = self
-            .env_session
-            .run(ort::inputs!["input_features" => tensor])?;
-        let (shape, data) = outputs["audio_embeds"].try_extract_tensor::<f32>()?;
+        #[cfg(not(feature = "mn10_env"))]
+        let input_name = "input_features";
+        #[cfg(feature = "mn10_env")]
+        let input_name = "mel_spectrogram";
+        let outputs = self.env_session.run(ort::inputs![input_name => tensor])?;
+        let (shape, data) = outputs[ENV_OUTPUT_NAME].try_extract_tensor::<f32>()?;
         let dims: Vec<i64> = shape.iter().copied().collect();
-        if dims != [1, 512] {
+        if dims != [1, ENV_DIM] {
             return Err(EncodingError::ShapeMismatch {
-                expected: vec![1, 512],
+                expected: vec![1, ENV_DIM],
                 got: dims,
             });
         }

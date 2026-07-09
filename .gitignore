@@ -21,6 +21,10 @@ models/*.onnx.data
 # Python venv for export scripts
 scripts/.venv/
 .venv/
+# Isolated venv for EfficientAT export (torch/torchvision pin incompatible with scripts/.venv's
+# pinned torch 2.11.0 — see ai-docs/gaps.md item 9)
+scripts/.venv-efficientat/
+scripts/.vendor-efficientat/
 experiments/**/.claude/
 
 # Raw HuggingFace checkouts used as export sources (see scripts/export_models.py) —

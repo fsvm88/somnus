@@ -7,6 +7,11 @@ edition = "2021"
 name = "somnus"
 path = "src/main.rs"
 
+[features]
+# A/B candidate (gaps.md item 9): EfficientAT mn10 env encoder instead of CLAP-HTSAT.
+# Forwards to somnus-encoding/somnus-perception's own mn10_env features (must move together).
+mn10_env = ["somnus-encoding/mn10_env", "somnus-perception/mn10_env"]
+
 [dependencies]
 somnus-sensory        = { path = "../somnus-sensory" }
 somnus-encoding       = { path = "../somnus-encoding" }

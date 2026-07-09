@@ -19,6 +19,7 @@ TARGETS = [
     "dinov2_small.onnx",
     "clap_audio_encoder.onnx",
     "whisper_tiny_encoder.onnx",
+    "efficientat_mn10_encoder.onnx",  # gaps.md item 9, A/B alternative to clap_audio_encoder
 ]
 
 for name in TARGETS:

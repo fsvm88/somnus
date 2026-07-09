@@ -206,19 +206,28 @@ episode counts.
 
 ---
 
-## 9. Audio env encoder: EfficientAT-mn10 (low-risk alternative to M2D-CLAP)
+## 9. Audio env encoder: EfficientAT-mn10 ❌ REJECTED (2026-07-09)
 
 **Source:** `fschmid56/EfficientAT` (GitHub, actively maintained 2025).
 
 **What:** ~5–20M params (MobileNetV3, width_mult=1.0). Pure CNN — no attention ops, no ScatterElements. AudioSet pre-trained.
 
-**ONNX status:** Very low risk — `torch.onnx.export` should be trivial for MobileNetV3.
+**Implementation (all done, uncommitted-then-committed together with this result):**
+- `Mn10Mel` in `crates/somnus-encoding/src/preprocess/mel.rs` — Rust port of EfficientAT's `AugmentMelSTFT` (Kaldi-style mel filterbank, genuinely different construction from the existing HTK/Slaney code). Parity-tested against the PyTorch reference at 1e-4 tolerance (`crates/somnus-encoding/tests/mel_parity.rs`).
+- `scripts/export_efficientat.py` exports the MobileNetV3 backbone only (mel frontend deliberately excluded — baking it in reintroduces an STFT op, defeating mn10's MIGraphX-compat rationale). Verified numerically against PyTorch (rel L2 ~9e-7), zero STFT/DFT ops in the graph.
+- New opt-in Cargo feature `mn10_env` (`somnus-encoding`, `somnus-perception`, `somnus`): swaps `REGION_DIMS[1]` 512→960 and the env encoder's session/mel/sample-rate (CLAP 48kHz vs mn10 32kHz).
 
-**Dimension:** ~960 (MobileNetV3 penultimate feature — verify before committing; projection update required vs CLAP-HTSAT's 512).
+**Dimension:** confirmed 960 (MobileNetV3 penultimate feature, pre-pooling-head).
 
-**Quality evidence:** Weaker than M2D-CLAP (no direct mAP vs CLAP-HTSAT head-to-head found). Main argument: tiny param count, guaranteed ONNX/MIGraphX compatibility.
+**A/B result (`scripts/ab_efficientat_mn10.sh`, 5 sessions × 2 cycles, fresh memory per arm, h3h3/shorts corpus):** region-1 (env) MSE is not a valid cross-arm comparison — CLAP (contrastive, unit-norm) and mn10 (raw pooled-conv, log-mel-scale) have different target distributions, so that number is a scale artifact, not a quality signal. Verdict is based on the mean MSE of the other four regions (speech/visual/symbolic — identical architecture both arms, genuinely comparable):
 
-**Effort:** Low (export + A/B). Best tried before M2D-CLAP given its lower export risk.
+- control (CLAP-HTSAT) avg = 0.011966, treatment (mn10) avg = 0.030588, **delta +155.6%, worse**
+- Regressed in essentially every cycle (9/10), no reversals — decisive, not noise.
+- `warm_recall_l2` and `gist_recall_rate` both moved in mn10's favor (+52.6%, +30.7%) but these don't override a 2.5× MSE regression on the shared representation; likely an artifact of the different env-region scale distorting recall geometry rather than genuine improvement.
+
+**Decision: REJECT.** mn10 significantly degrades the shared episode representation despite its ONNX/MIGraphX-compat appeal. `mn10_env` remains an opt-in, off-by-default Cargo feature (not deleted — the implementation is clean, parity-tested, and may be worth revisiting if M2D-CLAP (item 8) also fails and a smaller/cheaper env encoder becomes worth the quality tradeoff for a different reason, e.g. deployment constraints). Default env encoder stays CLAP-HTSAT.
+
+**Quality evidence (pre-A/B):** was already flagged weaker than M2D-CLAP (no direct mAP vs CLAP-HTSAT head-to-head found) — the A/B result is consistent with that prior.
 
 ---
 
@@ -349,8 +358,8 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | ✅ 4 | **Remove dead candle deps** | Trivial | Cleanliness | Already done (stale entry, corrected 2026-07-05) |
 | 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | ✅ Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
 | ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
-| 7 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Implemented 2026-07-06 (`--der-auto-lambda`, default off) — not yet A/B'd, §3 |
-| 8 | **EfficientAT-mn10 ONNX export test** | Low | Audio env encoder | Queued 2026-07-06 |
+| ❌ 7 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Rejected 2026-07-08 — A/B FAIL (+73.8% mean_output_mse), opt-in only, §3 |
+| ❌ 8 | **EfficientAT-mn10 ONNX export test** | Low→Med | Audio env encoder | Rejected 2026-07-09 — A/B FAIL (+155.6% MSE on comparable regions), opt-in-only `mn10_env` feature kept, §9 |
 | 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Deferred |
 | 10 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | Deferred |
 | 11 | **LISTA unrolled encoder** | Med | Sparse coding quality | Deferred |

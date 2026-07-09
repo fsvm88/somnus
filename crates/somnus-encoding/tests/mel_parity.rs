@@ -109,6 +109,35 @@ fn clap_sine440_parity() {
     assert!(err < TOL, "clap sine440 max_abs_err={err} >= {TOL}");
 }
 
+// ── EfficientAT mn10 parity ────────────────────────────────────────────────
+
+#[test]
+fn mn10_zeros_parity() {
+    let mel = somnus_encoding::preprocess::mel::Mn10Mel::new();
+    let pcm = vec![0.0f32; 320_000];
+    let got = mel.compute(&pcm);
+
+    let (shape, expected) = load_f32("mn10_zeros");
+    assert_eq!(shape, [128, 1000]);
+    assert_eq!(got.len(), expected.len());
+
+    let err = max_abs_err(&got, &expected);
+    assert!(err < TOL, "mn10 zeros max_abs_err={err} >= {TOL}");
+}
+
+#[test]
+fn mn10_sine440_parity() {
+    let mel = somnus_encoding::preprocess::mel::Mn10Mel::new();
+    let pcm = sine440(320_000, 32_000);
+    let got = mel.compute(&pcm);
+
+    let (shape, expected) = load_f32("mn10_sine440");
+    assert_eq!(shape, [128, 1000]);
+
+    let err = max_abs_err(&got, &expected);
+    assert!(err < TOL, "mn10 sine440 max_abs_err={err} >= {TOL}");
+}
+
 // ── DINOv2 image parity ────────────────────────────────────────────────────
 
 fn make_video_frame(

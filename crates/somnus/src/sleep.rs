@@ -340,7 +340,7 @@ pub fn run_sleep_cycle(
     let mut total_proj_loss = 0.0f32;
     let mut proj_loss_n = 0usize;
     let mut proj_loss_max = 0.0f32;
-    let mut stale_traces_skipped = 0usize;  // DER++ Phase 2: staleness detection
+    let mut stale_traces_skipped = 0usize; // DER++ Phase 2: staleness detection
 
     // Snapshot warm size before spill so REM can detect cross-cycle entries.
     let pre_spill_warm_len = recall.warm.len();
@@ -504,7 +504,11 @@ pub fn run_sleep_cycle(
 
     let decoder_trainable_records = traces.iter().filter(|(_, _, t, _, _)| t.is_some()).count();
     let replay_epochs = replay_epochs.max(1);
-    tracing::info!(decoder_trainable_records, replay_epochs, "NREM: decoder-trainable traces");
+    tracing::info!(
+        decoder_trainable_records,
+        replay_epochs,
+        "NREM: decoder-trainable traces"
+    );
 
     // Effective batch size: fall back to 1 (sequential) when 0 is passed.
     let batch_size = replay_batch_size.max(1);
@@ -522,168 +526,182 @@ pub fn run_sleep_cycle(
     for epoch_idx in 0..replay_epochs {
         let mut batch_start = 0usize; // index into `traces` of the current batch start
         while batch_start < n_traces {
-        let salient = nrem_salience_threshold > 0
-            && pending_embs.load(Ordering::Relaxed) > nrem_salience_threshold
-            && batch_start >= nrem_min_traces;
-        if interrupt.load(Ordering::Relaxed) || salient {
-            if salient {
-                tracing::info!(
-                    pending = pending_embs.load(Ordering::Relaxed),
-                    threshold = nrem_salience_threshold,
-                    "sleep interrupted: salience threshold exceeded"
-                );
+            let salient = nrem_salience_threshold > 0
+                && pending_embs.load(Ordering::Relaxed) > nrem_salience_threshold
+                && batch_start >= nrem_min_traces;
+            if interrupt.load(Ordering::Relaxed) || salient {
+                if salient {
+                    tracing::info!(
+                        pending = pending_embs.load(Ordering::Relaxed),
+                        threshold = nrem_salience_threshold,
+                        "sleep interrupted: salience threshold exceeded"
+                    );
+                }
+                was_interrupted = true;
+                nrem_exit_reason = "salience";
+                break;
             }
-            was_interrupted = true;
-            nrem_exit_reason = "salience";
-            break;
-        }
 
-        let batch_end = (batch_start + batch_size).min(n_traces);
-        let batch = &traces[batch_start..batch_end];
+            let batch_end = (batch_start + batch_size).min(n_traces);
+            let batch = &traces[batch_start..batch_end];
 
-        // ── DER++ stale-output detection (Phase 2) ────────────────────────────
-        // Filter out samples whose stored outputs (regionals) have drifted too far under distribution shift.
-        // Each trace: (ep: Vec<f32>, stored_regionals: [Vec<f32>; 5], ids: Option<Vec<u32>>, sal: f32, lm_h: Option<Vec<f32>>)
-        let mut filtered_indices: Vec<usize> = Vec::new();
-        for (i, (ep, stored_regionals, _ids, _salience, _lm_h)) in batch.iter().enumerate() {
-            // Infer current model's predictions for this episode
-            match perception.infer_episode_outputs(ep) {
-                Ok(predicted_regionals) => {
-                    // Check staleness: mean cosine sim across regions
-                    let mut cosines = Vec::new();
-                    for region_idx in 0..5 {
-                        let stored = &stored_regionals[region_idx];
-                        let predicted = &predicted_regionals[region_idx];
-                        if !stored.is_empty() && !predicted.is_empty() {
-                            // cosine_sim is a static helper — call it via the method
-                            let dot: f32 = stored.iter().zip(predicted.iter()).map(|(x, y)| x * y).sum();
-                            let norm_stored: f32 = stored.iter().map(|x| x * x).sum::<f32>().sqrt();
-                            let norm_pred: f32 = predicted.iter().map(|x| x * x).sum::<f32>().sqrt();
-                            let sim = if norm_stored < 1e-9 || norm_pred < 1e-9 {
-                                1.0
-                            } else {
-                                (dot / (norm_stored * norm_pred)).clamp(-1.0, 1.0)
-                            };
-                            cosines.push(sim);
+            // ── DER++ stale-output detection (Phase 2) ────────────────────────────
+            // Filter out samples whose stored outputs (regionals) have drifted too far under distribution shift.
+            // Each trace: (ep: Vec<f32>, stored_regionals: [Vec<f32>; 5], ids: Option<Vec<u32>>, sal: f32, lm_h: Option<Vec<f32>>)
+            let mut filtered_indices: Vec<usize> = Vec::new();
+            for (i, (ep, stored_regionals, _ids, _salience, _lm_h)) in batch.iter().enumerate() {
+                // Infer current model's predictions for this episode
+                match perception.infer_episode_outputs(ep) {
+                    Ok(predicted_regionals) => {
+                        // Check staleness: mean cosine sim across regions
+                        let mut cosines = Vec::new();
+                        for region_idx in 0..5 {
+                            let stored = &stored_regionals[region_idx];
+                            let predicted = &predicted_regionals[region_idx];
+                            if !stored.is_empty() && !predicted.is_empty() {
+                                // cosine_sim is a static helper — call it via the method
+                                let dot: f32 = stored
+                                    .iter()
+                                    .zip(predicted.iter())
+                                    .map(|(x, y)| x * y)
+                                    .sum();
+                                let norm_stored: f32 =
+                                    stored.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                let norm_pred: f32 =
+                                    predicted.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                let sim = if norm_stored < 1e-9 || norm_pred < 1e-9 {
+                                    1.0
+                                } else {
+                                    (dot / (norm_stored * norm_pred)).clamp(-1.0, 1.0)
+                                };
+                                cosines.push(sim);
+                            }
+                        }
+                        let mean_cosine = if cosines.is_empty() {
+                            1.0 // No stored outputs to check
+                        } else {
+                            cosines.iter().sum::<f32>() / cosines.len() as f32
+                        };
+
+                        // Keep sample if not stale (cosine above threshold)
+                        if mean_cosine >= STALE_COSINE_THRESHOLD {
+                            filtered_indices.push(i);
+                        } else {
+                            stale_traces_skipped += 1;
+                            tracing::debug!(
+                                mean_cosine,
+                                "skipping stale trace (cosine below {:.2})",
+                                STALE_COSINE_THRESHOLD
+                            );
                         }
                     }
-                    let mean_cosine = if cosines.is_empty() {
-                        1.0  // No stored outputs to check
-                    } else {
-                        cosines.iter().sum::<f32>() / cosines.len() as f32
-                    };
-
-                    // Keep sample if not stale (cosine above threshold)
-                    if mean_cosine >= STALE_COSINE_THRESHOLD {
+                    Err(e) => {
+                        tracing::warn!(?e, "staleness inference failed — keeping sample");
                         filtered_indices.push(i);
-                    } else {
-                        stale_traces_skipped += 1;
-                        tracing::debug!(mean_cosine, "skipping stale trace (cosine below {:.2})", STALE_COSINE_THRESHOLD);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(?e, "staleness inference failed — keeping sample");
-                    filtered_indices.push(i);
-                }
             }
-        }
 
-        // Skip training if all samples were filtered (stale)
-        if filtered_indices.is_empty() {
-            tracing::debug!("batch fully filtered — skipping training step");
-            batch_start = batch_end;
-            continue;
-        }
-
-        // Neuromodulated lr: use step index at batch start (cosine schedule is slow).
-        // Salience = mean warm-recall L2 of the non-stale batch (sentinel f32::MAX excluded from mean).
-        let prev_ewma = loss_ewma;
-        let non_sentinel: Vec<f32> = filtered_indices
-            .iter()
-            .map(|&i| batch[i].3)  // salience is the 4th element (index 3)
-            .filter(|&s| s < f32::MAX / 2.0)
-            .collect();
-        let batch_salience = if non_sentinel.is_empty() {
-            f32::MAX
-        } else {
-            non_sentinel.iter().sum::<f32>() / non_sentinel.len() as f32
-        };
-        let lr = nrem_lr(batch_start, n_traces, loss_ewma, prev_ewma, batch_salience);
-        perception.set_learning_rate(lr);
-
-        // ── Fused SAE replay + output-head training (single backward) ───────
-        // Extract regionals and episodes from non-stale samples
-        let regionals: Vec<&[Vec<f32>; 5]> = filtered_indices.iter().map(|&i| &batch[i].1).collect();
-        let ep_slices: Vec<&[f32]> = filtered_indices.iter().map(|&i| batch[i].0.as_slice()).collect();
-        let t_replay = Instant::now();
-        match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
-            Ok((loss, mse)) => {
-                loss_ewma = if first_batch_ever {
-                    first_batch_ever = false;
-                    loss
-                } else {
-                    EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
-                };
-                total_train_loss += loss * filtered_indices.len() as f32;
-                traces_replayed += filtered_indices.len();
-                total_output_mse += mse;
-                output_mse_n += 1;
+            // Skip training if all samples were filtered (stale)
+            if filtered_indices.is_empty() {
+                tracing::debug!("batch fully filtered — skipping training step");
+                batch_start = batch_end;
+                continue;
             }
-            Err(e) => tracing::warn!(?e, "fused_replay_wake_step_batch error — skipping batch"),
-        }
-        let fused_us = t_replay.elapsed().as_micros() as u64;
-        replay_us_total += fused_us / 2;
-        wake_us_total += fused_us / 2;
 
-        // ── Adaptive exit checks (10b) ────────────────────────────────────────
-        if sleep_loss_target > 0.0 && batch_start > 0 && loss_ewma < sleep_loss_target {
-            tracing::info!(
-                loss_ewma,
-                sleep_loss_target,
-                "NREM: loss target met — early exit"
-            );
-            nrem_exit_reason = "loss_target_met";
-            break;
-        }
-        if sleep_max_secs > 0 && sleep_start.elapsed().as_secs() >= sleep_max_secs {
-            tracing::info!(
-                elapsed_secs = sleep_start.elapsed().as_secs(),
-                sleep_max_secs,
-                "sleep: max time exceeded — interrupting"
-            );
-            was_interrupted = true;
-            nrem_exit_reason = "time_budget";
-            break;
-        }
-
-        // ── Projection distillation: LM hidden-state targets (Gap 6) ────────────
-        let t_proj = Instant::now();
-        if let Some(ref mut dec) = decoder {
-            let distill_pairs: Vec<(&[f32], &[f32])> = filtered_indices
+            // Neuromodulated lr: use step index at batch start (cosine schedule is slow).
+            // Salience = mean warm-recall L2 of the non-stale batch (sentinel f32::MAX excluded from mean).
+            let prev_ewma = loss_ewma;
+            let non_sentinel: Vec<f32> = filtered_indices
                 .iter()
-                .filter_map(|&i| {
-                    let (ep, _, _, _, lm_h) = &batch[i];
-                    lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
-                })
+                .map(|&i| batch[i].3) // salience is the 4th element (index 3)
+                .filter(|&s| s < f32::MAX / 2.0)
                 .collect();
-            if !distill_pairs.is_empty() {
-                match dec.projection_step_batch_distill(&distill_pairs) {
-                    Ok(loss) => {
-                        let cnt = distill_pairs.len();
-                        total_proj_loss += loss * cnt as f32;
-                        proj_loss_n += cnt;
-                        if loss > proj_loss_max {
-                            proj_loss_max = loss;
+            let batch_salience = if non_sentinel.is_empty() {
+                f32::MAX
+            } else {
+                non_sentinel.iter().sum::<f32>() / non_sentinel.len() as f32
+            };
+            let lr = nrem_lr(batch_start, n_traces, loss_ewma, prev_ewma, batch_salience);
+            perception.set_learning_rate(lr);
+
+            // ── Fused SAE replay + output-head training (single backward) ───────
+            // Extract regionals and episodes from non-stale samples
+            let regionals: Vec<&[Vec<f32>; 5]> =
+                filtered_indices.iter().map(|&i| &batch[i].1).collect();
+            let ep_slices: Vec<&[f32]> = filtered_indices
+                .iter()
+                .map(|&i| batch[i].0.as_slice())
+                .collect();
+            let t_replay = Instant::now();
+            match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
+                Ok((loss, mse)) => {
+                    loss_ewma = if first_batch_ever {
+                        first_batch_ever = false;
+                        loss
+                    } else {
+                        EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
+                    };
+                    total_train_loss += loss * filtered_indices.len() as f32;
+                    traces_replayed += filtered_indices.len();
+                    total_output_mse += mse;
+                    output_mse_n += 1;
+                }
+                Err(e) => tracing::warn!(?e, "fused_replay_wake_step_batch error — skipping batch"),
+            }
+            let fused_us = t_replay.elapsed().as_micros() as u64;
+            replay_us_total += fused_us / 2;
+            wake_us_total += fused_us / 2;
+
+            // ── Adaptive exit checks (10b) ────────────────────────────────────────
+            if sleep_loss_target > 0.0 && batch_start > 0 && loss_ewma < sleep_loss_target {
+                tracing::info!(
+                    loss_ewma,
+                    sleep_loss_target,
+                    "NREM: loss target met — early exit"
+                );
+                nrem_exit_reason = "loss_target_met";
+                break;
+            }
+            if sleep_max_secs > 0 && sleep_start.elapsed().as_secs() >= sleep_max_secs {
+                tracing::info!(
+                    elapsed_secs = sleep_start.elapsed().as_secs(),
+                    sleep_max_secs,
+                    "sleep: max time exceeded — interrupting"
+                );
+                was_interrupted = true;
+                nrem_exit_reason = "time_budget";
+                break;
+            }
+
+            // ── Projection distillation: LM hidden-state targets (Gap 6) ────────────
+            let t_proj = Instant::now();
+            if let Some(ref mut dec) = decoder {
+                let distill_pairs: Vec<(&[f32], &[f32])> = filtered_indices
+                    .iter()
+                    .filter_map(|&i| {
+                        let (ep, _, _, _, lm_h) = &batch[i];
+                        lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
+                    })
+                    .collect();
+                if !distill_pairs.is_empty() {
+                    match dec.projection_step_batch_distill(&distill_pairs) {
+                        Ok(loss) => {
+                            let cnt = distill_pairs.len();
+                            total_proj_loss += loss * cnt as f32;
+                            proj_loss_n += cnt;
+                            if loss > proj_loss_max {
+                                proj_loss_max = loss;
+                            }
                         }
+                        Err(e) => tracing::warn!(?e, "projection_step_batch_distill error"),
                     }
-                    Err(e) => tracing::warn!(?e, "projection_step_batch_distill error"),
                 }
             }
-        }
-        proj_us_total += t_proj.elapsed().as_micros() as u64;
-        n_batches += 1;
+            proj_us_total += t_proj.elapsed().as_micros() as u64;
+            n_batches += 1;
 
-        batch_start = batch_end;
+            batch_start = batch_end;
         }
         if epoch_idx + 1 < replay_epochs {
             tracing::info!(epoch_idx = epoch_idx + 1, "NREM: starting epoch");
@@ -1361,7 +1379,7 @@ pub fn run_sleep_cycle(
         nrem_budget_traces: n_traces,
         nrem_unique_traces,
         growth_cooldown_remaining,
-        stale_traces_skipped,  // DER++ Phase 2: staleness detection counter
+        stale_traces_skipped, // DER++ Phase 2: staleness detection counter
     })
 }
 
