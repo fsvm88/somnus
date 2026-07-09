@@ -8,8 +8,47 @@
 > this session (gaps.md §9). M2D-CLAP (gaps.md §8) scoped and explicitly not pursued this
 > session — see below, docs-only, no code.
 > **Status: gaps.md §3, §8, §9 all resolved (§3/§9 REJECTED via A/B, §8 NOT PURSUED —
-> decided against implementing before writing code). Queue empty — see "Queued for
-> next session" below.**
+> decided against implementing before writing code). Growth-scaling pilot run this session
+> (uncommitted, `memory/growth_pilot/` — scratch, not part of the tracked tree) — see below.**
+
+## Just completed (2026-07-09, later) — growth-rate pilot campaign (10x growable-core scaling)
+
+User asked to scale somnus's own growable core (region k-WTA units + GRU + binding, currently
+~5,400 units total, ~480,000× smaller than the human brain / roughly fruit-fly order of
+magnitude) 10x, toward honeybee-order scale (~54,000 units) rather than mouse (~71M neurons,
+a ~400x jump — corrected an earlier miscalibration in-conversation). Explicitly *not* the
+frozen-encoder scale-up (Qwen3/Whisper/DINOv3/CLAP) — those are "easy, do later."
+
+Growth mechanism (cascade-correlation-style, `grow_region_seeded`, ADR 0024 §2c
+`within_session_gist_rate` gate, 3-cycle cooldown, `GROWTH_BATCH=64`) was already fully
+implemented and live — no new code needed. Ran a 75-cycle characterization pilot
+(`SESSIONS=15 CYCLES=5 CAPACITY=8192`, h3h3/shorts corpus, isolated `memory/growth_pilot/`,
+not the main `memory/`) purely to measure real growth cadence, since nobody had run enough
+cycles to know it empirically.
+
+**Result:** 16 growth events in 75 cycles (~1 event per 4.7 cycles, close to the 3-cycle
+cooldown floor — growth is essentially gate-limited, not signal-limited). Final region sizes
+`[2048, 1984, 1984, 1984, 1984]` (region 0 grown 2×, others ~1.94× from the n=1024 baseline).
+No plateau observed over the full pilot — one quiet session (s9) was immediately followed by
+resumed growth at s10c1. `per_region_mse` *improved* alongside growth (e.g. region 0:
+0.127→0.007–0.017), no quality regression from growing. Avg 21.8s/cycle wall-clock (dominated
+by short pressure-triggered ~120-episode cycles after the first buffer-fill cycle); 1.7GB disk
+for the whole pilot (816GB free on the volume — no capacity concern).
+
+**Extrapolation to 10x (~9,660 units/region, ~135 growth events needed):** at the observed
+rate, ~633 cycles ≈ **~3.9 hours wall-clock** for a full campaign — far more tractable than
+the pessimistic first estimate (hundreds of cycles was right, but wall-clock per cycle is much
+cheaper than the growth-mechanisms.md research note's aspirational cascade-correlation
+estimate, since the actual implementation is a weight-tensor resize, not a candidate-training
+loop). Caveats not yet tested at this scale: (1) whether the 10-clip looping corpus causes a
+memorization plateau past 75 cycles (no sign of it yet, but untested); (2) whether per-cycle
+compute cost grows non-trivially as region matrices get ~10× larger (linear in n_units, likely
+modest but unverified).
+
+**Not yet done:** the actual full-scale campaign to reach 10x. Discussed with user but not
+launched — next step is user-driven (scope: same corpus repeated vs. expanded corpus to
+pressure-test the memorization-plateau risk before committing ~4h of unattended compute).
+`memory/growth_pilot/` is scratch pilot output, not committed/tracked.
 
 ## Just completed (2026-07-09) — M2D-CLAP (gaps.md item 8) — ⏸️ NOT PURSUED, no code written
 
