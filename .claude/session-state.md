@@ -5,9 +5,29 @@
 > (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4 replay-ratio default
 > (`f0fa9c6`), items queued (`709442b`), DER++ auto-λ implementation (`f2fd185`, gaps.md §3),
 > DER++ auto-λ A/B reject (`72d1503`). EfficientAT-mn10 implementation + A/B result committed
-> this session (gaps.md §9) — see below.
-> **Status: gaps.md §3 and §9 both resolved (both REJECTED). Queue empty — see "Queued for
+> this session (gaps.md §9). M2D-CLAP (gaps.md §8) scoped and explicitly not pursued this
+> session — see below, docs-only, no code.
+> **Status: gaps.md §3, §8, §9 all resolved (§3/§9 REJECTED via A/B, §8 NOT PURSUED —
+> decided against implementing before writing code). Queue empty — see "Queued for
 > next session" below.**
+
+## Just completed (2026-07-09) — M2D-CLAP (gaps.md item 8) — ⏸️ NOT PURSUED, no code written
+
+User asked to try a deferred item; picked M2D-CLAP (item 8) — the more credible audio-encoder
+upgrade candidate vs. the already-rejected mn10. Before implementing, ran feasibility research
+(no code): weights are available with no gate, but (a) no ONNX export precedent exists anywhere
+for M2D or M2D-CLAP — real risk of hitting a dead end at export, driven by dynamic
+positional-embedding interpolation and an `nnAudio` STFT-based mel frontend (the same STFT-op
+fragility class mn10 was chosen specifically to avoid), and (b) the license is NTT's custom
+non-commercial "Evaluation" agreement, not MIT/Apache like everything else in the tree.
+
+Weighed against that risk: the paper's +3 mAP AudioSet-tagging claim is a modest number on a
+different task than somnus's actual metric (`per_region_mse` through somnus's own pipeline), and
+item 9's A/B is a concrete precedent in this exact slot that paper-benchmark quality and
+somnus-pipeline quality diverge (mn10 had no quality claim at all and still regressed MSE +155.6%
+while a benchmark-adjacent recall metric moved the other way). User's call: **not worth the
+implementation/export/license risk for the expected effect size. Documented in `gaps.md` §8,
+no code written, nothing to revert.**
 
 ## Just completed (2026-07-09) — EfficientAT mn10 (gaps.md item 9) — ❌ REJECTED
 

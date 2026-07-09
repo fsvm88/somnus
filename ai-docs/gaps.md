@@ -190,7 +190,7 @@ episode counts.
 
 ---
 
-## 8. Audio env encoder: M2D-CLAP
+## 8. Audio env encoder: M2D-CLAP ⏸️ NOT PURSUED (2026-07-09) — small expected gain, too much risk
 
 **Source:** NTT, March 2025, arXiv:2503.22104. Weights: `nttcslab/m2d` (GitHub).
 
@@ -203,6 +203,29 @@ episode counts.
 **MIGraphX:** Uncertain (ViT attention ops require GPU op verification); expect to fall back to CPU as with current CLAP.
 
 **Effort:** Medium (export + validation + A/B). Verify ONNX export before committing.
+
+**Feasibility research (2026-07-09), decision: not pursued.** Before implementing, scoped out
+export/licensing risk (no code written):
+- **Weights**: available with no gate, plain GitHub release ZIPs — this part was fine.
+- **No ONNX export precedent found** for M2D or M2D-CLAP anywhere (no issues/forks/posts).
+  Real risk of a dead end before even reaching an A/B: dynamic positional-embedding
+  interpolation, and an `nnAudio` STFT-based mel frontend (the same STFT-op fragility class
+  that EfficientAT-mn10, item 9, was specifically chosen to avoid).
+- **License is non-standard**: NTT's custom "Evaluation" agreement (not MIT/Apache) —
+  non-commercial, no redistribution, NTT can terminate at will, Japan-law arbitration.
+  Plausibly fine for personal research use but a meaningfully different bar than everything
+  else in the tree.
+- **Expected gain is small relative to that risk.** The +3 mAP figure is on AudioSet
+  linear-probe tagging, not on somnus's actual metric (`per_region_mse` through somnus's own
+  projection/binding/replay pipeline). Item 9's A/B is a concrete cautionary precedent in
+  this exact slot: EfficientAT-mn10 had no claimed quality edge, and its downstream MSE
+  still moved sharply worse while a benchmark-adjacent number (recall) moved the "wrong"
+  direction — i.e. paper-benchmark quality and somnus-pipeline quality demonstrably diverge here.
+  A modest +3 mAP claim is unlikely to survive that translation any better.
+- **Decision:** not worth the implementation/export/licensing risk for the expected effect
+  size. Not implemented, no code exists. Revisit only if a documented ONNX export of
+  M2D-CLAP appears elsewhere, or if CLAP-HTSAT's quality becomes a bottleneck worth a
+  higher-risk swing.
 
 ---
 
@@ -360,7 +383,7 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 | ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
 | ❌ 7 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Rejected 2026-07-08 — A/B FAIL (+73.8% mean_output_mse), opt-in only, §3 |
 | ❌ 8 | **EfficientAT-mn10 ONNX export test** | Low→Med | Audio env encoder | Rejected 2026-07-09 — A/B FAIL (+155.6% MSE on comparable regions), opt-in-only `mn10_env` feature kept, §9 |
-| 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Deferred |
+| ⏸️ 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Not pursued 2026-07-09 — small expected gain vs. untested ONNX export + restrictive license, §8 |
 | 10 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | Deferred |
 | 11 | **LISTA unrolled encoder** | Med | Sparse coding quality | Deferred |
 | 12 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than Qwen3) | Deferred |
