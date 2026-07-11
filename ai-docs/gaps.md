@@ -371,22 +371,75 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 
 ---
 
-## Priority order (as of 2026-06-28)
+## 16. Growth-scaling pilot campaigns (10x growable-core scaling) 🔬 CHARACTERIZED, full campaign not yet run
+
+**Goal:** scale somnus's own growable core (5× k-WTA regions + GRU + binding, `~5,400` units baseline
+per `brain-scale-comparison.md`) 10x, toward honeybee-order scale (~54,000 units, ~9,660
+units/region) rather than mouse-order (~71M neurons, a ~400x jump). The growth mechanism itself
+(`grow_region_seeded`, ADR 0024 §2c) was already implemented and live — this item is about
+characterizing its real-world cadence/cost before spending unattended compute on the full run, not
+about implementing anything new.
+
+**Pilot 1 (2026-07-09):** 75-cycle run (`SESSIONS=15 CYCLES=5 CAPACITY=8192`) on a tight 10-clip
+looping corpus (5× `clips/h3h3/`, 5× `clips/shorts/`). 16 growth events, ~1 per 4.7 cycles
+(essentially gate-limited by the 3-cycle cooldown, not signal-limited), `per_region_mse` improved
+alongside growth, no plateau. Extrapolated to full 10x scale: ~135 growth events needed, ~633
+cycles, **~3.9 h wall-clock** at the observed ~21.8 s/cycle rate — far cheaper than the growth-
+mechanisms.md research note's pre-implementation cascade-correlation cost estimate, since the
+shipped mechanism is a seeded weight-tensor resize, not a candidate-training loop.
+
+**Open caveat after pilot 1:** the 10-clip corpus repeats every ~10 clips per session: could the
+observed growth/quality trend be a memorization artifact of seeing the same 10 clips over and over,
+rather than genuine capacity pressure? Untested at 75-cycle scale.
+
+**New corpus added to close that caveat:** `scripts/download_podcasts.sh` (new script, modeled on
+`download_h3h3.sh`) — pulls one-to-many episodes per show across 10 distinct podcasts (Lex Fridman,
+Joe Rogan, Huberman Lab, Tim Ferriss, Diary of a CEO, Armchair Expert, Conan O'Brien, This American
+Life, The Daily, Freakonomics Radio), 10–90 min duration filter. Yielded 56 episodes / 5.6 GB in
+`clips/podcasts/` (Lex Fridman/Huberman Lab/Tim Ferriss under-represented — their typical episode
+length exceeds the 90-min filter ceiling on most candidates, not a download failure).
+
+**Pilot 2 (2026-07-11):** identical protocol against the expanded 145-clip corpus (h3h3 + shorts +
+podcasts, 14.5x pilot 1's corpus size, far less repetition). **Result: no plateau, cadence and
+quality trend indistinguishable from pilot 1** — 16 growth events, same gate-limited cadence
+(4–7 cycle gaps), `per_region_mse` mean dropped ~0.0135→~0.0039 first-10-vs-last-10 cycles, final
+region sizes uniformly `[2048]×5` (vs. pilot 1's uneven `[2048,1984,1984,1984,1984]`). ~19% slower
+wall-clock per cycle (25.9 s vs 21.8 s), plausibly from decoding larger/more varied source files,
+not from the mechanism itself. Full writeup: `ai-docs/research/growth-mechanisms.md` "Empirical
+validation" section.
+
+**Conclusion: the memorization-plateau risk did not materialize — growth is gate-limited, not
+corpus-limited.** This was the last open question before committing to the full campaign.
+
+**Not yet done:** the actual full-scale campaign to reach 10x (~633 cycles, ~3.9 h unattended).
+Both pilots ran in isolated scratch memory dirs (`memory/growth_pilot/`, `memory/growth_pilot_
+expanded/` — untracked, not the main `memory/`); the full campaign has not been launched. Next step
+is user-driven.
+
+---
+
+## Priority order (as of 2026-07-11)
+
+> **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
+> order. Table numbering used to drift from the section headers — corrected 2026-07-11; if you're
+> reading an old cached copy of this table, re-fetch rather than trust remembered numbers.
 
 | # | Item | Effort | Impact | Status |
 |---|---|---|---|---|
-| ✅ 0 | **bincode migration** (→ bitcode) | Low–Med | Security advisory | Deployed (57c87a1) |
-| ✅ 1 | **BatchTopK SAE** | Low | Sparse coding quality | Deployed (25d7496) |
-| ✅ 2 | **High replay ratio A/B** (N=1/2/4) | Trivial | Consolidation quality | Adopted 2026-07-06 — N=4 default (-70.9% output_mse/+16.6% wall-clock); N=2 was more efficient (-49.1%/+7.6%) but not chosen |
-| ✅ 4 | **Remove dead candle deps** | Trivial | Cleanliness | Already done (stale entry, corrected 2026-07-05) |
-| 5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | ✅ Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
-| ✅ 6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
-| ❌ 7 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Rejected 2026-07-08 — A/B FAIL (+73.8% mean_output_mse), opt-in only, §3 |
-| ❌ 8 | **EfficientAT-mn10 ONNX export test** | Low→Med | Audio env encoder | Rejected 2026-07-09 — A/B FAIL (+155.6% MSE on comparable regions), opt-in-only `mn10_env` feature kept, §9 |
-| ⏸️ 9 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Not pursued 2026-07-09 — small expected gain vs. untested ONNX export + restrictive license, §8 |
-| 10 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | Deferred |
-| 11 | **LISTA unrolled encoder** | Med | Sparse coding quality | Deferred |
-| 12 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than Qwen3) | Deferred |
-| 13 | **usearch migration** | Med | HNSW footprint | Deferred |
-| ✅ 14 | **Change-gated video encoder** | Low | Wake-path compute (unmeasured savings) | Deployed 2026-07-06, opt-in via `--video-change-threshold` |
-| ❌ 15 | **SVD low-rank check (region/binding weights)** | Low | Capacity efficiency | Null result 2026-07-06 — near-full-rank, not pursued |
+| ✅ §0 | **bincode migration** (→ bitcode) | Low–Med | Security advisory | Deployed (57c87a1) |
+| ✅ §1 | **BatchTopK SAE** | Low | Sparse coding quality | Deployed (25d7496) |
+| ✅ §2 | **High replay ratio A/B** (N=1/2/4) | Trivial | Consolidation quality | Adopted 2026-07-06 — N=4 default (-70.9% output_mse/+16.6% wall-clock); N=2 was more efficient (-49.1%/+7.6%) but not chosen |
+| ❌ §3 | **DER++ auto-λ (Phase 3)** | Low–Med | Replay consolidation | Stale-output blocking (Phase 2) shipped earlier; auto-λ half rejected 2026-07-08 — A/B FAIL (+73.8% mean_output_mse), opt-in only |
+| §4 | **LISTA unrolled encoder** | Med | Sparse coding quality | Deferred |
+| ✅ §5 | **Qwen3-0.6B upgrade** | High | Generation quality + language region | Adopted 2026-07-05 (ADR 0036); Qwen2.5 dropped. Gen-quality confirmed (take 3) |
+| ✅ §6 | **DINOv3-ViT-S ONNX export test** | Low | Visual region (drop-in) | Deployed (validated 2026-07-05, ai-docs/a_b_dinov3_findings.md) |
+| §7 | **SigLIP2-ViT-B/16** | Med | Visual (Phase 7+ deferred) | Deferred |
+| ⏸️ §8 | **M2D-CLAP ONNX export test** | Med | Audio env encoder (+3 mAP) | Not pursued 2026-07-09 — small expected gain vs. untested ONNX export + restrictive license |
+| ❌ §9 | **EfficientAT-mn10 ONNX export test** | Low→Med | Audio env encoder | Rejected 2026-07-09 — A/B FAIL (+155.6% MSE on comparable regions), opt-in-only `mn10_env` feature kept |
+| §10 | **Dedicated text embedding model** | Med | Language encoder | Deferred |
+| §11 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than Qwen3) | Deferred |
+| §12 | **Episodic binding survey** | — | Binding area | Null result — 4-head cross-attention + GRU is state-of-art under the ORT/MIGraphX constraint (SSM/Mamba alternatives need an unsupported CUDA kernel); not pursued |
+| ✅ §13 | **Change-gated video encoder** | Low | Wake-path compute (unmeasured savings) | Deployed 2026-07-06, opt-in via `--video-change-threshold` |
+| ❌ §14 | **SVD low-rank check (region/binding weights)** | Low | Capacity efficiency | Null result 2026-07-06 — near-full-rank, not pursued |
+| §15 | **Crate hygiene** (usearch migration, burn-ndarray watch, ffmpeg-the-third) | Low–Med | HNSW footprint / maintenance | Dead deps removal already done; usearch/ffmpeg-the-third deferred until raised by a concrete need |
+| 🔬 §16 | **Growth-scaling pilot campaigns** (10x growable-core scaling) | Med (pilots done, full campaign is ~3.9h unattended) | Growable-core capacity | Characterized 2026-07-09/11 (2 pilots, no plateau risk found); full 10x campaign not yet run — user-driven next step |
