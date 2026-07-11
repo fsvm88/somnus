@@ -1,15 +1,65 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-09
-> **Branch:** `main`. Committed: change-gated video encoder (`9bba42b`), SVD null-result
-> (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4 replay-ratio default
-> (`f0fa9c6`), items queued (`709442b`), DER++ auto-λ implementation (`f2fd185`, gaps.md §3),
-> DER++ auto-λ A/B reject (`72d1503`). EfficientAT-mn10 implementation + A/B result committed
-> this session (gaps.md §9). M2D-CLAP (gaps.md §8) scoped and explicitly not pursued this
-> session — see below, docs-only, no code.
-> **Status: gaps.md §3, §8, §9 all resolved (§3/§9 REJECTED via A/B, §8 NOT PURSUED —
-> decided against implementing before writing code). Growth-scaling pilot run this session
-> (uncommitted, `memory/growth_pilot/` — scratch, not part of the tracked tree) — see below.**
+> **Last updated:** 2026-07-11
+> **Branch:** `main`. Committed (through 2026-07-09): change-gated video encoder (`9bba42b`),
+> SVD null-result (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4
+> replay-ratio default (`f0fa9c6`), items queued (`709442b`), DER++ auto-λ implementation
+> (`f2fd185`, gaps.md §3), DER++ auto-λ A/B reject (`72d1503`), EfficientAT-mn10 implementation +
+> A/B result (gaps.md §9), M2D-CLAP scoped and not pursued (gaps.md §8, docs-only).
+> **Not yet committed (2026-07-11 session):** `scripts/download_podcasts.sh` (new — pulls diverse
+> podcast episodes into `clips/podcasts/`, 56 episodes/5.6GB across 10 shows), growth-pilot 2
+> results (expanded-corpus characterization, `memory/growth_pilot_expanded/` — scratch, untracked),
+> and a documentation audit/correction pass across `architecture.md`, `gaps.md`,
+> `growth-mechanisms.md`, `roadmap.md`, `README.md`, and this file (stale open-questions,
+> priority-table numbering drift, a lost deferred-items trigger table, missing Phase 14 section).
+> **Status: gaps.md §16 (growth-scaling) now CHARACTERIZED — two 75-cycle pilots (10-clip loop,
+> then 145-clip diverse corpus incl. new podcasts) both show gate-limited growth cadence, no
+> memorization-plateau risk. Full 10x campaign (~633 cycles, ~3.9h) scoped but not launched —
+> next step is user-driven. See `ai-docs/gaps.md` §16 and `ai-docs/research/growth-mechanisms.md`
+> "Empirical validation" for full writeup.**
+
+## Just completed (2026-07-11) — expanded-corpus growth pilot + podcast corpus + doc audit
+
+Continuation of the growth-scaling pilot below: user wanted the memorization-plateau caveat closed
+before committing to the full 10x campaign, which meant a more diverse corpus than pilot 1's
+10-clip loop. Added `scripts/download_podcasts.sh` (new, modeled on `download_h3h3.sh`) — pulls
+episodes from 10 distinct podcast shows (Lex Fridman, Joe Rogan, Huberman Lab, Tim Ferriss, Diary
+of a CEO, Armchair Expert, Conan O'Brien, This American Life, The Daily, Freakonomics Radio),
+10–90 min duration filter, `N_PER`/`M_SEARCH` configurable. Ran twice (1 episode/show, then 10x
+more): landed 56 episodes / 5.6GB in `clips/podcasts/` (Lex Fridman/Huberman Lab/Tim Ferriss
+under-represented — their typical episode length exceeds the 90-min filter ceiling on most search
+candidates, not a download failure).
+
+Ran pilot 2: identical protocol to pilot 1 (`SESSIONS=15 CYCLES=5 CAPACITY=8192`, 75 cycles) against
+the combined 145-clip corpus (h3h3 + shorts + podcasts), isolated `memory/growth_pilot_expanded/`.
+**Result: no plateau — cadence and quality trend indistinguishable from pilot 1** (16 growth
+events, same gate-limited cadence, `per_region_mse` improved ~0.0135→~0.0039 first-10-vs-last-10
+cycles, final region sizes uniformly `[2048]×5`). Confirms growth is gate-limited (bounded by the
+3-cycle cooldown), not corpus/signal-limited — the memorization-plateau risk flagged after pilot 1
+did not materialize. Full numbers: `ai-docs/gaps.md` §16, `ai-docs/research/growth-mechanisms.md`
+"Empirical validation" section (both written up this session).
+
+Then did a full documentation audit (user request: "recheck all docs and make sure they are
+correct") — delegated a read-only staleness sweep to a subagent, applied its findings directly:
+- `architecture.md`: "Growth mechanism" and "Compression strategy" open questions were stale (both
+  long since resolved — ADR 0024 §2c and INT8+PQ respectively); struck through with references.
+  "Sleep-cycle time budget" narrowed (ADR 0024's S1–S4 controllers resolved most of what it asked).
+  Implementation-state paragraph updated with everything since 2026-07-05.
+- `gaps.md`: priority table's `#` column had drifted from the actual `##` section numbers since
+  around item 7 (table said "❌7 DER++" but that's actually §3; "10 SigLIP2" is actually §7; etc.) —
+  renumbered to match, added missing §10/§12 rows, added new §16 row for the growth pilots.
+- `.claude/session-state.md` (this file): the "Deferred backlog" section had decayed into a
+  circular pointer to `CLAUDE.md`, which itself points back here — the actual trigger-condition
+  table had been silently pruned in an earlier edit. Restored from git history (commit `03eb9b5`).
+  Flagged L/M (LoRA fine-tuning, MLP projection) as unverified against Qwen3 — they were marked
+  done for Qwen2.5, which was fully removed by ADR 0036; not re-checked here.
+- `roadmap.md`: had no Phase 14 section despite `architecture.md`/`gaps.md` referencing "Phase 14
+  (GPU unification)" as complete. Added it (ADR 0023, GPU unification via ORT/MIGraphX).
+- `README.md`: "Living archives" ADR callout list was missing ADR 0024 (large, multi-phase) and
+  ADR 0036 (Qwen3 adoption) — added both.
+
+Nothing here required code changes — pure documentation correction plus the two new artifacts
+(podcast corpus, pilot 2 metrics). Not yet committed.
 
 ## Just completed (2026-07-09, later) — growth-rate pilot campaign (10x growable-core scaling)
 
@@ -224,5 +274,26 @@ to re-A/B against).
 
 ## Deferred backlog (do not raise unprompted)
 
-Items A, C, E, F, I, J, K, L, M, N — see `CLAUDE.md` "Deferred architectural items" for the list
-and trigger conditions. `gaps.md`'s priority table covers everything else.
+CLAUDE.md's "Deferred architectural items" points here for trigger conditions. That table was lost
+in an earlier prune (silently collapsed to a pointer with nothing behind it) — restored 2026-07-11
+from git history (commit `03eb9b5`, 2026-06-14 ADR scan). `gaps.md`'s priority table covers
+everything not listed here.
+
+| # | Source | Item | Trigger |
+|---|--------|------|---------|
+| A | ADR 0006 | Cold archive O(1) promotion index | `promote()` called AND cold > 500k records |
+| C | ADR 0006 | Per-region sparse activation storage | Replay analysis shows episode vectors insufficient for diagnostics; no sparse-code consumer currently exists |
+| E | ADR 0009 | Separate optimizer for output heads (independent LR schedule) | Conflicting gradient directions between output heads and k-WTA observed |
+| F | ADR 0010 | Post-k-WTA prior injection | Pre-k-WTA injection shows poor `prior_cosine` uptake |
+| I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
+| J | ADR 0003 | Whisper-tiny → Whisper-base / WavLM-base (audio quality) | — (Tier 3, revisit opportunistically) |
+| K | ADR 0003 | DINOv2-S → SigLIP-B (language-aligned visual embeddings, Phase 7+) | — (superseded in spirit by DINOv3-ViT-S adoption, gaps.md §6 — SigLIP2-ViT-B/16 tracked separately as gaps.md §7) |
+| L | ADR 0012 | LoRA fine-tuning of Qwen2.5 for episode-vector prefix | — (Tier 3) — **caveat:** this was marked done 2026-06-25 for Qwen2.5, then Qwen2.5 was fully removed from the tree (ADR 0036, 2026-07-05). Not re-verified whether an equivalent LoRA path exists/is warranted for Qwen3 — check `crates/somnus/src/sleep.rs`/`main.rs` LoRA-related code before assuming this is either done or not-yet-started. |
+| M | ADR 0012 | MLP projection (640→5×896) instead of linear | — (Tier 3) — **caveat:** same as L, marked done 2026-06-21 against Qwen2.5's 896-dim output; not re-verified against Qwen3's dimensions post-ADR-0036. |
+| N | ADR 0014 | Visual/audio region grounding (captions, env sound labels) | — (Tier 3) |
+
+Original table also had items B, D, G, H (language last-token pooling, full differentiable SAE,
+learned per-region gate, activation-frequency pruning) — those are not in CLAUDE.md's current
+deferred list, meaning they were resolved/superseded/dropped at some point after the 2026-06-14
+scan. Not re-investigated here; if one becomes relevant, check `gaps.md` and ADR history before
+assuming it's still open.
