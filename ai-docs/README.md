@@ -20,7 +20,11 @@ For *behavioral* expectations on the assistant, see `../CLAUDE.md`. This folder 
 
 - [`research/`](research/) — research notes, by topic. Each file cites primary sources.
 - [`decisions/`](decisions/) — ADRs, numbered sequentially.
+  - 0024: Neuromodulatory self-regulation — accepted; replaces most fixed CLI thresholds
+    (salience gate, settle-rate, wakefulness pressure, prior-beta, growth controller) with
+    derived EWMA signals. Large, multi-phase, amended 2026-06-14.
   - 0025: SAE L1 coding loss — closed; λ=0.1 destabilised cold-start MSE by 27%; item D answered.
+  - 0036: Adopt Qwen3-0.6B, drop Qwen2.5 — accepted 2026-07-05; supersedes 0035.
 
 ## Conventions
 
