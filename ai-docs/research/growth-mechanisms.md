@@ -142,6 +142,51 @@ Growth is by far the most expensive sleep operation. Compression and replay are 
 
 ---
 
+## Empirical validation (2026-07-09 – 2026-07-11): actual implementation vs. the estimates above
+
+**The implemented mechanism (`grow_region_seeded`, `crates/somnus-perception/src/lib.rs`, ADR 0024 §2c
+"Growth controller — within-session signal") diverges from the cascade-correlation design sketched
+above.** It is not candidate-pool training against residual error — it is a seeded weight-tensor
+resize: existing region matrices grow in place, new units are seeded (not trained via a
+correlation-maximizing candidate pool), and the trigger is `within_session_gist_rate` (with a
+3-cycle cooldown backstop) rather than the aspirational "train candidates, pick the
+best-correlating one" loop. Consequence: the "~10–40 min GPU per unit added" budget estimate in
+the table above never applied in practice — growth itself is closer to instantaneous (a resize +
+seed op); the ~20–27 s/cycle wall-clock actually observed is dominated by perception/replay/NREM
+work, not growth. Treat the cost table above as the pre-implementation estimate it was; it is not
+corrected in place since the ADR is the authoritative record of what shipped and why the simpler
+approach was chosen.
+
+**Two characterization pilots** (not the full 10x campaign — see `gaps.md` for that decision),
+both `SESSIONS=15 CYCLES=5 CAPACITY=8192` (75 cycles total), isolated memory dirs, starting from
+the `n=1024` baseline region size:
+
+| | Pilot 1 (2026-07-09) | Pilot 2 (2026-07-11) |
+|---|---|---|
+| Corpus | 10 clips (5× `clips/h3h3/`, 5× `clips/shorts/`), looped | 145 clips (5× h3h3, 84× shorts, 56× `clips/podcasts/`), far less repetition |
+| Growth events | 16 | 16 |
+| Cadence | ~1 per 4.7 cycles, gate-limited (3-cycle cooldown floor) | Gaps of 4–7 cycles between events, same gate-limited pattern |
+| Final region sizes | `[2048, 1984, 1984, 1984, 1984]` (uneven) | `[2048, 2048, 2048, 2048, 2048]` (uniform) |
+| `per_region_mse` trend | Improved alongside growth (e.g. region 0: 0.127→0.007–0.017) | Mean across regions: ~0.0135 (first 10 cycles) → ~0.0039 (last 10 cycles) |
+| Plateau observed? | No — one quiet session (s9) immediately followed by resumed growth at s10c1 | No — cadence and MSE trend indistinguishable from pilot 1 |
+| Wall-clock | 21.8 s/cycle avg, ~1.7 GB disk | 25.9 s/cycle avg (~19% slower, plausibly larger/more varied source files to decode), 32 min total |
+
+**Why pilot 2 exists:** pilot 1's corpus was a tight 10-clip loop, leaving open whether the
+observed growth cadence and improving MSE were a genuine capacity/signal effect or an artifact of
+the network re-seeing the same 10 clips repeatedly (memorization masquerading as learning). Pilot 2
+reruns the identical protocol against a corpus 14.5× larger and structurally more diverse (podcast
+long-form speech added specifically for this test — see `scripts/download_podcasts.sh`) to
+pressure-test that risk before committing to the full-scale campaign.
+
+**Result: no plateau signal, cadence and quality trend match pilot 1 almost exactly.** This
+confirms the growth mechanism is gate-limited (bounded by the cooldown, not by how much novel
+signal is available) rather than signal-limited — corpus diversity doesn't change the observed
+behavior. This was the last open caveat blocking the full 10x campaign (~9,660 units/region,
+~135 growth events, extrapolated ~633 cycles / ~3.9 h wall-clock at the observed per-cycle rate).
+See `gaps.md` for campaign status.
+
+---
+
 ## Open questions → future ADR
 
 1. Cascade-correlation vs. online cloning vs. SAE dictionary expansion: which to implement in Phase 3 (first growth-enabled sleep cycle)?
