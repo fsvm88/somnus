@@ -1,6 +1,6 @@
 # Roadmap
 
-> **Contents:** Phase-by-phase record of what was built and when, with exit criteria. Phases 0–13 complete. Phase 9b (live mic/webcam) and Phase 14+ (GPU unification scaling) are open.  
+> **Contents:** Phase-by-phase record of what was built and when, with exit criteria. Phases 0–14 complete. Phase 9b (live mic/webcam end-to-end validation) remains open.  
 > **When to read:** Orienting in the project's history; finding which ADR covers a phase; identifying what's next.
 >
 > **Status:** coarse phasing. Use as orientation, not a commitment. Update when reality diverges.
@@ -288,3 +288,21 @@ multiple sessions from a single command.
 **Next step (not coded):** run `SESSIONS=20 CYCLES=3 scripts/train_campaign.sh` and
 observe whether language prior_cosine reaches 0.1–0.2 after 60 cycles (~30 sessions
 needed by Phase 8 estimate). Use eval harness output to confirm or revise the estimate.
+
+## Phase 14 — GPU unification ✓
+
+Move perception inference (k-WTA, cross-modal projection, BindingArea GRU) off CPU-only
+`burn` and onto the same ORT+MIGraphX GPU path already used for the frozen encoders, so
+perception scales with the growable core instead of becoming a CPU bottleneck as
+`N_UNITS` grows toward brain-inspired sizes.
+
+- ADR 0023: two-graph ONNX export (`perception_encoder.onnx` + `perception_binding.onnx`)
+  run via ORT+MIGraphX; `burn` retained CPU-side for training only. Duty-cycle top-k/masking
+  stays on CPU between the two graphs to avoid a MIGraphX `ScatterElements`/INT64 bug on
+  gfx1201.
+- `--onnx-models-dir` / `--onnx-script` flags (see `scripts/train_campaign.sh`) enable the
+  GPU path opt-in; `sync_ort_weights` keeps the exported graphs in sync with `burn`-trained
+  weights across sleep cycles.
+
+**Exit criterion:** ✓ Phase 0 + Phase 1 of ADR 0023 implemented and live (2026-06-07);
+perception inference runs on GPU via ORT/MIGraphX when `--onnx-models-dir` is set.
