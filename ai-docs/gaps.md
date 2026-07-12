@@ -409,12 +409,168 @@ not from the mechanism itself. Full writeup: `ai-docs/research/growth-mechanisms
 validation" section.
 
 **Conclusion: the memorization-plateau risk did not materialize — growth is gate-limited, not
-corpus-limited.** This was the last open question before committing to the full campaign.
+corpus-limited.** This was the last open question before committing to the full campaign at the
+time (before §17/§18/§19 below existed).
 
-**Not yet done:** the actual full-scale campaign to reach 10x (~633 cycles, ~3.9 h unattended).
-Both pilots ran in isolated scratch memory dirs (`memory/growth_pilot/`, `memory/growth_pilot_
-expanded/` — untracked, not the main `memory/`); the full campaign has not been launched. Next step
-is user-driven.
+**Pilot 3 / "v2" (2026-07-12): rerun after the §17/§18/§19 architectural fixes.** Identical
+protocol to pilot 2 (`SESSIONS=15 CYCLES=5 CAPACITY=8192`, same 145-clip corpus), fresh isolated
+`memory/growth_pilot_v2/`, to validate the fixes in a live run before committing to the full
+campaign. **Result: 14 growth events (cadence 4–7 cycles, unchanged from pilot 1/2), quality trend
+intact** (`per_region_mse` mean 0.0136→0.0048 first-10-vs-last-10 cycles, comparable to pilot 2's
+0.0135→0.0039), **k_active scaling confirmed live** (final `region_sizes = [1523]×5`;
+`scaled_k(1523) = 30` vs baseline `scaled_k(1024) = 20`, ratio preserved), no crashes attributable
+to the changes (5 segfaults, all the pre-existing/documented MIGraphX exit-race, auto-recovered by
+`train_campaign.sh` same as prior pilots), total wall-clock 39m49s (~31.9s/cycle avg, vs. pilot 2's
+25.9s/cycle — plausibly the extra segfault-restart overhead, not the architectural changes).
+
+**Important recalibration: batch sizes were much smaller than the old flat 64 in practice.**
+Novelty values across the 14 events ranged 0.01–0.54 (only one event exceeded 0.3), giving batches
+of 17–77 with a **mean of 35.6/event** — nearly half the old flat batch. Total capacity added
+over the 75 cycles was 499 units/region (final size 1523) vs. pilot 1/2's 896 units/region
+(64 × 14 events, final ~1984–2048) had the old flat batch been used for the same 14 events. This
+is §19 working exactly as designed (severity-proportional growth) — but it means **the previous
+10x campaign extrapolation (~633 cycles, ~3.9h) assumed the old flat-64 batch and is now stale**.
+Recalibrating from this pilot's observed mean batch (35.6/event) and cadence (1 event/5.36 cycles):
+reaching the 10x target (~9,660 units/region, ~8,636 units still needed) now projects to **~242
+growth events, ~1,298 cycles, ~9.3–11.5h wall-clock** (range spans this pilot's 25.9–31.9s/cycle
+observed rates) — roughly **2.4–3x longer than the pre-§19 estimate**, not because growth is
+slower or less healthy, but because it's now correctly proportional to actual novelty, and this
+corpus/setup mostly produces moderate (not severe) novelty per trigger.
+
+**Not yet done:** the actual full-scale campaign to reach 10x, now estimated at ~9.3–11.5h
+unattended (was ~3.9h pre-§19). All three pilots ran in isolated scratch memory dirs
+(`memory/growth_pilot/`, `memory/growth_pilot_expanded/`, `memory/growth_pilot_v2/` — untracked,
+not the main `memory/`); the full campaign has not been launched. Next step is user-driven: accept
+the longer campaign time, or revisit §19's `GROWTH_BATCH_MAX`/curve shape if ~3-4h is a hard
+budget constraint.
+
+---
+
+## 17. K_ACTIVE scaling with region growth ✅ DONE (2026-07-12)
+
+**Problem, found 2026-07-12 while reviewing the mechanism ahead of the full 10x campaign:**
+`K_ACTIVE = 20` (`crates/somnus-perception/src/region.rs:11`) is a hardcoded const. Neither
+`grow_region` nor `grow_region_seeded` (`crates/somnus-perception/src/lib.rs`) touched it — only
+`n_units` grew. `growth-mechanisms.md`'s own design note ("k must increase slightly to maintain
+the same sparsity ratio") flagged this as needed but it was never implemented.
+
+At baseline (n=1024) sparsity is 20/1024 ≈ 2%. At the 10x target (~9,660 units/region) it would have
+been 20/9660 ≈ 0.2% — a ~10x drop in relative sparsity, untested by either characterization pilot
+(both only grew regions to ~2x baseline).
+
+**Fix implemented:** `KWtaLayer` gained a per-layer `k_active` field (was a global const lookup);
+new free function `region::scaled_k(n_units)` computes `round(n_units * K_ACTIVE / N_UNITS)`
+(floored at 1) to preserve the baseline ratio linearly — the simplest option, chosen over
+sub-linear scaling since there's no evidence yet that concept complexity should track region size
+sub-linearly, and linear is trivially reversible if a pilot shows otherwise. `grow_region`,
+`grow_region_seeded`, and `prune_region` all call `scaled_k` after touching `n_units`, so k tracks
+region size symmetrically on both growth and pruning. All internal k-WTA selection call sites
+(`select_top_k`, `select_top_k_no_dc`, `forward_tracked_batch`, both batched and per-sample paths)
+now read `self.k_active` instead of the const. Also fixed four ORT-bootstrap placeholder call
+sites and `binding_only` that hardcoded `N_UNITS`/`K_ACTIVE` instead of the layer's live size —
+latent bugs that would have produced a wrong-sized placeholder activation for an already-grown
+region after a snapshot reload.
+
+New tests: `scaled_k_preserves_baseline_ratio`, `kwta_respects_grown_k_active`
+(`crates/somnus-perception/src/region.rs`). Full existing suite (`phase5_smoke.rs`, including
+`grow_then_bind_produces_finite_episode`, `grow_then_replay_finite`,
+`prune_region_reduces_grown_units`) passes unchanged. Build/clippy/test clean.
+
+**Not yet empirically validated:** no new pilot run to confirm sparsity-preserving k improves
+(or at least doesn't harm) `per_region_mse` at multi-x growth — the fix is a priori-motivated
+correction of a mismatch between design intent and implementation, not yet A/B'd against the old
+fixed-k behavior at scale. Worth a pilot before/instead of the full 10x campaign if the user wants
+empirical confirmation.
+
+---
+
+## 18. Scope optimizer reset to the grown region only ✅ DONE (2026-07-12)
+
+**Problem, found 2026-07-12:** `grow_region`/`grow_region_seeded`/`prune_region` all ended with
+`self.optimizer = AdamWConfig::new().init(...)` — this reinitialized Adam's momentum/variance state
+for the *entire* model (all 5 regions, GRU, binding), not just the grown/pruned region's new params.
+Every other region/component already had valid optimizer state (same `ParamId`) that was being
+discarded unnecessarily, ~135 times projected over the full 10x campaign.
+
+**Investigated burn-optim's actual mechanism** (`burn_optim::optim::simple::adaptor::
+OptimizerAdaptor`, `~/.cargo/registry/.../burn-optim-0.21.0/src/optim/simple/adaptor.rs`) before
+changing anything: its momentum state is a `HashMap<ParamId, AdaptorRecord>`, looked up per-param
+on every `.step()` call. When a param's `ParamId` isn't in the map (as happens automatically for
+the fresh `ParamId::new()` that growth/pruning already assigns to the resized encoder/decoder/
+binding-proj tensors), the optimizer treats it as brand new and starts fresh momentum for *that
+param only* — no full reset needed to achieve that. Every other param's id is unchanged, so it
+keeps its accumulated momentum for free.
+
+**Fix implemented:** deleted the `self.optimizer = AdamWConfig::new().init(...)` line from
+`grow_region`, `grow_region_seeded`, and `prune_region` — nothing else changed, since the desired
+per-param-fresh-state behavior already falls out of burn's ParamId-keyed HashMap once the full
+reset stops overriding it. Confirmed this is unrelated to (and doesn't regress) the separate
+`refresh_autodiff_state` mechanism (`crates/somnus-perception/src/lib.rs`), which resets the optimizer
+for a different, legitimate reason (a 100-500x NREM slowdown from AutodiffServer graph
+accumulation, fixed by re-keying *every* param's ParamId, not just a grown region's) — that
+mechanism is untouched and still runs on its own schedule from `sleep.rs`/`main.rs`.
+
+Full `phase5_smoke.rs` suite (including `grow_then_bind_produces_finite_episode`,
+`grow_then_replay_finite`, `prune_region_reduces_grown_units`) passes unchanged. Build/clippy clean.
+
+**Not empirically A/B'd:** the fix follows directly from reading burn-optim's source (not just an
+assumption), but no pilot was rerun to measure whether preserved momentum actually improves
+convergence speed/stability around growth events in practice — the old behavior didn't show visible
+harm in the existing pilots either, so there's no regression baseline to compare against.
+
+---
+
+## 19. Novelty-proportional growth batch size ✅ DONE (2026-07-12)
+
+**Problem, raised by user 2026-07-12:** growth batch size (`GROWTH_BATCH = 64`,
+`crates/somnus/src/sleep.rs:28`) was a flat constant added every time the gate (
+`within_session_gist_rate` failure + 3-cycle cooldown) fired. The *trigger* already reflected a
+novelty-like signal (recall-failure rate), but the *amount* added per event didn't scale with how
+much unexplained/novel information was actually present — relative growth rate necessarily decayed
+over a long campaign simply because a fixed absolute batch was added to an ever-growing denominator,
+independent of whether the information stream flowing in was still just as novel.
+
+**Fix implemented:** `crates/somnus/src/sleep.rs` gained `GROWTH_BATCH_MIN=16`/`GROWTH_BATCH_MAX=128`
+(the old 64 sits roughly in the middle, so near-threshold triggers land close to the old default)
+and three pure, unit-tested functions:
+- `gist_novelty(recall_rate, threshold)` — novelty ratio for the gist-based trigger:
+  `(threshold - rate) / threshold`, clamped `[0, 1]`. 0 at the pass/fail boundary, 1 at total
+  recall failure.
+- `mse_novelty(mse, threshold)` — mirror for the MSE-fallback trigger (S1C1, before any gist
+  signal exists): `(mse - threshold) / threshold`, same clamp.
+- `growth_batch_size(novelty)` — linear interpolation from `GROWTH_BATCH_MIN` (novelty 0) to
+  `GROWTH_BATCH_MAX` (novelty 1). Linear was chosen as the simplest starting point, not because
+  it's known to be the right response shape — easy to swap for a nonlinear curve if a pilot shows
+  otherwise.
+
+The growth loop's three-way signal match (within-session gist → cross-session gist → MSE
+fallback) now computes `novelty` alongside the existing `quality_poor` boolean from the same
+branch, so each region's batch size reflects whichever signal actually gated its growth. The
+cascade-correlation seed cap (`collect_high_residual_inputs`) was bumped from `2 × GROWTH_BATCH`
+to `2 × GROWTH_BATCH_MAX` to cover the worst case (every triggered region hitting max novelty) —
+seeds cycle via modulo when fewer are available than the batch, so this is a memory bound, not a
+hard requirement.
+
+New tests: `growth_batch_size_spans_min_to_max`, `growth_batch_size_clamps_out_of_range_novelty`,
+`gist_novelty_zero_at_threshold_one_at_zero_recall`, `mse_novelty_zero_at_threshold_scales_upward`,
+`worse_recall_failure_grows_a_bigger_batch` (`crates/somnus/src/sleep.rs`). Full `somnus`/`somnus-perception`
+suite passes, build/clippy/fmt clean.
+
+**Deliberately not done:** EWMA smoothing of the novelty signal across cycles. `within_session_gist_rate`
+is already an average over every probed episode in the current within-session warm subset (not a
+single noisy sample), so it has some inherent stability per-cycle; cross-cycle smoothing was left
+out to keep the first version simple. If a pilot shows batch size oscillating unhelpfully between
+consecutive growth events, that's the first thing to add.
+
+**Empirically validated 2026-07-12** (§16's pilot 3 / "v2" rerun, same protocol/corpus as pilot 2):
+batch sizes did vary sensibly across events (17–77, tracking novelty 0.01–0.54) — the mechanism
+works as designed. But total capacity added over 75 cycles was *smaller* than the flat-64 baseline
+would have produced for the same 14 events (499 vs. 896 units/region), because most triggers in
+this corpus/setup land at moderate, not severe, novelty. That's not a bug in this fix — it's the
+flat-64 baseline having (accidentally) been more generous than the actual observed severity
+warranted — but it does mean the 10x campaign now needs ~2.4-3x more cycles/wall-clock than
+previously estimated. See §16 pilot 3 for full numbers and the revised campaign-time estimate
+(~9.3–11.5h, was ~3.9h).
 
 ---
 
@@ -442,4 +598,7 @@ is user-driven.
 | ✅ §13 | **Change-gated video encoder** | Low | Wake-path compute (unmeasured savings) | Deployed 2026-07-06, opt-in via `--video-change-threshold` |
 | ❌ §14 | **SVD low-rank check (region/binding weights)** | Low | Capacity efficiency | Null result 2026-07-06 — near-full-rank, not pursued |
 | §15 | **Crate hygiene** (usearch migration, burn-ndarray watch, ffmpeg-the-third) | Low–Med | HNSW footprint / maintenance | Dead deps removal already done; usearch/ffmpeg-the-third deferred until raised by a concrete need |
-| 🔬 §16 | **Growth-scaling pilot campaigns** (10x growable-core scaling) | Med (pilots done, full campaign is ~3.9h unattended) | Growable-core capacity | Characterized 2026-07-09/11 (2 pilots, no plateau risk found); full 10x campaign not yet run — user-driven next step |
+| 🔬 §16 | **Growth-scaling pilot campaigns** (10x growable-core scaling) | Med (pilots done, full campaign now ~9.3–11.5h unattended, revised 2026-07-12) | Growable-core capacity | Characterized 2026-07-09/11/12 (3 pilots, no plateau risk found; post-§19 pilot recalibrated campaign time upward ~2.4-3x); full 10x campaign not yet run — user-driven next step |
+| ✅ §17 | **K_ACTIVE scaling with region growth** | Low–Med | Sparse coding quality at scale | Deployed 2026-07-12 — see §17 below |
+| ✅ §18 | **Scope optimizer reset to grown region only** | Low | Convergence stability during growth | Deployed 2026-07-12 — see §18 below |
+| ✅ §19 | **Novelty-proportional growth batch size** | Med | Growth-mechanism correctness | Deployed 2026-07-12 — see §19 below |

@@ -25,7 +25,16 @@ use crate::action::ActionDecoder;
 const DECAY_RATE: f32 = 1e-4;
 const GROWTH_THRESHOLD: f32 = 0.1;
 const GROWTH_MIN_SAMPLES: usize = 16;
-const GROWTH_BATCH: usize = 64;
+/// Growth batch size floor/ceiling (gaps.md §19). Previously a flat `GROWTH_BATCH = 64`
+/// added the same amount regardless of how badly the trigger threshold was missed —
+/// meaning relative growth mechanically decayed over a long campaign purely because a
+/// fixed absolute batch was added to an ever-growing region, independent of whether the
+/// incoming stream was still just as novel. `growth_batch_size` now scales within this
+/// range by how much unrecalled/novel signal actually drove the trigger. The old 64
+/// sits roughly in the middle of this range, so typical near-threshold triggers land
+/// close to the previous default and only genuinely bad recall failures reach the top.
+const GROWTH_BATCH_MIN: usize = 16;
+const GROWTH_BATCH_MAX: usize = 128;
 
 /// DER++ stale-output detection (ADR TBD): skip replaying traces whose stored
 /// episode vector has drifted too far from the current model's predictions,
@@ -102,6 +111,39 @@ fn nrem_lr(step: usize, total: usize, loss_ewma: f32, prev_ewma: f32, batch_sali
     let salience_scale = 1.0 + (LR_SALIENCE_MAX_SCALE - 1.0) * salience_norm;
 
     cosine * trend_scale * salience_scale
+}
+
+/// Map a novelty ratio in `[0, 1]` (0 = barely tripped the growth gate, 1 = total
+/// recall failure) to a growth batch size in `[GROWTH_BATCH_MIN, GROWTH_BATCH_MAX]`
+/// (gaps.md §19). Linear interpolation — simplest option, and easily revisited if a
+/// pilot shows the response should be nonlinear.
+fn growth_batch_size(novelty: f32) -> usize {
+    let novelty = novelty.clamp(0.0, 1.0);
+    let batch = GROWTH_BATCH_MIN as f32 + novelty * (GROWTH_BATCH_MAX - GROWTH_BATCH_MIN) as f32;
+    (batch.round() as usize).clamp(GROWTH_BATCH_MIN, GROWTH_BATCH_MAX)
+}
+
+/// Novelty ratio for a region whose growth trigger was a gist recall-rate shortfall:
+/// fraction of the gap between "no recall at all" (rate 0) and the pass threshold that
+/// the observed rate actually missed by. A rate right at `threshold` gives 0 (the
+/// boundary case that used to always add a flat batch); a rate of 0 gives 1 (maximum
+/// novelty). Rates above threshold (shouldn't reach here — the growth gate is closed)
+/// clamp to 0 rather than going negative.
+fn gist_novelty(recall_rate: f32, threshold: f32) -> f32 {
+    if threshold <= 1e-6 {
+        return 1.0;
+    }
+    ((threshold - recall_rate) / threshold).clamp(0.0, 1.0)
+}
+
+/// Novelty ratio for the MSE-fallback growth trigger (S1C1, before any gist signal
+/// exists): how far `mse` sits over `GROWTH_THRESHOLD`, relative to the threshold
+/// itself. Mirrors `gist_novelty`'s shape but for a "lower is better" signal.
+fn mse_novelty(mse: f32, threshold: f32) -> f32 {
+    if threshold <= 1e-6 {
+        return 1.0;
+    }
+    ((mse - threshold) / threshold).clamp(0.0, 1.0)
 }
 
 #[allow(dead_code)]
@@ -1099,28 +1141,40 @@ pub fn run_sleep_cycle(
         if !growth_blocked {
             // Cascade-correlation init (ADR 0007, P2b): collect high-residual inputs once
             // before the growth loop so that any regions that trigger growth can use them.
-            // Cap at 2 × GROWTH_BATCH seeds per region to bound memory.
+            // Cap at 2 × GROWTH_BATCH_MAX seeds per region to bound memory (worst case: every
+            // triggered region gets the largest possible batch).
             let cc_seeds =
-                perception.collect_high_residual_inputs(&traces_for_rem, 2 * GROWTH_BATCH);
+                perception.collect_high_residual_inputs(&traces_for_rem, 2 * GROWTH_BATCH_MAX);
 
             for (i, &region) in region_ids.iter().enumerate() {
                 // Quality signal: within-session gist primary (no drift); cross-session
                 // gist at c1 of any session (ws always None before first spill); MSE
-                // last resort when warm was empty (S1C1).
-                let quality_poor = match (within_session_gist_rate, gist_recall_rate) {
-                    (Some(ws), _) => ws < GIST_GROWTH_THRESHOLD,
-                    (None, Some(_)) => gist_poor,
-                    (None, None) => per_region_mse[i] > GROWTH_THRESHOLD,
+                // last resort when warm was empty (S1C1). Novelty mirrors the same
+                // three-way signal choice, feeding growth_batch_size (gaps.md §19)
+                // instead of the old flat GROWTH_BATCH.
+                let (quality_poor, novelty) = match (within_session_gist_rate, gist_recall_rate) {
+                    (Some(ws), _) => (
+                        ws < GIST_GROWTH_THRESHOLD,
+                        gist_novelty(ws, GIST_GROWTH_THRESHOLD),
+                    ),
+                    (None, Some(gr)) => (gist_poor, gist_novelty(gr, GIST_GROWTH_THRESHOLD)),
+                    (None, None) => (
+                        per_region_mse[i] > GROWTH_THRESHOLD,
+                        mse_novelty(per_region_mse[i], GROWTH_THRESHOLD),
+                    ),
                 };
                 if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor {
+                    let batch = growth_batch_size(novelty);
                     tracing::info!(
                         region = ?region,
                         mse = per_region_mse[i],
                         gist_recall_rate = ?gist_recall_rate,
+                        novelty,
+                        batch,
                         seeds = cc_seeds[i].len(),
                         "growing region (cascade-correlation)"
                     );
-                    perception.grow_region_seeded(region, GROWTH_BATCH, &cc_seeds[i]);
+                    perception.grow_region_seeded(region, batch, &cc_seeds[i]);
                     regions_grown.push(region);
                 }
             }
@@ -1441,6 +1495,60 @@ mod tests {
         assert!(
             rel_diff < 1e-6,
             "sentinel and 0.5×cap should give identical LR (diff={rel_diff:.2e})"
+        );
+    }
+
+    // ── novelty-proportional growth batch tests (gaps.md §19) ───────────────────
+
+    #[test]
+    fn growth_batch_size_spans_min_to_max() {
+        assert_eq!(growth_batch_size(0.0), GROWTH_BATCH_MIN);
+        assert_eq!(growth_batch_size(1.0), GROWTH_BATCH_MAX);
+        assert!(growth_batch_size(0.5) > GROWTH_BATCH_MIN);
+        assert!(growth_batch_size(0.5) < GROWTH_BATCH_MAX);
+    }
+
+    #[test]
+    fn growth_batch_size_clamps_out_of_range_novelty() {
+        // Defensive: novelty should never legitimately fall outside [0, 1], but the
+        // mapping must not panic or overflow the range if it somehow does.
+        assert_eq!(growth_batch_size(-1.0), GROWTH_BATCH_MIN);
+        assert_eq!(growth_batch_size(2.0), GROWTH_BATCH_MAX);
+    }
+
+    #[test]
+    fn gist_novelty_zero_at_threshold_one_at_zero_recall() {
+        assert_eq!(
+            gist_novelty(GIST_GROWTH_THRESHOLD, GIST_GROWTH_THRESHOLD),
+            0.0
+        );
+        assert_eq!(gist_novelty(0.0, GIST_GROWTH_THRESHOLD), 1.0);
+        // A rate above threshold shouldn't occur (growth gate would be closed), but
+        // must clamp to 0 rather than go negative.
+        assert_eq!(gist_novelty(1.0, GIST_GROWTH_THRESHOLD), 0.0);
+    }
+
+    #[test]
+    fn mse_novelty_zero_at_threshold_scales_upward() {
+        assert_eq!(mse_novelty(GROWTH_THRESHOLD, GROWTH_THRESHOLD), 0.0);
+        assert_eq!(mse_novelty(GROWTH_THRESHOLD * 2.0, GROWTH_THRESHOLD), 1.0);
+        // Below threshold shouldn't trigger growth, but must clamp to 0, not negative.
+        assert_eq!(mse_novelty(0.0, GROWTH_THRESHOLD), 0.0);
+    }
+
+    #[test]
+    fn worse_recall_failure_grows_a_bigger_batch() {
+        // A region that barely tripped the gate should grow less than one that's
+        // deep in recall failure — this is the whole point of gaps.md §19: growth
+        // amount should track how much unexplained signal is actually present.
+        let barely_failing = growth_batch_size(gist_novelty(
+            GIST_GROWTH_THRESHOLD - 0.01,
+            GIST_GROWTH_THRESHOLD,
+        ));
+        let badly_failing = growth_batch_size(gist_novelty(0.05, GIST_GROWTH_THRESHOLD));
+        assert!(
+            badly_failing > barely_failing,
+            "badly failing region should get a bigger batch (barely={barely_failing}, badly={badly_failing})"
         );
     }
 

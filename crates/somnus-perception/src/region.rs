@@ -13,6 +13,14 @@ pub const K_ACTIVE: usize = 20;
 const BOOST_STRENGTH: f32 = 1.0;
 const DUTY_CYCLE_ALPHA: f32 = 1.0 / 1000.0;
 
+/// Active-unit count that preserves the baseline `K_ACTIVE / N_UNITS` sparsity ratio
+/// at a grown region size. Growth (`grow_region`/`grow_region_seeded`) adds units but
+/// never revisited k — left at the fixed baseline, a 10x region growth would collapse
+/// relative sparsity from ~2% to ~0.2%. Rounds to nearest, floored at 1.
+pub fn scaled_k(n_units: usize) -> usize {
+    ((n_units as f64 * K_ACTIVE as f64 / N_UNITS as f64).round() as usize).max(1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegionId {
     AudioSpeech,
@@ -80,6 +88,11 @@ pub struct KWtaLayer<B: Backend> {
     pub region: RegionId,
     #[module(skip)]
     pub n_units: usize,
+    /// Active-unit count for this layer's k-WTA selection. Starts at K_ACTIVE and is
+    /// rescaled (via `scaled_k`) by the caller whenever `n_units` grows, to keep the
+    /// sparsity ratio roughly constant instead of decaying as the region grows.
+    #[module(skip)]
+    pub k_active: usize,
     #[module(skip)]
     pub duty_cycle: Vec<f32>,
 }
@@ -93,6 +106,7 @@ impl<B: Backend> KWtaLayer<B> {
             linear,
             region,
             n_units: N_UNITS,
+            k_active: K_ACTIVE,
             duty_cycle: vec![0.0f32; N_UNITS],
         }
     }
@@ -136,14 +150,15 @@ impl<B: Backend> KWtaLayer<B> {
 
     fn select_top_k(&mut self, z_vec: Vec<f32>) -> SparseActivation {
         let n = self.n_units;
-        let target_dc = K_ACTIVE as f32 / n as f32;
+        let k = self.k_active;
+        let target_dc = k as f32 / n as f32;
         let mut boosted = z_vec.clone();
         for (i, dc) in self.duty_cycle.iter().enumerate() {
             boosted[i] += BOOST_STRENGTH * (target_dc - dc);
         }
 
         let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
-        let split = n - K_ACTIVE;
+        let split = n - k;
         indexed.select_nth_unstable_by(split, |a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -171,13 +186,14 @@ impl<B: Backend> KWtaLayer<B> {
 
     fn select_top_k_no_dc(&self, z_vec: Vec<f32>) -> SparseActivation {
         let n = self.n_units;
-        let target_dc = K_ACTIVE as f32 / n as f32;
+        let k = self.k_active;
+        let target_dc = k as f32 / n as f32;
         let mut boosted = z_vec.clone();
         for (i, dc) in self.duty_cycle.iter().enumerate() {
             boosted[i] += BOOST_STRENGTH * (target_dc - dc);
         }
         let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
-        let split = n - K_ACTIVE;
+        let split = n - k;
         indexed.select_nth_unstable_by(split, |a, b| {
             a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -245,8 +261,9 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
             .unwrap();
 
         let n = self.n_units;
+        let k = self.k_active;
         let mut flat_masks = vec![0.0f32; b * n];
-        let target_dc = K_ACTIVE as f32 / n as f32;
+        let target_dc = k as f32 / n as f32;
 
         if batch_topk {
             // BatchTopK: compute one threshold over the entire batch
@@ -260,8 +277,8 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
                 })
                 .collect();
 
-            // Find threshold τ such that top (b * K_ACTIVE) values exceed it
-            let target_k = b * K_ACTIVE;
+            // Find threshold τ such that top (b * k) values exceed it
+            let target_k = b * k;
             let mut indexed: Vec<(usize, f32)> =
                 boosted_snapshot.iter().copied().enumerate().collect();
             let split = boosted_snapshot.len() - target_k;
@@ -294,7 +311,7 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
                     boosted[i] += BOOST_STRENGTH * (target_dc - dc);
                 }
                 let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
-                let split = n - K_ACTIVE;
+                let split = n - k;
                 indexed.select_nth_unstable_by(split, |a, b| {
                     a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
                 });
@@ -334,6 +351,28 @@ mod tests {
         let act = layer.forward(&input, &device);
         assert_eq!(act.indices.len(), K_ACTIVE);
         assert_eq!(act.values.len(), K_ACTIVE);
+    }
+
+    #[test]
+    fn scaled_k_preserves_baseline_ratio() {
+        assert_eq!(scaled_k(N_UNITS), K_ACTIVE);
+        // 10x region growth should scale k roughly 10x too, not leave it flat at 20.
+        assert_eq!(scaled_k(N_UNITS * 10), K_ACTIVE * 10);
+        // Never collapses to 0 for a tiny (hypothetical) region.
+        assert_eq!(scaled_k(1), 1);
+    }
+
+    #[test]
+    fn kwta_respects_grown_k_active() {
+        let mut layer = make_layer(RegionId::Visual, 384);
+        // Simulate what grow_region/grow_region_seeded do to a layer's bookkeeping:
+        // extend n_units and rescale k_active to match, without actually resizing
+        // the weight tensor (irrelevant to k-WTA selection logic under test here).
+        layer.n_units = N_UNITS * 10;
+        layer.k_active = scaled_k(layer.n_units);
+        layer.duty_cycle = vec![0.0f32; layer.n_units];
+        // Sparsity ratio should be preserved, not stuck at the baseline K_ACTIVE=20.
+        assert_eq!(layer.k_active, K_ACTIVE * 10);
     }
 
     #[test]

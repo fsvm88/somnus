@@ -12,11 +12,18 @@
 > and a documentation audit/correction pass across `architecture.md`, `gaps.md`,
 > `growth-mechanisms.md`, `roadmap.md`, `README.md`, and this file (stale open-questions,
 > priority-table numbering drift, a lost deferred-items trigger table, missing Phase 14 section).
-> **Status: gaps.md §16 (growth-scaling) now CHARACTERIZED — two 75-cycle pilots (10-clip loop,
-> then 145-clip diverse corpus incl. new podcasts) both show gate-limited growth cadence, no
-> memorization-plateau risk. Full 10x campaign (~633 cycles, ~3.9h) scoped but not launched —
-> next step is user-driven. See `ai-docs/gaps.md` §16 and `ai-docs/research/growth-mechanisms.md`
-> "Empirical validation" for full writeup.**
+> **Status: gaps.md §16 (growth-scaling) CHARACTERIZED — three 75-cycle pilots (10-clip loop, then
+> 145-clip diverse corpus, then a post-fix rerun of the same 145-clip corpus) all show gate-limited
+> growth cadence, no memorization-plateau risk.**
+> **Also done (2026-07-12, not yet committed): three architectural fixes found during pre-campaign
+> review, gaps.md §17/§18/§19 — K_ACTIVE now scales with region growth, optimizer reset scoped to
+> the grown region only (not the whole model), and growth batch size is now novelty-proportional
+> instead of a flat constant. Validated with a third growth pilot (`memory/growth_pilot_v2/`,
+> untracked) — mechanism confirmed working (k_active tracked region size correctly; batches varied
+> 17–77 with cadence unchanged from pilot 1/2). But that pilot revealed the average batch (35.6/
+> event) is well below the old flat 64, because most triggers in this corpus land at moderate, not
+> severe, novelty — so **the full 10x campaign is now re-estimated at ~9.3–11.5h (was ~3.9h),
+> ~2.4-3x longer than the pre-§19 number.** Full writeup: `ai-docs/gaps.md` §16 pilot 3, §19.**
 
 ## Just completed (2026-07-11) — expanded-corpus growth pilot + podcast corpus + doc audit
 
@@ -140,13 +147,69 @@ Full writeup: `ai-docs/gaps.md` §9. Build/clippy/test pass clean both with and 
 feature; committed together with the implementation in one shot (was never committed before
 since the A/B hadn't concluded).
 
-## Queued for next session
+## Just completed (2026-07-12) — three growth-mechanism architectural fixes (gaps.md §17/§18/§19)
 
-Nothing queued. Both A/B items on deck (`gaps.md` §3 DER++ auto-λ, §9 EfficientAT-mn10) are
-now resolved (both rejected, kept opt-in-only). Remaining `gaps.md` priority-table items are
-all either ✅ done or explicitly Deferred (M2D-CLAP #9, SigLIP2 #10, LISTA #11, Gemma 3 #12,
-usearch #13) — none are queued as an immediate next step. Next step is user-driven; see
-`ai-docs/gaps.md`'s priority table for deferred candidates if the user wants to pick one up.
+Found and fixed in order, while reviewing the growth mechanism ahead of the full 10x campaign.
+All implemented, tested, and documented this session; **not yet committed**.
+
+- **`gaps.md` §17 — K_ACTIVE scaling with region growth.** `K_ACTIVE=20` was a hardcoded const
+  never adjusted by `grow_region`/`grow_region_seeded`/`prune_region` — sparsity ratio would have
+  fallen ~10x (2%→0.2%) over the full 10x campaign. Fixed: `KWtaLayer` gained a per-layer
+  `k_active` field, new `region::scaled_k(n_units)` preserves the baseline ratio linearly, wired
+  into all three growth/prune call sites and all k-WTA selection code paths. Also fixed four
+  ORT-bootstrap placeholder call sites and `binding_only` that hardcoded `N_UNITS`/`K_ACTIVE`
+  instead of the layer's live size (latent bugs for an already-grown region after snapshot
+  reload). New tests: `scaled_k_preserves_baseline_ratio`, `kwta_respects_grown_k_active`.
+- **`gaps.md` §18 — scope optimizer reset to the grown region only.** Every growth/prune event
+  was calling `self.optimizer = AdamWConfig::new().init(...)`, wiping Adam momentum for the
+  *entire* model, not just the touched region. Investigated burn-optim's source
+  (`OptimizerAdaptor`, `HashMap<ParamId, AdaptorRecord>`) before changing anything: state is
+  already keyed by `ParamId`, and the resized tensors already get fresh `ParamId::new()` — so the
+  full reset was pure waste. Fix: deleted the reset line from all three call sites; nothing else
+  needed to change. Confirmed unrelated to (and doesn't regress) the separate
+  `refresh_autodiff_state` mechanism, which resets the optimizer for a different, legitimate
+  reason (NREM graph-accumulation slowdown) and is untouched.
+- **`gaps.md` §19 — novelty-proportional growth batch size** (user's proposal, judged sound).
+  Flat `GROWTH_BATCH=64` replaced with `GROWTH_BATCH_MIN=16`/`GROWTH_BATCH_MAX=128` and three
+  pure functions (`gist_novelty`, `mse_novelty`, `growth_batch_size`) that scale the batch by how
+  far the trigger signal missed its threshold — a region deep in recall failure now grows more
+  per event than one that barely tripped the gate, instead of every triggered region getting the
+  same fixed lump regardless of severity. New tests: `growth_batch_size_spans_min_to_max`,
+  `growth_batch_size_clamps_out_of_range_novelty`, `gist_novelty_zero_at_threshold_...`,
+  `mse_novelty_zero_at_threshold_...`, `worse_recall_failure_grows_a_bigger_batch`.
+
+All three: build/clippy/fmt clean, full `somnus`/`somnus-perception` test suite passes (including
+`phase5_smoke.rs`'s `grow_then_bind_produces_finite_episode`, `grow_then_replay_finite`,
+`prune_region_reduces_grown_units`). Full writeups: `ai-docs/gaps.md` §17–19.
+
+## Just completed (2026-07-12, later) — growth pilot 3/"v2": validated §17/§18/§19 live, recalibrated 10x campaign estimate
+
+Reran the exact pilot 2 protocol (`SESSIONS=15 CYCLES=5 CAPACITY=8192`, same 145-clip h3h3+shorts+
+podcasts corpus) against the post-fix build, fresh isolated `memory/growth_pilot_v2/` (untracked).
+75 cycles, 39m49s wall-clock, 5 benign MIGraphX-exit-race segfaults (same known issue, auto-
+recovered by `train_campaign.sh` as always).
+
+**Mechanism confirmed working correctly:** 14 growth events, same 4–7 cycle gate-limited cadence
+as pilot 1/2; `per_region_mse` improved 0.0136→0.0048 (comparable to pilot 2's 0.0135→0.0039);
+`k_active` tracked region growth as designed (final `region_sizes=[1523]×5`, `scaled_k(1523)=30`
+vs. baseline `scaled_k(1024)=20`, ratio preserved); batch sizes varied sensibly with novelty
+(17–77 across observed novelty 0.01–0.54).
+
+**But: this surfaced an important recalibration.** Mean batch across the 14 events was 35.6 —
+nearly half the old flat 64 — because most triggers in this corpus land at moderate, not severe,
+novelty. Total capacity added over 75 cycles (499 units/region) was noticeably less than the old
+flat-batch mechanism would have produced for the same 14 events (896 units/region). Extrapolating
+this pilot's observed mean batch (35.6/event) and cadence (1/5.36 cycles) to the 10x target
+(~9,660 units/region) now projects **~242 growth events, ~1,298 cycles, ~9.3–11.5h wall-clock** —
+roughly **2.4-3x longer than the pre-§19 estimate of ~3.9h/~633 cycles.** This isn't a regression;
+it's §19 correctly making growth proportional to actual severity, in a setup where severity is
+usually moderate. Full numbers: `ai-docs/gaps.md` §16 (pilot 3) and §19 (validation note).
+
+**Not yet committed:** all of §17/§18/§19's code changes plus this pilot's docs updates.
+
+**Next step is user-driven:** commit these changes, then either accept the longer (~9.3–11.5h)
+campaign time and launch it, or revisit §19's `GROWTH_BATCH_MAX`/curve shape first if ~3-4h is a
+hard time budget.
 
 ## Historical: EfficientAT mn10 implementation notes (2026-07-08, now committed and A/B'd — see above)
 

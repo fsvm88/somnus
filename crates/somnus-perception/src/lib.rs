@@ -8,7 +8,7 @@ pub mod wake_worker;
 pub use binding::{BindingArea, EpisodeVector, EPISODE_DIM};
 pub use error::{PerceptionError, PerceptionResult};
 pub use onnx_session::OnnxPerceptionSession;
-pub use region::{KWtaLayer, RegionId, SparseActivation, K_ACTIVE, N_UNITS};
+pub use region::{scaled_k, KWtaLayer, RegionId, SparseActivation, K_ACTIVE, N_UNITS};
 pub use sae::SaeDecoder;
 pub use wake_worker::WakeReconWorker;
 
@@ -424,12 +424,9 @@ impl PerceptionProcessor {
             // ORT encoder recomputes all 5 regions in try_bind; skip burn forward.
             // Bootstrap latest[0] if needed so try_bind gate can fire.
             if self.latest[RegionId::AudioSpeech.as_index()].is_none() {
-                self.latest[RegionId::AudioSpeech.as_index()] = Some(SparseActivation {
-                    region: RegionId::AudioSpeech,
-                    indices: (0..K_ACTIVE as u16).collect(),
-                    values: vec![1.0f32; K_ACTIVE],
-                    n_units: N_UNITS,
-                });
+                let n = self.model.as_ref().unwrap().speech_layer.n_units;
+                self.latest[RegionId::AudioSpeech.as_index()] =
+                    Some(bootstrap_placeholder(RegionId::AudioSpeech, n));
             }
             0.0
         } else {
@@ -496,12 +493,9 @@ impl PerceptionProcessor {
         let t0 = Instant::now();
         let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
             if self.latest[RegionId::AudioEnv.as_index()].is_none() {
-                self.latest[RegionId::AudioEnv.as_index()] = Some(SparseActivation {
-                    region: RegionId::AudioEnv,
-                    indices: (0..K_ACTIVE as u16).collect(),
-                    values: vec![1.0f32; K_ACTIVE],
-                    n_units: N_UNITS,
-                });
+                let n = self.model.as_ref().unwrap().env_layer.n_units;
+                self.latest[RegionId::AudioEnv.as_index()] =
+                    Some(bootstrap_placeholder(RegionId::AudioEnv, n));
             }
             0.0
         } else {
@@ -567,12 +561,9 @@ impl PerceptionProcessor {
         let t0 = Instant::now();
         let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
             if self.latest[RegionId::Visual.as_index()].is_none() {
-                self.latest[RegionId::Visual.as_index()] = Some(SparseActivation {
-                    region: RegionId::Visual,
-                    indices: (0..K_ACTIVE as u16).collect(),
-                    values: vec![1.0f32; K_ACTIVE],
-                    n_units: N_UNITS,
-                });
+                let n = self.model.as_ref().unwrap().visual_layer.n_units;
+                self.latest[RegionId::Visual.as_index()] =
+                    Some(bootstrap_placeholder(RegionId::Visual, n));
             }
             0.0
         } else {
@@ -800,12 +791,9 @@ impl PerceptionProcessor {
         // can fire; try_bind overwrites it immediately with the real ORT z3 activation.
         if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
             if self.latest[RegionId::Symbolic.as_index()].is_none() {
-                self.latest[RegionId::Symbolic.as_index()] = Some(SparseActivation {
-                    region: RegionId::Symbolic,
-                    indices: (0..K_ACTIVE as u16).collect(),
-                    values: vec![1.0f32; K_ACTIVE],
-                    n_units: N_UNITS,
-                });
+                let n = self.model.as_ref().unwrap().symbolic_layer.n_units;
+                self.latest[RegionId::Symbolic.as_index()] =
+                    Some(bootstrap_placeholder(RegionId::Symbolic, n));
             }
             return (None, 0.0);
         }
@@ -1746,6 +1734,9 @@ impl PerceptionProcessor {
                 Tensor::from_inner(Tensor::cat(vec![old_w, new_cols], 1));
             layer.linear.weight = Param::initialized(ParamId::new(), new_w);
             layer.n_units = new_n;
+            // Rescale k so sparsity ratio (k/n) stays roughly constant as the region
+            // grows, instead of decaying toward 0 (see gaps.md §17).
+            layer.k_active = region::scaled_k(new_n);
             layer.duty_cycle.extend(vec![0.0f32; n_new]);
             new_n
         };
@@ -1780,7 +1771,11 @@ impl PerceptionProcessor {
             model.binding.region_n[region.as_index()] = new_n;
         }
 
-        self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+        // No optimizer reset: burn's OptimizerAdaptor keys momentum state by ParamId
+        // (see burn_optim::simple::adaptor). The three tensors touched above got fresh
+        // ParamIds, so they naturally start with fresh (zero) Adam state on the next
+        // step; every other param's id is untouched and keeps its accumulated momentum
+        // instead of being wiped for no reason (gaps.md §18).
         tracing::info!(region = ?region, n_new, "region grown");
     }
 
@@ -1829,6 +1824,7 @@ impl PerceptionProcessor {
                 Tensor::from_inner(Tensor::cat(vec![old_w, cols_t.inner()], 1));
             layer.linear.weight = Param::initialized(ParamId::new(), new_w);
             layer.n_units = new_n;
+            layer.k_active = region::scaled_k(new_n);
             layer.duty_cycle.extend(vec![0.0f32; n_new]);
             new_n
         };
@@ -1860,7 +1856,7 @@ impl PerceptionProcessor {
             model.binding.region_n[region.as_index()] = new_n;
         }
 
-        self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+        // See grow_region: no optimizer reset needed, ParamId-keyed state handles it (gaps.md §18).
         tracing::info!(region = ?region, n_new, "region grown (seeded)");
     }
 
@@ -1998,6 +1994,7 @@ impl PerceptionProcessor {
             let old_dc = layer.duty_cycle.clone();
             layer.duty_cycle = keep.iter().map(|&i| old_dc[i]).collect();
             layer.n_units = new_n;
+            layer.k_active = region::scaled_k(new_n);
         }
 
         {
@@ -2035,7 +2032,7 @@ impl PerceptionProcessor {
             model.binding.region_n[region.as_index()] = new_n;
         }
 
-        self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+        // See grow_region: no optimizer reset needed, ParamId-keyed state handles it (gaps.md §18).
         tracing::info!(region = ?region, old_n = current_n, new_n, n_pruned = n_prune, "region pruned");
         n_prune
     }
@@ -2595,7 +2592,7 @@ impl PerceptionProcessor {
                 ][i],
                 indices,
                 values,
-                n_units: N_UNITS,
+                n_units: dense.len(),
             }
         });
         let act_refs: [&SparseActivation; 5] = [&acts[0], &acts[1], &acts[2], &acts[3], &acts[4]];
@@ -2931,6 +2928,21 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
         0.0
     } else {
         dot / (na * nb)
+    }
+}
+
+/// Cold-start placeholder activation for the ORT-encoder path (bypasses the burn k-WTA
+/// layer, so it never gets a real `SparseActivation` until `try_bind` runs). Sized from
+/// the layer's *current* `n_units` (which may already reflect prior growth after a
+/// snapshot reload) rather than the compile-time baseline, and `k` scaled to match —
+/// otherwise a grown region would get a placeholder with a stale, too-small k/n ratio.
+fn bootstrap_placeholder(region: RegionId, n_units: usize) -> SparseActivation {
+    let k = region::scaled_k(n_units);
+    SparseActivation {
+        region,
+        indices: (0..k as u16).collect(),
+        values: vec![1.0f32; k],
+        n_units,
     }
 }
 
