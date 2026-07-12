@@ -1,29 +1,35 @@
 # Session state — somnus
 
 > **Last updated:** 2026-07-12 (later still)
-> **🔄 IN PROGRESS: full 10x growth campaign launched, running unattended.** All of §17/§18/§19
-> (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional batch) committed at
-> `904980e`/`b883069`. Per the user's explicit call, **`memory/` was wiped completely** (all
-> production state + every old A/B/pilot scratch dir, ~17GB, all gitignored/untracked — nothing
-> lost that wasn't reproducible) and the campaign is regrowing from scratch on the new mechanism.
-> Launched via `scripts/train_campaign.sh` in the background (task id `bl7mf45tg` this session;
-> won't survive a session restart — check `pgrep -fa train_campaign.sh`, or just run
-> `scripts/campaign_status.py`, the new one-command status tool, described below). Params:
-> `SESSIONS=130 CYCLES=10 CAPACITY=8192 MEMORY_DIR=memory CAMPAIGN_DIR=memory/campaign_growth10x
-> SKIP_BUILD=1`, `CLIPS`=full 145-file h3h3+shorts+podcasts corpus (`.mp4` only — first launch
-> attempt included `clips/shorts/download.log` via a naive glob, killed and relaunched with a
-> `find -name '*.mp4'` filter before real damage). 1300 target cycles.
-> **Rate is currently beating the pilot-3 estimate:** ~440 cycles in, mean batch ~43.4 units/event
-> and cadence ~1/4.25 cycles (pilot-3: 35.6/event, 1/5.36) — projecting **~6.1h total** vs. the
-> ~9.3–11.5h pilot-3 estimate. Provisional; may slow once early novelty is consumed. Full backstory:
-> `ai-docs/gaps.md` §16/§19/§20.
+> **🔄 IN PROGRESS: full 10x growth campaign running unattended (restarted once, see below).**
+> All of §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional batch)
+> committed at `904980e`/`b883069`. Per the user's explicit call, **`memory/` was wiped
+> completely** (all production state + every old A/B/pilot scratch dir, ~17GB, all
+> gitignored/untracked — nothing lost that wasn't reproducible) and the campaign is regrowing from
+> scratch on the new mechanism. Launched via `scripts/train_campaign.sh` in the background — task
+> IDs won't survive a session restart; check `pgrep -fa train_campaign.sh`, or just run
+> `scripts/campaign_status.py`, the new one-command status tool. `CAMPAIGN_DIR=memory/campaign_growth10x`
+> throughout; `CLIPS`=full 145-file h3h3+shorts+podcasts corpus (`.mp4` only). Original target
+> 1300 cycles.
+> **Restarted mid-run to deploy a bug fix (gaps.md §21):** at ~cycle 486, found and fixed a real
+> bug — `SemanticStore::dump()` leaked a full HNSW index dump (~24-26MB) to `memory/warm/` every
+> single sleep cycle forever (461 orphaned pairs, 11G) instead of overwriting in place, *and* as a
+> side effect `load_warm()` was silently failing to find any saved index on every restart (falling
+> back to a cold-archive rebuild each time — no data loss, just wasted work). Stopped the campaign
+> cleanly (SIGTERM), fixed `crates/somnus-memory/src/semantic.rs`, verified (build/clippy/35 tests
+> pass), cleaned up the leaked files (`memory/warm/` 11G → 192M), and resumed with
+> `SESSION_START=50 SESSIONS=82` against the same `CAMPAIGN_DIR` — metrics/logs are continuous
+> across the restart (cycle 486→487, no gap). Confirmed live that the next dump landed under the
+> plain `index.hnsw.data` name and the restart after it reloaded successfully.
+> `scripts/campaign_status.py` also had two bugs fixed as a result (a `None`-format crash on an
+> early-session-null metric field, and a progress-target miscalculation across restarts — see §21).
+> **Rate before the restart was beating the pilot-3 estimate** (mean batch ~43/event, cadence
+> ~1/4.25 cycles vs. pilot-3's 35.6/1-5.36) — check `scripts/campaign_status.py` for the current
+> number, it may have changed post-restart. Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21.
 > **New: `scripts/campaign_status.py`** — one-command status report (progress, per-region growth,
 > quality trend, disk usage, health checks, ETA), colored (light-blue labels / light-green values),
 > grades pace-sensitive numbers green/yellow/red against the pilot-3 baseline. Run it first on
-> resume instead of reconstructing status by hand. Also fixed a real bug found while building it:
-> `scripts/eval_metrics.py`'s `REGION_NAMES` had speech/visual swapped (index 0/2) versus the
-> actual Rust emission order — every growth/MSE chart this project has generated mislabeled those
-> two regions. Both documented in `ai-docs/gaps.md` §20.
+> resume instead of reconstructing status by hand.
 > **Next-session action:** run `scripts/campaign_status.py` first. If the campaign is still
 > running, that's it — no action needed. If finished, verify final region sizes vs. the 10x target,
 > check for plateau/regression in `per_region_mse`/`metrics.jsonl`, then write up the result (new

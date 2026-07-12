@@ -201,14 +201,32 @@ impl SemanticStore {
         vbuf[4..6].copy_from_slice(&WARM_VERSION.to_le_bytes());
         fs::write(warm_dir.join("version"), vbuf)?;
 
+        // hnsw_rs::file_dump only overwrites "index.hnsw.{data,graph}" in place when no
+        // mmap datamap is active on self.index. Once the index has been reloaded via
+        // load_warm() (which mmaps it through HnswIo), that flag stays set for the rest
+        // of the process's life, so every subsequent dump picks a fresh random-suffixed
+        // name ("index-<0..10000>.hnsw.data") instead — and nothing here ever deleted
+        // the previous one. Left unfixed, every sleep cycle after the first reload leaks
+        // a full index dump (tens of MB) to disk, unbounded. Clear out any prior dump(s)
+        // before writing the new one so at most one pair ever exists.
+        for entry in fs::read_dir(warm_dir)?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("index")
+                && (name.ends_with(".hnsw.data") || name.ends_with(".hnsw.graph"))
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+
         // HNSW graph
         self.index
             .file_dump(warm_dir, "index")
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Sidecar
-        let encoded = bitcode::serialize(&self.records)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let encoded =
+            bitcode::serialize(&self.records).map_err(|e| std::io::Error::other(e.to_string()))?;
         fs::write(warm_dir.join("records.bin"), encoded)?;
 
         Ok(())
@@ -243,8 +261,7 @@ impl SemanticStore {
 
         // Sidecar records
         let sidecar_bytes = fs::read(&sidecar_path).ok()?;
-        let records: HashMap<usize, EpisodeRecord> =
-            bitcode::deserialize(&sidecar_bytes).ok()?;
+        let records: HashMap<usize, EpisodeRecord> = bitcode::deserialize(&sidecar_bytes).ok()?;
 
         // HNSW — leak HnswIo so the returned Hnsw<'static, ...> is valid
         let io = Box::new(HnswIo::new(warm_dir, "index"));

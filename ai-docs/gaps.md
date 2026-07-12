@@ -618,6 +618,73 @@ still runs clean against live campaign data with the corrected labels.
 
 ---
 
+## 21. Warm-store HNSW dump leak + broken cross-restart persistence ✅ FIXED (2026-07-12)
+
+**Found while answering a user question about disk usage** ("why is `warm` 11G but `episodes.cold`
+41M, when both hold the same 65,798 records?"). Answer led to a real, previously-unknown bug, not
+an expected size difference — `episodes.cold` is a single append-only file (`ColdArchive`,
+`crates/somnus-memory/src/cold.rs`) that grows cleanly with record count. `memory/warm/` had **461
+separate HNSW index dump pairs** (`index-<N>.hnsw.data`/`.graph`, ~24-26MB each) — only one of
+which was ever the live index; the rest were pure leak.
+
+**Root cause, traced into `hnsw_rs` 0.3.4:** `SemanticStore::dump()`
+(`crates/somnus-memory/src/semantic.rs`) calls `self.index.file_dump(warm_dir, "index")` on every
+sleep cycle. `Hnsw::file_dump` only overwrites the fixed `index.hnsw.{data,graph}` name in place
+when `!self.datamap_opt`. `HnswIo::load_hnsw` (used by `load_warm()` on process start) hardcodes
+`datamap_opt: true` on the returned `Hnsw` **unconditionally**, regardless of whether real mmap
+was actually requested (`ReloadOptions::default()` — what this code uses — has `datamap: false`,
+so no real mmap ever backs these reads; the flag is a spurious carry-over from the crate's reload
+path). Net effect: the very first dump each process makes writes the plain `index.hnsw.data`
+correctly; every dump for the rest of that process's life (and every dump in every subsequent
+process, since the reloaded index is *always* marked `datamap_opt: true`) instead falls into
+`DumpInit::new`'s "can't overwrite" branch, which finds the plain name already taken and picks a
+**random 0–9999 suffix** — `index-<N>` where `N` has no meaning (not a record count, not a
+timestamp). Nothing in `somnus`'s code ever deleted the superseded files, so warm-store disk usage
+grew ~24-26MB **every single sleep cycle**, unboundedly, for the life of any long-running process.
+
+**Second, related consequence — not just a leak, but broken persistence:** `SemanticStore::load_warm()`
+only ever looks for the fixed `index.hnsw.data`/`.graph` names. Since real dumps after the first
+one always land under a random name, `load_warm()` has silently failed to find *any* saved warm
+index on every restart after the first reload, for the entire time this mechanism has existed —
+falling back to `"warm dump absent or stale — rebuilding from cold archive"` every time. Not a
+correctness bug (cold archive is authoritative, so no data was lost — the rebuild is just wasted
+work every restart) but it meant the warm-index persistence path has effectively never fired.
+
+**Fix:** `SemanticStore::dump()` now deletes any existing `index*.hnsw.{data,graph}` in `warm_dir`
+before calling `file_dump`. This has two effects: (1) bounds warm-store disk usage to one live
+pair regardless of `hnsw_rs`'s internal overwrite decision, and (2) since `DumpInit::new`'s
+collision check only picks a random suffix when the plain-named file *already exists*, clearing it
+first means every dump now lands under the plain `index.hnsw.data` name again — restoring the
+cross-restart persistence path `load_warm()` was always meant to use. Verified live: after the
+fix, `memory/warm/` holds exactly one `index.hnsw.data` pair after a dump, and the *next* restart
+successfully finds and loads it (no more "rebuilding from cold archive" fallback each time).
+On Linux, deleting a file that a process still has mmap'd (if one ever were active) is safe — the
+inode stays alive via the existing file descriptor/mapping until it's unmapped; this only affects
+what `ls`/`du` see, not correctness.
+
+**Applied live to the running §16/§20 growth campaign:** stopped the campaign cleanly (SIGTERM;
+state is snapshotted every cycle, so at most a few seconds of in-progress work was lost), built
+and verified the fix (`cargo build/clippy/test -p somnus-memory`, 35/35 tests pass), manually cleaned
+up the pre-existing 461 orphaned dump pairs (`memory/warm/` 11G → 192M), and resumed via
+`SESSION_START=50 SESSIONS=82` against the same `CAMPAIGN_DIR` (metrics/logs are append-only, so
+the trajectory is continuous — cycle 486 to 487 crosses the restart with no gap). Confirmed via a
+`Monitor` wait that the very next dump landed under the plain name and the restart after it
+reloaded successfully. `memory/warm/` is now 362M (mostly the live index + records sidecar, not
+leaked dumps) vs. 11G before the fix.
+
+**Also fixed two `campaign_status.py` bugs surfaced by the restart, since this is exactly the kind
+of thing the tool exists to catch:** (1) a crash (`TypeError` on `None.__format__`) when a metric
+field is present but JSON `null` early in a session (e.g. `within_session_gist_rate` before the
+first gist probe) — `dict.get(key, default)` doesn't catch an explicit `null`, only a missing key;
+added a `gv()` helper that treats both the same. (2) `train_campaign.sh`'s `params.txt` is
+appended-to (not overwritten) across restarts, so after a `SESSION_START`/`SESSIONS` resume, using
+`SESSIONS × CYCLES` alone for the progress target understated the original whole-campaign target
+(reported 820 instead of the intended 1310). Fixed by computing the target as
+`(SESSION_START + SESSIONS - 1) × CYCLES` instead, which stays correct across any number of
+stop/resume cycles as long as `CYCLES` is unchanged.
+
+---
+
 ## Priority order (as of 2026-07-11)
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -647,3 +714,4 @@ still runs clean against live campaign data with the corrected labels.
 | ✅ §18 | **Scope optimizer reset to grown region only** | Low | Convergence stability during growth | Deployed 2026-07-12 — see §18 below |
 | ✅ §19 | **Novelty-proportional growth batch size** | Med | Growth-mechanism correctness | Deployed 2026-07-12 — see §19 below |
 | ✅ §20 | **Full 10x campaign launch + `campaign_status.py` + `eval_metrics.py` region-name fix** | Low (tooling) | Ops visibility / chart correctness | Deployed 2026-07-12 — see §20 below |
+| ✅ §21 | **Warm-store HNSW dump leak + broken cross-restart persistence** | Low | Disk usage (unbounded growth) / warm-index reload correctness | Fixed 2026-07-12 — see §21 below |

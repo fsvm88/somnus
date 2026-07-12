@@ -143,6 +143,14 @@ def read_metrics(campaign_dir):
     return records
 
 
+def gv(d, key, default=float("nan")):
+    """dict.get that also treats an explicit JSON null as missing, not just an absent key
+    (some metrics fields — e.g. within_session_gist_rate before the first gist probe — are
+    present but null early in a session; plain .get(key, default) doesn't catch that)."""
+    v = d.get(key)
+    return default if v is None else v
+
+
 def fmt_hms(seconds):
     seconds = max(0, int(seconds))
     h, rem = divmod(seconds, 3600)
@@ -226,7 +234,14 @@ def main():
 
     target_cycles = None
     if "SESSIONS" in params and "CYCLES" in params:
-        target_cycles = int(params["SESSIONS"]) * int(params["CYCLES"])
+        # params.txt is appended-to (not overwritten) across train_campaign.sh restarts, so
+        # after a resume with a fresh SESSION_START/SESSIONS this is the *last* leg's block —
+        # SESSIONS*CYCLES alone would understate the original whole-campaign target. Using
+        # (SESSION_START + SESSIONS - 1) * CYCLES instead gives the intended final cycle
+        # count regardless of how many times the campaign has been stopped and resumed.
+        session_start = int(params.get("SESSION_START", 1))
+        session_end = session_start + int(params["SESSIONS"]) - 1
+        target_cycles = session_end * int(params["CYCLES"])
 
     elapsed = last["ts"] - first["ts"]
     rate_slice = records[-args.rate_window:]
@@ -371,9 +386,9 @@ def main():
         c.kv(name, f"{last['per_region_mse'][i]:.4f}") for i, name in enumerate(REGION_NAMES)
     ))
     print("   ".join([
-        c.kv("gist_recall_rate", f"{last.get('gist_recall_rate', float('nan')):.3f}", sep=": "),
-        c.kv("warm_recall_l2", f"{last.get('warm_recall_l2', float('nan')):.3f}", sep=": "),
-        c.kv("within_session_gist_rate", f"{last.get('within_session_gist_rate', float('nan')):.3f}", sep=": "),
+        c.kv("gist_recall_rate", f"{gv(last, 'gist_recall_rate'):.3f}", sep=": "),
+        c.kv("warm_recall_l2", f"{gv(last, 'warm_recall_l2'):.3f}", sep=": "),
+        c.kv("within_session_gist_rate", f"{gv(last, 'within_session_gist_rate'):.3f}", sep=": "),
     ]))
 
     print()
