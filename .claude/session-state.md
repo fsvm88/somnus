@@ -7,6 +7,16 @@
 > final region sizes vs. the 10x target, check for plateau/regression in `per_region_mse`, write up
 > the result as a new `gaps.md` section, and commit.
 >
+> **If the campaign has been stopped** (crash, reboot, manual shutdown) and needs restarting:
+> `scripts/resume_growth_campaign.sh` — self-contained, reads `SESSION_START`/`SESSIONS`/`CYCLES`/
+> `CLIPS`/etc. from the campaign's own `params.txt` + `metrics.jsonl` (not from this file or any
+> session-specific state), computes the correct `SESSION_START`/`SESSIONS` to resume exactly where
+> it left off, rebuilds `somnus` first by default (`SKIP_BUILD=1` to skip), and refuses to run if a
+> `train_campaign.sh` is already active. `DRY_RUN=1` to preview the computed invocation without
+> launching. To stop the campaign cleanly at any point: `pkill -f train_campaign.sh` (stop the
+> wrapper first) then `pkill -TERM -f "target/release/somnus --file clips/h3h3"` (graceful somnus
+> shutdown — state is snapshotted every cycle, so this loses at most a few seconds).
+>
 > **What's live:** §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional
 > batch), §21 (fixed a warm-store HNSW dump leak — was leaking ~24-26MB/cycle unboundedly, also
 > silently broke cross-restart index reload), and §22/ADR 0037 (ORT/MIGraphX perception inference
