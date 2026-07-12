@@ -13,9 +13,10 @@
 > session-specific state), computes the correct `SESSION_START`/`SESSIONS` to resume exactly where
 > it left off, rebuilds `somnus` first by default (`SKIP_BUILD=1` to skip), and refuses to run if a
 > `train_campaign.sh` is already active. `DRY_RUN=1` to preview the computed invocation without
-> launching. To stop the campaign cleanly at any point: `pkill -f train_campaign.sh` (stop the
-> wrapper first) then `pkill -TERM -f "target/release/somnus --file clips/h3h3"` (graceful somnus
-> shutdown — state is snapshotted every cycle, so this loses at most a few seconds).
+> launching. To stop the campaign cleanly at any point: `scripts/stop_graceful.sh` (stops the
+> wrapper, then SIGTERMs `somnus` and waits up to 60s for a clean exit before SIGKILL; `--dry-run` to
+> preview, `--wait N` to change the timeout — state is snapshotted every cycle, so this loses at
+> most a few seconds).
 >
 > **What's live:** §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional
 > batch), §21 (fixed a warm-store HNSW dump leak — was leaking ~24-26MB/cycle unboundedly, also

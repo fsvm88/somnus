@@ -10,11 +10,9 @@
 #   SKIP_BUILD=1 scripts/resume_growth_campaign.sh  # skip the rebuild (binary already current)
 #   DRY_RUN=1 scripts/resume_growth_campaign.sh     # print the computed invocation, don't run it
 #
-# To stop the campaign cleanly at any point:
-#   pkill -f train_campaign.sh   # stop the wrapper so it doesn't launch a new session
-#   pkill -TERM -f "target/release/somnus --file clips/h3h3"   # graceful shutdown of somnus itself
-#   (state is snapshotted every sleep cycle, so at most a few seconds of
-#   in-progress work is lost — safe to do any time)
+# To stop the campaign cleanly at any point: scripts/stop_graceful.sh
+# (state is snapshotted every sleep cycle, so at most a few seconds of
+# in-progress work is lost — safe to do any time)
 
 set -euo pipefail
 
