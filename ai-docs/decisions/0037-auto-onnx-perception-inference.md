@@ -1,7 +1,19 @@
 # 0037. Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover
 
-- **Status:** accepted; implemented (2026-07-12)
+- **Status:** accepted; auto-switch mechanism implemented and correct, but its target is currently
+  broken — see gaps.md §24 (found 2026-07-12, same day, not yet fixed)
 - **Date:** 2026-07-12
+
+> **⚠️ Update (2026-07-12, later):** the "~2.1×/2.4× measured speedup" claims below are almost
+> certainly invalid. gaps.md §24 found that the sparse→dense conversion feeding the ORT graph
+> (`crates/somnus-perception/src/lib.rs`, `to_dense_n(N_UNITS)`) hardcodes the *baseline* `N_UNITS`
+> constant instead of each region's actual grown size, causing every ORT call to fail with a
+> dimension mismatch and silently fall back to burn/CPU — for the entire time ORT has been
+> "active" on the live campaign (confirmed from session start). The verification below never
+> actually observed a successful accelerated inference call; the auto-switch mechanism itself
+> (the part this ADR is actually about) is sound and unaffected, but its payoff is unconfirmed
+> until §24 is fixed and re-measured with a check for zero `ORT encoder failed`/`ORT binding
+> failed` occurrences.
 
 ## Context
 

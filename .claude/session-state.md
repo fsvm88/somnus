@@ -1,34 +1,47 @@
 # Session state — somnus
 
 > **Last updated:** 2026-07-12 (later still)
-> **🔄 IN PROGRESS: full 10x growth campaign running unattended (restarted twice, see below).**
-> `scripts/campaign_status.py` is the fast path back into context — run it first on resume, before
-> reading anything else in this file. If it's still running, no action needed. If finished, verify
-> final region sizes vs. the 10x target, check for plateau/regression in `per_region_mse`, write up
-> the result as a new `gaps.md` section, and commit.
+> **⏸️ STOPPED (clean, user-requested).** Campaign was at cycle 559/1310 (42.7%), region sizes
+> 6,886/9,660 (71.3%), stopped via `scripts/stop_graceful.sh` — confirmed clean exit, no data lost.
+> **Do not just resume it as-is** — read the next paragraph first, there's an open, unfixed bug.
 >
-> **If the campaign has been stopped** (crash, reboot, manual shutdown) and needs restarting:
-> `scripts/resume_growth_campaign.sh` — self-contained, reads `SESSION_START`/`SESSIONS`/`CYCLES`/
-> `CLIPS`/etc. from the campaign's own `params.txt` + `metrics.jsonl` (not from this file or any
-> session-specific state), computes the correct `SESSION_START`/`SESSIONS` to resume exactly where
-> it left off, rebuilds `somnus` first by default (`SKIP_BUILD=1` to skip), and refuses to run if a
-> `train_campaign.sh` is already active. `DRY_RUN=1` to preview the computed invocation without
-> launching. To stop the campaign cleanly at any point: `scripts/stop_graceful.sh` (stops the
-> wrapper, then SIGTERMs `somnus` and waits up to 60s for a clean exit before SIGKILL; `--dry-run` to
-> preview, `--wait N` to change the timeout — state is snapshotted every cycle, so this loses at
-> most a few seconds).
+> **⚠️ OPEN BUG, NOT YET FIXED — gaps.md §24, retracts part of §22/ADR 0037's claims.** Found
+> immediately before this shutdown: ORT/MIGraphX perception inference (§22, auto-enabled past
+> 1,230 units/region) has been silently failing on **every single call** since it first activated
+> — `crates/somnus-perception/src/lib.rs`'s sparse→dense conversion (`to_dense_n(N_UNITS)`, ~line
+> 899-919) hardcodes the *baseline* `N_UNITS` constant (1024) instead of each region's actual
+> grown size, so every ORT call hits a dimension mismatch and falls back to burn/CPU — slower than
+> not having ORT at all (pays both the failed-ORT-attempt overhead and the full burn computation).
+> 102,810 fallback occurrences in session 57's log alone (~1h45m), 2,400 in session 56 — present
+> from the very first ORT activation, not a later regression. **This means the "~2.1×/2.4×
+> measured speedup" reported earlier today for ADR 0037 was almost certainly invalid** — both
+> verification runs were already past baseline size, so both were likely hitting this same silent
+> fallback; there is no confirmed instance of ORT successfully accelerating anything on this
+> campaign yet. Fix: use each region's actual `n_units` (already exposed via `region_sizes()`,
+> same pattern as §17's `scaled_k`) instead of the `N_UNITS` constant at the 5 call sites + the
+> `lang_zero` fallback. **Before trusting any resumed-campaign timing numbers, grep the new
+> session log for `ORT encoder failed`/`ORT binding failed` — zero occurrences expected; if it's
+> not zero, the fix didn't work or wasn't applied.** No data was lost from this bug (burn fallback
+> is correct, just slow) — safe to resume without fixing first if speed doesn't matter right now,
+> but ORT is providing zero benefit until this lands.
 >
-> **What's live:** §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional
-> batch), §21 (fixed a warm-store HNSW dump leak — was leaking ~24-26MB/cycle unboundedly, also
-> silently broke cross-restart index reload), and §22/ADR 0037 (ORT/MIGraphX perception inference
-> now auto-enables past 1,230 units/region instead of requiring a flag — confirmed live,
-> `onnx=active` in `campaign_status.py`, ~2.1× faster perception step measured). `memory/` was
-> wiped completely at campaign start per the user's explicit call (all production state + old
-> A/B/pilot scratch dirs, ~17GB, gitignored/untracked, nothing lost that wasn't reproducible) —
-> regrowing from scratch on the current mechanism. `CAMPAIGN_DIR=memory/campaign_growth10x`
-> throughout; `CLIPS`=full 145-file h3h3+shorts+podcasts corpus (`.mp4` only). Launched via
-> `scripts/train_campaign.sh` in the background each time — task IDs don't survive a session
-> restart; use `pgrep -fa train_campaign.sh` or `campaign_status.py` instead.
+> **To resume:** `scripts/resume_growth_campaign.sh` — self-contained, reads
+> `SESSION_START`/`SESSIONS`/`CYCLES`/`CLIPS`/etc. from the campaign's own `params.txt` +
+> `metrics.jsonl` (not from this file or any session-specific state), computes the correct resume
+> point automatically, rebuilds `somnus` first by default (`SKIP_BUILD=1` to skip), refuses to
+> double-launch. `DRY_RUN=1` to preview. **To stop again:** `scripts/stop_graceful.sh` (`--dry-run`
+> to preview, `--wait N` to change the SIGTERM timeout — state is snapshotted every cycle, so this
+> loses at most a few seconds).
+>
+> **What's live and correct:** §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping,
+> novelty-proportional batch), §21 (fixed a warm-store HNSW dump leak — was leaking ~24-26MB/cycle
+> unboundedly, also silently broke cross-restart index reload). §22/ADR 0037's auto-switch
+> *mechanism* is also correct — it correctly detects the crossover and builds/activates an ORT
+> session — the bug is specifically in what happens after activation (§24). `memory/` was wiped
+> completely at campaign start per the user's explicit call (all production state + old A/B/pilot
+> scratch dirs, ~17GB, gitignored/untracked, nothing lost that wasn't reproducible) — regrowing
+> from scratch. `CAMPAIGN_DIR=memory/campaign_growth10x` throughout; `CLIPS`=full 145-file
+> h3h3+shorts+podcasts corpus (`.mp4` only).
 >
 > **Restart 1** (~cycle 486, gaps.md §21): `SemanticStore::dump()` leaked a full HNSW index dump
 > every sleep cycle forever (461 orphaned pairs, 11G) because `load_warm()`'s reload path
@@ -45,16 +58,25 @@
 > This surfaced two pre-existing, never-before-exercised bugs in `scripts/export_perception_graph.py`
 > (stale hardcoded `LANG_HIDDEN=896` since ADR 0036 made it 1024, and hardcoded `N_UNITS`/`K_ACTIVE`
 > that could never survive region growth) — fixed by deriving all dims from the actual exported
-> weight shapes (`infer_dims()`) instead of a second hand-maintained copy. Verified against a copy
-> of the live campaign's real grown weights (6,397 units/region) before touching the live one:
-> MIGraphX loaded successfully, `perception_total_ms` 7,735 vs. the CPU baseline's ~16,051 at
-> comparable scale — **~2.1× faster**, matching ADR 0023's predicted figure. Resumed
-> `SESSION_START=56 SESSIONS=76`; log confirmed `ORT binding session active` on the real process.
-> User also proposed eliminating the Python export step entirely (native Rust ONNX graph
-> construction) — sound long-term direction, scoped as gaps.md §23, deliberately not started (no
-> mature Rust ONNX-graph-builder crate exists; real rewrite effort, not a fast-follow).
+> weight shapes (`infer_dims()`) instead of a second hand-maintained copy. Resumed
+> `SESSION_START=56 SESSIONS=76`; log confirmed `ORT binding session active`. **Then found §24
+> (above) — the reported speedup from this restart's verification was invalid.** User also
+> proposed eliminating the Python export step entirely (native Rust ONNX graph construction) —
+> sound long-term direction, scoped as gaps.md §23, deliberately not started (no mature Rust
+> ONNX-graph-builder crate exists; real rewrite effort, not a fast-follow).
 >
-> Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21/§22/§23, ADR 0037.
+> **Stopped** (this shutdown, gaps.md §24): found the ORT bug above while checking status before a
+> routine user-requested shutdown. Documented and stopped cleanly rather than rushing a fix under
+> time pressure — same judgment call as every other fix today, just landing on "stop and document"
+> instead of "fix now" since there was no live-campaign urgency (burn fallback keeps state correct,
+> just slow) and no user ask to fix immediately.
+>
+> **Next-session action:** fix gaps.md §24 (the `to_dense_n(N_UNITS)` bug), verify with a smoke
+> test that greps for zero `ORT encoder failed`/`ORT binding failed` occurrences, re-measure the
+> real speedup (previous numbers are void), THEN resume the campaign via
+> `scripts/resume_growth_campaign.sh`.
+>
+> Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21/§22/§23/§24, ADR 0037.
 
 ## Historical (superseded by the in-progress campaign above, kept for context)
 

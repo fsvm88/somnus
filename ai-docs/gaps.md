@@ -730,6 +730,17 @@ effort — tracked as a future item below, not rushed into this change.
 touching the real one. Restart pending as of this writeup — see session-state.md for whether it's
 landed yet.
 
+> **⚠️ CORRECTION (2026-07-12, later): the "~2.1×/2.4× measured speedup" claims above are almost
+> certainly invalid.** §24 found that `to_dense_n(N_UNITS)` (the sparse→dense conversion feeding
+> the ORT graph) uses the *hardcoded baseline* `N_UNITS` constant, not each region's actual grown
+> size — causing every single ORT encoder/binding call to fail with a dimension mismatch and
+> silently fall back to burn/CPU, for the entire time ORT has been "active" on this campaign
+> (confirmed from session start, both session 56 and 57's logs). The verification run cited above
+> and the campaign's own early post-restart cycles were both already past baseline size, so both
+> were almost certainly hitting this same silent-fallback path — meaning I never actually observed
+> a genuine accelerated ORT/MIGraphX inference call, and the timing numbers reported may just be
+> run-to-run variance, not a real speedup. Root cause and fix: §24.
+
 ---
 
 ## 23. Future: native Rust ONNX graph construction (replace `export_perception_graph.py`) 🔮 SCOPED, NOT STARTED
@@ -758,6 +769,62 @@ weights-manifest.json/`.f32` round-trip to disk.
 
 **Trigger to pick this up:** none set yet — raise when export-script maintenance cost recurs, or
 when profiling shows the subprocess/export overhead is itself a meaningful fraction of cycle time.
+
+---
+
+## 24. ORT sparse→dense conversion hardcodes baseline N_UNITS — ORT has never actually run at grown sizes ❌ FOUND, NOT YET FIXED (2026-07-12)
+
+**Found while checking campaign status before a routine shutdown** — `perception_total_ms` had
+spiked to 188,000–196,000ms/cycle (vs. §22's ~6,500-7,700ms) and `gist_recall_rate`/
+`warm_recall_l2` had collapsed toward zero on several cycles. Grepping the session log turned up
+**102,810 occurrences** of `ORT encoder failed; using burn activations` / `ORT binding failed;
+falling back to burn`, both citing `Got invalid dimensions for input` (`language_enc`, `sp_0`),
+spanning session 57's entire ~1h45m runtime. Session 56 (the first session after §22's restart)
+already shows 2,400 of the same — this has been happening since ORT first activated, not
+something that developed later.
+
+**Root cause:** `crates/somnus-perception/src/lib.rs`, in the ORT encoder/binding call path
+(`~line 899-919`): the sparse-activation-to-dense-vector conversion feeding the ORT graph —
+`sp.to_dense_n(N_UNITS)`, `en.to_dense_n(N_UNITS)`, etc., and the `lang_zero` fallback's
+`n_units: N_UNITS` — uses the **hardcoded baseline constant** `N_UNITS = 1024`
+(`crates/somnus-perception/src/region.rs:10`), not each region's actual current (possibly grown)
+size. The ORT graphs themselves are correctly sized (§22's `infer_dims()` fix in
+`export_perception_graph.py` derives shapes from the real exported weights) — but every call site
+that *feeds* them still converts to a fixed 1024-length vector regardless of growth. The moment
+any region grows past baseline (which had already happened long before ORT's crossover point, so
+this fires on the very first ORT call ever made), every encoder/binding call fails with a
+dimension mismatch, is caught, logged as a WARN, and silently falls back to burn/CPU — paying the
+ORT round-trip's overhead *and* still doing the full burn computation, which is why the cost was
+worse than either path alone, not just "no speedup."
+
+**This invalidates §22's reported speedup measurements** — see the correction note appended to
+§22. Both the pre-live verification run and the campaign's own post-restart cycles were already
+past baseline size, so both were almost certainly hitting this same silent-fallback path the
+entire time. There is currently no confirmed instance of a real, successful ORT/MIGraphX
+perception inference call at a grown region size — the auto-switch mechanism (§22/ADR 0037) is
+sound, but the thing it switches *to* has never actually worked past baseline.
+
+**Same bug class as §17** (K_ACTIVE hardcoded, not scaled with growth) and the export-script issue
+fixed in §22 (`N_UNITS`/`REGION_DIMS` hardcoded in Python) — a second, non-derived copy of a
+per-region size that inevitably goes stale once growth is live. `region::scaled_k(n_units)` (§17)
+established the pattern for deriving a size-dependent value from the region's actual current size;
+this needs the equivalent for `to_dense_n`'s target length — almost certainly
+`model.speech_layer.n_units` (or the equivalent per-region field, already exposed via
+`region_sizes()`) instead of the `N_UNITS` constant, at each of the 5 call sites plus the
+`lang_zero` fallback.
+
+**Not yet fixed** — found immediately before a routine campaign shutdown; documenting rather than
+rushing a fix in under time pressure. Campaign was stopped cleanly (`scripts/stop_graceful.sh`,
+confirmed clean exit) with this bug still present — no data was lost (burn fallback is *correct*,
+just slow, so the campaign's actual learned state is not corrupted by this), but essentially the
+entire time ORT has been "active" this campaign has gotten none of §22's intended benefit and paid
+extra overhead for the attempt.
+
+**Next-session action:** fix the 5 `to_dense_n(N_UNITS)` call sites + `lang_zero`'s `n_units`
+field to use each region's actual current size; verify with a smoke test that greps the resulting
+log for `ORT encoder failed`/`ORT binding failed` (zero occurrences expected) *before* trusting
+any timing numbers — the exact check that was missing this time. Re-measure the real speedup only
+after confirming zero fallback occurrences.
 
 ---
 
@@ -791,5 +858,6 @@ when profiling shows the subprocess/export overhead is itself a meaningful fract
 | ✅ §19 | **Novelty-proportional growth batch size** | Med | Growth-mechanism correctness | Deployed 2026-07-12 — see §19 below |
 | ✅ §20 | **Full 10x campaign launch + `campaign_status.py` + `eval_metrics.py` region-name fix** | Low (tooling) | Ops visibility / chart correctness | Deployed 2026-07-12 — see §20 below |
 | ✅ §21 | **Warm-store HNSW dump leak + broken cross-restart persistence** | Low | Disk usage (unbounded growth) / warm-index reload correctness | Fixed 2026-07-12 — see §21 below |
-| ✅ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Deployed 2026-07-12 — see §22 below |
+| ⚠️ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Mechanism deployed 2026-07-12, but reported speedup **retracted** — see §24, ORT has never actually run successfully at a grown size |
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
+| ❌ §24 | **ORT sparse→dense conversion hardcodes baseline N_UNITS** | Low | Correctness/perf — ORT silently no-ops past baseline, worse than CPU-only | Found 2026-07-12, not yet fixed — see §24 below |
