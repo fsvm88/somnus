@@ -16,9 +16,13 @@ OUT="${1:-clips/podcasts}"
 mkdir -p "$OUT"
 
 # Per show: search top M_SEARCH candidates, keep up to N_PER that pass the
-# duration filter (10–90 min) and aren't already on disk.
+# duration filter (10 min – MAX_DURATION_S) and aren't already on disk.
 N_PER="${N_PER:-10}"
 M_SEARCH="${M_SEARCH:-40}"
+# 14400s = 4h. Raised from 5400s (90min) so long-form shows (Lex Fridman,
+# Huberman Lab, Tim Ferriss) whose typical episode runs 2-4h aren't silently
+# filtered out of every search result.
+MAX_DURATION_S="${MAX_DURATION_S:-14400}"
 
 dl() {
     local label="$1" query="$2"
@@ -28,7 +32,7 @@ dl() {
         -f 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]' \
         --merge-output-format mp4 \
         --no-playlist \
-        --match-filter "duration > 600 & duration < 5400" \
+        --match-filter "duration > 600 & duration < ${MAX_DURATION_S}" \
         --max-downloads "$N_PER" \
         --output "${OUT}/%(title).70s_[%(id)s].%(ext)s" \
         --restrict-filenames \
