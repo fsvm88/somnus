@@ -685,6 +685,82 @@ stop/resume cycles as long as `CYCLES` is unchanged.
 
 ---
 
+## 22. Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover ✅ DONE (2026-07-12)
+
+**User question, not a self-initiated finding:** "onnx=off — any impact on runtimes?" (asked about
+`campaign_status.py`'s `onnx=off` status line). Answer required pulling real numbers from the
+campaign's own `metrics.jsonl`: `perception_total_ms` was climbing steadily with region size
+(9.1s at 1,986 units → 16.1s at 6,043 units) and already over half the ~31s/cycle wall-clock —
+`perc_kwta_us`/`perc_symbolic_us` (exactly the ops ADR 0023's scaling analysis flagged as
+GPU-accelerable, crossover ≈1,230 units/region) dominating the growth. The opt-in
+`--onnx-models-dir` flag was costing real, measured, worsening wall-clock for no reason other than
+nobody had turned it on — none of the §16 pilots or the first ~490 cycles of the §20 campaign used
+it.
+
+**Decision, full detail in ADR 0037:** auto-enable ORT/MIGraphX perception inference once any
+region crosses `--onnx-crossover-units` (default 1,230, ADR 0023's empirical figure) instead of
+requiring the flag. One-directional (growth never shrinks regions), sticky failure handling (one
+WARN + stay on CPU for the process's life, not a retry every cycle), `--force-cpu-inference`
+opt-out. New pure/unit-tested `should_use_ort_inference()` in `crates/somnus/src/main.rs`.
+
+**Surfaced two pre-existing, previously-unexercised bugs in `scripts/export_perception_graph.py`**
+(neither caused by this change — both existed because nobody had run `--onnx-models-dir` past the
+crossover since Qwen3 landed): (1) hardcoded `REGION_DIMS`'s language dim was stale at Qwen2.5's
+896 instead of Qwen3's 1024 (ADR 0036), and more fundamentally `N_UNITS`/`K_ACTIVE` were hardcoded
+constants that could never survive region growth (non-uniform across regions is a real observed
+case — pilot 1 saw `[2048, 1984, 1984, 1984, 1984]`); (2) `--validate-numpy`'s synthetic
+weight generator never created `W_cross_bias`, silently broken since whenever the bias term was
+added. Fixed by deriving all dimensions from the actual exported weight shapes
+(`infer_dims()`) instead of a second hand-maintained copy, and adding the missing bias generator.
+Verified: `--validate-numpy` passes (`ep=6.64e-09` vs. numpy reference), and a real export against
+a copy of the live campaign's actual grown weights (6,397 units/region) built and loaded
+successfully through MIGraphX. Measured `perception_total_ms=7,735` on that copy at 6,397
+units/region vs. the live CPU-only campaign's `16,051` at a comparable 6,043 units/region —
+**~2.1× faster**, matching ADR 0023's predicted 2.2×-at-4K-units figure almost exactly.
+
+**Considered and deliberately deferred:** replacing the Python export step with native Rust ONNX
+graph construction entirely (eliminates the Python/onnx/onnxruntime runtime dependency, solves
+dynamic shapes for free). No mature Rust "build ONNX graphs" crate exists — would mean
+hand-constructing protobuf messages replicating the whole graph (GRU cell, multi-head attention,
+the MIGraphX ScatterElements workaround, etc.) correctly. Right direction, genuinely open-ended
+effort — tracked as a future item below, not rushed into this change.
+
+**Applied to the running §20 campaign:** built, tested (18/18 `somnus` unit tests pass incl. 4 new
+`ort_crossover_tests`), verified against a copy of the live campaign's actual snapshot before
+touching the real one. Restart pending as of this writeup — see session-state.md for whether it's
+landed yet.
+
+---
+
+## 23. Future: native Rust ONNX graph construction (replace `export_perception_graph.py`) 🔮 SCOPED, NOT STARTED
+
+Raised by user 2026-07-12 while fixing §22's export-script bugs. Eliminate the Python3 +
+`onnx` + `onnxruntime` subprocess dependency from `SemanticStore`/`PerceptionProcessor`'s ORT
+rebuild path entirely by constructing the ONNX `ModelProto` graphs natively in Rust from the
+already-in-memory burn weights — no export-to-disk-then-reinvoke-Python round trip, and the
+dynamic-shape problem (§22) is solved for free since Rust already knows every shape exactly,
+with no second copy to go stale.
+
+**Why not done now:** no mature "build ONNX graphs from Rust" crate exists (checked
+`onnx-protobuf`/`onnx-ir` — raw protobuf message bindings only, no graph-builder convenience
+layer). Would require hand-constructing `ModelProto`/`GraphProto`/`NodeProto` messages replicating
+everything `export_perception_graph.py` currently does: Concat, MatMul, Add, the CPU
+topk/duty-cycle step, the GRU cell (burn→ONNX weight transpose/stacking), multi-head attention,
+and the documented MIGraphX ScatterElements two-graph-split workaround
+(`research/gpu-unification-design.md`). Real correctness risk, genuinely open-ended — a dedicated
+focused session, not a fast-follow.
+
+**Expected wins if done:** removes a runtime dependency (Python3+onnx+onnxruntime) that's
+currently load-bearing for any campaign past the §22 crossover; removes a subprocess spawn +
+Python startup + graph construction on every sleep cycle once ORT is active (currently folded
+into `perception_total_ms`/wake→sleep boundary cost, not separately measured); removes the
+weights-manifest.json/`.f32` round-trip to disk.
+
+**Trigger to pick this up:** none set yet — raise when export-script maintenance cost recurs, or
+when profiling shows the subprocess/export overhead is itself a meaningful fraction of cycle time.
+
+---
+
 ## Priority order (as of 2026-07-11)
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -715,3 +791,5 @@ stop/resume cycles as long as `CYCLES` is unchanged.
 | ✅ §19 | **Novelty-proportional growth batch size** | Med | Growth-mechanism correctness | Deployed 2026-07-12 — see §19 below |
 | ✅ §20 | **Full 10x campaign launch + `campaign_status.py` + `eval_metrics.py` region-name fix** | Low (tooling) | Ops visibility / chart correctness | Deployed 2026-07-12 — see §20 below |
 | ✅ §21 | **Warm-store HNSW dump leak + broken cross-restart persistence** | Low | Disk usage (unbounded growth) / warm-index reload correctness | Fixed 2026-07-12 — see §21 below |
+| ✅ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Deployed 2026-07-12 — see §22 below |
+| 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |

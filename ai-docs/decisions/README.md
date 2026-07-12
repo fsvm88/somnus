@@ -87,3 +87,5 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0033](0033-lora-qwen-finetuning.md) | LoRA fine-tuning of Qwen2.5-0.5B on episode prefixes (ADR 0012 item L) | validated and deployed |
 | [0034](0034-kv-cache-generation.md) | KV-cache split prefill/decode generation (generation speedup) | implemented |
 | [0035](0035-qwen3-hidden-size-compile-time.md) | LM hidden size (Qwen2.5 vs Qwen3) is a compile-time choice, not runtime | implemented |
+| [0036](0036-adopt-qwen3-drop-qwen25.md) | Adopt Qwen3-0.6B as the action-decoder LM; drop Qwen2.5 | implemented |
+| [0037](0037-auto-onnx-perception-inference.md) | Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover | accepted |

@@ -1,39 +1,49 @@
 # Session state — somnus
 
 > **Last updated:** 2026-07-12 (later still)
-> **🔄 IN PROGRESS: full 10x growth campaign running unattended (restarted once, see below).**
-> All of §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional batch)
-> committed at `904980e`/`b883069`. Per the user's explicit call, **`memory/` was wiped
-> completely** (all production state + every old A/B/pilot scratch dir, ~17GB, all
-> gitignored/untracked — nothing lost that wasn't reproducible) and the campaign is regrowing from
-> scratch on the new mechanism. Launched via `scripts/train_campaign.sh` in the background — task
-> IDs won't survive a session restart; check `pgrep -fa train_campaign.sh`, or just run
-> `scripts/campaign_status.py`, the new one-command status tool. `CAMPAIGN_DIR=memory/campaign_growth10x`
-> throughout; `CLIPS`=full 145-file h3h3+shorts+podcasts corpus (`.mp4` only). Original target
-> 1300 cycles.
-> **Restarted mid-run to deploy a bug fix (gaps.md §21):** at ~cycle 486, found and fixed a real
-> bug — `SemanticStore::dump()` leaked a full HNSW index dump (~24-26MB) to `memory/warm/` every
-> single sleep cycle forever (461 orphaned pairs, 11G) instead of overwriting in place, *and* as a
-> side effect `load_warm()` was silently failing to find any saved index on every restart (falling
-> back to a cold-archive rebuild each time — no data loss, just wasted work). Stopped the campaign
-> cleanly (SIGTERM), fixed `crates/somnus-memory/src/semantic.rs`, verified (build/clippy/35 tests
-> pass), cleaned up the leaked files (`memory/warm/` 11G → 192M), and resumed with
-> `SESSION_START=50 SESSIONS=82` against the same `CAMPAIGN_DIR` — metrics/logs are continuous
-> across the restart (cycle 486→487, no gap). Confirmed live that the next dump landed under the
-> plain `index.hnsw.data` name and the restart after it reloaded successfully.
-> `scripts/campaign_status.py` also had two bugs fixed as a result (a `None`-format crash on an
-> early-session-null metric field, and a progress-target miscalculation across restarts — see §21).
-> **Rate before the restart was beating the pilot-3 estimate** (mean batch ~43/event, cadence
-> ~1/4.25 cycles vs. pilot-3's 35.6/1-5.36) — check `scripts/campaign_status.py` for the current
-> number, it may have changed post-restart. Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21.
-> **New: `scripts/campaign_status.py`** — one-command status report (progress, per-region growth,
-> quality trend, disk usage, health checks, ETA), colored (light-blue labels / light-green values),
-> grades pace-sensitive numbers green/yellow/red against the pilot-3 baseline. Run it first on
-> resume instead of reconstructing status by hand.
-> **Next-session action:** run `scripts/campaign_status.py` first. If the campaign is still
-> running, that's it — no action needed. If finished, verify final region sizes vs. the 10x target,
-> check for plateau/regression in `per_region_mse`/`metrics.jsonl`, then write up the result (new
-> `gaps.md` section) and commit.
+> **🔄 IN PROGRESS: full 10x growth campaign running unattended (restarted twice, see below).**
+> `scripts/campaign_status.py` is the fast path back into context — run it first on resume, before
+> reading anything else in this file. If it's still running, no action needed. If finished, verify
+> final region sizes vs. the 10x target, check for plateau/regression in `per_region_mse`, write up
+> the result as a new `gaps.md` section, and commit.
+>
+> **What's live:** §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional
+> batch), §21 (fixed a warm-store HNSW dump leak — was leaking ~24-26MB/cycle unboundedly, also
+> silently broke cross-restart index reload), and §22/ADR 0037 (ORT/MIGraphX perception inference
+> now auto-enables past 1,230 units/region instead of requiring a flag — confirmed live,
+> `onnx=active` in `campaign_status.py`, ~2.1× faster perception step measured). `memory/` was
+> wiped completely at campaign start per the user's explicit call (all production state + old
+> A/B/pilot scratch dirs, ~17GB, gitignored/untracked, nothing lost that wasn't reproducible) —
+> regrowing from scratch on the current mechanism. `CAMPAIGN_DIR=memory/campaign_growth10x`
+> throughout; `CLIPS`=full 145-file h3h3+shorts+podcasts corpus (`.mp4` only). Launched via
+> `scripts/train_campaign.sh` in the background each time — task IDs don't survive a session
+> restart; use `pgrep -fa train_campaign.sh` or `campaign_status.py` instead.
+>
+> **Restart 1** (~cycle 486, gaps.md §21): `SemanticStore::dump()` leaked a full HNSW index dump
+> every sleep cycle forever (461 orphaned pairs, 11G) because `load_warm()`'s reload path
+> permanently disables `hnsw_rs`'s in-place overwrite; fixed by clearing stale dumps before
+> writing, which also restores the plain-name path `load_warm()` needs to find anything on
+> restart. Cleaned up the leak (`memory/warm/` 11G → 192M), resumed `SESSION_START=50 SESSIONS=82`,
+> metrics/logs continuous across the restart (486→487, no gap).
+>
+> **Restart 2** (~cycle 542, gaps.md §22/ADR 0037): user asked whether `onnx=off` had a runtime
+> cost — pulling real numbers from `metrics.jsonl` showed `perception_total_ms` climbing steadily
+> (9.1s→16.1s as regions grew 1,986→6,043 units), already over half the cycle's wall-clock, and
+> past ADR 0023's documented CPU/GPU crossover (~1,230 units/region). Implemented auto-enable
+> (`should_use_ort_inference`, unit-tested) instead of requiring the old `--onnx-models-dir` flag.
+> This surfaced two pre-existing, never-before-exercised bugs in `scripts/export_perception_graph.py`
+> (stale hardcoded `LANG_HIDDEN=896` since ADR 0036 made it 1024, and hardcoded `N_UNITS`/`K_ACTIVE`
+> that could never survive region growth) — fixed by deriving all dims from the actual exported
+> weight shapes (`infer_dims()`) instead of a second hand-maintained copy. Verified against a copy
+> of the live campaign's real grown weights (6,397 units/region) before touching the live one:
+> MIGraphX loaded successfully, `perception_total_ms` 7,735 vs. the CPU baseline's ~16,051 at
+> comparable scale — **~2.1× faster**, matching ADR 0023's predicted figure. Resumed
+> `SESSION_START=56 SESSIONS=76`; log confirmed `ORT binding session active` on the real process.
+> User also proposed eliminating the Python export step entirely (native Rust ONNX graph
+> construction) — sound long-term direction, scoped as gaps.md §23, deliberately not started (no
+> mature Rust ONNX-graph-builder crate exists; real rewrite effort, not a fast-follow).
+>
+> Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21/§22/§23, ADR 0037.
 
 ## Historical (superseded by the in-progress campaign above, kept for context)
 

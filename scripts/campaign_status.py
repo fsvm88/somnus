@@ -200,6 +200,32 @@ def latest_session_log(campaign_dir):
     return max(logs, key=os.path.getmtime)
 
 
+def onnx_status(campaign_dir):
+    """Best-effort ORT-active status (ADR 0037), scanned from the newest session log.
+    Each train_campaign.sh session is a fresh somnus process that re-checks the crossover
+    at its own startup, so the newest log alone reflects current state — no need to
+    scan history. Pre-ADR-0037 logs (before 2026-07-12) won't have these markers."""
+    newest = latest_session_log(campaign_dir)
+    if not newest:
+        return "unknown"
+    active = failed = seen_check = False
+    with open(newest, errors="replace") as f:
+        for line in f:
+            if "ORT binding session active" in line:
+                active = True
+            elif "ORT session init failed" in line or "ORT session rebuild failed" in line:
+                failed = True
+            elif "ORT crossover" in line or "crossover" in line and "region" in line:
+                seen_check = True
+    if active:
+        return "active"
+    if failed:
+        return "cpu (init failed, check log)"
+    if seen_check:
+        return "cpu (below crossover)"
+    return "cpu (pre-ADR-0037 run)"
+
+
 def scan_panics(campaign_dir):
     hits = []
     for path in sorted(
@@ -259,7 +285,7 @@ def main():
             c.kv("CYCLES", params.get("CYCLES")),
             c.kv("CAPACITY", params.get("CAPACITY")),
             c.kv("REPLAY_EPOCHS", params.get("REPLAY_EPOCHS")),
-            c.kv("onnx", params.get("ONNX_MODELS_DIR") or "off"),
+            c.kv("onnx", onnx_status(campaign_dir)),
         ]
         print(c("label", "params: ") + " ".join(parts))
     if wrapper_running:

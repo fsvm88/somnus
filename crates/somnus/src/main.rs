@@ -469,23 +469,54 @@ struct Args {
     #[arg(long)]
     ort_profile_dir: Option<PathBuf>,
 
-    /// Enable ORT binding inference (Phase 1 GPU unification).
-    /// Directory where ONNX files are written and loaded from.
-    /// On startup and after each sleep cycle, burn weights are exported and
-    /// the ONNX graphs are rebuilt via scripts/export_perception_graph.py.
-    /// Requires Python3 with onnx + onnxruntime installed.
+    /// Directory where ONNX files are written and loaded from, when ORT binding
+    /// inference (Phase 1 GPU unification, ADR 0023/0037) is active.
+    /// Default: `<memory-dir>/onnx_models` — no need to set this explicitly.
+    /// Whether ORT is actually *used* is decided automatically by the
+    /// `--onnx-crossover-units` threshold, not by whether this is set (see below);
+    /// this flag only overrides *where* the graphs live if the default is unwanted.
     #[arg(long)]
     onnx_models_dir: Option<PathBuf>,
 
     /// Path to scripts/export_perception_graph.py (default: auto-detected relative
-    /// to the binary location). Only needed when --onnx-models-dir is set.
+    /// to the binary location).
     #[arg(long)]
     onnx_script: Option<PathBuf>,
 
     /// Use MIGraphX GPU EP for ORT binding session (requires AMD GPU + MIGraphX).
-    /// When false and --onnx-models-dir is set, uses CPU EP (for testing / validation).
+    /// When false, uses CPU EP (for testing / validation).
     #[arg(long, default_value = "true")]
     onnx_migraphx: bool,
+
+    /// Disable automatic ORT/MIGraphX perception inference entirely — always use
+    /// burn on CPU, regardless of region size. For testing, reproducing older runs
+    /// (all growth pilots predate ADR 0037's auto-switch), or machines without a
+    /// working Python3+onnx+onnxruntime environment or MIGraphX GPU.
+    #[arg(long)]
+    force_cpu_inference: bool,
+
+    /// Region size (units) at or above which ORT/MIGraphX perception inference is
+    /// automatically enabled (ADR 0037; empirical CPU/GPU crossover from ADR 0023's
+    /// scaling analysis, research/gpu-unification-design.md §2). Once any region
+    /// crosses this, ORT stays active for the rest of the process — growth only
+    /// ever increases region size, so there's no reason to switch back to CPU.
+    #[arg(long, default_value_t = ONNX_INFERENCE_CROSSOVER_UNITS)]
+    onnx_crossover_units: usize,
+}
+
+/// Empirical CPU(burn)/GPU(ORT+MIGraphX) crossover for perception inference, from
+/// ADR 0023's scaling analysis (research/gpu-unification-design.md §2): GPU breaks
+/// even with CPU around N_UNITS≈1,230 at batch-1 and wins by increasing margins
+/// above it (2.2x at 4K units batch-1, 6.5x with micro-batching). Below this, CPU
+/// is faster and simpler — not worth ORT's Python-export overhead per sleep cycle.
+const ONNX_INFERENCE_CROSSOVER_UNITS: usize = 1_230;
+
+/// True if any region has grown large enough that ORT/MIGraphX inference should be
+/// active. Pure and unit-tested — growth is monotonic (regions never shrink at
+/// runtime except via an explicit, user-invoked prune), so this only ever needs to
+/// flip CPU->ORT once, never back.
+fn should_use_ort_inference(region_sizes: &[usize; 5], threshold: usize) -> bool {
+    region_sizes.iter().any(|&n| n >= threshold)
 }
 
 // ── audio accumulator + resampler ─────────────────────────────────────────────
@@ -893,8 +924,22 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── ORT binding session (Phase 1 GPU unification) ─────────────────────────
-    let onnx_script_path: Option<PathBuf> = args.onnx_models_dir.as_ref().map(|_| {
+    // ── ORT binding session (Phase 1 GPU unification, ADR 0023/0037) ──────────
+    // Enabled automatically once any region crosses `onnx_crossover_units` — see
+    // should_use_ort_inference. `onnx_dir`/`onnx_script_path` are resolved
+    // unconditionally (unless --force-cpu-inference) so the same paths are ready
+    // whether the crossover trips at startup (a resumed, already-grown snapshot)
+    // or mid-run (growth during this process).
+    let onnx_dir: Option<PathBuf> = if args.force_cpu_inference {
+        None
+    } else {
+        Some(
+            args.onnx_models_dir
+                .clone()
+                .unwrap_or_else(|| args.memory_dir.join("onnx_models")),
+        )
+    };
+    let onnx_script_path: Option<PathBuf> = onnx_dir.as_ref().map(|_| {
         args.onnx_script.clone().unwrap_or_else(|| {
             // Default: find script relative to the binary
             std::env::current_exe()
@@ -904,12 +949,27 @@ async fn main() -> Result<()> {
                 .join("../../scripts/export_perception_graph.py")
         })
     });
-    if let (Some(ref onnx_dir), Some(ref script)) = (&args.onnx_models_dir, &onnx_script_path) {
-        std::fs::create_dir_all(onnx_dir)?;
-        info!(onnx_dir = %onnx_dir.display(), migraphx = args.onnx_migraphx, "building ORT binding session");
-        match perception.rebuild_ort_session(script, onnx_dir, args.onnx_migraphx) {
-            Ok(()) => info!("ORT binding session active"),
-            Err(e) => tracing::warn!(?e, "ORT session init failed — running with burn inference"),
+    // Sticky: once an attempt fails (missing Python/onnx/onnxruntime, MIGraphX
+    // unavailable, ...), don't retry every sleep cycle — log once and stay on burn
+    // CPU for the rest of the process. The environment problem won't fix itself.
+    let mut onnx_failed = false;
+    if let (Some(ref dir), Some(ref script)) = (&onnx_dir, &onnx_script_path) {
+        if should_use_ort_inference(&perception.region_sizes(), args.onnx_crossover_units) {
+            std::fs::create_dir_all(dir)?;
+            info!(
+                onnx_dir = %dir.display(),
+                migraphx = args.onnx_migraphx,
+                region_sizes = ?perception.region_sizes(),
+                threshold = args.onnx_crossover_units,
+                "region size past ORT crossover — building ORT binding session"
+            );
+            match perception.rebuild_ort_session(script, dir, args.onnx_migraphx) {
+                Ok(()) => info!("ORT binding session active"),
+                Err(e) => {
+                    tracing::warn!(?e, "ORT session init failed — running with burn inference");
+                    onnx_failed = true;
+                }
+            }
         }
     }
 
@@ -2214,16 +2274,42 @@ async fn main() -> Result<()> {
             }
             wake_start = std::time::Instant::now();
 
-            // Rebuild ORT binding session with updated weights after sleep training.
-            if let (Some(ref onnx_dir), Some(ref script)) =
-                (&args.onnx_models_dir, &onnx_script_path)
-            {
-                match perception.rebuild_ort_session(script, onnx_dir, args.onnx_migraphx) {
-                    Ok(()) => tracing::debug!("ORT binding session rebuilt"),
-                    Err(e) => tracing::warn!(
-                        ?e,
-                        "ORT session rebuild failed — continuing with existing session"
-                    ),
+            // Rebuild ORT binding session with updated weights after sleep training —
+            // or, if not active yet, check whether growth just crossed the ORT
+            // crossover threshold (ADR 0037) and build it for the first time.
+            if let (Some(ref onnx_dir), Some(ref script)) = (&onnx_dir, &onnx_script_path) {
+                let already_active = perception.ort_active();
+                let now_wants_ort = already_active
+                    || (!onnx_failed
+                        && should_use_ort_inference(
+                            &perception.region_sizes(),
+                            args.onnx_crossover_units,
+                        ));
+                if now_wants_ort {
+                    match perception.rebuild_ort_session(script, onnx_dir, args.onnx_migraphx) {
+                        Ok(()) => {
+                            if already_active {
+                                tracing::debug!("ORT binding session rebuilt");
+                            } else {
+                                info!(
+                                    region_sizes = ?perception.region_sizes(),
+                                    threshold = args.onnx_crossover_units,
+                                    "region size crossed ORT threshold mid-run — ORT binding session now active"
+                                );
+                            }
+                        }
+                        Err(e) if already_active => tracing::warn!(
+                            ?e,
+                            "ORT session rebuild failed — continuing with existing session"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                ?e,
+                                "ORT session init failed — running with burn inference"
+                            );
+                            onnx_failed = true;
+                        }
+                    }
                 }
             }
 
@@ -3205,4 +3291,37 @@ fn forward_frames_blocking<T: Send>(src: Receiver<T>, tx: Sender<T>) -> bool {
         }
     }
     true // source exhausted normally
+}
+
+#[cfg(test)]
+mod ort_crossover_tests {
+    use super::should_use_ort_inference;
+
+    #[test]
+    fn below_threshold_stays_on_cpu() {
+        assert!(!should_use_ort_inference(&[1024; 5], 1230));
+    }
+
+    #[test]
+    fn at_threshold_switches_to_ort() {
+        assert!(should_use_ort_inference(
+            &[1230, 1024, 1024, 1024, 1024],
+            1230
+        ));
+    }
+
+    #[test]
+    fn any_single_region_crossing_is_enough() {
+        // Regions grow independently (grow_region_seeded can pick a subset), so a
+        // single grown region should already flip the whole process to ORT.
+        assert!(should_use_ort_inference(
+            &[1024, 1024, 5000, 1024, 1024],
+            1230
+        ));
+    }
+
+    #[test]
+    fn zero_threshold_always_true() {
+        assert!(should_use_ort_inference(&[0, 0, 0, 0, 0], 0));
+    }
 }

@@ -7,7 +7,7 @@ Produces two ONNX files:
   perception_binding.onnx  — binding area (projections + GRU + attention)
 
 The caller (Rust PerceptionProcessor) runs them with one CPU step in between:
-  1. encoder.onnx  →  5 z vectors [1, N_UNITS]
+  1. encoder.onnx  →  5 z vectors [1, n_units[i]] (per-region; growth can be uneven)
   2. CPU: topk + mask + duty-cycle update (uses non-zero z values; fast)
   3. binding.onnx  →  episode [1, 640]  +  gru_hidden_out [1, 1, 256]
 
@@ -35,20 +35,56 @@ import onnx.numpy_helper as nph
 import onnxruntime as ort
 from onnx import TensorProto
 
-# ── Dimensions (must match crates/somnus-perception/src/*.rs) ────────────────────
-N_UNITS         = 1024
-K_ACTIVE        = 20
+# ── Dimensions ──────────────────────────────────────────────────────────────
+# D_PROJ/N_HEADS/EPISODE_DIM/GRU_HIDDEN are architecturally fixed (binding-area
+# shape, independent of region growth) — safe as constants.
+#
+# N_UNITS, K_ACTIVE, REGION_DIMS (encoder input dims), and CROSS_MODAL_DIM are
+# NOT fixed: region growth (crates/somnus-perception, ADR 0024 §2c, gaps.md §17/§19)
+# changes N_UNITS/K_ACTIVE per region at runtime, growth can be non-uniform
+# across regions (gaps.md §16 pilot 1 observed [2048, 1984, 1984, 1984, 1984]),
+# and REGION_DIMS[4] (language) has already changed once across LM adoptions
+# (ADR 0036: Qwen2.5's 896 -> Qwen3's 1024) with no guarantee it won't again.
+# A second hardcoded copy of any of these WILL drift from crates/somnus-perception
+# eventually — infer_dims() below derives them from the actual weight shapes
+# Rust wrote instead, which can't drift because they ARE the ground truth.
 D_PROJ          = 128
 N_HEADS         = 4
 D_HEAD          = D_PROJ // N_HEADS     # 32
 EPISODE_DIM     = 640                   # 5 * D_PROJ
 GRU_INPUT       = EPISODE_DIM
 GRU_HIDDEN      = 256
-CROSS_MODAL_DIM = 384 + 512 + 384 + 896  # 2176
 DUTY_CYCLE_ALPHA = 1.0 / 1000.0
 
-# Region encoder input dimensions [speech, env, visual, symbolic, language]
-REGION_DIMS = [384, 512, 384, 384, 896]
+# Baseline-only constants: used solely by --validate-numpy's synthetic weight
+# generator (no real weights dict to derive from). NOT used on the real
+# --weights-dir path — see infer_dims(). Kept in sync with the current
+# architecture's baseline (crates/somnus-perception/src/region.rs N_UNITS/K_ACTIVE,
+# crates/somnus-perception/src/lib.rs REGION_DIMS/LANG_HIDDEN) for validation
+# fidelity, but a staleness here can only break --validate-numpy, never
+# production export.
+BASELINE_N_UNITS    = 1024
+BASELINE_K_ACTIVE   = 20
+BASELINE_REGION_DIMS = [384, 512, 384, 384, 1024]  # [speech, env, visual, symbolic, language]
+
+
+def infer_dims(weights: dict):
+    """Derive region_dims (encoder input dims) and n_units (per-region, may
+    differ across regions after uneven growth) from the actual exported weight
+    shapes — the only source that can't drift from what Rust is really running.
+    W_enc_i is [region_dims[i], n_units[i]]; W_cross is [cross_modal_dim, 384].
+    """
+    region_dims = [weights[f"W_enc_{i}"].shape[0] for i in range(5)]
+    n_units = [weights[f"W_enc_{i}"].shape[1] for i in range(5)]
+    cross_modal_dim = weights["W_cross"].shape[0]
+    expected_cross = region_dims[0] + region_dims[1] + region_dims[2] + region_dims[4]
+    if cross_modal_dim != expected_cross:
+        raise ValueError(
+            f"W_cross first dim ({cross_modal_dim}) doesn't match "
+            f"speech+env+visual+language region dims ({expected_cross}) — "
+            "weight export is inconsistent, not safe to build a graph from"
+        )
+    return region_dims, n_units, cross_modal_dim
 
 
 # ── Graph 1: encoder ──────────────────────────────────────────────────────────
@@ -56,15 +92,18 @@ REGION_DIMS = [384, 512, 384, 384, 896]
 def build_encoder_graph(weights: dict) -> onnx.ModelProto:
     """
     Inputs:
-      speech_enc   [1, 384]
-      env_enc      [1, 512]
-      visual_enc   [1, 384]
-      language_enc [1, 896]
+      speech_enc   [1, region_dims[0]]
+      env_enc      [1, region_dims[1]]
+      visual_enc   [1, region_dims[2]]
+      language_enc [1, region_dims[4]]
 
-    Outputs (all [1, N_UNITS]):
-      z_0 .. z_4   — raw pre-topk activations per region (symbolic derived internally)
+    Outputs:
+      z_0 .. z_4   [1, n_units[i]] — raw pre-topk activations per region
+                   (symbolic derived internally; region_dims/n_units come from
+                   the actual weight shapes, see infer_dims())
     """
     w = weights
+    region_dims, n_units, _cross_modal_dim = infer_dims(weights)
     nodes = [
         # Cross-modal concat → symbolic encoder input (derived, not a graph input)
         # cross_modal_proj has bias=true: symbolic_enc = cross_cat @ W_cross + W_cross_bias
@@ -90,13 +129,13 @@ def build_encoder_graph(weights: dict) -> onnx.ModelProto:
         nph.from_array(w["W_enc_4"].astype(np.float32),  name="W_enc_4"),
     ]
     graph_inputs = [
-        h.make_tensor_value_info("speech_enc",   TensorProto.FLOAT, [1, 384]),
-        h.make_tensor_value_info("env_enc",       TensorProto.FLOAT, [1, 512]),
-        h.make_tensor_value_info("visual_enc",    TensorProto.FLOAT, [1, 384]),
-        h.make_tensor_value_info("language_enc",  TensorProto.FLOAT, [1, 896]),
+        h.make_tensor_value_info("speech_enc",   TensorProto.FLOAT, [1, region_dims[0]]),
+        h.make_tensor_value_info("env_enc",       TensorProto.FLOAT, [1, region_dims[1]]),
+        h.make_tensor_value_info("visual_enc",    TensorProto.FLOAT, [1, region_dims[2]]),
+        h.make_tensor_value_info("language_enc",  TensorProto.FLOAT, [1, region_dims[4]]),
     ]
     graph_outputs = [
-        h.make_tensor_value_info(f"z_{i}", TensorProto.FLOAT, [1, N_UNITS])
+        h.make_tensor_value_info(f"z_{i}", TensorProto.FLOAT, [1, n_units[i]])
         for i in range(5)
     ]
     graph = h.make_graph(nodes, "somnus_encoder", graph_inputs, graph_outputs, initializers)
@@ -110,7 +149,8 @@ def build_encoder_graph(weights: dict) -> onnx.ModelProto:
 def build_binding_graph(weights: dict) -> onnx.ModelProto:
     """
     Inputs:
-      sp_0 .. sp_4   [1, N_UNITS]  — sparse activations (after CPU topk/mask)
+      sp_0 .. sp_4   [1, n_units[i]] — sparse activations (after CPU topk/mask;
+                     n_units[i] from the actual weight shapes, see infer_dims())
       prev_episode   [1, EPISODE_DIM]
       gru_hidden     [1, 1, GRU_HIDDEN]
 
@@ -119,6 +159,7 @@ def build_binding_graph(weights: dict) -> onnx.ModelProto:
       gru_hidden_out [1, 1, GRU_HIDDEN]
     """
     w = weights
+    _region_dims, n_units, _cross_modal_dim = infer_dims(weights)
 
     # GRU weights: burn stores [in, out]; ONNX needs transposed + stacked per gate.
     # Gate order: update(z), reset(r), new(n) — same in burn and ONNX.
@@ -199,7 +240,7 @@ def build_binding_graph(weights: dict) -> onnx.ModelProto:
     ]
 
     graph_inputs = [
-        h.make_tensor_value_info(f"sp_{i}", TensorProto.FLOAT, [1, N_UNITS])
+        h.make_tensor_value_info(f"sp_{i}", TensorProto.FLOAT, [1, n_units[i]])
         for i in range(5)
     ] + [
         h.make_tensor_value_info("prev_episode",  TensorProto.FLOAT, [1, EPISODE_DIM]),
@@ -236,9 +277,9 @@ def numpy_encoder(feeds: dict, weights: dict):
 def numpy_topk_mask(z: np.ndarray, dc: np.ndarray):
     """CPU step: boosted topk selection + sparse mask. Must match burn's select_top_k."""
     boost = 1.0
-    target_dc = K_ACTIVE / N_UNITS
+    target_dc = BASELINE_K_ACTIVE / BASELINE_N_UNITS
     boosted = z + boost * (target_dc - dc)
-    topk_idx = np.argpartition(boosted[0], -K_ACTIVE)[-K_ACTIVE:]
+    topk_idx = np.argpartition(boosted[0], -BASELINE_K_ACTIVE)[-BASELINE_K_ACTIVE:]
     mask = np.zeros_like(z)
     mask[0, topk_idx] = 1.0
     sparse_z = z * mask
@@ -303,15 +344,20 @@ def load_weights_from_dir(weights_dir: str) -> dict:
     return weights
 
 def make_random_weights(seed: int = 42) -> dict:
-    """Random weights in correct shapes for validation."""
+    """Random weights in baseline (unqrown) shapes, for --validate-numpy only."""
     rng = np.random.default_rng(seed)
     def randn(*shape): return rng.normal(0, 0.02, shape).astype(np.float32)
     w = {}
-    for i, d in enumerate(REGION_DIMS):
-        w[f"W_enc_{i}"] = randn(d, N_UNITS)
-    w["W_cross"] = randn(CROSS_MODAL_DIM, 384)
+    for i, d in enumerate(BASELINE_REGION_DIMS):
+        w[f"W_enc_{i}"] = randn(d, BASELINE_N_UNITS)
+    cross_modal_dim = (
+        BASELINE_REGION_DIMS[0] + BASELINE_REGION_DIMS[1]
+        + BASELINE_REGION_DIMS[2] + BASELINE_REGION_DIMS[4]
+    )
+    w["W_cross"] = randn(cross_modal_dim, 384)
+    w["W_cross_bias"] = randn(384)
     for i in range(5):
-        w[f"W_region_{i}"] = randn(N_UNITS, D_PROJ)
+        w[f"W_region_{i}"] = randn(BASELINE_N_UNITS, D_PROJ)
     w["W_q"] = randn(D_PROJ, D_PROJ)
     w["W_k"] = randn(D_PROJ, D_PROJ)
     w["W_v"] = randn(D_PROJ, D_PROJ)
@@ -324,16 +370,15 @@ def make_random_weights(seed: int = 42) -> dict:
 def make_random_feeds(rng=None) -> dict:
     if rng is None: rng = np.random.default_rng(7)
     def r(*s): return rng.normal(0, 1, s).astype(np.float32)
-    target = K_ACTIVE / N_UNITS
     return {
-        "speech_enc":   r(1, 384),
-        "env_enc":      r(1, 512),
-        "visual_enc":   r(1, 384),
-        "language_enc": r(1, 896),
+        "speech_enc":   r(1, BASELINE_REGION_DIMS[0]),
+        "env_enc":      r(1, BASELINE_REGION_DIMS[1]),
+        "visual_enc":   r(1, BASELINE_REGION_DIMS[2]),
+        "language_enc": r(1, BASELINE_REGION_DIMS[4]),
         "prev_episode": np.zeros((1, EPISODE_DIM), np.float32),
         "gru_hidden":   np.zeros((1, 1, GRU_HIDDEN), np.float32),
         # Non-uniform dc: exercises the boost term (uniform dc → boost=0, hides errors)
-        "dc": [rng.uniform(0.005, 0.05, (1, N_UNITS)).astype(np.float32)
+        "dc": [rng.uniform(0.005, 0.05, (1, BASELINE_N_UNITS)).astype(np.float32)
                for _ in range(5)],
     }
 
