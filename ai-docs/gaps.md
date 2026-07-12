@@ -574,6 +574,50 @@ previously estimated. See §16 pilot 3 for full numbers and the revised campaign
 
 ---
 
+## 20. Full 10x growth campaign launched; `campaign_status.py`; `eval_metrics.py` region-name bug fix (2026-07-12)
+
+**§16's full campaign is now running** (not just pilots). Per the user's explicit call, `memory/`
+was wiped completely first (all production state + every old A/B/pilot scratch dir — ~17GB, all
+gitignored/untracked, nothing lost that wasn't reproducible), so the growable core is regrowing
+from scratch on the post-§17/§18/§19 mechanism. Launched via `scripts/train_campaign.sh`
+(`SESSIONS=130 CYCLES=10 CAPACITY=8192`, 1300 target cycles, full 145-clip h3h3+shorts+podcasts
+corpus, `CAMPAIGN_DIR=memory/campaign_growth10x`), running unattended in the background.
+
+**First observed rate is beating the pilot-3 baseline, not matching it.** At ~440 cycles in:
+mean batch ~43.4 units/event (pilot-3: 35.6) and cadence ~1/4.25 cycles (pilot-3: 1/5.36) — both
+faster than expected, projecting a **~6.1h total campaign time** against the pilot-3 estimate of
+9.3–11.5h. Plausible cause: a from-scratch corpus produces more severe novelty per trigger early
+on than pilot 3's partially-trained starting state did — untested whether this holds once the
+low-hanging novelty is consumed later in the run. Treat the faster rate as provisional until the
+campaign is further along or complete.
+
+**New tool: `scripts/campaign_status.py`.** One-command status report for any `train_campaign.sh`
+run (auto-detects the newest `memory/campaign_*` dir, or takes one explicitly) — replaces manually
+recomputing progress/growth/ETA from `metrics.jsonl` by hand every check-in. Reports: process
+state, cycle progress + ETA to session target, current-session progress + ETA, per-region growth
+sizes/deltas, growth-event cadence/batch size, an ETA to a configurable unit target
+(`--target-units`, defaults to the 9,660 10x goal), quality trend (early-vs-late MSE window),
+recall metrics, latest-cycle timing breakdown, disk usage per memory subdir + free space, and a
+health check (stale-log detection, panic scan across session logs). Colored output (light-blue
+labels, light-green values; auto-disabled when not a TTY, or via `--no-color`/`NO_COLOR`) grades
+the pace-sensitive numbers — rate, growth batch/cadence, per-region growth-so-far, projected total
+campaign time, quality trend — green/yellow/red against the pilot-3 baseline (`EXPECTED_*`
+constants at the top of the script, sourced from this doc's §16/§19), so "ahead of schedule" vs.
+"behind schedule" is visible at a glance instead of requiring the reader to do the arithmetic.
+No non-stdlib dependencies.
+
+**Bug found and fixed while writing that script:** `scripts/eval_metrics.py`'s
+`REGION_NAMES = ["visual", "env", "speech", "symbolic", "language"]` had indices 0 and 2 swapped
+relative to the actual Rust emission order (`RegionId::as_index`,
+`crates/somnus-perception/src/region.rs`: 0=AudioSpeech, 1=AudioEnv, 2=Visual, 3=Symbolic,
+4=Language — confirmed against `PerceptionState::region_sizes()` and `sleep.rs`'s
+`per_region_mse` construction). Every growth-timeline and per-region-MSE chart this project has
+ever generated has been mislabeling speech as visual and vice versa (env/symbolic/language were
+unaffected — they happened to already be in the right slots). Fixed; verified the eval harness
+still runs clean against live campaign data with the corrected labels.
+
+---
+
 ## Priority order (as of 2026-07-11)
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -598,7 +642,8 @@ previously estimated. See §16 pilot 3 for full numbers and the revised campaign
 | ✅ §13 | **Change-gated video encoder** | Low | Wake-path compute (unmeasured savings) | Deployed 2026-07-06, opt-in via `--video-change-threshold` |
 | ❌ §14 | **SVD low-rank check (region/binding weights)** | Low | Capacity efficiency | Null result 2026-07-06 — near-full-rank, not pursued |
 | §15 | **Crate hygiene** (usearch migration, burn-ndarray watch, ffmpeg-the-third) | Low–Med | HNSW footprint / maintenance | Dead deps removal already done; usearch/ffmpeg-the-third deferred until raised by a concrete need |
-| 🔬 §16 | **Growth-scaling pilot campaigns** (10x growable-core scaling) | Med (pilots done, full campaign now ~9.3–11.5h unattended, revised 2026-07-12) | Growable-core capacity | Characterized 2026-07-09/11/12 (3 pilots, no plateau risk found; post-§19 pilot recalibrated campaign time upward ~2.4-3x); full 10x campaign not yet run — user-driven next step |
+| 🔄 §16 | **Growth-scaling pilot campaigns** (10x growable-core scaling) | Med (pilots done; full campaign launched 2026-07-12, running unattended) | Growable-core capacity | Characterized 2026-07-09/11/12 (3 pilots, no plateau risk found); full 10x campaign launched 2026-07-12 from wiped `memory/`, tracked live via `scripts/campaign_status.py` — see §20 |
 | ✅ §17 | **K_ACTIVE scaling with region growth** | Low–Med | Sparse coding quality at scale | Deployed 2026-07-12 — see §17 below |
 | ✅ §18 | **Scope optimizer reset to grown region only** | Low | Convergence stability during growth | Deployed 2026-07-12 — see §18 below |
 | ✅ §19 | **Novelty-proportional growth batch size** | Med | Growth-mechanism correctness | Deployed 2026-07-12 — see §19 below |
+| ✅ §20 | **Full 10x campaign launch + `campaign_status.py` + `eval_metrics.py` region-name fix** | Low (tooling) | Ops visibility / chart correctness | Deployed 2026-07-12 — see §20 below |

@@ -1,5 +1,36 @@
 # Session state — somnus
 
+> **Last updated:** 2026-07-12 (later still)
+> **🔄 IN PROGRESS: full 10x growth campaign launched, running unattended.** All of §17/§18/§19
+> (K_ACTIVE scaling, optimizer-reset scoping, novelty-proportional batch) committed at
+> `904980e`/`b883069`. Per the user's explicit call, **`memory/` was wiped completely** (all
+> production state + every old A/B/pilot scratch dir, ~17GB, all gitignored/untracked — nothing
+> lost that wasn't reproducible) and the campaign is regrowing from scratch on the new mechanism.
+> Launched via `scripts/train_campaign.sh` in the background (task id `bl7mf45tg` this session;
+> won't survive a session restart — check `pgrep -fa train_campaign.sh`, or just run
+> `scripts/campaign_status.py`, the new one-command status tool, described below). Params:
+> `SESSIONS=130 CYCLES=10 CAPACITY=8192 MEMORY_DIR=memory CAMPAIGN_DIR=memory/campaign_growth10x
+> SKIP_BUILD=1`, `CLIPS`=full 145-file h3h3+shorts+podcasts corpus (`.mp4` only — first launch
+> attempt included `clips/shorts/download.log` via a naive glob, killed and relaunched with a
+> `find -name '*.mp4'` filter before real damage). 1300 target cycles.
+> **Rate is currently beating the pilot-3 estimate:** ~440 cycles in, mean batch ~43.4 units/event
+> and cadence ~1/4.25 cycles (pilot-3: 35.6/event, 1/5.36) — projecting **~6.1h total** vs. the
+> ~9.3–11.5h pilot-3 estimate. Provisional; may slow once early novelty is consumed. Full backstory:
+> `ai-docs/gaps.md` §16/§19/§20.
+> **New: `scripts/campaign_status.py`** — one-command status report (progress, per-region growth,
+> quality trend, disk usage, health checks, ETA), colored (light-blue labels / light-green values),
+> grades pace-sensitive numbers green/yellow/red against the pilot-3 baseline. Run it first on
+> resume instead of reconstructing status by hand. Also fixed a real bug found while building it:
+> `scripts/eval_metrics.py`'s `REGION_NAMES` had speech/visual swapped (index 0/2) versus the
+> actual Rust emission order — every growth/MSE chart this project has generated mislabeled those
+> two regions. Both documented in `ai-docs/gaps.md` §20.
+> **Next-session action:** run `scripts/campaign_status.py` first. If the campaign is still
+> running, that's it — no action needed. If finished, verify final region sizes vs. the 10x target,
+> check for plateau/regression in `per_region_mse`/`metrics.jsonl`, then write up the result (new
+> `gaps.md` section) and commit.
+
+## Historical (superseded by the in-progress campaign above, kept for context)
+
 > **Last updated:** 2026-07-11
 > **Branch:** `main`. Committed (through 2026-07-09): change-gated video encoder (`9bba42b`),
 > SVD null-result (`b410ad7`), train_campaign.sh bugfix + replay-ratio A/B (`d5ce2ab`), N=4

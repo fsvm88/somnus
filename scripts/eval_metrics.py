@@ -31,7 +31,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-REGION_NAMES = ["visual", "env", "speech", "symbolic", "language"]
+# Index order must match RegionId::as_index (crates/somnus-perception/src/region.rs):
+# 0=AudioSpeech, 1=AudioEnv, 2=Visual, 3=Symbolic, 4=Language. Previously listed as
+# ["visual", "env", "speech", ...] here, which swapped indices 0 and 2 in every plot
+# this script has ever produced (per_region_mse, region_sizes, growth annotations).
+REGION_NAMES = ["speech", "env", "visual", "symbolic", "language"]
 REGION_COLORS = ["#4c8ef5", "#e06c75", "#98c379", "#c678dd", "#e5c07b"]
 
 
