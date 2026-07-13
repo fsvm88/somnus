@@ -1,8 +1,8 @@
 # 0037. Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover
 
-- **Status:** accepted; auto-switch mechanism implemented and correct. Its target was broken by the
-  gaps.md §24 bug (found 2026-07-12); §24 is now fixed (2026-07-13) but the real speedup is still
-  unmeasured against a live campaign — see update below.
+- **Status:** accepted and confirmed. Auto-switch mechanism implemented and correct; its target was
+  broken by two gaps.md §24 bugs (found 2026-07-12/13), both now fixed and verified live — real
+  speedup confirmed at ~3-4× over the pre-crossover CPU baseline. See updates below.
 - **Date:** 2026-07-12
 
 > **⚠️ Update (2026-07-12, later):** the "~2.1×/2.4× measured speedup" claims below are almost
@@ -16,12 +16,24 @@
 > until §24 is fixed and re-measured with a check for zero `ORT encoder failed`/`ORT binding
 > failed` occurrences.
 >
-> **⚠️ Update (2026-07-13):** §24 is fixed — verified directly against the real leftover campaign
-> ONNX graph (built at `n_units=6886`), which now round-trips through `run_binding` correctly
-> (regression test `crates/somnus-perception/tests/ort_grown_region.rs`, confirmed to fail pre-fix and
-> pass post-fix). Still open: this was verified offline against a saved artifact, not via a live
-> campaign session — the "~2.1×/2.4×" speedup number above remains void until the campaign is
-> resumed and a session log shows zero `ORT encoder failed`/`ORT binding failed` occurrences.
+> **⚠️ Update (2026-07-13):** §24's binding-side bug is fixed — verified directly against the real
+> leftover campaign ONNX graph (built at `n_units=6886`), which now round-trips through
+> `run_binding` correctly (regression test `crates/somnus-perception/tests/ort_grown_region.rs`,
+> confirmed to fail pre-fix and pass post-fix). Resuming the campaign to verify live surfaced a
+> *second*, independent bug in the same call path: the encoder session's `language_enc` input dim
+> was hardcoded at 896 (stale since ADR 0036 raised `LANG_HIDDEN` to 1024) — same drift class,
+> different call site. Fixed the same way (derive from the live constant), same regression-test
+> treatment (confirmed to fail pre-fix/pass post-fix).
+>
+> **✅ Update (2026-07-13, later): fully confirmed live.** Campaign resumed at session 60 with both
+> fixes deployed. Sessions 60-61: **zero** `ORT encoder failed` and **zero** `ORT binding failed`
+> occurrences across ~8,000 log lines. `perception_total_ms` mean: 2,158ms (session 60), 1,457ms
+> (session 61) — vs. session 57's 250,099ms fully-broken baseline and the pre-ORT-crossover
+> baseline of ~6,900-7,200ms (sessions 50-52). **Real confirmed speedup: ~3-4× over CPU baseline**,
+> genuinely via the ORT/MIGraphX path, not a silent fallback. This supersedes and retracts the
+> original "~2.1×/2.4×" number below — that number was measured entirely on the broken path and
+> never reflected a real accelerated call. This ADR's mechanism and payoff are both now confirmed;
+> no further action pending.
 
 ## Context
 

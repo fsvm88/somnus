@@ -1,46 +1,57 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-13
-> **⏸️ STOPPED (clean, user-requested).** Campaign was at cycle 559/1310 (42.7%), region sizes
-> 6,886/9,660 (71.3%), stopped via `scripts/stop_graceful.sh` — confirmed clean exit, no data lost.
+> **Last updated:** 2026-07-13 (later still)
+> **▶️ RUNNING.** Campaign resumed at session 60/131; as of this writeup at session 69/131 (region
+> sizes 8,494/9,660 ≈ 88%) — both gaps.md §24 bugs are fixed, committed, and confirmed live with
+> zero ORT fallback occurrences. `CAMPAIGN_DIR=memory/campaign_growth10x`, `CLIPS`=full 145-file
+> h3h3+shorts+podcasts corpus. Check `scripts/campaign_status.py` for the current live state.
 >
-> **✅ gaps.md §24 FIXED (2026-07-13).** The bug described below (ORT sparse→dense conversion
-> hardcoding baseline `N_UNITS` instead of each region's grown size) is fixed: all 5
-> `to_dense_n(N_UNITS)` call sites in `crates/somnus-perception/src/lib.rs` now use each
-> `SparseActivation`'s own `n_units`; `lang_zero` fallbacks now read the live language-layer/region
-> size instead of the constant; `onnx_session.rs`'s `run_binding` now derives its ONNX input shapes
-> from each vector's own `.len()` instead of hardcoding `N_UNITS`. New regression test
-> `crates/somnus-perception/tests/ort_grown_region.rs` loads the actual leftover campaign ONNX graph
-> (`memory/onnx_models/perception_binding.onnx`, built at `n_units=6886`) and calls `run_binding`
-> directly — confirmed it fails pre-fix (`ShapeError/IncompatibleShape`, verified via a temporary
-> `git stash` revert) and passes post-fix. Full build/clippy/test clean. **Not yet committed.**
-> Full writeup: `ai-docs/gaps.md` §24.
+> **✅ gaps.md §24 FULLY FIXED AND CONFIRMED LIVE (2026-07-13).** Two independent bugs, both in the
+> ORT call path, found back to back:
+> 1. **Binding-side:** `to_dense_n(N_UNITS)` at 5 call sites in `crates/somnus-perception/src/lib.rs`
+>    hardcoded the baseline `N_UNITS=1024` instead of each region's actual grown size;
+>    `onnx_session.rs`'s `run_binding` independently hardcoded `N_UNITS` for its ONNX tensor shapes.
+>    Fixed: both now derive size from the actual data (`SparseActivation.n_units`, each vector's
+>    `.len()`). Commit `8718099`.
+> 2. **Encoder-side** (found resuming the campaign to verify fix #1 live): `onnx_session.rs`'s
+>    `ENC_DIMS` hardcoded the language encoder input at 896, stale since ADR 0036 raised
+>    `LANG_HIDDEN` to 1024 — same drift class as §22's already-fixed Python-side bug, just never
+>    fixed on this Rust caller. Fixed: `ENC_DIMS` now derives from live `ENV_DIM`/`LANG_HIDDEN`
+>    constants. Commit `debd6c4`.
 >
-> **Still pending (this is what's left before trusting resumed-campaign timing numbers):** this
-> was verified against the real ONNX artifact directly, NOT via a live campaign run — the
-> session-state's original ask ("grep the new session log for `ORT encoder failed`/`ORT binding
-> failed`, zero occurrences expected") has not been done yet. Next step: resume the campaign
-> (`scripts/resume_growth_campaign.sh`), let it build a fresh ORT session past the crossover, grep
-> the new session log for those two strings (zero expected), then re-measure the real ORT speedup
-> — the "~2.1×/2.4×" ADR 0037 number is still void until a genuine successful ORT call is observed.
+> Both fixes have regression tests (`crates/somnus-perception/tests/ort_grown_region.rs`) confirmed to
+> fail pre-fix (exact errors seen in the campaign log) and pass post-fix.
 >
-> **To resume:** `scripts/resume_growth_campaign.sh` — self-contained, reads
+> **Live confirmation (sessions 60-61, both fixes deployed):** **zero** `ORT encoder failed` and
+> **zero** `ORT binding failed` occurrences across ~8,000 log lines. `perception_total_ms` mean:
+> 2,158ms (session 60), 1,457ms (session 61) — vs. 250,099ms fully-broken (session 57) and
+> ~6,900-7,200ms pre-ORT-crossover baseline (sessions 50-52). **Real confirmed speedup: ~3-4× over
+> CPU baseline.** This supersedes and retracts ADR 0037's original "~2.1×/2.4×" claim (measured
+> entirely on the broken path). §24 and ADR 0037 are both fully closed out — no further action
+> pending on this item. Full writeup: `ai-docs/gaps.md` §24, ADR 0037.
+>
+> **To resume (if stopped again):** `scripts/resume_growth_campaign.sh` — self-contained, reads
 > `SESSION_START`/`SESSIONS`/`CYCLES`/`CLIPS`/etc. from the campaign's own `params.txt` +
 > `metrics.jsonl` (not from this file or any session-specific state), computes the correct resume
 > point automatically, rebuilds `somnus` first by default (`SKIP_BUILD=1` to skip), refuses to
-> double-launch. `DRY_RUN=1` to preview. **To stop again:** `scripts/stop_graceful.sh` (`--dry-run`
-> to preview, `--wait N` to change the SIGTERM timeout — state is snapshotted every cycle, so this
+> double-launch. `DRY_RUN=1` to preview. **To stop:** `scripts/stop_graceful.sh` (`--dry-run` to
+> preview, `--wait N` to change the SIGTERM timeout — state is snapshotted every cycle, so this
 > loses at most a few seconds).
 >
 > **What's live and correct:** §17/§18/§19 (K_ACTIVE scaling, optimizer-reset scoping,
 > novelty-proportional batch), §21 (fixed a warm-store HNSW dump leak — was leaking ~24-26MB/cycle
-> unboundedly, also silently broke cross-restart index reload). §22/ADR 0037's auto-switch
-> *mechanism* is also correct — it correctly detects the crossover and builds/activates an ORT
-> session — the bug is specifically in what happens after activation (§24). `memory/` was wiped
-> completely at campaign start per the user's explicit call (all production state + old A/B/pilot
-> scratch dirs, ~17GB, gitignored/untracked, nothing lost that wasn't reproducible) — regrowing
-> from scratch. `CAMPAIGN_DIR=memory/campaign_growth10x` throughout; `CLIPS`=full 145-file
-> h3h3+shorts+podcasts corpus (`.mp4` only).
+> unboundedly, also silently broke cross-restart index reload), §22/ADR 0037's auto-switch
+> mechanism plus both §24 fixes (confirmed above). `memory/` was wiped completely at campaign start
+> per the user's explicit call (all production state + old A/B/pilot scratch dirs, ~17GB,
+> gitignored/untracked, nothing lost that wasn't reproducible) — regrowing from scratch.
+>
+> **Cold-archive note (2026-07-13, user question):** `max_cold_records_effective` has been `0`
+> (unlimited) the whole campaign — `sysinfo`'s disk lookup can't match `memory/`'s mount point
+> (likely the btrfs subvolume under `/mainpool`), so it falls back to no cap per ADR 0024's
+> documented behavior (not a bug). Cold archive (`memory/episodes.cold`) is growing correctly and
+> steadily every cycle regardless (94MB / 141,765 records as of session 67, exactly matching
+> `cold_len`) — it's an append-only full ledger by design (every episode goes to both cold and warm
+> every cycle), not a warm-eviction target, so it was never expected to jump discontinuously.
 >
 > **Restart 1** (~cycle 486, gaps.md §21): `SemanticStore::dump()` leaked a full HNSW index dump
 > every sleep cycle forever (461 orphaned pairs, 11G) because `load_warm()`'s reload path
@@ -58,22 +69,21 @@
 > (stale hardcoded `LANG_HIDDEN=896` since ADR 0036 made it 1024, and hardcoded `N_UNITS`/`K_ACTIVE`
 > that could never survive region growth) — fixed by deriving all dims from the actual exported
 > weight shapes (`infer_dims()`) instead of a second hand-maintained copy. Resumed
-> `SESSION_START=56 SESSIONS=76`; log confirmed `ORT binding session active`. **Then found §24
-> (above) — the reported speedup from this restart's verification was invalid.** User also
-> proposed eliminating the Python export step entirely (native Rust ONNX graph construction) —
-> sound long-term direction, scoped as gaps.md §23, deliberately not started (no mature Rust
-> ONNX-graph-builder crate exists; real rewrite effort, not a fast-follow).
+> `SESSION_START=56 SESSIONS=76`; log confirmed `ORT binding session active`. **Then found §24's two
+> bugs (above) — now both fixed and confirmed live.** User also proposed eliminating the Python
+> export step entirely (native Rust ONNX graph construction) — sound long-term direction, scoped as
+> gaps.md §23, deliberately not started (no mature Rust ONNX-graph-builder crate exists; real
+> rewrite effort, not a fast-follow).
 >
-> **Stopped** (this shutdown, gaps.md §24): found the ORT bug above while checking status before a
-> routine user-requested shutdown. Documented and stopped cleanly rather than rushing a fix under
-> time pressure — same judgment call as every other fix today, just landing on "stop and document"
-> instead of "fix now" since there was no live-campaign urgency (burn fallback keeps state correct,
-> just slow) and no user ask to fix immediately.
+> **Restart 3** (session 57→58, gaps.md §24 bug #1 fix): stopped cleanly to deploy the binding-side
+> N_UNITS fix. Resumed at session 58, confirmed zero `ORT binding failed` but found bug #2
+> (`ORT encoder failed` on `language_enc`, 100% of calls).
 >
-> **Next-session action:** gaps.md §24 is fixed (see note above) but not yet verified live — commit
-> the fix, resume the campaign via `scripts/resume_growth_campaign.sh`, grep the new session log for
-> zero `ORT encoder failed`/`ORT binding failed` occurrences, THEN re-measure the real speedup
-> (previous numbers are void until that grep comes back clean).
+> **Restart 4** (session 59→60, gaps.md §24 bug #2 fix): stopped cleanly to deploy the encoder-side
+> LANG_HIDDEN fix. Resumed at session 60 — both bugs confirmed fixed, campaign running clean since.
+>
+> **Next-session action:** none queued — campaign is healthy and running unattended toward the 10x
+> target (session 60+/131). Check in periodically or let it run to completion; no known open bugs.
 >
 > Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21/§22/§23/§24, ADR 0037.
 

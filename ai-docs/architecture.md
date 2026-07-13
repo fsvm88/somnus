@@ -8,6 +8,18 @@
 > **Implementation state (2026-07-11):** Phases 1–14 + architectural roundup + gap fixes + Item 6 (DINOv3-ViT-S, deployed) + Item 7 Phase 2 (DER++ stale blocking) + Item 5 (Qwen3 adopted, ADR 0036) complete. `crates/somnus-sensory` captures audio/video. `crates/somnus-encoding` runs Whisper-tiny (384-dim), CLAP-HTSAT (512-dim), DINOv3-ViT-S (384-dim, active; DINOv2-S/14 fallback) via ORT. `crates/somnus-perception` runs five k-WTA layers (n=1024, k=20) — audio-speech, audio-env, visual, symbolic, language (`LANG_HIDDEN`=1024, Qwen3-0.6B) — plus 4-head cross-attention binding area with GRU temporal context (GRU_HIDDEN=256) → 640-dim episode vectors + SAE decoders for reconstruction error. `crates/somnus-memory` implements the three-tier memory hierarchy: `EpisodicBuffer` (bounded ring, hot), `SemanticStore` (hnsw_rs HNSW over episode vectors, warm), `ColdArchive` (INT8-quantised append-only binary, cold), `RecollectionLayer` (warm query + cold→warm promotion). The `somnus` binary wires all crates end-to-end with a full sleep cycle (NREM + REM, DER++ stale-output detection), text bypass, auto-grounding, action decoder (Qwen3-0.6B, single build) and eval harness. A/B on a speech-dense corpus favored Qwen3 over Qwen2.5 on proj_loss (~22% lower, consistent across a 5-session campaign); adopted as the sole LM 2026-07-05 (ADR 0036) — Qwen2.5 support removed. Confirmed the same day with a direct `generate()` quality comparison: Qwen3 produces coherent English, Qwen2.5 incoherent token garbage.
 >
 > **Since 2026-07-05:** two A/B rejections kept opt-in-only (DER++ auto-λ, `gaps.md` §3; EfficientAT-mn10 env encoder, §9), one candidate scoped and explicitly not pursued (M2D-CLAP, §8) — none changed defaults. Separately, the growth mechanism (`grow_region_seeded`, ADR 0024 §2c — see "Growth mechanism" below) was characterized empirically for the first time via two 75-cycle pilots (2026-07-09, 2026-07-11): ~1 growth event per 4.7 cycles, gate-limited by its 3-cycle cooldown rather than signal-limited, `per_region_mse` improving alongside growth, no memorization-plateau signal even against a 145-clip diverse corpus. Full writeup: `ai-docs/research/growth-mechanisms.md` "Empirical validation"; status: `gaps.md` §16. Both pilots ran in isolated scratch memory dirs, not the main `memory/` — no production region sizes have changed.
+>
+> **Since 2026-07-12:** the main `memory/` was wiped and a full 10x growth campaign launched
+> (target ~9,660 units/region, honeybee-order scale vs. the fruit-fly-order ~1,024-unit baseline
+> above) — as of 2026-07-13 at session 69/131, region sizes are 8,494 (≈88% of target), so the
+> "n=1024, k=20" figure in the 2026-07-11 paragraph above describes the architectural *baseline*,
+> not current production region sizes. Alongside the campaign: K_ACTIVE now scales with region
+> growth (`region::scaled_k`, gaps.md §17), optimizer resets are scoped to the grown region only
+> (§18), growth batch size is novelty-proportional (§19). Perception inference now auto-switches
+> to the ORT/MIGraphX GPU path past the CPU/GPU crossover without a manual flag (ADR 0037,
+> superseding Phase 14's opt-in `--onnx-models-dir`) — after two dimension-drift bugs found
+> immediately after auto-enable went live were fixed (gaps.md §24), this is confirmed live with
+> zero fallback and a genuine ~3-4× perception speedup over the CPU baseline.
 
 somnus is decomposed by **function**, in loose correspondence with brain systems. Four shaping commitments:
 

@@ -300,9 +300,18 @@ perception scales with the growable core instead of becoming a CPU bottleneck as
   run via ORT+MIGraphX; `burn` retained CPU-side for training only. Duty-cycle top-k/masking
   stays on CPU between the two graphs to avoid a MIGraphX `ScatterElements`/INT64 bug on
   gfx1201.
-- `--onnx-models-dir` / `--onnx-script` flags (see `scripts/train_campaign.sh`) enable the
-  GPU path opt-in; `sync_ort_weights` keeps the exported graphs in sync with `burn`-trained
-  weights across sleep cycles.
+- ADR 0037 (2026-07-12) superseded the opt-in `--onnx-models-dir`/`--onnx-script` flags with
+  auto-enable: `should_use_ort_inference` detects the CPU/GPU crossover (~1,230 units/region,
+  ADR 0023) from live region sizes and switches over automatically, rebuilding the ONNX graphs
+  from current `burn` weights at each sleep→wake boundary (`rebuild_ort_session`) — no manual
+  flag needed once a region grows past baseline.
+- gaps.md §24 (2026-07-12/13) found and fixed two dimension-drift bugs that had silently
+  defeated the GPU path since it first auto-activated (sparse→dense conversion hardcoding
+  baseline `N_UNITS` instead of each region's grown size; encoder `language_enc` input
+  hardcoding a stale pre-ADR-0036 `LANG_HIDDEN`). Confirmed live once both were fixed: zero ORT
+  fallback occurrences, `perception_total_ms` ~3-4× faster than the pre-crossover CPU baseline.
 
-**Exit criterion:** ✓ Phase 0 + Phase 1 of ADR 0023 implemented and live (2026-06-07);
-perception inference runs on GPU via ORT/MIGraphX when `--onnx-models-dir` is set.
+**Exit criterion:** ✓ Phase 0 + Phase 1 of ADR 0023 implemented and live (2026-06-07); auto-enable
+(ADR 0037) live and confirmed 2026-07-13 with a genuine, measured ~3-4× speedup once gaps.md §24's
+two bugs were fixed — perception inference now runs on GPU via ORT/MIGraphX automatically past the
+crossover, with no flag required.

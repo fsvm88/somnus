@@ -853,8 +853,21 @@ the ORT/MIGraphX binding path is a genuine, large speedup once it's actually bei
 silently falling back. Full re-measurement with *both* fixes live (encoder succeeding too) is the
 next step, once the campaign is resumed again.
 
-**Not yet done:** confirm zero `ORT encoder failed` occurrences too (not just `ORT binding failed`)
-on a resumed session, then re-measure `perception_total_ms` with the fully-working ORT path.
+**Fully confirmed live (2026-07-13, resumed at session 60 with both fixes deployed):** sessions
+60-61 show **zero** `ORT encoder failed` and **zero** `ORT binding failed` occurrences across
+~8,000 combined log lines — both bugs are gone, not just the binding one. `perception_total_ms`
+holds steady at the fixed level: session 60 mean 2,158ms, session 61 mean 1,457ms (vs. session 57's
+250,099ms fully-broken baseline and the pre-ORT-crossover baseline of ~6,900-7,200ms, sessions
+50-52). The encoder fix didn't move the number further beyond what the binding fix alone already
+achieved — expected, since the encoder replaces 5 small matmuls (cheap) while the binding replaces
+the GRU + cross-attention call made repeatedly per settle iteration (the actual heavy compute).
+
+**Conclusion:** ORT/MIGraphX perception inference genuinely works and is genuinely fast — roughly
+**3-4× faster than the pre-ORT-crossover CPU baseline**, once both this bug and the encoder
+dim-drift bug (found while verifying this one, see above) are fixed. This is the real number; the
+original ADR 0037 "~2.1×/2.4×" claim was invalid (measured entirely on the silent-fallback path)
+and is superseded by this measurement. §24 and its ADR 0037 correction notes are now closed out —
+no further action needed on this item.
 
 ---
 
@@ -888,6 +901,6 @@ on a resumed session, then re-measure `perception_total_ms` with the fully-worki
 | ✅ §19 | **Novelty-proportional growth batch size** | Med | Growth-mechanism correctness | Deployed 2026-07-12 — see §19 below |
 | ✅ §20 | **Full 10x campaign launch + `campaign_status.py` + `eval_metrics.py` region-name fix** | Low (tooling) | Ops visibility / chart correctness | Deployed 2026-07-12 — see §20 below |
 | ✅ §21 | **Warm-store HNSW dump leak + broken cross-restart persistence** | Low | Disk usage (unbounded growth) / warm-index reload correctness | Fixed 2026-07-12 — see §21 below |
-| ⚠️ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Mechanism deployed 2026-07-12, but reported speedup **retracted** — see §24, ORT has never actually run successfully at a grown size |
+| ✅ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Mechanism deployed 2026-07-12; real speedup blocked by §24's bugs, now confirmed **~3-4× real speedup** live 2026-07-13 |
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
-| ✅ §24 | **ORT sparse→dense conversion hardcodes baseline N_UNITS** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Found 2026-07-12, fixed 2026-07-13 — see §24 below; real-speedup re-measurement still pending |
+| ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
