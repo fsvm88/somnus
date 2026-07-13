@@ -8,11 +8,14 @@ use std::path::Path;
 use ndarray::{Array2, Array3};
 use ort::{session::Session, value::TensorRef};
 
-use crate::EPISODE_DIM;
+use crate::{ENV_DIM, EPISODE_DIM, LANG_HIDDEN};
 
 const GRU_HIDDEN: usize = 256;
-// Encoder input dimensions per region: [speech, env, visual, language]
-const ENC_DIMS: [usize; 4] = [384, 512, 384, 896];
+// Encoder input dimensions per region: [speech, env, visual, language]. Derived from the
+// live constants, not a second hardcoded copy — a stale copy here (896 vs. LANG_HIDDEN=1024
+// after ADR 0036) previously caused every encoder call to fail with a language_enc dimension
+// mismatch (found 2026-07-13 resuming the growth campaign after gaps.md §24's fix).
+const ENC_DIMS: [usize; 4] = [384, ENV_DIM, 384, LANG_HIDDEN];
 
 pub struct OnnxPerceptionSession {
     sess_bind: Session,

@@ -831,10 +831,30 @@ reverting just `onnx_session.rs` via `git stash`) and passes after the fix. (2) 
 `cargo build/clippy/test --release -p somnus -p somnus-perception` clean, including the existing
 `ort_crossover_tests` and `phase5_smoke.rs` growth tests.
 
-**Not yet done:** re-measuring the real ORT speedup on a live campaign (the session-state doc's
-"grep the new session log for zero `ORT encoder failed`/`ORT binding failed`" check) — that
-requires actually resuming `scripts/resume_growth_campaign.sh` and watching a session's log, which
-is the next step, not part of this fix.
+**Live verification (2026-07-13, resuming the campaign at session 58):** the binding-path fix
+worked immediately — `ORT binding failed` occurrences: **zero** across sessions 58-60. But the log
+grep turned up a *second*, independent bug in the same call path: `ORT encoder failed` on
+`language_enc`, 100% of encoder calls, every session since resume. Root cause: `onnx_session.rs`'s
+`const ENC_DIMS: [usize; 4] = [384, 512, 384, 896]` hardcoded the language encoder input at 896 —
+stale since ADR 0036 raised `LANG_HIDDEN` to 1024, the exact drift class §22 already fixed on the
+Python export side but never fixed on this Rust caller. Fixed: `ENC_DIMS` now derived from the
+live `ENV_DIM`/`LANG_HIDDEN` constants instead of a second hardcoded copy. New regression test
+`ort_encoder_accepts_current_lang_hidden_dim` (same file) confirmed to fail pre-fix with the exact
+`language_enc`/896/1024 error seen in the campaign log, pass post-fix. Campaign was stopped
+(`scripts/stop_graceful.sh`) to deploy this second fix; `ort_binding_accepts_grown_region_size` was
+also updated to probe the graph's expected dim from ORT's own error message instead of hardcoding
+6886, since the campaign had grown past that value (to 7441) during the time the first fix ran.
+
+**Despite the encoder bug still being 100%-fallback, the binding fix alone was already a large win:**
+`perception_total_ms` mean dropped from **250,099ms** (session 57, fully broken — both encoder and
+binding silently failing) to **~1,900ms** (sessions 58-59, binding fixed, encoder still failing) —
+well *below* the pre-ORT-crossover baseline of ~6,900-7,200ms (sessions 50-52). Real-world evidence
+the ORT/MIGraphX binding path is a genuine, large speedup once it's actually being exercised, not
+silently falling back. Full re-measurement with *both* fixes live (encoder succeeding too) is the
+next step, once the campaign is resumed again.
+
+**Not yet done:** confirm zero `ORT encoder failed` occurrences too (not just `ORT binding failed`)
+on a resumed session, then re-measure `perception_total_ms` with the fully-working ORT path.
 
 ---
 
