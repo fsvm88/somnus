@@ -1,29 +1,28 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-12 (later still)
+> **Last updated:** 2026-07-13
 > **⏸️ STOPPED (clean, user-requested).** Campaign was at cycle 559/1310 (42.7%), region sizes
 > 6,886/9,660 (71.3%), stopped via `scripts/stop_graceful.sh` — confirmed clean exit, no data lost.
-> **Do not just resume it as-is** — read the next paragraph first, there's an open, unfixed bug.
 >
-> **⚠️ OPEN BUG, NOT YET FIXED — gaps.md §24, retracts part of §22/ADR 0037's claims.** Found
-> immediately before this shutdown: ORT/MIGraphX perception inference (§22, auto-enabled past
-> 1,230 units/region) has been silently failing on **every single call** since it first activated
-> — `crates/somnus-perception/src/lib.rs`'s sparse→dense conversion (`to_dense_n(N_UNITS)`, ~line
-> 899-919) hardcodes the *baseline* `N_UNITS` constant (1024) instead of each region's actual
-> grown size, so every ORT call hits a dimension mismatch and falls back to burn/CPU — slower than
-> not having ORT at all (pays both the failed-ORT-attempt overhead and the full burn computation).
-> 102,810 fallback occurrences in session 57's log alone (~1h45m), 2,400 in session 56 — present
-> from the very first ORT activation, not a later regression. **This means the "~2.1×/2.4×
-> measured speedup" reported earlier today for ADR 0037 was almost certainly invalid** — both
-> verification runs were already past baseline size, so both were likely hitting this same silent
-> fallback; there is no confirmed instance of ORT successfully accelerating anything on this
-> campaign yet. Fix: use each region's actual `n_units` (already exposed via `region_sizes()`,
-> same pattern as §17's `scaled_k`) instead of the `N_UNITS` constant at the 5 call sites + the
-> `lang_zero` fallback. **Before trusting any resumed-campaign timing numbers, grep the new
-> session log for `ORT encoder failed`/`ORT binding failed` — zero occurrences expected; if it's
-> not zero, the fix didn't work or wasn't applied.** No data was lost from this bug (burn fallback
-> is correct, just slow) — safe to resume without fixing first if speed doesn't matter right now,
-> but ORT is providing zero benefit until this lands.
+> **✅ gaps.md §24 FIXED (2026-07-13).** The bug described below (ORT sparse→dense conversion
+> hardcoding baseline `N_UNITS` instead of each region's grown size) is fixed: all 5
+> `to_dense_n(N_UNITS)` call sites in `crates/somnus-perception/src/lib.rs` now use each
+> `SparseActivation`'s own `n_units`; `lang_zero` fallbacks now read the live language-layer/region
+> size instead of the constant; `onnx_session.rs`'s `run_binding` now derives its ONNX input shapes
+> from each vector's own `.len()` instead of hardcoding `N_UNITS`. New regression test
+> `crates/somnus-perception/tests/ort_grown_region.rs` loads the actual leftover campaign ONNX graph
+> (`memory/onnx_models/perception_binding.onnx`, built at `n_units=6886`) and calls `run_binding`
+> directly — confirmed it fails pre-fix (`ShapeError/IncompatibleShape`, verified via a temporary
+> `git stash` revert) and passes post-fix. Full build/clippy/test clean. **Not yet committed.**
+> Full writeup: `ai-docs/gaps.md` §24.
+>
+> **Still pending (this is what's left before trusting resumed-campaign timing numbers):** this
+> was verified against the real ONNX artifact directly, NOT via a live campaign run — the
+> session-state's original ask ("grep the new session log for `ORT encoder failed`/`ORT binding
+> failed`, zero occurrences expected") has not been done yet. Next step: resume the campaign
+> (`scripts/resume_growth_campaign.sh`), let it build a fresh ORT session past the crossover, grep
+> the new session log for those two strings (zero expected), then re-measure the real ORT speedup
+> — the "~2.1×/2.4×" ADR 0037 number is still void until a genuine successful ORT call is observed.
 >
 > **To resume:** `scripts/resume_growth_campaign.sh` — self-contained, reads
 > `SESSION_START`/`SESSIONS`/`CYCLES`/`CLIPS`/etc. from the campaign's own `params.txt` +
@@ -71,10 +70,10 @@
 > instead of "fix now" since there was no live-campaign urgency (burn fallback keeps state correct,
 > just slow) and no user ask to fix immediately.
 >
-> **Next-session action:** fix gaps.md §24 (the `to_dense_n(N_UNITS)` bug), verify with a smoke
-> test that greps for zero `ORT encoder failed`/`ORT binding failed` occurrences, re-measure the
-> real speedup (previous numbers are void), THEN resume the campaign via
-> `scripts/resume_growth_campaign.sh`.
+> **Next-session action:** gaps.md §24 is fixed (see note above) but not yet verified live — commit
+> the fix, resume the campaign via `scripts/resume_growth_campaign.sh`, grep the new session log for
+> zero `ORT encoder failed`/`ORT binding failed` occurrences, THEN re-measure the real speedup
+> (previous numbers are void until that grep comes back clean).
 >
 > Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21/§22/§23/§24, ADR 0037.
 

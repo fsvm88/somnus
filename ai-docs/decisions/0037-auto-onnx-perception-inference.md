@@ -1,7 +1,8 @@
 # 0037. Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover
 
-- **Status:** accepted; auto-switch mechanism implemented and correct, but its target is currently
-  broken — see gaps.md §24 (found 2026-07-12, same day, not yet fixed)
+- **Status:** accepted; auto-switch mechanism implemented and correct. Its target was broken by the
+  gaps.md §24 bug (found 2026-07-12); §24 is now fixed (2026-07-13) but the real speedup is still
+  unmeasured against a live campaign — see update below.
 - **Date:** 2026-07-12
 
 > **⚠️ Update (2026-07-12, later):** the "~2.1×/2.4× measured speedup" claims below are almost
@@ -14,6 +15,13 @@
 > (the part this ADR is actually about) is sound and unaffected, but its payoff is unconfirmed
 > until §24 is fixed and re-measured with a check for zero `ORT encoder failed`/`ORT binding
 > failed` occurrences.
+>
+> **⚠️ Update (2026-07-13):** §24 is fixed — verified directly against the real leftover campaign
+> ONNX graph (built at `n_units=6886`), which now round-trips through `run_binding` correctly
+> (regression test `crates/somnus-perception/tests/ort_grown_region.rs`, confirmed to fail pre-fix and
+> pass post-fix). Still open: this was verified offline against a saved artifact, not via a live
+> campaign session — the "~2.1×/2.4×" speedup number above remains void until the campaign is
+> resumed and a session log shows zero `ORT encoder failed`/`ORT binding failed` occurrences.
 
 ## Context
 

@@ -8,7 +8,7 @@ use std::path::Path;
 use ndarray::{Array2, Array3};
 use ort::{session::Session, value::TensorRef};
 
-use crate::{EPISODE_DIM, N_UNITS};
+use crate::EPISODE_DIM;
 
 const GRU_HIDDEN: usize = 256;
 // Encoder input dimensions per region: [speech, env, visual, language]
@@ -115,12 +115,15 @@ impl OnnxPerceptionSession {
         sparse_z: &[Vec<f32>; 5],
         prev_ep: &[f32],
     ) -> anyhow::Result<Vec<f32>> {
+        // Shape from each vector's own length, not the baseline N_UNITS constant — the
+        // ONNX graph's actual input dims match each region's size at export time, which
+        // may be larger than baseline for a grown region (gaps.md §24).
         // Each ndarray must outlive the TensorRef that borrows it.
-        let sp0 = Array2::from_shape_vec((1, N_UNITS), sparse_z[0].clone())?;
-        let sp1 = Array2::from_shape_vec((1, N_UNITS), sparse_z[1].clone())?;
-        let sp2 = Array2::from_shape_vec((1, N_UNITS), sparse_z[2].clone())?;
-        let sp3 = Array2::from_shape_vec((1, N_UNITS), sparse_z[3].clone())?;
-        let sp4 = Array2::from_shape_vec((1, N_UNITS), sparse_z[4].clone())?;
+        let sp0 = Array2::from_shape_vec((1, sparse_z[0].len()), sparse_z[0].clone())?;
+        let sp1 = Array2::from_shape_vec((1, sparse_z[1].len()), sparse_z[1].clone())?;
+        let sp2 = Array2::from_shape_vec((1, sparse_z[2].len()), sparse_z[2].clone())?;
+        let sp3 = Array2::from_shape_vec((1, sparse_z[3].len()), sparse_z[3].clone())?;
+        let sp4 = Array2::from_shape_vec((1, sparse_z[4].len()), sparse_z[4].clone())?;
         let prev_arr = Array2::from_shape_vec((1, EPISODE_DIM), prev_ep.to_vec())?;
         let gru_arr = Array3::from_shape_vec((1, 1, GRU_HIDDEN), self.gru_hidden.clone())?;
 

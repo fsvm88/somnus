@@ -900,7 +900,7 @@ impl PerceptionProcessor {
             region: RegionId::Language,
             indices: vec![],
             values: vec![],
-            n_units: N_UNITS,
+            n_units: self.model.as_ref().unwrap().language_layer.n_units,
         };
         let sp = self.latest[0].as_ref().unwrap();
         let en = self.latest[1].as_ref().unwrap();
@@ -909,13 +909,15 @@ impl PerceptionProcessor {
         let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
 
         let ep = if let Some(ref mut ort) = self.ort_session {
-            // ORT binding path
+            // ORT binding path — use each region's own (possibly grown) size, not the
+            // baseline N_UNITS constant (gaps.md §24: this silently mismatched the ONNX
+            // graph's actual input dims for any region grown past the baseline).
             let sparse_z: [Vec<f32>; 5] = [
-                sp.to_dense_n(N_UNITS),
-                en.to_dense_n(N_UNITS),
-                vi.to_dense_n(N_UNITS),
-                sy.to_dense_n(N_UNITS),
-                lang.to_dense_n(N_UNITS),
+                sp.to_dense_n(sp.n_units),
+                en.to_dense_n(en.n_units),
+                vi.to_dense_n(vi.n_units),
+                sy.to_dense_n(sy.n_units),
+                lang.to_dense_n(lang.n_units),
             ];
             let prev_zeros = vec![0.0f32; EPISODE_DIM];
             let prev = latest_episode.map(|v| v.as_slice()).unwrap_or(&prev_zeros);
@@ -2707,12 +2709,17 @@ impl PerceptionProcessor {
                         // topk_no_dc: immutable model borrow, dropped before binding.
                         let sparse_z: [Vec<f32>; 5] = {
                             let m = self.model.as_ref().unwrap();
+                            let a0 = m.speech_layer.topk_from_z_no_dc(z0);
+                            let a1 = m.env_layer.topk_from_z_no_dc(z1);
+                            let a2 = m.visual_layer.topk_from_z_no_dc(z2);
+                            let a3 = m.symbolic_layer.topk_from_z_no_dc(z3);
+                            let a4 = m.language_layer.topk_from_z_no_dc(z4);
                             [
-                                m.speech_layer.topk_from_z_no_dc(z0).to_dense_n(N_UNITS),
-                                m.env_layer.topk_from_z_no_dc(z1).to_dense_n(N_UNITS),
-                                m.visual_layer.topk_from_z_no_dc(z2).to_dense_n(N_UNITS),
-                                m.symbolic_layer.topk_from_z_no_dc(z3).to_dense_n(N_UNITS),
-                                m.language_layer.topk_from_z_no_dc(z4).to_dense_n(N_UNITS),
+                                a0.to_dense_n(a0.n_units),
+                                a1.to_dense_n(a1.n_units),
+                                a2.to_dense_n(a2.n_units),
+                                a3.to_dense_n(a3.n_units),
+                                a4.to_dense_n(a4.n_units),
                             ]
                         };
                         // ORT binding — restore hidden so settle doesn't advance live GRU.
@@ -2768,12 +2775,14 @@ impl PerceptionProcessor {
                 } // model borrow dropped
 
                 if use_ort {
-                    // ── Path B: ORT binding ──────────────────────────────────────
+                    // ── Path B: ORT binding ── each region's own (possibly grown) size,
+                    // not the baseline N_UNITS constant (gaps.md §24).
+                    let region_sizes = self.region_sizes();
                     let sparse_z: [Vec<f32>; 5] = std::array::from_fn(|i| {
                         acts[i]
                             .as_ref()
-                            .map(|a| a.to_dense_n(N_UNITS))
-                            .unwrap_or_else(|| vec![0.0f32; N_UNITS])
+                            .map(|a| a.to_dense_n(a.n_units))
+                            .unwrap_or_else(|| vec![0.0f32; region_sizes[i]])
                     });
                     let ort = self.ort_session.as_mut().unwrap();
                     match ort.run_binding(&sparse_z, &current.0) {

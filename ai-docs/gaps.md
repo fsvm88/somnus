@@ -772,7 +772,7 @@ when profiling shows the subprocess/export overhead is itself a meaningful fract
 
 ---
 
-## 24. ORT sparse→dense conversion hardcodes baseline N_UNITS — ORT has never actually run at grown sizes ❌ FOUND, NOT YET FIXED (2026-07-12)
+## 24. ORT sparse→dense conversion hardcodes baseline N_UNITS — ORT has never actually run at grown sizes ✅ FIXED (2026-07-13)
 
 **Found while checking campaign status before a routine shutdown** — `perception_total_ms` had
 spiked to 188,000–196,000ms/cycle (vs. §22's ~6,500-7,700ms) and `gist_recall_rate`/
@@ -813,18 +813,28 @@ this needs the equivalent for `to_dense_n`'s target length — almost certainly
 `region_sizes()`) instead of the `N_UNITS` constant, at each of the 5 call sites plus the
 `lang_zero` fallback.
 
-**Not yet fixed** — found immediately before a routine campaign shutdown; documenting rather than
-rushing a fix in under time pressure. Campaign was stopped cleanly (`scripts/stop_graceful.sh`,
-confirmed clean exit) with this bug still present — no data was lost (burn fallback is *correct*,
-just slow, so the campaign's actual learned state is not corrupted by this), but essentially the
-entire time ORT has been "active" this campaign has gotten none of §22's intended benefit and paid
-extra overhead for the attempt.
+**Fix (2026-07-13):** all 5 `to_dense_n(N_UNITS)` call sites (the main `try_bind` binding path and
+both `settle_episode` ORT paths — encoder+binding and burn-kwta+binding) now pass each
+`SparseActivation`'s own `n_units` field instead of the baseline constant; the `lang_zero`
+fallbacks now read `self.model.as_ref().unwrap().language_layer.n_units` (or, in the settle
+burn-kwta path, `self.region_sizes()[i]`) instead of hardcoding `N_UNITS`. `onnx_session.rs`'s
+`run_binding` was also hardcoding `N_UNITS` for its `Array2` input shapes independent of the Rust
+caller's conversion bug — fixed to derive shape from each `sparse_z[i]`'s own `.len()`, so the ORT
+call and the vector it receives can never disagree on size again.
 
-**Next-session action:** fix the 5 `to_dense_n(N_UNITS)` call sites + `lang_zero`'s `n_units`
-field to use each region's actual current size; verify with a smoke test that greps the resulting
-log for `ORT encoder failed`/`ORT binding failed` (zero occurrences expected) *before* trusting
-any timing numbers — the exact check that was missing this time. Re-measure the real speedup only
-after confirming zero fallback occurrences.
+**Verified two ways:** (1) new regression test `crates/somnus-perception/tests/ort_grown_region.rs`
+loads the actual leftover campaign ONNX graph at `memory/onnx_models/perception_binding.onnx`
+(built with all 5 regions at `n_units=6886`, confirmed via `onnx.load()` inspecting `sp_0..sp_4`'s
+declared input shapes) and calls `run_binding` with 6886-length vectors — confirmed this test
+fails with `ShapeError/IncompatibleShape` against the pre-fix code (verified by temporarily
+reverting just `onnx_session.rs` via `git stash`) and passes after the fix. (2) full
+`cargo build/clippy/test --release -p somnus -p somnus-perception` clean, including the existing
+`ort_crossover_tests` and `phase5_smoke.rs` growth tests.
+
+**Not yet done:** re-measuring the real ORT speedup on a live campaign (the session-state doc's
+"grep the new session log for zero `ORT encoder failed`/`ORT binding failed`" check) — that
+requires actually resuming `scripts/resume_growth_campaign.sh` and watching a session's log, which
+is the next step, not part of this fix.
 
 ---
 
@@ -860,4 +870,4 @@ after confirming zero fallback occurrences.
 | ✅ §21 | **Warm-store HNSW dump leak + broken cross-restart persistence** | Low | Disk usage (unbounded growth) / warm-index reload correctness | Fixed 2026-07-12 — see §21 below |
 | ⚠️ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Mechanism deployed 2026-07-12, but reported speedup **retracted** — see §24, ORT has never actually run successfully at a grown size |
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
-| ❌ §24 | **ORT sparse→dense conversion hardcodes baseline N_UNITS** | Low | Correctness/perf — ORT silently no-ops past baseline, worse than CPU-only | Found 2026-07-12, not yet fixed — see §24 below |
+| ✅ §24 | **ORT sparse→dense conversion hardcodes baseline N_UNITS** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Found 2026-07-12, fixed 2026-07-13 — see §24 below; real-speedup re-measurement still pending |
