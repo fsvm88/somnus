@@ -1,10 +1,44 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-13 (later still)
-> **▶️ RUNNING.** Campaign resumed at session 60/131; as of this writeup at session 69/131 (region
-> sizes 8,494/9,660 ≈ 88%) — both gaps.md §24 bugs are fixed, committed, and confirmed live with
-> zero ORT fallback occurrences. `CAMPAIGN_DIR=memory/campaign_growth10x`, `CLIPS`=full 145-file
-> h3h3+shorts+podcasts corpus. Check `scripts/campaign_status.py` for the current live state.
+> **Last updated:** 2026-07-14
+> **⏸️ STOPPED (clean, user-requested shutdown).** Campaign was at session 75/131, cycle 6, region
+> sizes 9,151/9,660 ≈ **94.7%** — very close to the 10x target. Stopped via
+> `scripts/stop_graceful.sh`, confirmed clean exit, no data lost. `CAMPAIGN_DIR=memory/campaign_growth10x`,
+> `CLIPS`=full 145-file h3h3+shorts+podcasts corpus. **No known open bugs; safe to resume anytime**
+> via `scripts/resume_growth_campaign.sh` (self-contained, computes the correct resume point from
+> the campaign's own on-disk state).
+>
+> **✅ gaps.md §25 — sparse-aware binding projection, deployed 2026-07-13, with an honest
+> correction added 2026-07-14.** Raised while discussing what would genuinely help scale toward
+> mouse-order brain size rather than just running more GPU cycles: `BindingArea::forward`
+> (`crates/somnus-perception/src/binding.rs`) was materializing a dense `[1, n_units]` vector from each
+> region's ~98%-zero k-WTA activation and running a full dense matmul on it. Replaced with a sparse
+> `select(0, active_indices)` gather + small matmul — numerically identical (new test
+> `sparse_projection_matches_dense_reference` proves it), all pre-existing `BindingArea` tests pass
+> unchanged, **measured 11.4× speedup** in an isolated benchmark at the campaign's actual region
+> size (n=8,655, k=169). Deployed live at session 72 (stop/rebuild/resume, same safe pattern as
+> every other restart this campaign).
+>
+> **Correction (2026-07-14):** checked `perception_total_ms`/`nrem_wall_ms` before vs. after
+> deploying — no visible change. Traced why: `perc_bind_us` (the profiling metric that motivated
+> this fix) times the whole `try_bind` call, which — since ORT is active past the §22 crossover —
+> dispatches to `ort.run_binding` (ONNX/MIGraphX), not `burn`'s `BindingArea::forward` at all. The
+> fix is real and correctly deployed, but it's currently **dormant** on this specific campaign: the
+> only call sites that hit it (non-ORT `try_bind` branch, ORT-failure fallback in `settle_episode`,
+> the `binding_only` validation helper) don't fire while ORT is healthy. It'll matter for
+> pre-crossover campaigns, CPU-only/no-MIGraphX hardware, and as an ORT-failure safety net — keep
+> it deployed (strictly better, costs nothing when dormant) — but don't attribute any of this
+> campaign's remaining wall-clock to it. Separately noticed while tracing this: no training function
+> (`replay_step*`, `wake_reconstruct_step*`) calls `BindingArea::forward` either, so its weights
+> (`region_projs`, `w_q`/`w_k`/`w_v`) currently receive no gradient updates from any path in this
+> codebase — un-investigated, flagged for later, not fixed here. Full writeup: `ai-docs/gaps.md` §25.
+>
+> **Queued next (not started, by design):** the harder, deeper lever from the same discussion — the
+> k-WTA *encoder* itself is inherently O(input_dim × n_units) since every candidate unit must be
+> scored before top-k can pick winners, and can't be sparsified the way the binding projection was.
+> Getting real headroom toward mouse-order scale (not just bigger `N_UNITS`) likely needs local/
+> blocked connectivity or hierarchical/approximate WTA — a genuine research question, to be written
+> up as a research note before any implementation. User confirmed this stays queued, not started.
 >
 > **✅ gaps.md §24 FULLY FIXED AND CONFIRMED LIVE (2026-07-13).** Two independent bugs, both in the
 > ORT call path, found back to back:
@@ -82,10 +116,19 @@
 > **Restart 4** (session 59→60, gaps.md §24 bug #2 fix): stopped cleanly to deploy the encoder-side
 > LANG_HIDDEN fix. Resumed at session 60 — both bugs confirmed fixed, campaign running clean since.
 >
-> **Next-session action:** none queued — campaign is healthy and running unattended toward the 10x
-> target (session 60+/131). Check in periodically or let it run to completion; no known open bugs.
+> **Restart 5** (session 71→72, gaps.md §25): stopped cleanly to deploy the sparse binding-projection
+> fix. Resumed at session 72 — confirmed clean (zero ORT fallback), though see the §25 correction
+> above re: this fix's actual live impact.
 >
-> Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21/§22/§23/§24, ADR 0037.
+> **Shutdown** (session 75, this writeup): user asked to save everything and shut down cleanly.
+> Docs brought current (this file, `gaps.md` §25 correction), all code changes already committed,
+> campaign stopped via `scripts/stop_graceful.sh` — confirmed clean exit.
+>
+> **Next-session action:** none queued as a bug — campaign is healthy, 94.7% to target, safe to
+> resume anytime with `scripts/resume_growth_campaign.sh`. The one open design thread is the
+> queued-next encoder-sparsity research note (see above) — user-driven, not started.
+>
+> Full backstory: `ai-docs/gaps.md` §16/§19/§20/§21/§22/§23/§24/§25, ADR 0037.
 
 ## Historical (superseded by the in-progress campaign above, kept for context)
 

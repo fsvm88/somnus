@@ -906,12 +906,35 @@ gradient updates), so this is correctness- and training-neutral, not an approxim
   Because `scaled_k` keeps `k/n` constant as regions grow, this ratio holds at any future scale —
   it's not a one-time win that erodes as the campaign continues toward its target.
 
-**Relationship to §22/ADR 0037 (ORT path):** independent and complementary. ORT/MIGraphX
-accelerates the *dense* matmul on GPU; this change reduces the FLOP count itself regardless of
-backend. Both apply to `burn`'s CPU training/replay path (which this change touches) — the ORT
-inference path already has its own graph-level shape correctness (§24) but doesn't independently
-exploit sparsity inside the exported ONNX binding graph; revisiting that is future work, not
-scoped here.
+**Correction (2026-07-14) — live-metric impact is currently smaller than the deployment writeup
+implied.** Deployed live at session 72; sessions 72-75 show no clear drop in `perception_total_ms`
+or `nrem_wall_ms` versus 60-71. Traced why: `perc_bind_us` (the metric that motivated this fix)
+times the *entire* `try_bind` call (`crates/somnus-perception/src/lib.rs:456-459`), which — once ORT
+is active past the §22 crossover — dispatches to `ort.run_binding` (the ONNX/MIGraphX call), not
+`burn`'s `BindingArea::forward`. So the profiling data that motivated this change was very likely
+measuring ORT overhead, not the dense `burn` matmul this fix actually touches. Grepped every call
+site: `BindingArea::forward` is invoked only from `try_bind`'s non-ORT branch, `settle_episode`'s
+ORT-failure fallback branches, and the `binding_only` ONNX-validation helper — none of which fire
+in the current campaign (ORT healthy, zero fallback occurrences). Separately, no training function
+(`replay_step*`, `wake_reconstruct_step*`, `fused_replay_wake_step_batch`) calls
+`BindingArea::forward` either — `wake_reconstruct_step` rebuilds its episode tensor from plain
+`&[f32]` data rather than a tracked graph node, so `BindingArea`'s weights (`region_projs`,
+`w_q`/`w_k`/`w_v`) currently receive no gradient updates from any path in this codebase, a
+separate, un-investigated fact worth a closer look later but out of scope here.
+
+**Net effect:** the fix is real, numerically verified, and a genuine 11.4× win wherever `burn`'s
+binding path actually runs — pre-crossover campaigns, CPU-only/no-MIGraphX hardware, and the ORT
+failure-fallback safety net — but it is **not** currently accelerating this specific campaign's
+live wake-path cost, since ORT already bypasses it entirely. Keep this deployed (it's strictly
+better than the code it replaced, and costs nothing when dormant), but don't count on it for this
+campaign's remaining ETA, and don't repeat the "profiled per-cycle metric ⇒ blame `burn`" mistake
+next time without first checking whether ORT owns that call site.
+
+**Relationship to §22/ADR 0037 (ORT path):** independent and complementary in principle — ORT/MIGraphX
+accelerates the *dense* matmul on GPU; this change would reduce the FLOP count itself regardless of
+backend, in the cases where `burn`'s path actually runs (see correction above). The ORT inference
+path already has its own graph-level shape correctness (§24) but doesn't independently exploit
+sparsity inside the exported ONNX binding graph; revisiting that is future work, not scoped here.
 
 **Not pursued here, deliberately queued next:** the deeper architectural question raised in the
 same discussion — the k-WTA *encoder* itself (raw embedding → n_units pre-activations) is
@@ -957,4 +980,4 @@ implementation.
 | ✅ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Mechanism deployed 2026-07-12; real speedup blocked by §24's bugs, now confirmed **~3-4× real speedup** live 2026-07-13 |
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
-| ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Growth-scaling headroom before hardware ceiling; complements §22's GPU backend | Deployed 2026-07-13, measured 11.4× speedup at current campaign region size — see §25 below |
+| ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics |
