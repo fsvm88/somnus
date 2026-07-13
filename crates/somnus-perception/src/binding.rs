@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{Gru, GruConfig, Linear, LinearConfig},
-    tensor::{activation, backend::Backend, Tensor, TensorData},
+    tensor::{activation, backend::Backend, Int, Tensor, TensorData},
 };
 
 use crate::region::{SparseActivation, N_UNITS};
@@ -119,17 +119,29 @@ impl<B: Backend> BindingArea<B> {
             &self.region_4,
         ];
 
-        // Project each region: region_n[i] → D_PROJ (region_n[i] == N_UNITS until grown)
+        // Project each region: region_n[i] → D_PROJ. A k-WTA activation is >95% zero
+        // (k_active/n_units ≈ 2%, preserved by scaled_k as regions grow), so instead of
+        // materializing a dense [1, n] vector and running the full [n, D_PROJ] matmul
+        // (mostly multiplying by zero), gather only the active rows of the projection
+        // weight — [k, D_PROJ] — and contract against the k nonzero values. Same result
+        // (region_projs have no bias, see `new()`), ~n/k_active fewer FLOPs, and `select`
+        // is autodiff-tracked so gradients still flow to just the active weight rows
+        // (gaps.md §25).
         let projected: Vec<Tensor<B, 2>> = acts
             .iter()
             .zip(region_projs.iter())
-            .enumerate()
-            .map(|(i, (act, proj))| {
-                let n = self.region_n[i];
-                let dense = act.to_dense_n(n);
-                let t = Tensor::<B, 2>::from_data(TensorData::new(dense, [1, n]), device);
-                let out: Tensor<B, 2> = proj.forward(t); // [1, D_PROJ]
-                out
+            .map(|(act, proj)| {
+                if act.indices.is_empty() {
+                    return Tensor::<B, 2>::zeros([1, D_PROJ], device);
+                }
+                let idx_data: Vec<i64> = act.indices.iter().map(|&i| i as i64).collect();
+                let k = idx_data.len();
+                let idx_t: Tensor<B, 1, Int> =
+                    Tensor::from_data(TensorData::new(idx_data, [k]), device);
+                let gathered = proj.weight.val().select(0, idx_t); // [k, D_PROJ]
+                let vals_t: Tensor<B, 2> =
+                    Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), device);
+                vals_t.matmul(gathered) // [1, D_PROJ]
             })
             .collect();
 
@@ -327,6 +339,39 @@ mod tests {
         );
         // Suppress unused-mut warning after the initialisation above.
         let _ = &mut low_block;
+    }
+
+    /// gaps.md §25: the sparse gather-based region projection must produce exactly the
+    /// same result as the old dense `to_dense_n` + full `Linear::forward` it replaced —
+    /// same math, just skipping the multiply-by-zero terms. Compares against a
+    /// hand-rolled dense reference computed independently of `BindingArea::forward`.
+    #[test]
+    fn sparse_projection_matches_dense_reference() {
+        let device = NdArrayDevice::Cpu;
+        let area = make_area();
+        let act = SparseActivation {
+            region: RegionId::AudioSpeech,
+            indices: vec![3, 7, 100, 999],
+            values: vec![0.5, -1.2, 2.0, 0.1],
+            n_units: N_UNITS,
+        };
+
+        // Reference: old dense path (to_dense_n + full Linear::forward).
+        let dense = act.to_dense_n(N_UNITS);
+        let dense_t: Tensor<NdArray, 2> = Tensor::from_data(TensorData::new(dense, [1, N_UNITS]), &device);
+        let dense_out = area.region_0.forward(dense_t);
+
+        // Sparse path: gather only the active rows and contract against the nonzero values.
+        let idx_data: Vec<i64> = act.indices.iter().map(|&i| i as i64).collect();
+        let k = idx_data.len();
+        let idx_t: Tensor<NdArray, 1, Int> = Tensor::from_data(TensorData::new(idx_data, [k]), &device);
+        let gathered = area.region_0.weight.val().select(0, idx_t);
+        let vals_t: Tensor<NdArray, 2> = Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), &device);
+        let sparse_out = vals_t.matmul(gathered);
+
+        dense_out
+            .into_data()
+            .assert_approx_eq::<f32>(&sparse_out.into_data(), burn::tensor::Tolerance::default());
     }
 
     #[test]

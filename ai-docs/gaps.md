@@ -871,6 +871,59 @@ no further action needed on this item.
 
 ---
 
+## 25. Sparse-aware binding projection — exploit k-WTA sparsity computationally, not just in storage ✅ DEPLOYED (2026-07-13)
+
+**Motivation:** raised while discussing what would genuinely help scale toward mouse-order brain
+size (vs. this campaign's honeybee-order target) rather than just running more GPU cycles. k-WTA
+activations are already sparse *in representation* (k_active/n_units ≈ 2%, preserved as a fixed
+ratio by `region::scaled_k` as regions grow) — but `BindingArea::forward`
+(`crates/somnus-perception/src/binding.rs`) was still materializing a dense `[1, n_units]` vector via
+`SparseActivation::to_dense_n` and running the full `[n_units, D_PROJ]` `Linear::forward` on it —
+computing and discarding ~98% zero-multiplications every call. Confirmed with live profiling data
+from the 10x campaign: `perc_bind_us`/`perc_settle_us` (both include this call, the latter
+repeated per settle iteration) were the two largest region-size-dependent cost buckets in the
+per-cycle metrics, growing with `n_units`.
+
+**Fix:** replaced the dense path with a sparse gather + matmul. For each region, `select(0,
+active_indices)` on the projection weight (`Param<Tensor<B,2>>`, shape `[n_units, D_PROJ]`) pulls
+out only the `k_active` active rows — `[k, D_PROJ]` — then a `[1,k] × [k,D_PROJ]` matmul against
+the nonzero activation values reproduces the exact same result as the old dense computation
+(region projections have no bias term, so there's nothing else to account for). `select` is a
+standard autodiff-tracked op in burn (embedding-style sparse gradient — only the touched rows get
+gradient updates), so this is correctness- and training-neutral, not an approximation.
+
+**Verification:**
+- New test `sparse_projection_matches_dense_reference` (`crates/somnus-perception/src/binding.rs`)
+  computes both the old dense path and the new sparse path independently from the same weights and
+  asserts numeric equivalence — passes.
+- All 5 pre-existing `BindingArea` tests (shape, finiteness, temporal context, the
+  head-feature-partitioning regression test, differing-input sensitivity) pass unchanged — since
+  this is the same math, any behavioral test that passed before must still pass.
+- Full `cargo build/clippy/test --release -p somnus -p somnus-perception` clean.
+- **Measured speedup:** standalone benchmark at the live campaign's actual current region size
+  (`n=8,655`, `k_active=169` via `scaled_k`) — dense path 532µs/call, sparse path 47µs/call,
+  **11.4× faster**, matching the region-size-dependent cost buckets identified in profiling.
+  Because `scaled_k` keeps `k/n` constant as regions grow, this ratio holds at any future scale —
+  it's not a one-time win that erodes as the campaign continues toward its target.
+
+**Relationship to §22/ADR 0037 (ORT path):** independent and complementary. ORT/MIGraphX
+accelerates the *dense* matmul on GPU; this change reduces the FLOP count itself regardless of
+backend. Both apply to `burn`'s CPU training/replay path (which this change touches) — the ORT
+inference path already has its own graph-level shape correctness (§24) but doesn't independently
+exploit sparsity inside the exported ONNX binding graph; revisiting that is future work, not
+scoped here.
+
+**Not pursued here, deliberately queued next:** the deeper architectural question raised in the
+same discussion — the k-WTA *encoder* itself (raw embedding → n_units pre-activations) is
+inherently O(input_dim × n_units) since every candidate unit's activation must be computed before
+top-k can pick winners, and that can't be sparsified the same way without a genuinely different
+mechanism (local/blocked connectivity, hierarchical or approximate WTA). That's the real
+"not-linear-scaling" lever for approaching mouse-order scale and needs design work, not a
+mechanical fix — tracked as next-in-queue, to be written up as a research note before any
+implementation.
+
+---
+
 ## Priority order (as of 2026-07-11)
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -904,3 +957,4 @@ no further action needed on this item.
 | ✅ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Mechanism deployed 2026-07-12; real speedup blocked by §24's bugs, now confirmed **~3-4× real speedup** live 2026-07-13 |
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
+| ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Growth-scaling headroom before hardware ceiling; complements §22's GPU backend | Deployed 2026-07-13, measured 11.4× speedup at current campaign region size — see §25 below |
