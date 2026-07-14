@@ -1008,10 +1008,53 @@ extended JSON schema without error, and (4) `kwta_score_matmul` dominates `kwta_
 ~124–165× even at tiny baseline region sizes — early live evidence bearing on ADR 0038's still-open
 question, not yet at the campaign's actual ~9,660-unit scale.
 
-**Not done, deliberately deferred:** `somnus-memory` has zero converted call sites (it never had
-hand-rolled timers to convert — its I/O paths were never individually timed). Adding
-instrumentation there is future opportunistic work, not part of this conversion. Full design
-rationale and the "why some spans use direct `METRICS.record()` instead of the macro" explanation:
+**Follow-up, same session: full-coverage expansion.** User asked to go further still — "make
+somnus-metrics cover all code... reach into every stupid step and evaluate it against an A/B run."
+Ran a 3-way parallel inventory (Explore agents) of every remaining uninstrumented data-handling
+operation across `somnus-perception`, `somnus-memory`, and `somnus-sensory`/`somnus`'s action/ASR paths, then
+instrumented essentially everything the inventory flagged as "operation granularity" (not a
+per-element tight loop already covered by an enclosing aggregate). `Metric` grew from 24 to 67
+variants:
+
+- **`somnus-perception`** (+25): `BindingArea::forward`, ORT `run_encoder`/`run_binding`,
+  `fused_replay_wake_step_batch`'s 3 internal sub-phases (SAE/head/backward — previously one
+  opaque call-site metric), `refresh_language_cache` (previously silently untimed despite its own
+  doc comment claiming otherwise), the full ORT lifecycle (`rebuild_ort_session`,
+  `export_weights_for_onnx`, `enable_ort_inference`), `homeostatic_decay`, growth/pruning
+  (`grow_region`, `grow_region_seeded`, `prune_region`), every REM self-probe function
+  (`measure_mse`, `synthesize_episode`, `measure_output_mse_inference`, `infer_episode_outputs`,
+  `collect_high_residual_inputs`), `wake_reconstruct_step`, the async `wake_worker::train_step`
+  (its own background OS thread — confirmed atomics are safe to write cross-thread, no locking
+  needed), all 3 `EmaOutputHeads` sub-steps, and `refresh_autodiff_state`.
+- **`somnus-memory`** (+10): `ColdArchive::open`/`truncate_to_recent`/`evict_lowest_salience`,
+  `SemanticStore::load_warm`, `RecollectionLayer::promote`, `snapshot::save_episodic`/
+  `load_episodic`/`save_snapshot`/`load_snapshot` (the latter's fast-mmap vs. slow-cold-rebuild
+  branches — documented up to ~3 min at 164k records — now separately attributable), and
+  `pq::convert_cold_to_pq`. Closes the "zero converted call sites" gap the original §26 writeup
+  above left open.
+- **`somnus-sensory`** (+1): one aggregate `MediaFileDecode` metric spanning a whole file's
+  decode-thread lifetime (demux + decode + resample/scale + both EOF flush passes) — deliberately
+  *not* per-packet, per the crate's own tight-loop guardrail.
+- **`somnus` binary** (+7): `ActionDecoder::new`/`generate` (the full autoregressive LM generation
+  loop), `GainWorker`'s background-thread compute (another cross-thread atomics case),
+  `WhisperDecoder::decode_greedy` (ASR), `AudioProcessor::ingest`'s resampling step, the
+  language-embedding step in `ingest_language_line` (previously invisible — `MainPerceptionIngest`
+  only started timing after this returned), and `record_episode`'s work outside its already-timed
+  `MainWarmQuery` sub-call.
+
+Two new structural patterns, both documented in ADR 0039: the **private-`_inner`-method split**
+(the default for any function with early `return`/`?`/`bail!`, used for the large majority of new
+sites) and the **immediately-invoked-closure wrap** (used once, for `somnus-sensory`'s decode-thread
+closure, which had no separate method to split into). Both preserve the original body byte-for-byte
+aside from the wrapper — behavior unchanged by construction.
+
+**Verified:** full workspace build/clippy/test clean in both feature states after every single
+function conversion (rebuilt and retested incrementally, not just at the end). A live pilot with
+the fully-expanded coverage recorded **40 distinct metrics simultaneously** in one small 2-session
+run — including the two cross-thread ones firing correctly, and metrics tied to conditions the
+pilot didn't trigger (region growth, `--action`, cold-archive eviction) correctly staying at zero
+rather than silently missing. Full design rationale, the two new patterns, and the "why some spans
+use direct `METRICS.record()` instead of the macro" explanation:
 `ai-docs/decisions/0039-unified-metrics-instrumentation.md`.
 
 ---
@@ -1050,4 +1093,4 @@ rationale and the "why some spans use direct `METRICS.record()` instead of the m
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
 | ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics. Follow-on research note + ADR 0038 (encoder scoring-cost scaling) written 2026-07-14 — see `sparse-coding.md`; not started |
-| ✅ §26 | **Unified two-tier metrics instrumentation** (`somnus-metrics`, ADR 0039) | Med | Ops visibility — every hand-rolled timer now shares one registry/macro system, "big item" tier always on, granular tier opt-in | Implemented 2026-07-14 — see §26 below |
+| ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 67-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR; every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14 — see §26 below |

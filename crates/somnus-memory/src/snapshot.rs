@@ -43,6 +43,14 @@ use crate::{
 const EPISODIC_MAGIC: &[u8; 8] = b"SMNHOT02";
 
 pub fn save_episodic(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {
+    let (result, _) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::SnapshotSaveEpisodic,
+        save_episodic_inner(buf, path)
+    );
+    result
+}
+
+fn save_episodic_inner(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {
     let file = fs::File::create(path)?;
     let mut w = BufWriter::new(file);
 
@@ -73,6 +81,14 @@ pub fn save_episodic(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {
 }
 
 pub fn load_episodic(path: &Path, capacity: usize) -> MemoryResult<EpisodicBuffer> {
+    let (result, _) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::SnapshotLoadEpisodic,
+        load_episodic_inner(path, capacity)
+    );
+    result
+}
+
+fn load_episodic_inner(path: &Path, capacity: usize) -> MemoryResult<EpisodicBuffer> {
     let file = fs::File::open(path)?;
     let mut r = BufReader::new(file);
 
@@ -123,6 +139,14 @@ pub fn load_episodic(path: &Path, capacity: usize) -> MemoryResult<EpisodicBuffe
 /// Also rebuilds the SemanticStore from all episode records in the buffer
 /// (the warm tier is reconstructed on load, not persisted separately).
 pub fn save_snapshot(episodic: &EpisodicBuffer, memory_dir: &Path) -> MemoryResult<()> {
+    let (result, _) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::SnapshotSave,
+        save_snapshot_inner(episodic, memory_dir)
+    );
+    result
+}
+
+fn save_snapshot_inner(episodic: &EpisodicBuffer, memory_dir: &Path) -> MemoryResult<()> {
     let tmp = memory_dir.join("snapshot.tmp");
     let snap = memory_dir.join("snapshot");
 
@@ -278,6 +302,18 @@ pub fn load_wake_ewma(memory_dir: &Path) -> (f32, u64) {
 ///
 /// Returns None if no snapshot exists.
 pub fn load_snapshot(
+    memory_dir: &Path,
+    episodic_capacity: usize,
+    episode_dim: usize,
+) -> MemoryResult<Option<(EpisodicBuffer, SemanticStore)>> {
+    let (result, _) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::SnapshotLoad,
+        load_snapshot_inner(memory_dir, episodic_capacity, episode_dim)
+    );
+    result
+}
+
+fn load_snapshot_inner(
     memory_dir: &Path,
     episodic_capacity: usize,
     episode_dim: usize,

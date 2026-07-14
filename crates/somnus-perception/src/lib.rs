@@ -78,10 +78,12 @@ impl EmaOutputHeads {
     /// EMA-blend a fresh set of live head weights (NdArray inner tensors).
     /// Shared by the in-thread `update` path and the async WakeReconWorker.
     pub(crate) fn update_from_weights(&mut self, live: [burn::tensor::Tensor<NdArray, 2>; 5]) {
-        for (ema, w) in self.heads.iter_mut().zip(live) {
-            *ema = ema.clone() * EMA_ALPHA + w * (1.0 - EMA_ALPHA);
-        }
-        self.sync_flat();
+        somnus_metrics::timed_core!(somnus_metrics::Metric::EmaUpdateFromWeights, {
+            for (ema, w) in self.heads.iter_mut().zip(live) {
+                *ema = ema.clone() * EMA_ALPHA + w * (1.0 - EMA_ALPHA);
+            }
+            self.sync_flat();
+        });
     }
 
     /// Flat EMA weights for streaming back from the worker thread.
@@ -99,39 +101,44 @@ impl EmaOutputHeads {
 
     /// Re-extract flat weight arrays from the EMA tensors.
     fn sync_flat(&mut self) {
-        for (i, h) in self.heads.iter().enumerate() {
-            let dims = h.dims();
-            self.d_out[i] = dims[1];
-            self.flat[i] = h.clone().into_data().convert::<f32>().to_vec().unwrap();
-        }
+        somnus_metrics::timed_core!(somnus_metrics::Metric::EmaSyncFlat, {
+            for (i, h) in self.heads.iter().enumerate() {
+                let dims = h.dims();
+                self.d_out[i] = dims[1];
+                self.flat[i] = h.clone().into_data().convert::<f32>().to_vec().unwrap();
+            }
+        });
     }
 
     /// Inference-only head forward: ep_data @ weight → Vec<f32>.
     /// Uses sgemm for AVX2/FMA-accelerated GEMV.
     fn predict(&self, ep_data: &[f32], idx: usize) -> Vec<f32> {
-        let w = &self.flat[idx];
-        let d_in = ep_data.len();
-        let d_out = self.d_out[idx];
-        let mut out = vec![0.0f32; d_out];
-        // A: [1, d_in] row-major   B: [d_in, d_out] row-major   C: [1, d_out]
-        unsafe {
-            matrixmultiply::sgemm(
-                1,
-                d_in,
-                d_out,
-                1.0,
-                ep_data.as_ptr(),
-                d_in as isize,
-                1,
-                w.as_ptr(),
-                d_out as isize,
-                1,
-                0.0,
-                out.as_mut_ptr(),
-                d_out as isize,
-                1,
-            );
-        }
+        let (out, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::EmaPredict, {
+            let w = &self.flat[idx];
+            let d_in = ep_data.len();
+            let d_out = self.d_out[idx];
+            let mut out = vec![0.0f32; d_out];
+            // A: [1, d_in] row-major   B: [d_in, d_out] row-major   C: [1, d_out]
+            unsafe {
+                matrixmultiply::sgemm(
+                    1,
+                    d_in,
+                    d_out,
+                    1.0,
+                    ep_data.as_ptr(),
+                    d_in as isize,
+                    1,
+                    w.as_ptr(),
+                    d_out as isize,
+                    1,
+                    0.0,
+                    out.as_mut_ptr(),
+                    d_out as isize,
+                    1,
+                );
+            }
+            out
+        });
         out
     }
 }
@@ -854,22 +861,23 @@ impl PerceptionProcessor {
     }
 
     fn refresh_language_cache(&mut self) {
-        // Phase 1.5: when encoder ORT is active, skip — the language z comes from
-        // run_encoder in try_bind, which uses latest_inputs[Language] directly.
-        if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-            return;
-        }
-        let device = self.device;
-        if let Some(emb) = self.last_language_input.clone() {
-            let act = self
-                .model
-                .as_ref()
-                .unwrap()
-                .language_layer
-                .forward_no_dc(&emb, &device);
-            self.latest[RegionId::Language.as_index()] = Some(act);
-            self.latest_inputs[RegionId::Language.as_index()] = Some(emb);
-        }
+        somnus_metrics::timed_core!(somnus_metrics::Metric::RefreshLanguageCache, {
+            // Phase 1.5: when encoder ORT is active, skip — the language z comes from
+            // run_encoder in try_bind, which uses latest_inputs[Language] directly.
+            if !self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+                let device = self.device;
+                if let Some(emb) = self.last_language_input.clone() {
+                    let act = self
+                        .model
+                        .as_ref()
+                        .unwrap()
+                        .language_layer
+                        .forward_no_dc(&emb, &device);
+                    self.latest[RegionId::Language.as_index()] = Some(act);
+                    self.latest_inputs[RegionId::Language.as_index()] = Some(emb);
+                }
+            }
+        });
     }
 
     #[allow(clippy::type_complexity)]
@@ -1257,148 +1265,158 @@ impl PerceptionProcessor {
         // ── Phase 1: SAE replay losses (needs &mut model for duty-cycle updates) ──
         let sae_l1_coeff = self.sae_l1_coeff;
         let batch_topk = self.batch_topk;
-        let mut sae_loss: Option<Tensor<TrainB, 1>> = None;
-        let mut sae_n_terms = 0usize;
-        {
-            let model = self.model.as_mut().unwrap();
-            for region_idx in 0..5usize {
-                let valid: Vec<&Vec<f32>> = batch
-                    .iter()
-                    .filter_map(|r| {
-                        let v = &r[region_idx];
-                        if v.is_empty() {
-                            None
-                        } else {
-                            Some(v)
+        let ((sae_loss, sae_n_terms), _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::FusedReplaySaePhase, {
+                let mut sae_loss: Option<Tensor<TrainB, 1>> = None;
+                let mut sae_n_terms = 0usize;
+                {
+                    let model = self.model.as_mut().unwrap();
+                    for region_idx in 0..5usize {
+                        let valid: Vec<&Vec<f32>> = batch
+                            .iter()
+                            .filter_map(|r| {
+                                let v = &r[region_idx];
+                                if v.is_empty() {
+                                    None
+                                } else {
+                                    Some(v)
+                                }
+                            })
+                            .collect();
+                        if valid.is_empty() {
+                            continue;
                         }
-                    })
-                    .collect();
-                if valid.is_empty() {
-                    continue;
-                }
-                let b = valid.len();
-                let n_in = valid[0].len();
-                let flat: Vec<f32> = valid.iter().flat_map(|v| v.iter().copied()).collect();
+                        let b = valid.len();
+                        let n_in = valid[0].len();
+                        let flat: Vec<f32> = valid.iter().flat_map(|v| v.iter().copied()).collect();
 
-                let input_batch: Tensor<TrainB, 2> =
-                    Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
+                        let input_batch: Tensor<TrainB, 2> =
+                            Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
 
-                let (z_batch, flat_masks) = match region_idx {
-                    0 => {
-                        model
-                            .speech_layer
-                            .forward_tracked_batch(input_batch.clone(), b, batch_topk)
+                        let (z_batch, flat_masks) = match region_idx {
+                            0 => model.speech_layer.forward_tracked_batch(
+                                input_batch.clone(),
+                                b,
+                                batch_topk,
+                            ),
+                            1 => model.env_layer.forward_tracked_batch(
+                                input_batch.clone(),
+                                b,
+                                batch_topk,
+                            ),
+                            2 => model.visual_layer.forward_tracked_batch(
+                                input_batch.clone(),
+                                b,
+                                batch_topk,
+                            ),
+                            3 => model.symbolic_layer.forward_tracked_batch(
+                                input_batch.clone(),
+                                b,
+                                batch_topk,
+                            ),
+                            4 => model.language_layer.forward_tracked_batch(
+                                input_batch.clone(),
+                                b,
+                                batch_topk,
+                            ),
+                            _ => unreachable!(),
+                        };
+
+                        let n_units = flat_masks.len() / b;
+                        let mask_inner: Tensor<NdArray, 2> =
+                            Tensor::from_data(TensorData::new(flat_masks, [b, n_units]), &device);
+                        let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
+                        let sparse_z = z_batch * mask;
+                        let l1_term: Option<Tensor<TrainB, 1>> = if sae_l1_coeff > 0.0 {
+                            Some(sparse_z.clone().abs().mean())
+                        } else {
+                            None
+                        };
+                        let target: Tensor<TrainB, 2> =
+                            Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
+
+                        let mse_loss = match region_idx {
+                            0 => model.speech_decoder.mse_loss_batch(target, sparse_z),
+                            1 => model.env_decoder.mse_loss_batch(target, sparse_z),
+                            2 => model.visual_decoder.mse_loss_batch(target, sparse_z),
+                            3 => model.symbolic_decoder.mse_loss_batch(target, sparse_z),
+                            4 => model.language_decoder.mse_loss_batch(target, sparse_z),
+                            _ => unreachable!(),
+                        };
+                        let region_loss = match l1_term {
+                            Some(l1) => mse_loss + l1.mul_scalar(sae_l1_coeff),
+                            None => mse_loss,
+                        };
+                        sae_loss = Some(match sae_loss {
+                            None => region_loss,
+                            Some(a) => a + region_loss,
+                        });
+                        sae_n_terms += 1;
                     }
-                    1 => model
-                        .env_layer
-                        .forward_tracked_batch(input_batch.clone(), b, batch_topk),
-                    2 => {
-                        model
-                            .visual_layer
-                            .forward_tracked_batch(input_batch.clone(), b, batch_topk)
-                    }
-                    3 => model.symbolic_layer.forward_tracked_batch(
-                        input_batch.clone(),
-                        b,
-                        batch_topk,
-                    ),
-                    4 => model.language_layer.forward_tracked_batch(
-                        input_batch.clone(),
-                        b,
-                        batch_topk,
-                    ),
-                    _ => unreachable!(),
-                };
-
-                let n_units = flat_masks.len() / b;
-                let mask_inner: Tensor<NdArray, 2> =
-                    Tensor::from_data(TensorData::new(flat_masks, [b, n_units]), &device);
-                let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
-                let sparse_z = z_batch * mask;
-                let l1_term: Option<Tensor<TrainB, 1>> = if sae_l1_coeff > 0.0 {
-                    Some(sparse_z.clone().abs().mean())
-                } else {
-                    None
-                };
-                let target: Tensor<TrainB, 2> =
-                    Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
-
-                let mse_loss = match region_idx {
-                    0 => model.speech_decoder.mse_loss_batch(target, sparse_z),
-                    1 => model.env_decoder.mse_loss_batch(target, sparse_z),
-                    2 => model.visual_decoder.mse_loss_batch(target, sparse_z),
-                    3 => model.symbolic_decoder.mse_loss_batch(target, sparse_z),
-                    4 => model.language_decoder.mse_loss_batch(target, sparse_z),
-                    _ => unreachable!(),
-                };
-                let region_loss = match l1_term {
-                    Some(l1) => mse_loss + l1.mul_scalar(sae_l1_coeff),
-                    None => mse_loss,
-                };
-                sae_loss = Some(match sae_loss {
-                    None => region_loss,
-                    Some(a) => a + region_loss,
-                });
-                sae_n_terms += 1;
-            }
-        } // &mut borrow of model ends here
+                } // &mut borrow of model ends here
+                (sae_loss, sae_n_terms)
+            });
 
         // ── Phase 2: output-head losses (needs only &model, not &mut) ───────────
         let ep_dim = EPISODE_DIM;
-        let mut wake_loss: Option<Tensor<TrainB, 1>> = None;
-        let mut wake_n_terms = 0usize;
-        if !episodes.is_empty() {
-            for head_idx in 0..5usize {
-                let valid_pairs: Vec<(&[f32], &Vec<f32>)> = episodes
-                    .iter()
-                    .zip(batch.iter())
-                    .filter_map(|(&ep, &r)| {
-                        let inp = &r[head_idx];
-                        if inp.is_empty() {
-                            None
-                        } else {
-                            Some((ep, inp))
+        let ((wake_loss, wake_n_terms), _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::FusedReplayHeadPhase, {
+                let mut wake_loss: Option<Tensor<TrainB, 1>> = None;
+                let mut wake_n_terms = 0usize;
+                if !episodes.is_empty() {
+                    for head_idx in 0..5usize {
+                        let valid_pairs: Vec<(&[f32], &Vec<f32>)> = episodes
+                            .iter()
+                            .zip(batch.iter())
+                            .filter_map(|(&ep, &r)| {
+                                let inp = &r[head_idx];
+                                if inp.is_empty() {
+                                    None
+                                } else {
+                                    Some((ep, inp))
+                                }
+                            })
+                            .collect();
+                        if valid_pairs.is_empty() {
+                            continue;
                         }
-                    })
-                    .collect();
-                if valid_pairs.is_empty() {
-                    continue;
-                }
-                let b = valid_pairs.len();
-                let n_out = valid_pairs[0].1.len();
-                let flat_eps: Vec<f32> = valid_pairs
-                    .iter()
-                    .flat_map(|(ep, _)| ep.iter().copied())
-                    .collect();
-                let flat_tgt: Vec<f32> = valid_pairs
-                    .iter()
-                    .flat_map(|(_, inp)| inp.iter().copied())
-                    .collect();
+                        let b = valid_pairs.len();
+                        let n_out = valid_pairs[0].1.len();
+                        let flat_eps: Vec<f32> = valid_pairs
+                            .iter()
+                            .flat_map(|(ep, _)| ep.iter().copied())
+                            .collect();
+                        let flat_tgt: Vec<f32> = valid_pairs
+                            .iter()
+                            .flat_map(|(_, inp)| inp.iter().copied())
+                            .collect();
 
-                let ep_batch: Tensor<TrainB, 2> =
-                    Tensor::from_data(TensorData::new(flat_eps, [b, ep_dim]), &device);
-                let target_batch: Tensor<TrainB, 2> =
-                    Tensor::from_data(TensorData::new(flat_tgt, [b, n_out]), &device);
+                        let ep_batch: Tensor<TrainB, 2> =
+                            Tensor::from_data(TensorData::new(flat_eps, [b, ep_dim]), &device);
+                        let target_batch: Tensor<TrainB, 2> =
+                            Tensor::from_data(TensorData::new(flat_tgt, [b, n_out]), &device);
 
-                let pred = {
-                    let model = self.model.as_ref().unwrap();
-                    match head_idx {
-                        0 => model.speech_head.forward(ep_batch),
-                        1 => model.env_head.forward(ep_batch),
-                        2 => model.visual_head.forward(ep_batch),
-                        3 => model.symbolic_head.forward(ep_batch),
-                        4 => model.language_head.forward(ep_batch),
-                        _ => unreachable!(),
+                        let pred = {
+                            let model = self.model.as_ref().unwrap();
+                            match head_idx {
+                                0 => model.speech_head.forward(ep_batch),
+                                1 => model.env_head.forward(ep_batch),
+                                2 => model.visual_head.forward(ep_batch),
+                                3 => model.symbolic_head.forward(ep_batch),
+                                4 => model.language_head.forward(ep_batch),
+                                _ => unreachable!(),
+                            }
+                        };
+                        let h_loss: Tensor<TrainB, 1> = (pred - target_batch).powi_scalar(2).mean();
+                        wake_loss = Some(match wake_loss {
+                            None => h_loss,
+                            Some(a) => a + h_loss,
+                        });
+                        wake_n_terms += 1;
                     }
-                };
-                let h_loss: Tensor<TrainB, 1> = (pred - target_batch).powi_scalar(2).mean();
-                wake_loss = Some(match wake_loss {
-                    None => h_loss,
-                    Some(a) => a + h_loss,
-                });
-                wake_n_terms += 1;
-            }
-        }
+                }
+                (wake_loss, wake_n_terms)
+            });
 
         // ── Single combined backward + optimizer step ────────────────────────────
         let sae_val = sae_loss
@@ -1433,13 +1451,15 @@ impl PerceptionProcessor {
             (None, Some(wl)) => Some(wl.mul_scalar(der_lambda)),
             (None, None) => None,
         };
-        if let Some(loss) = combined {
-            let model = self.model.take().unwrap();
-            let grads = loss.backward();
-            let grads_p = GradientsParams::from_grads(grads, &model);
-            let model = self.optimizer.step(self.current_lr, model, grads_p);
-            self.model = Some(model);
-        }
+        somnus_metrics::timed_core!(somnus_metrics::Metric::FusedReplayBackward, {
+            if let Some(loss) = combined {
+                let model = self.model.take().unwrap();
+                let grads = loss.backward();
+                let grads_p = GradientsParams::from_grads(grads, &model);
+                let model = self.optimizer.step(self.current_lr, model, grads_p);
+                self.model = Some(model);
+            }
+        });
 
         Ok((sae_val, wake_val))
     }
@@ -1450,53 +1470,56 @@ impl PerceptionProcessor {
         episode: &[f32],
         regional: &[Vec<f32>; 5],
     ) -> PerceptionResult<f32> {
-        let device = self.device;
-        let ep_t: Tensor<TrainB, 2> = Tensor::from_data(
-            TensorData::new(episode.to_vec(), [1, episode.len()]),
-            &device,
-        );
-        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
-        let mut n = 0usize;
+        let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::WakeReconstructStep, {
+            let device = self.device;
+            let ep_t: Tensor<TrainB, 2> = Tensor::from_data(
+                TensorData::new(episode.to_vec(), [1, episode.len()]),
+                &device,
+            );
+            let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+            let mut n = 0usize;
 
-        for (head_idx, input) in regional.iter().enumerate() {
-            if input.is_empty() {
-                continue;
-            }
-            let target: Tensor<TrainB, 2> =
-                Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
-
-            let pred = {
-                let model = self.model.as_ref().unwrap();
-                match head_idx {
-                    0 => model.speech_head.forward(ep_t.clone()),
-                    1 => model.env_head.forward(ep_t.clone()),
-                    2 => model.visual_head.forward(ep_t.clone()),
-                    3 => model.symbolic_head.forward(ep_t.clone()),
-                    4 => model.language_head.forward(ep_t.clone()),
-                    _ => unreachable!(),
+            for (head_idx, input) in regional.iter().enumerate() {
+                if input.is_empty() {
+                    continue;
                 }
-            };
+                let target: Tensor<TrainB, 2> =
+                    Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
 
-            let loss: Tensor<TrainB, 1> = (pred - target).powi_scalar(2).mean();
-            total_loss = Some(match total_loss {
-                None => loss,
-                Some(acc) => acc + loss,
-            });
-            n += 1;
-        }
+                let pred = {
+                    let model = self.model.as_ref().unwrap();
+                    match head_idx {
+                        0 => model.speech_head.forward(ep_t.clone()),
+                        1 => model.env_head.forward(ep_t.clone()),
+                        2 => model.visual_head.forward(ep_t.clone()),
+                        3 => model.symbolic_head.forward(ep_t.clone()),
+                        4 => model.language_head.forward(ep_t.clone()),
+                        _ => unreachable!(),
+                    }
+                };
 
-        if let Some(loss) = total_loss {
-            let loss_val: f32 = loss.clone().into_scalar();
-            let model = self.model.take().unwrap();
-            let grads = loss.backward();
-            let grads_p = GradientsParams::from_grads(grads, &model);
-            let model = self.optimizer.step(self.current_lr, model, grads_p);
-            self.ema_heads.update(&model);
-            self.model = Some(model);
-            Ok(loss_val / n.max(1) as f32)
-        } else {
-            Ok(0.0)
-        }
+                let loss: Tensor<TrainB, 1> = (pred - target).powi_scalar(2).mean();
+                total_loss = Some(match total_loss {
+                    None => loss,
+                    Some(acc) => acc + loss,
+                });
+                n += 1;
+            }
+
+            if let Some(loss) = total_loss {
+                let loss_val: f32 = loss.clone().into_scalar();
+                let model = self.model.take().unwrap();
+                let grads = loss.backward();
+                let grads_p = GradientsParams::from_grads(grads, &model);
+                let model = self.optimizer.step(self.current_lr, model, grads_p);
+                self.ema_heads.update(&model);
+                self.model = Some(model);
+                Ok(loss_val / n.max(1) as f32)
+            } else {
+                Ok(0.0)
+            }
+        });
+        result
     }
 
     // ── Async wake reconstruction (WakeReconWorker) ──────────────────────────
@@ -1562,50 +1585,66 @@ impl PerceptionProcessor {
 
     /// Measure SAE reconstruction MSE per region (inference, no weight update).
     pub fn measure_mse(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<[f32; 5]> {
-        let device = self.device;
-        let mut result = [0.0f32; 5];
-        for (idx, input) in regional.iter().enumerate() {
-            if input.is_empty() {
-                continue;
+        let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::MeasureMse, {
+            let device = self.device;
+            let mut result = [0.0f32; 5];
+            for (idx, input) in regional.iter().enumerate() {
+                if input.is_empty() {
+                    continue;
+                }
+                let act = {
+                    let model = self.model.as_mut().unwrap();
+                    match idx {
+                        0 => model.speech_layer.forward(input, &device),
+                        1 => model.env_layer.forward(input, &device),
+                        2 => model.visual_layer.forward(input, &device),
+                        3 => model.symbolic_layer.forward(input, &device),
+                        4 => model.language_layer.forward(input, &device),
+                        _ => unreachable!(),
+                    }
+                };
+                let err = {
+                    let model = self.model.as_ref().unwrap();
+                    match idx {
+                        0 => model
+                            .speech_decoder
+                            .reconstruction_error(input, &act, &device),
+                        1 => model.env_decoder.reconstruction_error(input, &act, &device),
+                        2 => model
+                            .visual_decoder
+                            .reconstruction_error(input, &act, &device),
+                        3 => model
+                            .symbolic_decoder
+                            .reconstruction_error(input, &act, &device),
+                        4 => model
+                            .language_decoder
+                            .reconstruction_error(input, &act, &device),
+                        _ => unreachable!(),
+                    }
+                };
+                result[idx] = err;
             }
-            let act = {
-                let model = self.model.as_mut().unwrap();
-                match idx {
-                    0 => model.speech_layer.forward(input, &device),
-                    1 => model.env_layer.forward(input, &device),
-                    2 => model.visual_layer.forward(input, &device),
-                    3 => model.symbolic_layer.forward(input, &device),
-                    4 => model.language_layer.forward(input, &device),
-                    _ => unreachable!(),
-                }
-            };
-            let err = {
-                let model = self.model.as_ref().unwrap();
-                match idx {
-                    0 => model
-                        .speech_decoder
-                        .reconstruction_error(input, &act, &device),
-                    1 => model.env_decoder.reconstruction_error(input, &act, &device),
-                    2 => model
-                        .visual_decoder
-                        .reconstruction_error(input, &act, &device),
-                    3 => model
-                        .symbolic_decoder
-                        .reconstruction_error(input, &act, &device),
-                    4 => model
-                        .language_decoder
-                        .reconstruction_error(input, &act, &device),
-                    _ => unreachable!(),
-                }
-            };
-            result[idx] = err;
-        }
+            result
+        });
         Ok(result)
     }
 
     /// Blend two sets of regional encoder inputs and produce a synthetic episode.
     /// No DC update — inference only.
     pub fn synthesize_episode(
+        &mut self,
+        regional_a: &[Vec<f32>; 5],
+        regional_b: &[Vec<f32>; 5],
+        alpha: f32,
+    ) -> PerceptionResult<Vec<f32>> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::SynthesizeEpisode,
+            self.synthesize_episode_inner(regional_a, regional_b, alpha)
+        );
+        result
+    }
+
+    fn synthesize_episode_inner(
         &mut self,
         regional_a: &[Vec<f32>; 5],
         regional_b: &[Vec<f32>; 5],
@@ -1660,60 +1699,73 @@ impl PerceptionProcessor {
         episode: &[f32],
         regional: &[Vec<f32>; 5],
     ) -> PerceptionResult<f32> {
-        let device = self.device;
-        let ep_t: Tensor<TrainB, 2> =
-            Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
-        let model = self.model.as_ref().unwrap();
-        let mut total = 0.0f32;
-        let mut n = 0usize;
-        for (head_idx, input) in regional.iter().enumerate() {
-            if input.is_empty() {
-                continue;
-            }
-            let pred = match head_idx {
-                0 => model.speech_head.forward(ep_t.clone()),
-                1 => model.env_head.forward(ep_t.clone()),
-                2 => model.visual_head.forward(ep_t.clone()),
-                3 => model.symbolic_head.forward(ep_t.clone()),
-                4 => model.language_head.forward(ep_t.clone()),
-                _ => unreachable!(),
-            };
-            let target: Tensor<TrainB, 2> =
-                Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
-            let mse: f32 = (pred - target).powi_scalar(2).mean().into_scalar();
-            total += mse;
-            n += 1;
-        }
-        Ok(if n > 0 { total / n as f32 } else { 0.0 })
+        let (result, _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::MeasureOutputMseInference, {
+                let device = self.device;
+                let ep_t: Tensor<TrainB, 2> =
+                    Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
+                let model = self.model.as_ref().unwrap();
+                let mut total = 0.0f32;
+                let mut n = 0usize;
+                for (head_idx, input) in regional.iter().enumerate() {
+                    if input.is_empty() {
+                        continue;
+                    }
+                    let pred = match head_idx {
+                        0 => model.speech_head.forward(ep_t.clone()),
+                        1 => model.env_head.forward(ep_t.clone()),
+                        2 => model.visual_head.forward(ep_t.clone()),
+                        3 => model.symbolic_head.forward(ep_t.clone()),
+                        4 => model.language_head.forward(ep_t.clone()),
+                        _ => unreachable!(),
+                    };
+                    let target: Tensor<TrainB, 2> = Tensor::from_data(
+                        TensorData::new(input.clone(), [1, input.len()]),
+                        &device,
+                    );
+                    let mse: f32 = (pred - target).powi_scalar(2).mean().into_scalar();
+                    total += mse;
+                    n += 1;
+                }
+                if n > 0 {
+                    total / n as f32
+                } else {
+                    0.0
+                }
+            });
+        Ok(result)
     }
 
     /// Infer predicted outputs (regional embeddings) from an episode vector (DER++ stale detection).
     /// Returns [Vec<f32>; 5] with one prediction per region. Empty regions get empty vectors.
     /// Used to detect staleness: compare predicted vs stored outputs via cosine similarity.
     pub fn infer_episode_outputs(&self, episode: &[f32]) -> PerceptionResult<[Vec<f32>; 5]> {
-        let device = self.device;
-        let ep_t: Tensor<TrainB, 2> =
-            Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
-        let model = self.model.as_ref().unwrap();
+        let (outputs, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::InferEpisodeOutputs, {
+            let device = self.device;
+            let ep_t: Tensor<TrainB, 2> =
+                Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
+            let model = self.model.as_ref().unwrap();
 
-        let mut outputs: [Vec<f32>; 5] = Default::default();
-        let heads: [&Linear<TrainB>; 5] = [
-            &model.speech_head,
-            &model.env_head,
-            &model.visual_head,
-            &model.symbolic_head,
-            &model.language_head,
-        ];
+            let mut outputs: [Vec<f32>; 5] = Default::default();
+            let heads: [&Linear<TrainB>; 5] = [
+                &model.speech_head,
+                &model.env_head,
+                &model.visual_head,
+                &model.symbolic_head,
+                &model.language_head,
+            ];
 
-        for (i, head) in heads.iter().enumerate() {
-            let pred: Tensor<TrainB, 2> = head.forward(ep_t.clone());
-            let pred_vec: Vec<f32> = pred
-                .into_data()
-                .convert::<f32>()
-                .to_vec()
-                .map_err(|e| PerceptionError::Burn(format!("tensor extraction: {}", e)))?;
-            outputs[i] = pred_vec;
-        }
+            for (i, head) in heads.iter().enumerate() {
+                let pred: Tensor<TrainB, 2> = head.forward(ep_t.clone());
+                let pred_vec: Vec<f32> = pred
+                    .into_data()
+                    .convert::<f32>()
+                    .to_vec()
+                    .map_err(|e| PerceptionError::Burn(format!("tensor extraction: {}", e)))?;
+                outputs[i] = pred_vec;
+            }
+            outputs
+        });
         Ok(outputs)
     }
 
@@ -1721,35 +1773,43 @@ impl PerceptionProcessor {
 
     /// Apply global weight decay to all trainable Linear weights.
     pub fn homeostatic_decay(&mut self, rate: f32) {
-        let scale = 1.0 - rate;
-        let model = self.model.as_mut().unwrap();
-        scale_weight(&mut model.speech_layer.linear, scale);
-        scale_weight(&mut model.env_layer.linear, scale);
-        scale_weight(&mut model.visual_layer.linear, scale);
-        scale_weight(&mut model.symbolic_layer.linear, scale);
-        scale_weight(&mut model.language_layer.linear, scale);
-        scale_weight(&mut model.speech_decoder.decoder, scale);
-        scale_weight(&mut model.env_decoder.decoder, scale);
-        scale_weight(&mut model.visual_decoder.decoder, scale);
-        scale_weight(&mut model.symbolic_decoder.decoder, scale);
-        scale_weight(&mut model.language_decoder.decoder, scale);
-        scale_weight(&mut model.binding.region_0, scale);
-        scale_weight(&mut model.binding.region_1, scale);
-        scale_weight(&mut model.binding.region_2, scale);
-        scale_weight(&mut model.binding.region_3, scale);
-        scale_weight(&mut model.binding.region_4, scale);
-        scale_weight(&mut model.binding.w_q, scale);
-        scale_weight(&mut model.binding.w_k, scale);
-        scale_weight(&mut model.binding.w_v, scale);
-        scale_weight(&mut model.speech_head, scale);
-        scale_weight(&mut model.env_head, scale);
-        scale_weight(&mut model.visual_head, scale);
-        scale_weight(&mut model.symbolic_head, scale);
-        scale_weight(&mut model.language_head, scale);
+        somnus_metrics::timed_core!(somnus_metrics::Metric::HomeostaticDecay, {
+            let scale = 1.0 - rate;
+            let model = self.model.as_mut().unwrap();
+            scale_weight(&mut model.speech_layer.linear, scale);
+            scale_weight(&mut model.env_layer.linear, scale);
+            scale_weight(&mut model.visual_layer.linear, scale);
+            scale_weight(&mut model.symbolic_layer.linear, scale);
+            scale_weight(&mut model.language_layer.linear, scale);
+            scale_weight(&mut model.speech_decoder.decoder, scale);
+            scale_weight(&mut model.env_decoder.decoder, scale);
+            scale_weight(&mut model.visual_decoder.decoder, scale);
+            scale_weight(&mut model.symbolic_decoder.decoder, scale);
+            scale_weight(&mut model.language_decoder.decoder, scale);
+            scale_weight(&mut model.binding.region_0, scale);
+            scale_weight(&mut model.binding.region_1, scale);
+            scale_weight(&mut model.binding.region_2, scale);
+            scale_weight(&mut model.binding.region_3, scale);
+            scale_weight(&mut model.binding.region_4, scale);
+            scale_weight(&mut model.binding.w_q, scale);
+            scale_weight(&mut model.binding.w_k, scale);
+            scale_weight(&mut model.binding.w_v, scale);
+            scale_weight(&mut model.speech_head, scale);
+            scale_weight(&mut model.env_head, scale);
+            scale_weight(&mut model.visual_head, scale);
+            scale_weight(&mut model.symbolic_head, scale);
+            scale_weight(&mut model.language_head, scale);
+        });
     }
 
     /// Grow a region by appending `n_new` units with small random encoder weights.
     pub fn grow_region(&mut self, region: RegionId, n_new: usize) {
+        somnus_metrics::timed_core!(somnus_metrics::Metric::GrowRegion, {
+            self.grow_region_inner(region, n_new)
+        });
+    }
+
+    fn grow_region_inner(&mut self, region: RegionId, n_new: usize) {
         let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model.as_mut().unwrap();
@@ -1825,9 +1885,23 @@ impl PerceptionProcessor {
         n_new: usize,
         sorted_inputs: &[Vec<f32>],
     ) {
+        // Empty-seed calls degrade to a plain grow_region (own GrowRegion metric already
+        // covers it) — not timed as GrowRegionSeeded, since no seeding actually happens.
         if sorted_inputs.is_empty() {
-            return self.grow_region(region, n_new);
+            self.grow_region(region, n_new);
+            return;
         }
+        somnus_metrics::timed_core!(somnus_metrics::Metric::GrowRegionSeeded, {
+            self.grow_region_seeded_inner(region, n_new, sorted_inputs)
+        });
+    }
+
+    fn grow_region_seeded_inner(
+        &mut self,
+        region: RegionId,
+        n_new: usize,
+        sorted_inputs: &[Vec<f32>],
+    ) {
         let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model.as_mut().unwrap();
@@ -1905,57 +1979,70 @@ impl PerceptionProcessor {
         traces: &[(Vec<f32>, [Vec<f32>; 5], T, U)],
         cap: usize,
     ) -> [Vec<Vec<f32>>; 5] {
-        let device = self.device;
-        // Per-region: (residual_mse, input_vec)
-        let mut scored: [Vec<(f32, Vec<f32>)>; 5] = Default::default();
+        let (result, _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::CollectHighResidualInputs, {
+                let device = self.device;
+                // Per-region: (residual_mse, input_vec)
+                let mut scored: [Vec<(f32, Vec<f32>)>; 5] = Default::default();
 
-        for (_, regional, _, _) in traces {
-            for (idx, input) in regional.iter().enumerate() {
-                if input.is_empty() {
-                    continue;
+                for (_, regional, _, _) in traces {
+                    for (idx, input) in regional.iter().enumerate() {
+                        if input.is_empty() {
+                            continue;
+                        }
+                        let (act, recon) = {
+                            let model = self.model.as_mut().unwrap();
+                            let act = match idx {
+                                0 => model.speech_layer.forward(input, &device),
+                                1 => model.env_layer.forward(input, &device),
+                                2 => model.visual_layer.forward(input, &device),
+                                3 => model.symbolic_layer.forward(input, &device),
+                                4 => model.language_layer.forward(input, &device),
+                                _ => unreachable!(),
+                            };
+                            let recon = match idx {
+                                0 => model.speech_decoder.reconstruct(&act, &device),
+                                1 => model.env_decoder.reconstruct(&act, &device),
+                                2 => model.visual_decoder.reconstruct(&act, &device),
+                                3 => model.symbolic_decoder.reconstruct(&act, &device),
+                                4 => model.language_decoder.reconstruct(&act, &device),
+                                _ => unreachable!(),
+                            };
+                            (act, recon)
+                        };
+                        let _ = act;
+                        let mse: f32 = input
+                            .iter()
+                            .zip(&recon)
+                            .map(|(a, b)| (a - b).powi(2))
+                            .sum::<f32>()
+                            / input.len() as f32;
+                        scored[idx].push((mse, input.clone()));
+                    }
                 }
-                let (act, recon) = {
-                    let model = self.model.as_mut().unwrap();
-                    let act = match idx {
-                        0 => model.speech_layer.forward(input, &device),
-                        1 => model.env_layer.forward(input, &device),
-                        2 => model.visual_layer.forward(input, &device),
-                        3 => model.symbolic_layer.forward(input, &device),
-                        4 => model.language_layer.forward(input, &device),
-                        _ => unreachable!(),
-                    };
-                    let recon = match idx {
-                        0 => model.speech_decoder.reconstruct(&act, &device),
-                        1 => model.env_decoder.reconstruct(&act, &device),
-                        2 => model.visual_decoder.reconstruct(&act, &device),
-                        3 => model.symbolic_decoder.reconstruct(&act, &device),
-                        4 => model.language_decoder.reconstruct(&act, &device),
-                        _ => unreachable!(),
-                    };
-                    (act, recon)
-                };
-                let _ = act;
-                let mse: f32 = input
-                    .iter()
-                    .zip(&recon)
-                    .map(|(a, b)| (a - b).powi(2))
-                    .sum::<f32>()
-                    / input.len() as f32;
-                scored[idx].push((mse, input.clone()));
-            }
-        }
 
-        let mut result: [Vec<Vec<f32>>; 5] = Default::default();
-        for i in 0..5 {
-            scored[i].sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            result[i] = scored[i].drain(..).take(cap).map(|(_, v)| v).collect();
-        }
+                let mut result: [Vec<Vec<f32>>; 5] = Default::default();
+                for i in 0..5 {
+                    scored[i]
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    result[i] = scored[i].drain(..).take(cap).map(|(_, v)| v).collect();
+                }
+                result
+            });
         result
     }
 
     /// Prune low-magnitude grown units from a region (Phase 12c).
     /// Only removes units with index >= N_UNITS. Returns number pruned.
     pub fn prune_region(&mut self, region: RegionId, prune_fraction: f32) -> usize {
+        let (n_pruned, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::PruneRegion,
+            self.prune_region_inner(region, prune_fraction)
+        );
+        n_pruned
+    }
+
+    fn prune_region_inner(&mut self, region: RegionId, prune_fraction: f32) -> usize {
         let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model.as_mut().unwrap();
@@ -2081,6 +2168,18 @@ impl PerceptionProcessor {
         bind_path: &std::path::Path,
         use_migraphx: bool,
     ) -> anyhow::Result<()> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::EnableOrtInference,
+            self.enable_ort_inference_inner(bind_path, use_migraphx)
+        );
+        result
+    }
+
+    fn enable_ort_inference_inner(
+        &mut self,
+        bind_path: &std::path::Path,
+        use_migraphx: bool,
+    ) -> anyhow::Result<()> {
         let mut sess = crate::onnx_session::OnnxPerceptionSession::load(bind_path, use_migraphx)?;
         // Phase 1.5: attach encoder session if its ONNX file exists in the same directory.
         let enc_path = bind_path
@@ -2112,6 +2211,19 @@ impl PerceptionProcessor {
     /// `onnx_dir`:    where to write (and read from) the ONNX graphs
     /// `use_migraphx`: true for production GPU; false for CPU-only testing
     pub fn rebuild_ort_session(
+        &mut self,
+        script_path: &std::path::Path,
+        onnx_dir: &std::path::Path,
+        use_migraphx: bool,
+    ) -> anyhow::Result<()> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::RebuildOrtSession,
+            self.rebuild_ort_session_inner(script_path, onnx_dir, use_migraphx)
+        );
+        result
+    }
+
+    fn rebuild_ort_session_inner(
         &mut self,
         script_path: &std::path::Path,
         onnx_dir: &std::path::Path,
@@ -2213,21 +2325,23 @@ impl PerceptionProcessor {
     /// Equivalent to what grow_region / prune_region do incidentally (hence why post-growth
     /// NREM cycles are always fast).
     pub fn refresh_autodiff_state(&mut self) {
-        use burn::module::ModuleMapper;
-        struct GraphDetacher;
-        impl ModuleMapper<TrainB> for GraphDetacher {
-            fn map_float<const D: usize>(
-                &mut self,
-                param: Param<Tensor<TrainB, D>>,
-            ) -> Param<Tensor<TrainB, D>> {
-                let (_, tensor, mapper) = param.consume();
-                let fresh = Tensor::from_inner(tensor.inner()).require_grad();
-                Param::from_mapped_value(ParamId::new(), fresh, mapper)
+        somnus_metrics::timed_core!(somnus_metrics::Metric::RefreshAutodiffState, {
+            use burn::module::ModuleMapper;
+            struct GraphDetacher;
+            impl ModuleMapper<TrainB> for GraphDetacher {
+                fn map_float<const D: usize>(
+                    &mut self,
+                    param: Param<Tensor<TrainB, D>>,
+                ) -> Param<Tensor<TrainB, D>> {
+                    let (_, tensor, mapper) = param.consume();
+                    let fresh = Tensor::from_inner(tensor.inner()).require_grad();
+                    Param::from_mapped_value(ParamId::new(), fresh, mapper)
+                }
             }
-        }
-        let model = self.model.take().unwrap();
-        self.model = Some(model.map(&mut GraphDetacher));
-        self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+            let model = self.model.take().unwrap();
+            self.model = Some(model.map(&mut GraphDetacher));
+            self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+        });
     }
 
     pub fn region_sizes(&self) -> [usize; 5] {
@@ -2352,6 +2466,14 @@ impl PerceptionProcessor {
     ///   gru_{gate}_hidden_W    – GRU hidden weight, shape [GRU_HIDDEN, GRU_HIDDEN]
     ///   W_temporal_proj        – GRU hidden → EPISODE_DIM, shape [GRU_HIDDEN, EPISODE_DIM]
     pub fn export_weights_for_onnx(&self, dir: &std::path::Path) -> PerceptionResult<()> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::ExportWeightsForOnnx,
+            self.export_weights_for_onnx_inner(dir)
+        );
+        result
+    }
+
+    fn export_weights_for_onnx_inner(&self, dir: &std::path::Path) -> PerceptionResult<()> {
         std::fs::create_dir_all(dir).map_err(|e| PerceptionError::Burn(e.to_string()))?;
         let m = self.model.as_ref().unwrap();
 

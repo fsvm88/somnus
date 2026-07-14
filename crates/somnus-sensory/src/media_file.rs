@@ -164,77 +164,73 @@ impl MediaFile {
             let mut audio_raw = frame::Audio::empty();
             let mut video_raw = frame::Video::empty();
 
-            // Main demux + decode loop.
-            for (stream, packet) in ictx.packets() {
-                if stream.index() == audio_idx {
-                    if audio_decoder.send_packet(&packet).is_err() {
-                        break;
+            // Aggregate the whole decode thread's lifetime (main demux loop + both flush
+            // passes) into one metric per file, per this crate's own guardrail against
+            // per-packet instrumentation at decode-thread frequency. The inner closure lets
+            // the early `return`s below exit just this closure, not the timed_core! call's
+            // own post-body recording (a bare `return` inside the block would otherwise skip
+            // the metric write entirely for files that hit the early-return paths).
+            #[allow(clippy::redundant_closure_call)]
+            let (_, _) = somnus_metrics::timed_core!(
+                somnus_metrics::Metric::MediaFileDecode,
+                (|| {
+                    // Main demux + decode loop.
+                    for (stream, packet) in ictx.packets() {
+                        if stream.index() == audio_idx {
+                            if audio_decoder.send_packet(&packet).is_err() {
+                                break;
+                            }
+                            while audio_decoder.receive_frame(&mut audio_raw).is_ok() {
+                                let mut conv = frame::Audio::empty();
+                                if audio_resampler.run(&audio_raw, &mut conv).is_err() {
+                                    continue;
+                                }
+                                if conv.samples() == 0 {
+                                    continue;
+                                }
+                                let af = AudioFrame {
+                                    samples: f32_samples_from_frame(&conv),
+                                    sample_rate,
+                                    channels,
+                                    timestamp: Timestamp::now(),
+                                };
+                                audio_metrics_t.increment_captured();
+                                if !send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t)
+                                {
+                                    return; // consumer gone; skip flush
+                                }
+                            }
+                        } else if stream.index() == video_idx {
+                            if video_decoder.send_packet(&packet).is_err() {
+                                break;
+                            }
+                            while video_decoder.receive_frame(&mut video_raw).is_ok() {
+                                let mut conv = frame::Video::empty();
+                                if video_scaler.run(&video_raw, &mut conv).is_err() {
+                                    continue;
+                                }
+                                let vf = VideoFrame {
+                                    data: rgb24_from_frame(&conv),
+                                    width,
+                                    height,
+                                    format: PixelFormat::Rgb8,
+                                    timestamp: Timestamp::now(),
+                                };
+                                video_metrics_t.increment_captured();
+                                if !send_drop_oldest(&video_tx, &video_drain, vf, &video_metrics_t)
+                                {
+                                    return;
+                                }
+                            }
+                        }
                     }
+
+                    // ── flush audio decoder ───────────────────────────────────────────
+                    audio_decoder.send_eof().ok();
                     while audio_decoder.receive_frame(&mut audio_raw).is_ok() {
                         let mut conv = frame::Audio::empty();
-                        if audio_resampler.run(&audio_raw, &mut conv).is_err() {
-                            continue;
-                        }
-                        if conv.samples() == 0 {
-                            continue;
-                        }
-                        let af = AudioFrame {
-                            samples: f32_samples_from_frame(&conv),
-                            sample_rate,
-                            channels,
-                            timestamp: Timestamp::now(),
-                        };
-                        audio_metrics_t.increment_captured();
-                        if !send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t) {
-                            return; // consumer gone; skip flush
-                        }
-                    }
-                } else if stream.index() == video_idx {
-                    if video_decoder.send_packet(&packet).is_err() {
-                        break;
-                    }
-                    while video_decoder.receive_frame(&mut video_raw).is_ok() {
-                        let mut conv = frame::Video::empty();
-                        if video_scaler.run(&video_raw, &mut conv).is_err() {
-                            continue;
-                        }
-                        let vf = VideoFrame {
-                            data: rgb24_from_frame(&conv),
-                            width,
-                            height,
-                            format: PixelFormat::Rgb8,
-                            timestamp: Timestamp::now(),
-                        };
-                        video_metrics_t.increment_captured();
-                        if !send_drop_oldest(&video_tx, &video_drain, vf, &video_metrics_t) {
-                            return;
-                        }
-                    }
-                }
-            }
-
-            // ── flush audio decoder ───────────────────────────────────────────
-            audio_decoder.send_eof().ok();
-            while audio_decoder.receive_frame(&mut audio_raw).is_ok() {
-                let mut conv = frame::Audio::empty();
-                if audio_resampler.run(&audio_raw, &mut conv).is_ok() && conv.samples() > 0 {
-                    let af = AudioFrame {
-                        samples: f32_samples_from_frame(&conv),
-                        sample_rate,
-                        channels,
-                        timestamp: Timestamp::now(),
-                    };
-                    audio_metrics_t.increment_captured();
-                    send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t);
-                }
-            }
-
-            // Drain resampler residue. Same-rate resampler holds ≤ 1 frame; loop runs at most twice.
-            loop {
-                let mut conv = frame::Audio::empty();
-                match audio_resampler.flush(&mut conv) {
-                    Ok(delay) => {
-                        if conv.samples() > 0 {
+                        if audio_resampler.run(&audio_raw, &mut conv).is_ok() && conv.samples() > 0
+                        {
                             let af = AudioFrame {
                                 samples: f32_samples_from_frame(&conv),
                                 sample_rate,
@@ -244,31 +240,50 @@ impl MediaFile {
                             audio_metrics_t.increment_captured();
                             send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t);
                         }
-                        if delay.is_none() {
-                            break;
+                    }
+
+                    // Drain resampler residue. Same-rate resampler holds ≤ 1 frame; loop runs at most twice.
+                    loop {
+                        let mut conv = frame::Audio::empty();
+                        match audio_resampler.flush(&mut conv) {
+                            Ok(delay) => {
+                                if conv.samples() > 0 {
+                                    let af = AudioFrame {
+                                        samples: f32_samples_from_frame(&conv),
+                                        sample_rate,
+                                        channels,
+                                        timestamp: Timestamp::now(),
+                                    };
+                                    audio_metrics_t.increment_captured();
+                                    send_drop_oldest(&audio_tx, &audio_drain, af, &audio_metrics_t);
+                                }
+                                if delay.is_none() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
-                    Err(_) => break,
-                }
-            }
 
-            // ── flush video decoder ───────────────────────────────────────────
-            video_decoder.send_eof().ok();
-            while video_decoder.receive_frame(&mut video_raw).is_ok() {
-                let mut conv = frame::Video::empty();
-                if video_scaler.run(&video_raw, &mut conv).is_ok() {
-                    let vf = VideoFrame {
-                        data: rgb24_from_frame(&conv),
-                        width,
-                        height,
-                        format: PixelFormat::Rgb8,
-                        timestamp: Timestamp::now(),
-                    };
-                    video_metrics_t.increment_captured();
-                    send_drop_oldest(&video_tx, &video_drain, vf, &video_metrics_t);
-                }
-            }
-            // Video scaler is stateless; no flush needed.
+                    // ── flush video decoder ───────────────────────────────────────────
+                    video_decoder.send_eof().ok();
+                    while video_decoder.receive_frame(&mut video_raw).is_ok() {
+                        let mut conv = frame::Video::empty();
+                        if video_scaler.run(&video_raw, &mut conv).is_ok() {
+                            let vf = VideoFrame {
+                                data: rgb24_from_frame(&conv),
+                                width,
+                                height,
+                                format: PixelFormat::Rgb8,
+                                timestamp: Timestamp::now(),
+                            };
+                            video_metrics_t.increment_captured();
+                            send_drop_oldest(&video_tx, &video_drain, vf, &video_metrics_t);
+                        }
+                    }
+                    // Video scaler is stateless; no flush needed.
+                })()
+            );
         });
 
         Ok(MediaFileStreams {

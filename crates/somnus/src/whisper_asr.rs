@@ -56,6 +56,14 @@ impl WhisperDecoder {
     /// We maintain a padded buffer; at each step we read logits from position (real_len-1).
     /// Causal attention means padding zeros after real_len have no effect on earlier positions.
     pub fn decode_greedy(&mut self, encoder_hidden: &[f32], max_tokens: usize) -> Result<String> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::AsrDecode,
+            self.decode_greedy_inner(encoder_hidden, max_tokens)
+        );
+        result
+    }
+
+    fn decode_greedy_inner(&mut self, encoder_hidden: &[f32], max_tokens: usize) -> Result<String> {
         let max_tokens = max_tokens.min(DECODER_MAX_SEQ - 4); // 4 = prefix length
 
         let enc_arr = Array3::from_shape_vec(

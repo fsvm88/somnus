@@ -111,6 +111,18 @@ impl<B: Backend> BindingArea<B> {
         new_episode: Option<&Vec<f32>>,
         device: &B::Device,
     ) -> EpisodeVector {
+        let (ep, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::BindingForward, {
+            self.forward_inner(acts, new_episode, device)
+        });
+        ep
+    }
+
+    fn forward_inner(
+        &mut self,
+        acts: &[&SparseActivation; 5],
+        new_episode: Option<&Vec<f32>>,
+        device: &B::Device,
+    ) -> EpisodeVector {
         let region_projs = [
             &self.region_0,
             &self.region_1,

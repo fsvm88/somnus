@@ -89,51 +89,56 @@ fn train_step(
     lr: f64,
     device: &NdArrayDevice,
 ) -> (WakeHeadsModel<TrainB>, Option<f32>) {
-    let ep_t: Tensor<TrainB, 2> = Tensor::from_data(
-        TensorData::new(episode.to_vec(), [1, episode.len()]),
-        device,
-    );
-    let mut total_loss: Option<Tensor<TrainB, 1>> = None;
-    let mut n = 0usize;
+    // Runs on this module's dedicated background OS thread — somnus_metrics::METRICS.record()
+    // (invoked inside timed_core!) is a plain atomic fetch_add, safe to call from any thread.
+    let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::WakeWorkerTrainStep, {
+        let ep_t: Tensor<TrainB, 2> = Tensor::from_data(
+            TensorData::new(episode.to_vec(), [1, episode.len()]),
+            device,
+        );
+        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+        let mut n = 0usize;
 
-    for (head_idx, input) in regional.iter().enumerate() {
-        if input.is_empty() {
-            continue;
+        for (head_idx, input) in regional.iter().enumerate() {
+            if input.is_empty() {
+                continue;
+            }
+            let target: Tensor<TrainB, 2> =
+                Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), device);
+            let pred = match head_idx {
+                0 => model.speech.forward(ep_t.clone()),
+                1 => model.env.forward(ep_t.clone()),
+                2 => model.visual.forward(ep_t.clone()),
+                3 => model.symbolic.forward(ep_t.clone()),
+                4 => model.language.forward(ep_t.clone()),
+                _ => unreachable!(),
+            };
+            let loss: Tensor<TrainB, 1> = (pred - target).powi_scalar(2).mean();
+            total_loss = Some(match total_loss {
+                None => loss,
+                Some(acc) => acc + loss,
+            });
+            n += 1;
         }
-        let target: Tensor<TrainB, 2> =
-            Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), device);
-        let pred = match head_idx {
-            0 => model.speech.forward(ep_t.clone()),
-            1 => model.env.forward(ep_t.clone()),
-            2 => model.visual.forward(ep_t.clone()),
-            3 => model.symbolic.forward(ep_t.clone()),
-            4 => model.language.forward(ep_t.clone()),
-            _ => unreachable!(),
-        };
-        let loss: Tensor<TrainB, 1> = (pred - target).powi_scalar(2).mean();
-        total_loss = Some(match total_loss {
-            None => loss,
-            Some(acc) => acc + loss,
-        });
-        n += 1;
-    }
 
-    if let Some(loss) = total_loss {
-        let loss_val: f32 = loss.clone().into_scalar();
-        let grads = loss.backward();
-        let grads_p = GradientsParams::from_grads(grads, &model);
-        let model = optim.step(lr, model, grads_p);
-        ema.update_from_weights([
-            model.speech.weight.val().inner(),
-            model.env.weight.val().inner(),
-            model.visual.weight.val().inner(),
-            model.symbolic.weight.val().inner(),
-            model.language.weight.val().inner(),
-        ]);
-        (model, Some(loss_val / n.max(1) as f32))
-    } else {
-        (model, None)
-    }
+        if let Some(loss) = total_loss {
+            let loss_val: f32 = loss.clone().into_scalar();
+            let grads = loss.backward();
+            let grads_p = GradientsParams::from_grads(grads, &model);
+            let model = optim.step(lr, model, grads_p);
+            ema.update_from_weights([
+                model.speech.weight.val().inner(),
+                model.env.weight.val().inner(),
+                model.visual.weight.val().inner(),
+                model.symbolic.weight.val().inner(),
+                model.language.weight.val().inner(),
+            ]);
+            (model, Some(loss_val / n.max(1) as f32))
+        } else {
+            (model, None)
+        }
+    });
+    result
 }
 
 fn weights_flat(model: &WakeHeadsModel<TrainB>) -> [Vec<f32>; 5] {

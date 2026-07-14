@@ -1,8 +1,41 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-14 (final)
-> **✅ Unified two-tier metrics instrumentation, fully implemented and converted: ADR 0039,
-> `crates/somnus-metrics`.** Extends the earlier same-session instrumentation work (see superseded
+> **Last updated:** 2026-07-14 (final, full-coverage pass)
+> **✅ somnus-metrics: full-coverage expansion complete, on top of the unified two-tier system (ADR
+> 0039).** After the base conversion (below) landed, user asked to go further still — "make
+> somnus-metrics cover all code... reach into every stupid step and evaluate it against an A/B run."
+> Ran a 3-way parallel inventory (Explore agents over somnus-perception/somnus-memory/somnus-sensory+main.rs)
+> of every remaining uninstrumented data-handling operation, then instrumented essentially all of
+> it (operation-granularity only — per-element hot loops stay covered in aggregate by an enclosing
+> phase metric, per the crate's own guardrail). `Metric` enum grew **24 → 67 variants**:
+> `somnus-perception` +25 (binding forward, ORT run_encoder/run_binding, fused-replay's 3 internal
+> sub-phases, ORT lifecycle, growth/prune, all REM self-probe functions, EMA sub-steps,
+> refresh_autodiff_state, the async wake_worker::train_step), `somnus-memory` +10 (cold archive
+> open/truncate/evict, semantic-store warm-load, recollection promote, snapshot save/load — closes
+> the "zero coverage" gap noted in the original ADR 0039), `somnus-sensory` +1 (one aggregate
+> `MediaFileDecode` metric per file), `somnus` binary +7 (action-decoder init/generate, gain-worker
+> compute, ASR decode, audio resampling, language embedding, record_episode). Two new patterns
+> documented in ADR 0039: **private-`_inner`-method split** (default for functions with early
+> return/`?`/`bail!`) and **immediately-invoked-closure wrap** (used once, somnus-sensory's decode
+> thread, which had no separate method to split into). Both preserve the original body
+> byte-for-byte aside from the wrapper.
+>
+> **Verified incrementally** — rebuilt/retested after every single function conversion, not just
+> at the end — `cargo build/clippy/test --release --workspace` clean in both feature states
+> throughout. Final live pilot (2 sessions, isolated scratch memory dir, cleaned up after) recorded
+> **40 distinct metrics simultaneously** in one small run, including both cross-thread ones
+> (`wake_worker_train_step`, `gain_compute` — confirmed plain atomics are safe to write from any
+> thread) firing correctly, and metrics tied to untriggered conditions (growth, `--action`,
+> cold-archive eviction) correctly staying at zero rather than silently missing. Docs updated:
+> `ai-docs/decisions/0039-unified-metrics-instrumentation.md` (new "Update" section + "Implementation
+> patterns" section), `ai-docs/gaps.md` §26 (follow-up writeup + priority-table row bumped to
+> Med–High impact). **Committed to git** — see commit history, nothing left uncommitted.
+>
+> ---
+>
+> **Prior writeup (base conversion, now extended by the above, kept for the discovery trail):**
+> unified two-tier metrics instrumentation, fully implemented and converted: ADR 0039,
+> `crates/somnus-metrics`. Extends the earlier same-session instrumentation work (see superseded
 > writeup a few lines below, kept for the discovery trail) after the user asked to go further:
 > convert *every* existing hand-rolled timer to one shared system ("one way of doing metrics")
 > and treat the metrics this codebase has always reported as the always-on default tier.

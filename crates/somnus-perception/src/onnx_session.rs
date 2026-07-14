@@ -65,46 +65,49 @@ impl OnnxPerceptionSession {
         visual: &[f32],
         lang: &[f32],
     ) -> anyhow::Result<[Vec<f32>; 5]> {
-        let sess = self
-            .sess_enc
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("encoder session not loaded"))?;
+        let (z, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::OrtRunEncoder, {
+            let sess = self
+                .sess_enc
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("encoder session not loaded"))?;
 
-        // Pad or truncate to expected dims
-        let speech_v = pad_to(speech, ENC_DIMS[0]);
-        let env_v = pad_to(env, ENC_DIMS[1]);
-        let visual_v = pad_to(visual, ENC_DIMS[2]);
-        let lang_v = pad_to(lang, ENC_DIMS[3]);
+            // Pad or truncate to expected dims
+            let speech_v = pad_to(speech, ENC_DIMS[0]);
+            let env_v = pad_to(env, ENC_DIMS[1]);
+            let visual_v = pad_to(visual, ENC_DIMS[2]);
+            let lang_v = pad_to(lang, ENC_DIMS[3]);
 
-        let sp_arr = Array2::from_shape_vec((1, ENC_DIMS[0]), speech_v)?;
-        let en_arr = Array2::from_shape_vec((1, ENC_DIMS[1]), env_v)?;
-        let vi_arr = Array2::from_shape_vec((1, ENC_DIMS[2]), visual_v)?;
-        let la_arr = Array2::from_shape_vec((1, ENC_DIMS[3]), lang_v)?;
+            let sp_arr = Array2::from_shape_vec((1, ENC_DIMS[0]), speech_v)?;
+            let en_arr = Array2::from_shape_vec((1, ENC_DIMS[1]), env_v)?;
+            let vi_arr = Array2::from_shape_vec((1, ENC_DIMS[2]), visual_v)?;
+            let la_arr = Array2::from_shape_vec((1, ENC_DIMS[3]), lang_v)?;
 
-        let t_sp = TensorRef::from_array_view(sp_arr.view())?;
-        let t_en = TensorRef::from_array_view(en_arr.view())?;
-        let t_vi = TensorRef::from_array_view(vi_arr.view())?;
-        let t_la = TensorRef::from_array_view(la_arr.view())?;
+            let t_sp = TensorRef::from_array_view(sp_arr.view())?;
+            let t_en = TensorRef::from_array_view(en_arr.view())?;
+            let t_vi = TensorRef::from_array_view(vi_arr.view())?;
+            let t_la = TensorRef::from_array_view(la_arr.view())?;
 
-        let outputs = sess.run(ort::inputs![
-            "speech_enc"   => t_sp,
-            "env_enc"      => t_en,
-            "visual_enc"   => t_vi,
-            "language_enc" => t_la,
-        ])?;
+            let outputs = sess.run(ort::inputs![
+                "speech_enc"   => t_sp,
+                "env_enc"      => t_en,
+                "visual_enc"   => t_vi,
+                "language_enc" => t_la,
+            ])?;
 
-        let extract = |name: &str| -> anyhow::Result<Vec<f32>> {
-            let (_, data) = outputs[name].try_extract_tensor::<f32>()?;
-            Ok(data.to_vec())
-        };
+            let extract = |name: &str| -> anyhow::Result<Vec<f32>> {
+                let (_, data) = outputs[name].try_extract_tensor::<f32>()?;
+                Ok(data.to_vec())
+            };
 
-        Ok([
-            extract("z_0")?,
-            extract("z_1")?,
-            extract("z_2")?,
-            extract("z_3")?,
-            extract("z_4")?,
-        ])
+            [
+                extract("z_0")?,
+                extract("z_1")?,
+                extract("z_2")?,
+                extract("z_3")?,
+                extract("z_4")?,
+            ]
+        });
+        Ok(z)
     }
 
     /// Run the binding graph.
@@ -118,42 +121,45 @@ impl OnnxPerceptionSession {
         sparse_z: &[Vec<f32>; 5],
         prev_ep: &[f32],
     ) -> anyhow::Result<Vec<f32>> {
-        // Shape from each vector's own length, not the baseline N_UNITS constant — the
-        // ONNX graph's actual input dims match each region's size at export time, which
-        // may be larger than baseline for a grown region (gaps.md §24).
-        // Each ndarray must outlive the TensorRef that borrows it.
-        let sp0 = Array2::from_shape_vec((1, sparse_z[0].len()), sparse_z[0].clone())?;
-        let sp1 = Array2::from_shape_vec((1, sparse_z[1].len()), sparse_z[1].clone())?;
-        let sp2 = Array2::from_shape_vec((1, sparse_z[2].len()), sparse_z[2].clone())?;
-        let sp3 = Array2::from_shape_vec((1, sparse_z[3].len()), sparse_z[3].clone())?;
-        let sp4 = Array2::from_shape_vec((1, sparse_z[4].len()), sparse_z[4].clone())?;
-        let prev_arr = Array2::from_shape_vec((1, EPISODE_DIM), prev_ep.to_vec())?;
-        let gru_arr = Array3::from_shape_vec((1, 1, GRU_HIDDEN), self.gru_hidden.clone())?;
+        let (episode, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::OrtRunBinding, {
+            // Shape from each vector's own length, not the baseline N_UNITS constant — the
+            // ONNX graph's actual input dims match each region's size at export time, which
+            // may be larger than baseline for a grown region (gaps.md §24).
+            // Each ndarray must outlive the TensorRef that borrows it.
+            let sp0 = Array2::from_shape_vec((1, sparse_z[0].len()), sparse_z[0].clone())?;
+            let sp1 = Array2::from_shape_vec((1, sparse_z[1].len()), sparse_z[1].clone())?;
+            let sp2 = Array2::from_shape_vec((1, sparse_z[2].len()), sparse_z[2].clone())?;
+            let sp3 = Array2::from_shape_vec((1, sparse_z[3].len()), sparse_z[3].clone())?;
+            let sp4 = Array2::from_shape_vec((1, sparse_z[4].len()), sparse_z[4].clone())?;
+            let prev_arr = Array2::from_shape_vec((1, EPISODE_DIM), prev_ep.to_vec())?;
+            let gru_arr = Array3::from_shape_vec((1, 1, GRU_HIDDEN), self.gru_hidden.clone())?;
 
-        let t_sp0 = TensorRef::from_array_view(sp0.view())?;
-        let t_sp1 = TensorRef::from_array_view(sp1.view())?;
-        let t_sp2 = TensorRef::from_array_view(sp2.view())?;
-        let t_sp3 = TensorRef::from_array_view(sp3.view())?;
-        let t_sp4 = TensorRef::from_array_view(sp4.view())?;
-        let t_prev = TensorRef::from_array_view(prev_arr.view())?;
-        let t_gru = TensorRef::from_array_view(gru_arr.view())?;
+            let t_sp0 = TensorRef::from_array_view(sp0.view())?;
+            let t_sp1 = TensorRef::from_array_view(sp1.view())?;
+            let t_sp2 = TensorRef::from_array_view(sp2.view())?;
+            let t_sp3 = TensorRef::from_array_view(sp3.view())?;
+            let t_sp4 = TensorRef::from_array_view(sp4.view())?;
+            let t_prev = TensorRef::from_array_view(prev_arr.view())?;
+            let t_gru = TensorRef::from_array_view(gru_arr.view())?;
 
-        let outputs = self.sess_bind.run(ort::inputs![
-            "sp_0"         => t_sp0,
-            "sp_1"         => t_sp1,
-            "sp_2"         => t_sp2,
-            "sp_3"         => t_sp3,
-            "sp_4"         => t_sp4,
-            "prev_episode" => t_prev,
-            "gru_hidden"   => t_gru,
-        ])?;
+            let outputs = self.sess_bind.run(ort::inputs![
+                "sp_0"         => t_sp0,
+                "sp_1"         => t_sp1,
+                "sp_2"         => t_sp2,
+                "sp_3"         => t_sp3,
+                "sp_4"         => t_sp4,
+                "prev_episode" => t_prev,
+                "gru_hidden"   => t_gru,
+            ])?;
 
-        let (_, ep_data) = outputs["episode"].try_extract_tensor::<f32>()?;
-        let episode: Vec<f32> = ep_data.to_vec();
+            let (_, ep_data) = outputs["episode"].try_extract_tensor::<f32>()?;
+            let episode: Vec<f32> = ep_data.to_vec();
 
-        let (_, h_data) = outputs["gru_hidden_out"].try_extract_tensor::<f32>()?;
-        self.gru_hidden = h_data.to_vec();
+            let (_, h_data) = outputs["gru_hidden_out"].try_extract_tensor::<f32>()?;
+            self.gru_hidden = h_data.to_vec();
 
+            episode
+        });
         Ok(episode)
     }
 

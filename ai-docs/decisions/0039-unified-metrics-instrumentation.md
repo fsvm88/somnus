@@ -1,7 +1,26 @@
 # 0039. Unified two-tier metrics instrumentation (`somnus-metrics`)
 
-- **Status:** implemented.
+- **Status:** implemented, full-coverage pass complete.
 - **Date:** 2026-07-14
+
+> **Update (2026-07-14, later):** user asked to extend coverage from "every existing hand-rolled
+> timer" (the original scope below) to "every meaningful data-handling step, reachable for A/B
+> comparison" — i.e. instrument previously-untimed functions, not just convert existing timers.
+> Grew `Metric` from 24 to 67 variants across `somnus-perception` (binding forward, ORT run_encoder/
+> run_binding, fused-replay sub-phases, growth/prune, EMA predict/update/sync, ORT lifecycle,
+> homeostatic decay, REM self-probe functions), `somnus-memory` (cold archive open/truncate/evict,
+> semantic-store warm-load, recollection promote, snapshot save/load), `somnus-sensory` (one
+> aggregate `MediaFileDecode` metric spanning a whole file's decode-thread lifetime), and `somnus`
+> (action-decoder init/generate, gain-worker compute, ASR greedy decode, audio resampling,
+> language embedding, episode recording). Two new structural patterns emerged and are documented
+> below: the **private-`_inner`-method split** (for functions with early `return`/`?`/`bail!` that
+> would otherwise skip the macro's post-body recording), and the **immediately-invoked-closure
+> wrap** (for the one case — `somnus-sensory`'s decode thread — where isolating early returns inside
+> an already-existing closure required a nested closure rather than a new method). Verified live:
+> a single 2-session pilot recorded 40 distinct metrics simultaneously, including cross-thread
+> ones (`wake_worker_train_step`, `gain_compute` — plain atomics are safe to write from any
+> thread, no locking needed) and metrics that correctly stayed at zero for conditions the pilot
+> didn't trigger (region growth, `--action`, cold-archive eviction).
 
 ## Context
 
@@ -84,6 +103,45 @@ twice.
    state after the first half of this session's work (see gaps.md's write-up) and is explicitly
    what the user asked to eliminate — "one way of doing metrics."
 
+## Implementation patterns (full-coverage pass)
+
+Two structural patterns cover every function encountered, beyond the straightforward "wrap a
+self-contained expression" case already shown above:
+
+1. **Private-`_inner`-method split** — the default choice for any function with an early
+   `return`, `?`, or `bail!` reachable from multiple points (most fallible functions). Rather than
+   restructure the body to avoid early exits (risky, easy to introduce a subtle behavior change),
+   split into a thin public wrapper that calls `timed_core!` around a call to a same-signature
+   private `_inner` method, e.g.:
+   ```rust
+   pub fn prune_region(&mut self, region: RegionId, prune_fraction: f32) -> usize {
+       let (n_pruned, _) = somnus_metrics::timed_core!(
+           somnus_metrics::Metric::PruneRegion,
+           self.prune_region_inner(region, prune_fraction)
+       );
+       n_pruned
+   }
+   fn prune_region_inner(&mut self, region: RegionId, prune_fraction: f32) -> usize { /* unchanged body, early returns and all */ }
+   ```
+   The macro always records — regardless of which internal return path the `_inner` call takes —
+   because the early returns exit `_inner`, not the timed block itself. Used for the large
+   majority of newly-instrumented functions (`grow_region_seeded`, `synthesize_episode`,
+   `rebuild_ort_session`, `ColdArchive::open`, `snapshot::load_snapshot`, `ActionDecoder::generate`,
+   `WhisperDecoder::decode_greedy`, and about a dozen more).
+2. **Immediately-invoked closure** — used exactly once, for `somnus-sensory`'s `MediaFile` decode
+   thread, where the code to time is *already* the body of a `move ||` closure passed to
+   `std::thread::spawn` (no separate method to split out to). Wrapping the whole closure body in
+   `timed_core!` directly would have the same early-`return`-skips-recording problem as an
+   unsplit function, since `return` targets the nearest enclosing closure just as it targets the
+   nearest enclosing function. Fix: nest a nested `(|| { ...original body with returns... })()`
+   *inside* the `timed_core!` block, so the early returns exit the inner IIFE only, leaving the
+   outer macro's post-body recording intact. One `#[allow(clippy::redundant_closure_call)]` needed
+   since clippy doesn't know the wrap is load-bearing, not decorative.
+
+Both patterns are minimal-diff: the original function/closure body is preserved byte-for-byte
+(aside from the rename to `_inner` or the IIFE wrapper), so behavior is unchanged by construction
+— confirmed by the full test suite passing unmodified after every conversion in this pass.
+
 ## Consequences
 
 - New always-on runtime cost: one `Instant::now()`/`.elapsed()` pair (already present everywhere
@@ -97,11 +155,14 @@ twice.
 - `main.rs`'s `#![recursion_limit]` had to rise 256→512 to add the one new `"fine_metrics"` key to
   the already-large `json!{}` macro invocation — noted here since it's an easy thing to trip over
   again if more fields are added to that literal in the future.
-- `somnus-memory` currently has no Core-tier call sites converted (it has no pre-existing hand-rolled
-  timers — its I/O operations were never individually timed at all). Adding instrumentation there
-  is a Fine-tier, opportunistic addition for a future investigation, not part of this conversion
-  (per the crate's own doc-comment guardrail: add `Metric` variants as specific questions need
-  them, not as an upfront exhaustive inventory).
+- `somnus-memory` now has Core-tier coverage on every operation-granularity I/O path (cold archive
+  open/truncate/evict, semantic-store warm-load, recollection promote, snapshot save/load) added
+  in the full-coverage pass — the "no pre-existing timers to convert" gap noted in the original
+  version of this ADR is closed. Still deliberately *not* instrumented: per-record operations
+  inside an already-aggregated loop (`ColdArchive::append`/`SemanticStore::insert` during the
+  spill loop, `PqCodebook::encode`/`decode` per record) — these stay covered only in aggregate via
+  the enclosing `SleepSpill`/`MediaFileDecode`-style phase metric, per the crate's own guardrail
+  against per-element instrumentation.
 
 ## What would invalidate this
 

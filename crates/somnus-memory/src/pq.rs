@@ -370,6 +370,14 @@ impl Iterator for PqIter {
 /// Training sample: up to `PQ_TRAIN_SAMPLE` vectors drawn with deterministic
 /// even-spacing so results are reproducible without a fixed RNG seed.
 pub fn convert_cold_to_pq(src: &ColdArchive, pq_dir: &Path) -> MemoryResult<PqColdArchive> {
+    let (result, _) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::PqConvertColdToPq,
+        convert_cold_to_pq_inner(src, pq_dir)
+    );
+    result
+}
+
+fn convert_cold_to_pq_inner(src: &ColdArchive, pq_dir: &Path) -> MemoryResult<PqColdArchive> {
     let n = src.len();
     if n == 0 {
         return Err(MemoryError::DimMismatch {

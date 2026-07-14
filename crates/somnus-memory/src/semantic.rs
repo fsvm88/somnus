@@ -242,6 +242,14 @@ impl SemanticStore {
     /// Uses `Box::leak` on the `HnswIo` reader so the returned `Hnsw` is
     /// `'static`. The allocation is fixed per process restart (~a few KB).
     pub fn load_warm(warm_dir: &Path, episode_dim: usize) -> Option<Self> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::SemanticStoreLoadWarm,
+            Self::load_warm_inner(warm_dir, episode_dim)
+        );
+        result
+    }
+
+    fn load_warm_inner(warm_dir: &Path, episode_dim: usize) -> Option<Self> {
         // Version check
         let vbuf = fs::read(warm_dir.join("version")).ok()?;
         if vbuf.len() < 6

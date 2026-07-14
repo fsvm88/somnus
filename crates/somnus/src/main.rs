@@ -606,14 +606,20 @@ impl AudioProcessor {
 
         self.src_buf.extend_from_slice(&mono);
 
-        while self.src_buf.len() >= AUDIO_CHUNK {
-            let chunk = self.src_buf[..AUDIO_CHUNK].to_vec();
-            self.src_buf.drain(..AUDIO_CHUNK);
-            self.buf_16k
-                .extend_from_slice(&self.r16k.as_mut().unwrap().process(&chunk)?);
-            self.buf_env
-                .extend_from_slice(&self.r_env.as_mut().unwrap().process(&chunk)?);
-        }
+        let (resample_result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::AudioResample, {
+            (|| -> Result<()> {
+                while self.src_buf.len() >= AUDIO_CHUNK {
+                    let chunk = self.src_buf[..AUDIO_CHUNK].to_vec();
+                    self.src_buf.drain(..AUDIO_CHUNK);
+                    self.buf_16k
+                        .extend_from_slice(&self.r16k.as_mut().unwrap().process(&chunk)?);
+                    self.buf_env
+                        .extend_from_slice(&self.r_env.as_mut().unwrap().process(&chunk)?);
+                }
+                Ok(())
+            })()
+        });
+        resample_result?;
 
         let mut embs = Vec::new();
 
@@ -2799,34 +2805,37 @@ fn ingest_language_line(
     sal_threshold: f32,
 ) -> Option<LangIngestResult> {
     let Some(le) = lang_embedder else { return None };
-    let emb = if lang_use_lm {
-        // Use LM forward-pass hidden states (contextualized, richer than embed-table).
-        // Reuses the ActionDecoder's already-loaded qwen3_lm.onnx session; no extra load.
-        // Falls back to embed-table if decoder is unavailable.
-        let lm_result = decoder.as_mut().and_then(|dec| {
-            dec.tokenize(text)
-                .ok()
-                .and_then(|ids| dec.text_hidden_states(&ids).ok())
-        });
-        match lm_result {
-            Some(v) => v,
-            None => match le.embed(text) {
-                Ok(v) => v,
+    let (emb_opt, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::LangEmbed, {
+        if lang_use_lm {
+            // Use LM forward-pass hidden states (contextualized, richer than embed-table).
+            // Reuses the ActionDecoder's already-loaded qwen3_lm.onnx session; no extra load.
+            // Falls back to embed-table if decoder is unavailable.
+            let lm_result = decoder.as_mut().and_then(|dec| {
+                dec.tokenize(text)
+                    .ok()
+                    .and_then(|ids| dec.text_hidden_states(&ids).ok())
+            });
+            match lm_result {
+                Some(v) => Some(v),
+                None => match le.embed(text) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(?e, "language embed failed");
+                        None
+                    }
+                },
+            }
+        } else {
+            match le.embed(text) {
+                Ok(v) => Some(v),
                 Err(e) => {
                     tracing::warn!(?e, "language embed failed");
-                    return None;
+                    None
                 }
-            },
-        }
-    } else {
-        match le.embed(text) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(?e, "language embed failed");
-                return None;
             }
         }
-    };
+    });
+    let emb = emb_opt?;
     tracing::info!(chars = text.len(), "language ingest");
     let t_perc = std::time::Instant::now();
     match perception.ingest_language(&emb) {
@@ -3058,6 +3067,21 @@ struct RecordedEpisode {
 /// Returns `RecordedEpisode` with salience, blend flag, and source for the caller
 /// to accumulate cycle-level stats (ADR 0022). Returns `None` when no episode was produced.
 fn record_episode(
+    out: &somnus_perception::PerceptionOutput,
+    ts: &Timestamp,
+    sink: &mut Option<BufWriter<std::fs::File>>,
+    episodic: &mut EpisodicBuffer,
+    top_k: usize,
+    recall: &RecollectionLayer,
+) -> Option<RecordedEpisode> {
+    let (result, _) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::MainRecordEpisode,
+        record_episode_inner(out, ts, sink, episodic, top_k, recall)
+    );
+    result
+}
+
+fn record_episode_inner(
     out: &somnus_perception::PerceptionOutput,
     ts: &Timestamp,
     sink: &mut Option<BufWriter<std::fs::File>>,

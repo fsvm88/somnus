@@ -292,6 +292,28 @@ impl ActionDecoder {
         linear_proj: bool,
         model_prefix: &str,
     ) -> Result<Self> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::ActionDecoderInit,
+            Self::new_inner(
+                models_dir,
+                device,
+                ort_profile_dir,
+                gpu_generation,
+                linear_proj,
+                model_prefix,
+            )
+        );
+        result
+    }
+
+    fn new_inner(
+        models_dir: &std::path::Path,
+        device: NdArrayDevice,
+        ort_profile_dir: Option<&std::path::Path>,
+        gpu_generation: bool,
+        linear_proj: bool,
+        model_prefix: &str,
+    ) -> Result<Self> {
         let gain_path = models_dir.join(format!("{model_prefix}_gain.onnx"));
         let lm_path = models_dir.join(format!("{model_prefix}_lm.onnx"));
         let embed_path = models_dir.join(format!("{model_prefix}_embed_table.safetensors"));
@@ -473,6 +495,20 @@ impl ActionDecoder {
     /// Pushes (query_ids, response_ids) into the conversation buffer after each successful call.
     /// Returns the generated text (decoded, EOS stripped).
     pub fn generate(
+        &mut self,
+        episode: &[f32],
+        recalled_episodes: &[Vec<f32>],
+        query: &str,
+        max_tokens: usize,
+    ) -> Result<String> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::ActionGenerate,
+            self.generate_inner(episode, recalled_episodes, query, max_tokens)
+        );
+        result
+    }
+
+    fn generate_inner(
         &mut self,
         episode: &[f32],
         recalled_episodes: &[Vec<f32>],
@@ -1366,6 +1402,22 @@ impl GainWorker {
 ///   W1: [EPISODE_DIM, N_REGIONS*LM_HIDDEN]
 /// Burn stores Linear weights as [n_in, n_out], so y = x @ W (no transpose).
 fn gain_from_episode(
+    session: &mut Session,
+    proj_w: &[f32],
+    episode: &[f32],
+    linear_proj: bool,
+) -> Result<[f32; 5]> {
+    // Runs on GainWorker's dedicated background OS thread — somnus_metrics::METRICS.record()
+    // (inside timed_core!) is a plain atomic fetch_add, safe cross-thread (same reasoning as
+    // somnus-perception's WakeWorkerTrainStep).
+    let (result, _) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::GainCompute,
+        gain_from_episode_inner(session, proj_w, episode, linear_proj)
+    );
+    result
+}
+
+fn gain_from_episode_inner(
     session: &mut Session,
     proj_w: &[f32],
     episode: &[f32],

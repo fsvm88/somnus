@@ -44,6 +44,12 @@ pub struct ColdArchive {
 impl ColdArchive {
     /// Open (or create) the archive file.
     pub fn open(dir: &Path) -> MemoryResult<Self> {
+        let (result, _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::ColdArchiveOpen, Self::open_inner(dir));
+        result
+    }
+
+    fn open_inner(dir: &Path) -> MemoryResult<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("episodes.cold");
         if path.exists() {
@@ -134,6 +140,14 @@ impl ColdArchive {
     /// Cheap for large archives: reads only the tail slice and rewrites in one pass.
     /// No-op if `n >= self.len`.
     pub fn truncate_to_recent(&mut self, n: usize) -> MemoryResult<()> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::ColdArchiveTruncate,
+            self.truncate_to_recent_inner(n)
+        );
+        result
+    }
+
+    fn truncate_to_recent_inner(&mut self, n: usize) -> MemoryResult<()> {
         if n >= self.len {
             return Ok(());
         }
@@ -159,6 +173,14 @@ impl ColdArchive {
     /// `f32::MAX` sentinel (empty warm memory) sorts as maximally salient.
     /// No-op if `n >= self.len`.
     pub fn evict_lowest_salience(&mut self, n: usize) -> MemoryResult<()> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::ColdArchiveEvict,
+            self.evict_lowest_salience_inner(n)
+        );
+        result
+    }
+
+    fn evict_lowest_salience_inner(&mut self, n: usize) -> MemoryResult<()> {
         if n >= self.len {
             return Ok(());
         }

@@ -28,6 +28,14 @@ impl RecollectionLayer {
     /// Linear scan over the cold archive — acceptable for Phase 5 (cold len < 10k).
     /// Phase 6: build a cold-side id index to replace this scan.
     pub fn promote(&mut self, id: u64) -> MemoryResult<()> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::RecollectionPromote,
+            self.promote_inner(id)
+        );
+        result
+    }
+
+    fn promote_inner(&mut self, id: u64) -> MemoryResult<()> {
         let record = self
             .cold
             .iter()?

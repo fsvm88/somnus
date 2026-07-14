@@ -23,8 +23,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// One instrumented operation. Doc comments note which existing hand-rolled field/log line each
-/// Core-tier variant replaces, where applicable. Add variants as specific investigations need
-/// them — this is not an exhaustive upfront inventory of every data-touching call site.
+/// Core-tier variant replaces, where applicable, and which caller(s) it nests inside for
+/// operations that sit within an already-timed span (nesting is expected and intentional — a
+/// full-coverage pass, ADR 0039 follow-up, deliberately breaks several previously-opaque
+/// aggregates like `IngestBind`/`SleepFusedReplayWake`/`SleepRem` into their real sub-steps, so
+/// an A/B comparison can attribute a wall-clock delta to the actual changed step instead of just
+/// the whole enclosing phase). Genuinely per-element hot loops (audio/video frame decode,
+/// per-record cold/PQ archive I/O during spill) are deliberately NOT given their own variants —
+/// they're already covered in aggregate by an enclosing phase (`SleepSpill`, `MediaFileDecode`),
+/// per the guardrail below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     // ── Core: PerceptionProcessor ingest phases (crates/somnus-perception/src/lib.rs) ──────────
@@ -90,10 +97,161 @@ pub enum Metric {
     /// `KWtaLayer::select_top_k`'s selection body alone (duty-cycle boost + top-k partition +
     /// duty-cycle update), excluding the scoring matmul.
     KwtaSelectTopK,
+
+    // ── Core: remaining somnus-perception steps (lib.rs, binding.rs, onnx_session.rs,
+    //    wake_worker.rs) — gaps.md §26 follow-up, full-coverage pass ───────────────────────
+    /// `refresh_language_cache`'s `language_layer.forward_no_dc` call, invoked after every
+    /// non-language ingest. Previously undocumented-but-claimed as part of `IngestSymbolic`'s
+    /// doc comment; actually untimed until this variant.
+    RefreshLanguageCache,
+    /// `BindingArea::forward` alone — the cross-attention + GRU pass, nested inside whichever
+    /// caller is already timed (`IngestBind`, `IngestSettle`, or `SleepRem`'s synth path).
+    BindingForward,
+    /// `OnnxPerceptionSession::run_encoder` alone — the ORT/GPU dispatch for the 5-region
+    /// scoring matmul, nested inside `IngestBind`/`IngestSettle`.
+    OrtRunEncoder,
+    /// `OnnxPerceptionSession::run_binding` alone — the ORT/GPU dispatch for cross-attention +
+    /// GRU, nested inside `IngestBind`/`IngestSettle`.
+    OrtRunBinding,
+    /// `infer_episode_outputs` — 5 output-head forward passes, called once per trace inside the
+    /// NREM DER++ staleness-filter loop (`sleep.rs`), nested inside `SleepNrem`.
+    InferEpisodeOutputs,
+    /// `fused_replay_wake_step_batch`'s Phase 1 (per-region SAE forward + MSE), nested inside
+    /// `SleepFusedReplayWake`.
+    FusedReplaySaePhase,
+    /// `fused_replay_wake_step_batch`'s Phase 2 (per-head output forward + MSE), nested inside
+    /// `SleepFusedReplayWake`.
+    FusedReplayHeadPhase,
+    /// `fused_replay_wake_step_batch`'s combined backward + optimizer step, nested inside
+    /// `SleepFusedReplayWake` — the documented ~150ms/batch-at-128 AdamW cost.
+    FusedReplayBackward,
+    /// `rebuild_ort_session` — exports weights, shells out to
+    /// `scripts/export_perception_graph.py`, reloads ORT sessions. Runs once per sleep→wake
+    /// boundary while ORT is active; the Python subprocess makes this the single largest
+    /// candidate wall-clock item in the whole crate.
+    RebuildOrtSession,
+    /// `export_weights_for_onnx` alone — tensor→disk serialization step inside
+    /// `rebuild_ort_session`, distinct from the subprocess call itself.
+    ExportWeightsForOnnx,
+    /// `enable_ort_inference` — loads ORT sessions from disk (session construction/graph
+    /// compile), called from both startup and `rebuild_ort_session`.
+    EnableOrtInference,
+    /// `homeostatic_decay` — scales ~20 weight tensors by a constant. Exactly one call per sleep
+    /// cycle, in a gap between `SleepNrem` and `SleepRem` that was previously invisible.
+    HomeostaticDecay,
+    /// `measure_mse` — per-region k-WTA forward + reconstruction error, inference-only. Called
+    /// once per REM-sampled trace inside the REM self-probe, nested inside `SleepRem`.
+    MeasureMse,
+    /// `collect_high_residual_inputs` — scores every REM trace by reconstruction residual to
+    /// seed `grow_region_seeded`. One call per sleep cycle, O(n_traces) internal work.
+    CollectHighResidualInputs,
+    /// `grow_region` — unseeded region growth (weight-tensor concat). Fallback path or
+    /// restart-time pre-grow.
+    GrowRegion,
+    /// `grow_region_seeded` — cascade-correlation-seeded region growth. Bounded ≤5 calls/cycle.
+    GrowRegionSeeded,
+    /// `prune_region` — L1-norm-based unit pruning (weight-tensor gather/rebuild). Bounded ≤5
+    /// calls/cycle.
+    PruneRegion,
+    /// `synthesize_episode` — blends two regional-input sets, 5-region forward + binding
+    /// forward. REM creative-recombination step, bounded by `REM_SYNTH_MAX_N`.
+    SynthesizeEpisode,
+    /// `measure_output_mse_inference` — per-head forward + MSE, no backward. REM real/synthetic
+    /// quality probe, bounded-multiple per cycle.
+    MeasureOutputMseInference,
+    /// `wake_reconstruct_step` — synchronous single-episode output-head training (the fallback
+    /// path when no `WakeReconWorker` is active). Per-episode, throttled by `wake_interval`.
+    WakeReconstructStep,
+    /// `wake_worker::train_step` — the async wake-reconstruct path's training step, running on
+    /// its own background OS thread. Cross-thread `METRICS.record()` calls are safe (plain
+    /// atomics); this is the only variant recorded from outside the main/sleep threads.
+    WakeWorkerTrainStep,
+    /// `EmaOutputHeads::predict` — the GEMV inside `update_prior_predictions` (`IngestPriorUpdate`)
+    /// and every settle iteration (`IngestSettle`). Finest-grained sub-step of both.
+    EmaPredict,
+    /// `EmaOutputHeads::update_from_weights` — EMA tensor blend, called from the sync
+    /// (`wake_reconstruct_step`) and async (`wake_worker::train_step`) training paths.
+    EmaUpdateFromWeights,
+    /// `EmaOutputHeads::sync_flat` — re-extracts flat host copies from 5 EMA tensors (5
+    /// tensor→host transfers). Called from `update_from_weights` and `from_model` (restart).
+    EmaSyncFlat,
+    /// `refresh_autodiff_state` — remaps every model parameter to a fresh leaf tensor and
+    /// reinitializes the optimizer. Its own doc comment calls out a "100-500x NREM slowdown"
+    /// this exists to prevent — perf-sensitive by its own admission, previously untimed.
+    RefreshAutodiffState,
+
+    // ── Core: somnus-memory (crates/somnus-memory/src) — zero prior instrumentation ───────────────
+    /// `ColdArchive::open` — mmap-open (or create) the cold archive file. Per-restart.
+    ColdArchiveOpen,
+    /// `ColdArchive::truncate_to_recent` — rewrite the cold archive keeping only the most
+    /// recent N records.
+    ColdArchiveTruncate,
+    /// `ColdArchive::evict_lowest_salience` — read every record's salience via mmap, select-nth,
+    /// rewrite kept records. One call per sleep cycle when the cold cap is exceeded.
+    ColdArchiveEvict,
+    /// `SemanticStore::load_warm` — mmap-load the persisted HNSW dump + bitcode sidecar. The
+    /// fast branch of startup restore (vs. `SnapshotLoad`'s slow full-cold-rebuild branch).
+    SemanticStoreLoadWarm,
+    /// `RecollectionLayer::promote` — O(cold_len) linear scan of the entire cold archive to find
+    /// one record by id. Flagged in its own doc comment as a future bottleneck at scale.
+    RecollectionPromote,
+    /// `snapshot::save_episodic` — binary-encode the whole hot episodic buffer to disk. One
+    /// call per `SnapshotSave`, itself nested inside `SleepSnapshot`.
+    SnapshotSaveEpisodic,
+    /// `snapshot::load_episodic` — binary-decode the episodic buffer from disk. Per-restart.
+    SnapshotLoadEpisodic,
+    /// `snapshot::save_snapshot` — the whole per-cycle save orchestration (episodic + next_id +
+    /// atomic rename), nested inside `SleepSnapshot` alongside the HNSW dump/weights save.
+    SnapshotSave,
+    /// `snapshot::load_snapshot` — the whole startup restore orchestration. Has two very
+    /// different-cost branches (fast `SemanticStoreLoadWarm` mmap-load vs. slow full
+    /// cold-archive rebuild, documented as up to ~3 min at 164k records) — this variant times
+    /// the call as a whole; `SemanticStoreLoadWarm` distinguishes the fast branch.
+    SnapshotLoad,
+    /// `pq::convert_cold_to_pq` — offline cold→PQ archive conversion (train codebook + re-encode
+    /// every record). Not on any current production hot/cold path; instrumented for when it is
+    /// invoked (analysis tooling).
+    PqConvertColdToPq,
+
+    // ── Core: somnus-sensory (crates/somnus-sensory/src/media_file.rs) ────────────────────────────
+    /// Aggregate per-file decode+resample time for one `MediaFile` playback — accumulated
+    /// locally across the whole per-packet decode loop (audio + video, both branches) and
+    /// recorded once at end-of-stream, per this crate's own guardrail against per-packet
+    /// instrumentation at decode-thread frequency.
+    MediaFileDecode,
+
+    // ── Core: somnus binary — action decoder, ASR, remaining main-loop steps ───────────────────
+    /// `ActionDecoder::new` — loads Qwen3 ONNX sessions, tokenizer, embed table. Per-restart,
+    /// only with `--action`.
+    ActionDecoderInit,
+    /// `ActionDecoder::generate` — the full autoregressive greedy-generation loop (tokenize →
+    /// project episode(s) → per-token ORT forward). One call per user/startup query.
+    ActionGenerate,
+    /// `GainWorker`'s background-thread gain computation (ORT forward → region-token
+    /// projection → LM forward → gain norms). Async, throttled by `--gain-interval`; the
+    /// worker thread's own atomics-only recording is safe cross-thread, same as
+    /// `WakeWorkerTrainStep`.
+    GainCompute,
+    /// Language-line embedding step in `ingest_language_line` — either `LangEmbedder::embed`
+    /// (table mean-pool, default) or `ActionDecoder::text_hidden_states` (`--lang-use-lm`).
+    /// Previously invisible: `MainPerceptionIngest` only starts timing after this returns.
+    LangEmbed,
+    /// `WhisperDecoder::decode_greedy` — autoregressive ASR decode (up to `max_tokens`
+    /// sequential ORT calls + repetition penalty + tokenizer decode). One call per audio chunk
+    /// that reaches the ASR thread.
+    AsrDecode,
+    /// `AudioProcessor::ingest`'s resampling step (`SincResampler::process` for both the 16kHz
+    /// speech path and the env-encoder-rate path). Per audio chunk, before `EncodeSpeech`/
+    /// `EncodeEnv`.
+    AudioResample,
+    /// `record_episode`'s work outside the already-timed `MainWarmQuery` sub-call — L2-normalize,
+    /// recall-blend arithmetic, episodic-buffer push, sink JSON write. Wraps the whole function;
+    /// `MainWarmQuery` nests inside it as before.
+    MainRecordEpisode,
 }
 
 impl Metric {
-    pub const COUNT: usize = 24;
+    pub const COUNT: usize = 67;
 
     const fn as_index(self) -> usize {
         match self {
@@ -121,6 +279,49 @@ impl Metric {
             Metric::MainWarmQuery => 21,
             Metric::KwtaScoreMatmul => 22,
             Metric::KwtaSelectTopK => 23,
+            Metric::RefreshLanguageCache => 24,
+            Metric::BindingForward => 25,
+            Metric::OrtRunEncoder => 26,
+            Metric::OrtRunBinding => 27,
+            Metric::InferEpisodeOutputs => 28,
+            Metric::FusedReplaySaePhase => 29,
+            Metric::FusedReplayHeadPhase => 30,
+            Metric::FusedReplayBackward => 31,
+            Metric::RebuildOrtSession => 32,
+            Metric::ExportWeightsForOnnx => 33,
+            Metric::EnableOrtInference => 34,
+            Metric::HomeostaticDecay => 35,
+            Metric::MeasureMse => 36,
+            Metric::CollectHighResidualInputs => 37,
+            Metric::GrowRegion => 38,
+            Metric::GrowRegionSeeded => 39,
+            Metric::PruneRegion => 40,
+            Metric::SynthesizeEpisode => 41,
+            Metric::MeasureOutputMseInference => 42,
+            Metric::WakeReconstructStep => 43,
+            Metric::WakeWorkerTrainStep => 44,
+            Metric::EmaPredict => 45,
+            Metric::EmaUpdateFromWeights => 46,
+            Metric::EmaSyncFlat => 47,
+            Metric::RefreshAutodiffState => 48,
+            Metric::ColdArchiveOpen => 49,
+            Metric::ColdArchiveTruncate => 50,
+            Metric::ColdArchiveEvict => 51,
+            Metric::SemanticStoreLoadWarm => 52,
+            Metric::RecollectionPromote => 53,
+            Metric::SnapshotSaveEpisodic => 54,
+            Metric::SnapshotLoadEpisodic => 55,
+            Metric::SnapshotSave => 56,
+            Metric::SnapshotLoad => 57,
+            Metric::PqConvertColdToPq => 58,
+            Metric::MediaFileDecode => 59,
+            Metric::ActionDecoderInit => 60,
+            Metric::ActionGenerate => 61,
+            Metric::GainCompute => 62,
+            Metric::LangEmbed => 63,
+            Metric::AsrDecode => 64,
+            Metric::AudioResample => 65,
+            Metric::MainRecordEpisode => 66,
         }
     }
 
@@ -150,6 +351,49 @@ impl Metric {
             Metric::MainWarmQuery => "main_warm_query",
             Metric::KwtaScoreMatmul => "kwta_score_matmul",
             Metric::KwtaSelectTopK => "kwta_select_topk",
+            Metric::RefreshLanguageCache => "refresh_language_cache",
+            Metric::BindingForward => "binding_forward",
+            Metric::OrtRunEncoder => "ort_run_encoder",
+            Metric::OrtRunBinding => "ort_run_binding",
+            Metric::InferEpisodeOutputs => "infer_episode_outputs",
+            Metric::FusedReplaySaePhase => "fused_replay_sae_phase",
+            Metric::FusedReplayHeadPhase => "fused_replay_head_phase",
+            Metric::FusedReplayBackward => "fused_replay_backward",
+            Metric::RebuildOrtSession => "rebuild_ort_session",
+            Metric::ExportWeightsForOnnx => "export_weights_for_onnx",
+            Metric::EnableOrtInference => "enable_ort_inference",
+            Metric::HomeostaticDecay => "homeostatic_decay",
+            Metric::MeasureMse => "measure_mse",
+            Metric::CollectHighResidualInputs => "collect_high_residual_inputs",
+            Metric::GrowRegion => "grow_region",
+            Metric::GrowRegionSeeded => "grow_region_seeded",
+            Metric::PruneRegion => "prune_region",
+            Metric::SynthesizeEpisode => "synthesize_episode",
+            Metric::MeasureOutputMseInference => "measure_output_mse_inference",
+            Metric::WakeReconstructStep => "wake_reconstruct_step",
+            Metric::WakeWorkerTrainStep => "wake_worker_train_step",
+            Metric::EmaPredict => "ema_predict",
+            Metric::EmaUpdateFromWeights => "ema_update_from_weights",
+            Metric::EmaSyncFlat => "ema_sync_flat",
+            Metric::RefreshAutodiffState => "refresh_autodiff_state",
+            Metric::ColdArchiveOpen => "cold_archive_open",
+            Metric::ColdArchiveTruncate => "cold_archive_truncate",
+            Metric::ColdArchiveEvict => "cold_archive_evict",
+            Metric::SemanticStoreLoadWarm => "semantic_store_load_warm",
+            Metric::RecollectionPromote => "recollection_promote",
+            Metric::SnapshotSaveEpisodic => "snapshot_save_episodic",
+            Metric::SnapshotLoadEpisodic => "snapshot_load_episodic",
+            Metric::SnapshotSave => "snapshot_save",
+            Metric::SnapshotLoad => "snapshot_load",
+            Metric::PqConvertColdToPq => "pq_convert_cold_to_pq",
+            Metric::MediaFileDecode => "media_file_decode",
+            Metric::ActionDecoderInit => "action_decoder_init",
+            Metric::ActionGenerate => "action_generate",
+            Metric::GainCompute => "gain_compute",
+            Metric::LangEmbed => "lang_embed",
+            Metric::AsrDecode => "asr_decode",
+            Metric::AudioResample => "audio_resample",
+            Metric::MainRecordEpisode => "main_record_episode",
         }
     }
 
@@ -178,6 +422,49 @@ impl Metric {
         Metric::MainWarmQuery,
         Metric::KwtaScoreMatmul,
         Metric::KwtaSelectTopK,
+        Metric::RefreshLanguageCache,
+        Metric::BindingForward,
+        Metric::OrtRunEncoder,
+        Metric::OrtRunBinding,
+        Metric::InferEpisodeOutputs,
+        Metric::FusedReplaySaePhase,
+        Metric::FusedReplayHeadPhase,
+        Metric::FusedReplayBackward,
+        Metric::RebuildOrtSession,
+        Metric::ExportWeightsForOnnx,
+        Metric::EnableOrtInference,
+        Metric::HomeostaticDecay,
+        Metric::MeasureMse,
+        Metric::CollectHighResidualInputs,
+        Metric::GrowRegion,
+        Metric::GrowRegionSeeded,
+        Metric::PruneRegion,
+        Metric::SynthesizeEpisode,
+        Metric::MeasureOutputMseInference,
+        Metric::WakeReconstructStep,
+        Metric::WakeWorkerTrainStep,
+        Metric::EmaPredict,
+        Metric::EmaUpdateFromWeights,
+        Metric::EmaSyncFlat,
+        Metric::RefreshAutodiffState,
+        Metric::ColdArchiveOpen,
+        Metric::ColdArchiveTruncate,
+        Metric::ColdArchiveEvict,
+        Metric::SemanticStoreLoadWarm,
+        Metric::RecollectionPromote,
+        Metric::SnapshotSaveEpisodic,
+        Metric::SnapshotLoadEpisodic,
+        Metric::SnapshotSave,
+        Metric::SnapshotLoad,
+        Metric::PqConvertColdToPq,
+        Metric::MediaFileDecode,
+        Metric::ActionDecoderInit,
+        Metric::ActionGenerate,
+        Metric::GainCompute,
+        Metric::LangEmbed,
+        Metric::AsrDecode,
+        Metric::AudioResample,
+        Metric::MainRecordEpisode,
     ];
 }
 
