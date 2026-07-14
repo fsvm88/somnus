@@ -1,5 +1,16 @@
 # Session state — somnus
 
+> **⏸️ SHUTDOWN (clean, user-requested), 2026-07-14.** Working tree clean, everything committed
+> (`25d8174` full-coverage somnus-metrics expansion, `b5b5849` base somnus-metrics + research note + ADR
+> 0038 — both this session). No `somnus` process running, no stray pilot/scratch directories (all
+> `memory/*_pilot*` dirs used during this session's validation runs were `rm -rf`'d after use).
+> `memory/` (the production growth campaign) untouched this entire session — still safely stopped
+> from before, resumable anytime via `scripts/resume_growth_campaign.sh`, session 75/131, 94.7% to
+> the 10x target, per the shutdown record further below. **Next-session entry points:** ADR 0038
+> (hierarchical k-WTA scoring, `proposed`, not started — now unblockable via a `--features
+> fine-metrics` build against the real campaign instead of a synthetic benchmark) or resuming the
+> growth campaign itself. Nothing else queued.
+>
 > **Last updated:** 2026-07-14 (final, full-coverage pass)
 > **✅ somnus-metrics: full-coverage expansion complete, on top of the unified two-tier system (ADR
 > 0039).** After the base conversion (below) landed, user asked to go further still — "make
