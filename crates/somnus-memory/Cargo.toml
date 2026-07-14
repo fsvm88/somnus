@@ -3,13 +3,19 @@ name    = "somnus-memory"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Fine-grained timing/counters (somnus-metrics). Off by default. See somnus-perception's
+# Cargo.toml / somnus-metrics crate docs for the design rationale.
+fine-metrics = ["somnus-metrics/fine-metrics"]
+
 [dependencies]
-bitcode   = { workspace = true }
-hnsw_rs   = { workspace = true }
-log       = "0.4"
-memmap2   = { workspace = true }
-serde     = { workspace = true }
-thiserror = { workspace = true }
+bitcode     = { workspace = true }
+somnus-metrics = { workspace = true }
+hnsw_rs     = { workspace = true }
+log         = "0.4"
+memmap2     = { workspace = true }
+serde       = { workspace = true }
+thiserror   = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

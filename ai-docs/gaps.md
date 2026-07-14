@@ -945,6 +945,75 @@ mechanism (local/blocked connectivity, hierarchical or approximate WTA). That's 
 mechanical fix — tracked as next-in-queue, to be written up as a research note before any
 implementation.
 
+**Research note written 2026-07-14:** `ai-docs/research/sparse-coding.md` §"Encoder-side scaling" —
+confirms the O(input_dim × n_units) scoring cost is real and not addressable by exploiting output
+sparsity, surveys three candidate mechanisms (local/blocked connectivity, hierarchical/coarse-to-
+fine WTA, approximate top-k sampling) with rough risk tradeoffs, and lays out three prerequisites
+before implementation: (1) measure the actual scoring-matmul cost at current/projected scale on
+both the `burn` and ORT-exported paths (no isolated benchmark exists yet, unlike §25's), (2) confirm
+this is worth doing at honeybee scale vs. being a "next order of magnitude" concern, (3) scope as an
+ADR given the representational-structure change interacts with growth/duty-cycle/binding
+assumptions.
+
+**ADR written 2026-07-14 (same session): ADR 0038** — status `proposed`, picks hierarchical/
+coarse-to-fine WTA as the target mechanism (over MoE-style routing and sampling — preserves exact
+top-k within selected blocks, degrades gracefully, may reuse existing HNSW machinery for the coarse
+stage). Implementation still explicitly not started — gated on the same three prerequisites above,
+now tracked as the ADR's own prerequisite list. Purely a "don't re-litigate the comparison next
+time" record, not a green light to build.
+
+---
+
+## §26 — Unified two-tier metrics instrumentation (`somnus-metrics`, ADR 0039)
+
+Raised while scoping ADR 0038's Phase 0 (benchmark the k-WTA scoring matmul): the codebase had no
+shared timing mechanism at all — every timed call site hand-rolled its own
+`Instant::now()`/`.elapsed()` pair, duplicated dozens of times across `somnus-perception`, `somnus`, and
+`somnus-encoding`. User asked for two things, done in sequence in the same session:
+
+1. **Fine-grained, macro-gated counters** — new crate `crates/somnus-metrics`: a `Metric` enum
+   (mirrors `RegionId::as_index()`'s dense-array-over-enum pattern), a fixed-size atomic
+   `Registry`, and `timed!`/`counted!` macros gated behind a new `fine-metrics` Cargo feature
+   (default off, forwarded from `somnus-perception`/`somnus-memory`/`somnus-sensory`/`somnus-encoding`/`somnus`
+   like the existing `mn10_env` precedent). With the feature off, the macro body is textually a
+   bare passthrough — zero-cost by construction. Piloted on `somnus-perception`'s 6 ingest phases
+   (dual-write alongside the existing `perf_*_us` fields) plus new `KwtaScoreMatmul`/
+   `KwtaSelectTopK` sub-breakdown counters inside `KWtaLayer::forward`/`select_top_k`
+   (`region.rs`) — this reopens ADR 0038's benchmarking prerequisite through live campaign traffic
+   instead of a synthetic bench binary.
+2. **Full conversion — "one way of doing metrics."** User then asked to convert every *existing*
+   hand-rolled timer to the same system rather than leave two parallel mechanisms, and to treat
+   the current always-on metrics as what stays always-on. Added a second, unconditional tier
+   (`timed_core!`/`counted_core!` — always compiled, always recording) and converted every
+   hand-rolled site across `somnus-perception` (6 ingest phases), `somnus/src/sleep.rs` (11 wall-clock
+   phases — 8 via the macro's block-wrap idiom, 3 structurally-entangled spans via a direct
+   `somnus_metrics::METRICS.record()` call, documented as a deliberate exception in ADR 0039),
+   `somnus-encoding/src/{audio,video}.rs` (3 encoder timers), and `somnus/src/main.rs` (4 more sites).
+   Found and removed two genuine duplicate-measurement bugs in the process: `main.rs` was
+   independently re-timing `encode_speech`/`encode_env`/video-frame `encode()` calls that
+   `somnus-encoding` already timed and returned via `encode_ms` — now logs that field directly. All
+   pre-existing top-level JSON fields (`perc_kwta_us`, `nrem_wall_ms`, `speech_encode_total_ms`,
+   etc.) are populated exactly as before from the same `Duration` values, so `campaign_status.py`/
+   `eval_metrics.py` need no changes; a new `"fine_metrics"` key in the metrics NDJSON line carries
+   the unified registry snapshot (Core-tier entries always present, Fine-tier entries additionally
+   present when `--features fine-metrics` is built).
+
+**Verified:** both feature states (`cargo build/clippy/test --release --workspace`) pass clean,
+including 5 new `somnus-metrics` unit tests. Two short live pilot runs (isolated scratch `memory/`
+dirs, cleaned up after) confirmed: (1) the NDJSON `fine_metrics` field appears correctly, (2) old
+top-level fields cross-check against the new registry within expected truncation-order noise
+(e.g. `perc_kwta_us` 92,976 vs registry-derived 93,004 — sum-of-truncated-microseconds vs
+exact-nanosecond-sum-then-divide, not a bug), (3) the eval harness (`eval_metrics.py`) parses the
+extended JSON schema without error, and (4) `kwta_score_matmul` dominates `kwta_select_topk` by
+~124–165× even at tiny baseline region sizes — early live evidence bearing on ADR 0038's still-open
+question, not yet at the campaign's actual ~9,660-unit scale.
+
+**Not done, deliberately deferred:** `somnus-memory` has zero converted call sites (it never had
+hand-rolled timers to convert — its I/O paths were never individually timed). Adding
+instrumentation there is future opportunistic work, not part of this conversion. Full design
+rationale and the "why some spans use direct `METRICS.record()` instead of the macro" explanation:
+`ai-docs/decisions/0039-unified-metrics-instrumentation.md`.
+
 ---
 
 ## Priority order (as of 2026-07-11)
@@ -980,4 +1049,5 @@ implementation.
 | ✅ §22 | **Auto-enable ORT/MIGraphX perception inference past CPU/GPU crossover** (ADR 0037) | Med | Wake-path perception wall-clock (measured >50% of cycle time at 6K units/region) | Mechanism deployed 2026-07-12; real speedup blocked by §24's bugs, now confirmed **~3-4× real speedup** live 2026-07-13 |
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
-| ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics |
+| ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics. Follow-on research note + ADR 0038 (encoder scoring-cost scaling) written 2026-07-14 — see `sparse-coding.md`; not started |
+| ✅ §26 | **Unified two-tier metrics instrumentation** (`somnus-metrics`, ADR 0039) | Med | Ops visibility — every hand-rolled timer now shares one registry/macro system, "big item" tier always on, granular tier opt-in | Implemented 2026-07-14 — see §26 below |

@@ -79,41 +79,44 @@ impl AudioEncoder {
         pcm_16k: &[f32],
         ts: Timestamp,
     ) -> EncodingResult<(AudioEmbedding, Vec<f32>)> {
-        let t0 = std::time::Instant::now();
-        debug_assert_eq!(pcm_16k.len(), WHISPER_SAMPLES);
-        if pcm_16k.len() != WHISPER_SAMPLES {
-            return Err(EncodingError::WrongLength {
-                expected: WHISPER_SAMPLES,
-                got: pcm_16k.len(),
+        let ((values, hidden_flat), d0) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::EncodeSpeech, {
+                debug_assert_eq!(pcm_16k.len(), WHISPER_SAMPLES);
+                if pcm_16k.len() != WHISPER_SAMPLES {
+                    return Err(EncodingError::WrongLength {
+                        expected: WHISPER_SAMPLES,
+                        got: pcm_16k.len(),
+                    });
+                }
+
+                let mel_flat = self.speech_mel.compute(pcm_16k);
+                // Shape: (1, 80, 3000)
+                let mel_arr = Array3::from_shape_vec((1, 80, 3000), mel_flat)
+                    .map_err(|e| EncodingError::Image(e.to_string()))?;
+                let tensor = TensorRef::from_array_view(&mel_arr)?;
+
+                let outputs = self
+                    .speech_session
+                    .run(ort::inputs!["input_features" => tensor])?;
+                let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+                let dims: Vec<i64> = shape.iter().copied().collect();
+                if dims != [1, 1500, 384] {
+                    return Err(EncodingError::ShapeMismatch {
+                        expected: vec![1, 1500, 384],
+                        got: dims,
+                    });
+                }
+
+                let hidden_flat = data.to_vec(); // [1500 * 384] for optional ASR
+                let values = mean_pool_2d(&hidden_flat, 1500, 384);
+                (values, hidden_flat)
             });
-        }
-
-        let mel_flat = self.speech_mel.compute(pcm_16k);
-        // Shape: (1, 80, 3000)
-        let mel_arr = Array3::from_shape_vec((1, 80, 3000), mel_flat)
-            .map_err(|e| EncodingError::Image(e.to_string()))?;
-        let tensor = TensorRef::from_array_view(&mel_arr)?;
-
-        let outputs = self
-            .speech_session
-            .run(ort::inputs!["input_features" => tensor])?;
-        let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
-        let dims: Vec<i64> = shape.iter().copied().collect();
-        if dims != [1, 1500, 384] {
-            return Err(EncodingError::ShapeMismatch {
-                expected: vec![1, 1500, 384],
-                got: dims,
-            });
-        }
-
-        let hidden_flat = data.to_vec(); // [1500 * 384] for optional ASR
-        let values = mean_pool_2d(&hidden_flat, 1500, 384);
         Ok((
             AudioEmbedding {
                 source: AudioEncoderSource::Speech,
                 values,
                 timestamp: ts,
-                encode_ms: t0.elapsed().as_millis() as u64,
+                encode_ms: d0.as_millis() as u64,
             },
             hidden_flat,
         ))
@@ -122,44 +125,45 @@ impl AudioEncoder {
     /// Encode `ENV_SAMPLES` f32 samples → `ENV_DIM`-dim env embedding (CLAP: 480 000 @
     /// 48 kHz → 512-dim; mn10: 320 000 @ 32 kHz → 960-dim).
     pub fn encode_env(&mut self, pcm_env: &[f32], ts: Timestamp) -> EncodingResult<AudioEmbedding> {
-        let t0 = std::time::Instant::now();
-        debug_assert_eq!(pcm_env.len(), ENV_SAMPLES);
-        if pcm_env.len() != ENV_SAMPLES {
-            return Err(EncodingError::WrongLength {
-                expected: ENV_SAMPLES,
-                got: pcm_env.len(),
-            });
-        }
+        let (values, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::EncodeEnv, {
+            debug_assert_eq!(pcm_env.len(), ENV_SAMPLES);
+            if pcm_env.len() != ENV_SAMPLES {
+                return Err(EncodingError::WrongLength {
+                    expected: ENV_SAMPLES,
+                    got: pcm_env.len(),
+                });
+            }
 
-        let mel_flat = self.env_mel.compute(pcm_env);
-        #[cfg(not(feature = "mn10_env"))]
-        let mel_shape = (1, 1, 1001, 64);
-        #[cfg(feature = "mn10_env")]
-        let mel_shape = (1, 1, 128, 1000);
-        let mel_arr = Array4::from_shape_vec(mel_shape, mel_flat)
-            .map_err(|e| EncodingError::Image(e.to_string()))?;
-        let tensor = TensorRef::from_array_view(&mel_arr)?;
+            let mel_flat = self.env_mel.compute(pcm_env);
+            #[cfg(not(feature = "mn10_env"))]
+            let mel_shape = (1, 1, 1001, 64);
+            #[cfg(feature = "mn10_env")]
+            let mel_shape = (1, 1, 128, 1000);
+            let mel_arr = Array4::from_shape_vec(mel_shape, mel_flat)
+                .map_err(|e| EncodingError::Image(e.to_string()))?;
+            let tensor = TensorRef::from_array_view(&mel_arr)?;
 
-        #[cfg(not(feature = "mn10_env"))]
-        let input_name = "input_features";
-        #[cfg(feature = "mn10_env")]
-        let input_name = "mel_spectrogram";
-        let outputs = self.env_session.run(ort::inputs![input_name => tensor])?;
-        let (shape, data) = outputs[ENV_OUTPUT_NAME].try_extract_tensor::<f32>()?;
-        let dims: Vec<i64> = shape.iter().copied().collect();
-        if dims != [1, ENV_DIM] {
-            return Err(EncodingError::ShapeMismatch {
-                expected: vec![1, ENV_DIM],
-                got: dims,
-            });
-        }
+            #[cfg(not(feature = "mn10_env"))]
+            let input_name = "input_features";
+            #[cfg(feature = "mn10_env")]
+            let input_name = "mel_spectrogram";
+            let outputs = self.env_session.run(ort::inputs![input_name => tensor])?;
+            let (shape, data) = outputs[ENV_OUTPUT_NAME].try_extract_tensor::<f32>()?;
+            let dims: Vec<i64> = shape.iter().copied().collect();
+            if dims != [1, ENV_DIM] {
+                return Err(EncodingError::ShapeMismatch {
+                    expected: vec![1, ENV_DIM],
+                    got: dims,
+                });
+            }
 
-        let values = data.to_vec();
+            data.to_vec()
+        });
         Ok(AudioEmbedding {
             source: AudioEncoderSource::Env,
             values,
             timestamp: ts,
-            encode_ms: t0.elapsed().as_millis() as u64,
+            encode_ms: d0.as_millis() as u64,
         })
     }
 }

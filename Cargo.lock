@@ -2406,6 +2406,7 @@ dependencies = [
  "crossbeam-channel",
  "somnus-encoding",
  "somnus-memory",
+ "somnus-metrics",
  "somnus-perception",
  "somnus-sensory",
  "ndarray 0.17.2",
@@ -2424,6 +2425,7 @@ name = "somnus-encoding"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "somnus-metrics",
  "somnus-sensory",
  "ndarray 0.17.2",
  "ort",
@@ -2438,6 +2440,7 @@ name = "somnus-memory"
 version = "0.1.0"
 dependencies = [
  "bitcode",
+ "somnus-metrics",
  "hnsw_rs",
  "log",
  "memmap2",
@@ -2447,12 +2450,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "somnus-metrics"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "somnus-perception"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
  "burn-ndarray",
+ "somnus-metrics",
  "matrixmultiply",
  "ndarray 0.17.2",
  "ort",
@@ -2467,6 +2478,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "crossbeam-channel",
+ "somnus-metrics",
  "ffmpeg-next",
  "nokhwa",
  "thiserror 2.0.18",

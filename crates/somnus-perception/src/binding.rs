@@ -358,15 +358,18 @@ mod tests {
 
         // Reference: old dense path (to_dense_n + full Linear::forward).
         let dense = act.to_dense_n(N_UNITS);
-        let dense_t: Tensor<NdArray, 2> = Tensor::from_data(TensorData::new(dense, [1, N_UNITS]), &device);
+        let dense_t: Tensor<NdArray, 2> =
+            Tensor::from_data(TensorData::new(dense, [1, N_UNITS]), &device);
         let dense_out = area.region_0.forward(dense_t);
 
         // Sparse path: gather only the active rows and contract against the nonzero values.
         let idx_data: Vec<i64> = act.indices.iter().map(|&i| i as i64).collect();
         let k = idx_data.len();
-        let idx_t: Tensor<NdArray, 1, Int> = Tensor::from_data(TensorData::new(idx_data, [k]), &device);
+        let idx_t: Tensor<NdArray, 1, Int> =
+            Tensor::from_data(TensorData::new(idx_data, [k]), &device);
         let gathered = area.region_0.weight.val().select(0, idx_t);
-        let vals_t: Tensor<NdArray, 2> = Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), &device);
+        let vals_t: Tensor<NdArray, 2> =
+            Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), &device);
         let sparse_out = vals_t.matmul(gathered);
 
         dense_out

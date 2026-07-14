@@ -3,9 +3,15 @@ name    = "somnus-sensory"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Fine-grained timing/counters (somnus-metrics). Off by default. See somnus-perception's
+# Cargo.toml / somnus-metrics crate docs for the design rationale.
+fine-metrics = ["somnus-metrics/fine-metrics"]
+
 [dependencies]
 cpal              = { workspace = true }
 crossbeam-channel = { workspace = true }
+somnus-metrics       = { workspace = true }
 ffmpeg-next       = { workspace = true }
 nokhwa            = { workspace = true }
 thiserror         = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name    = "somnus-metrics"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Compiles the timed!/counted! macro bodies into real Instant/atomic-counter code.
+# Off by default: the crate still builds, but every macro call site expands to a
+# bare passthrough of its body — textually zero-cost, not just runtime-disabled.
+# See ai-docs/decisions (fine-grained instrumentation) for the design rationale.
+fine-metrics = []
+
+[dependencies]
+serde_json = { workspace = true }

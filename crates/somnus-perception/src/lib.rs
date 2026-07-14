@@ -24,7 +24,7 @@ use burn::{
     record::{BinFileRecorder, FullPrecisionSettings},
     tensor::{Distribution, Tensor, TensorData},
 };
-use std::{collections::VecDeque, time::Instant};
+use std::collections::VecDeque;
 
 pub type TrainB = Autodiff<NdArray>;
 type PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>;
@@ -419,49 +419,55 @@ impl PerceptionProcessor {
             tracing::info!(region = "speech", prior_cosine = c, "top-down prior");
         }
 
-        let t0 = Instant::now();
-        let speech_err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-            // ORT encoder recomputes all 5 regions in try_bind; skip burn forward.
-            // Bootstrap latest[0] if needed so try_bind gate can fire.
-            if self.latest[RegionId::AudioSpeech.as_index()].is_none() {
-                let n = self.model.as_ref().unwrap().speech_layer.n_units;
-                self.latest[RegionId::AudioSpeech.as_index()] =
-                    Some(bootstrap_placeholder(RegionId::AudioSpeech, n));
+        let (speech_err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
+            if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+                // ORT encoder recomputes all 5 regions in try_bind; skip burn forward.
+                // Bootstrap latest[0] if needed so try_bind gate can fire.
+                if self.latest[RegionId::AudioSpeech.as_index()].is_none() {
+                    let n = self.model.as_ref().unwrap().speech_layer.n_units;
+                    self.latest[RegionId::AudioSpeech.as_index()] =
+                        Some(bootstrap_placeholder(RegionId::AudioSpeech, n));
+                }
+                0.0
+            } else {
+                let act = self
+                    .model
+                    .as_mut()
+                    .unwrap()
+                    .speech_layer
+                    .forward(&speech_input, &device);
+                let err = self
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .speech_decoder
+                    .reconstruction_error(values, &act, &device);
+                self.latest[RegionId::AudioSpeech.as_index()] = Some(act);
+                err
             }
-            0.0
-        } else {
-            let act = self
-                .model
-                .as_mut()
-                .unwrap()
-                .speech_layer
-                .forward(&speech_input, &device);
-            let err = self
-                .model
-                .as_ref()
-                .unwrap()
-                .speech_decoder
-                .reconstruction_error(values, &act, &device);
-            self.latest[RegionId::AudioSpeech.as_index()] = Some(act);
-            err
-        };
-        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
+        });
+        self.perf_kwta_us += d0.as_micros() as u64;
         self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
 
-        let t1 = Instant::now();
-        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
+        let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestSymbolic,
+            self.compute_symbolic_cross_modal()
+        );
         self.refresh_language_cache();
-        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+        self.perf_symbolic_us += d1.as_micros() as u64;
 
-        let t2 = Instant::now();
         let latest_ep = self.working_memory.back().cloned();
-        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
-        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+        let ((episode, regional_inputs), d2) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestBind,
+            self.try_bind(latest_ep.as_ref())
+        );
+        self.perf_bind_us += d2.as_micros() as u64;
 
-        let t3 = Instant::now();
-        let (episode, settle_iters, settle_delta) =
-            self.maybe_settle_and_update(episode, speech_cos);
-        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+        let ((episode, settle_iters, settle_delta), d3) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestPrior,
+            self.maybe_settle_and_update(episode, speech_cos)
+        );
+        self.perf_prior_us += d3.as_micros() as u64;
 
         self.push_to_wm(&episode);
 
@@ -490,46 +496,53 @@ impl PerceptionProcessor {
             tracing::info!(region = "env", prior_cosine = c, "top-down prior");
         }
 
-        let t0 = Instant::now();
-        let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-            if self.latest[RegionId::AudioEnv.as_index()].is_none() {
-                let n = self.model.as_ref().unwrap().env_layer.n_units;
-                self.latest[RegionId::AudioEnv.as_index()] =
-                    Some(bootstrap_placeholder(RegionId::AudioEnv, n));
+        let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
+            if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+                if self.latest[RegionId::AudioEnv.as_index()].is_none() {
+                    let n = self.model.as_ref().unwrap().env_layer.n_units;
+                    self.latest[RegionId::AudioEnv.as_index()] =
+                        Some(bootstrap_placeholder(RegionId::AudioEnv, n));
+                }
+                0.0
+            } else {
+                let act = self
+                    .model
+                    .as_mut()
+                    .unwrap()
+                    .env_layer
+                    .forward(&input, &device);
+                let e = self
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .env_decoder
+                    .reconstruction_error(values, &act, &device);
+                self.latest[RegionId::AudioEnv.as_index()] = Some(act);
+                e
             }
-            0.0
-        } else {
-            let act = self
-                .model
-                .as_mut()
-                .unwrap()
-                .env_layer
-                .forward(&input, &device);
-            let e = self
-                .model
-                .as_ref()
-                .unwrap()
-                .env_decoder
-                .reconstruction_error(values, &act, &device);
-            self.latest[RegionId::AudioEnv.as_index()] = Some(act);
-            e
-        };
-        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
+        });
+        self.perf_kwta_us += d0.as_micros() as u64;
         self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
 
-        let t1 = Instant::now();
-        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
+        let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestSymbolic,
+            self.compute_symbolic_cross_modal()
+        );
         self.refresh_language_cache();
-        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+        self.perf_symbolic_us += d1.as_micros() as u64;
 
-        let t2 = Instant::now();
         let latest_ep = self.working_memory.back().cloned();
-        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
-        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+        let ((episode, regional_inputs), d2) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestBind,
+            self.try_bind(latest_ep.as_ref())
+        );
+        self.perf_bind_us += d2.as_micros() as u64;
 
-        let t3 = Instant::now();
-        let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
-        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+        let ((episode, settle_iters, settle_delta), d3) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestPrior,
+            self.maybe_settle_and_update(episode, cosine)
+        );
+        self.perf_prior_us += d3.as_micros() as u64;
 
         self.push_to_wm(&episode);
 
@@ -558,46 +571,53 @@ impl PerceptionProcessor {
             tracing::info!(region = "visual", prior_cosine = c, "top-down prior");
         }
 
-        let t0 = Instant::now();
-        let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-            if self.latest[RegionId::Visual.as_index()].is_none() {
-                let n = self.model.as_ref().unwrap().visual_layer.n_units;
-                self.latest[RegionId::Visual.as_index()] =
-                    Some(bootstrap_placeholder(RegionId::Visual, n));
+        let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
+            if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+                if self.latest[RegionId::Visual.as_index()].is_none() {
+                    let n = self.model.as_ref().unwrap().visual_layer.n_units;
+                    self.latest[RegionId::Visual.as_index()] =
+                        Some(bootstrap_placeholder(RegionId::Visual, n));
+                }
+                0.0
+            } else {
+                let act = self
+                    .model
+                    .as_mut()
+                    .unwrap()
+                    .visual_layer
+                    .forward(&input, &device);
+                let e = self
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .visual_decoder
+                    .reconstruction_error(values, &act, &device);
+                self.latest[RegionId::Visual.as_index()] = Some(act);
+                e
             }
-            0.0
-        } else {
-            let act = self
-                .model
-                .as_mut()
-                .unwrap()
-                .visual_layer
-                .forward(&input, &device);
-            let e = self
-                .model
-                .as_ref()
-                .unwrap()
-                .visual_decoder
-                .reconstruction_error(values, &act, &device);
-            self.latest[RegionId::Visual.as_index()] = Some(act);
-            e
-        };
-        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
+        });
+        self.perf_kwta_us += d0.as_micros() as u64;
         self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
 
-        let t1 = Instant::now();
-        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
+        let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestSymbolic,
+            self.compute_symbolic_cross_modal()
+        );
         self.refresh_language_cache();
-        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+        self.perf_symbolic_us += d1.as_micros() as u64;
 
-        let t2 = Instant::now();
         let latest_ep = self.working_memory.back().cloned();
-        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
-        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+        let ((episode, regional_inputs), d2) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestBind,
+            self.try_bind(latest_ep.as_ref())
+        );
+        self.perf_bind_us += d2.as_micros() as u64;
 
-        let t3 = Instant::now();
-        let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
-        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+        let ((episode, settle_iters, settle_delta), d3) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestPrior,
+            self.maybe_settle_and_update(episode, cosine)
+        );
+        self.perf_prior_us += d3.as_micros() as u64;
 
         self.push_to_wm(&episode);
 
@@ -624,42 +644,49 @@ impl PerceptionProcessor {
             tracing::info!(region = "language", prior_cosine = c, "top-down prior");
         }
 
-        let t0 = Instant::now();
-        let err = if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-            // Language is not checked in the try_bind gate (indices 0-3 only),
-            // so no bootstrap needed; try_bind updates latest[4] via topk_from_z.
-            0.0
-        } else {
-            let act = self
-                .model
-                .as_mut()
-                .unwrap()
-                .language_layer
-                .forward(&input, &device);
-            let e = self
-                .model
-                .as_ref()
-                .unwrap()
-                .language_decoder
-                .reconstruction_error(values, &act, &device);
-            self.latest[RegionId::Language.as_index()] = Some(act);
-            e
-        };
-        self.perf_kwta_us += t0.elapsed().as_micros() as u64;
+        let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
+            if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+                // Language is not checked in the try_bind gate (indices 0-3 only),
+                // so no bootstrap needed; try_bind updates latest[4] via topk_from_z.
+                0.0
+            } else {
+                let act = self
+                    .model
+                    .as_mut()
+                    .unwrap()
+                    .language_layer
+                    .forward(&input, &device);
+                let e = self
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .language_decoder
+                    .reconstruction_error(values, &act, &device);
+                self.latest[RegionId::Language.as_index()] = Some(act);
+                e
+            }
+        });
+        self.perf_kwta_us += d0.as_micros() as u64;
         self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
 
-        let t1 = Instant::now();
-        let (symbolic_cos, symbolic_err) = self.compute_symbolic_cross_modal();
-        self.perf_symbolic_us += t1.elapsed().as_micros() as u64;
+        let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestSymbolic,
+            self.compute_symbolic_cross_modal()
+        );
+        self.perf_symbolic_us += d1.as_micros() as u64;
 
-        let t2 = Instant::now();
         let latest_ep = self.working_memory.back().cloned();
-        let (episode, regional_inputs) = self.try_bind(latest_ep.as_ref());
-        self.perf_bind_us += t2.elapsed().as_micros() as u64;
+        let ((episode, regional_inputs), d2) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestBind,
+            self.try_bind(latest_ep.as_ref())
+        );
+        self.perf_bind_us += d2.as_micros() as u64;
 
-        let t3 = Instant::now();
-        let (episode, settle_iters, settle_delta) = self.maybe_settle_and_update(episode, cosine);
-        self.perf_prior_us += t3.elapsed().as_micros() as u64;
+        let ((episode, settle_iters, settle_delta), d3) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::IngestPrior,
+            self.maybe_settle_and_update(episode, cosine)
+        );
+        self.perf_prior_us += d3.as_micros() as u64;
 
         self.push_to_wm(&episode);
 
@@ -692,16 +719,20 @@ impl PerceptionProcessor {
             let should_settle = self.settle_steps > 0
                 && cosine.is_none_or(|c| c < self.settle_gate)
                 && self.settle_episode_count.is_multiple_of(self.settle_every);
-            let t_settle = Instant::now();
-            let (refined, iters, delta) = if should_settle {
-                self.settle_episode(&ep)
-            } else {
-                (ep, 0, 0.0)
-            };
-            self.perf_settle_us += t_settle.elapsed().as_micros() as u64;
-            let t_prior_update = Instant::now();
-            self.update_prior_predictions(&refined.0);
-            self.perf_prior_update_us += t_prior_update.elapsed().as_micros() as u64;
+            let ((refined, iters, delta), d_settle) =
+                somnus_metrics::timed_core!(somnus_metrics::Metric::IngestSettle, {
+                    if should_settle {
+                        self.settle_episode(&ep)
+                    } else {
+                        (ep, 0, 0.0)
+                    }
+                });
+            self.perf_settle_us += d_settle.as_micros() as u64;
+            let (_, d_prior_update) = somnus_metrics::timed_core!(
+                somnus_metrics::Metric::IngestPriorUpdate,
+                self.update_prior_predictions(&refined.0)
+            );
+            self.perf_prior_update_us += d_prior_update.as_micros() as u64;
             (Some(refined), iters, delta)
         } else {
             (None, 0, 0.0)

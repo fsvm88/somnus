@@ -1,6 +1,102 @@
 # Session state — somnus
 
-> **Last updated:** 2026-07-14
+> **Last updated:** 2026-07-14 (final)
+> **✅ Unified two-tier metrics instrumentation, fully implemented and converted: ADR 0039,
+> `crates/somnus-metrics`.** Extends the earlier same-session instrumentation work (see superseded
+> writeup a few lines below, kept for the discovery trail) after the user asked to go further:
+> convert *every* existing hand-rolled timer to one shared system ("one way of doing metrics")
+> and treat the metrics this codebase has always reported as the always-on default tier.
+>
+> **Design:** two tiers sharing one `Registry`. **Core** (`timed_core!`/`counted_core!`) —
+> unconditional, always recording, the "big item" tier (exactly what was always reported, now via
+> one macro instead of copy-pasted `Instant::now()`/`.elapsed()` boilerplate). **Fine**
+> (`timed!`/`counted!`) — gated behind `fine-metrics` (default off), textually a bare passthrough
+> when disabled. `Metric` enum mirrors `RegionId::as_index()`'s dense-array-over-enum pattern (24
+> variants). `fine-metrics` forwarded from `somnus-perception`/`somnus-memory`/`somnus-sensory`/
+> `somnus-encoding`/`somnus`, same shape as the existing `mn10_env` precedent.
+>
+> **Full conversion done:** all 6 `somnus-perception` ingest phases (single `timed_core!` call each,
+> replacing the earlier dual-write pilot pattern), all ~11 `somnus/src/sleep.rs` wall-clock phases (8
+> via the macro block-wrap idiom; 3 structurally-entangled spans — the full NREM loop, the two
+> non-contiguous REM sub-sections, the whole-cycle total — via a direct
+> `somnus_metrics::METRICS.record()` call instead, a documented exception in ADR 0039 since their
+> locals escape scope for use hundreds of lines later), all 3 `somnus-encoding` encoder timers
+> (`encode_speech`/`encode_env`/video `encode`), and all 4 remaining `somnus/src/main.rs` sites
+> (3× `MainPerceptionIngest`, 1× `MainWarmQuery`). **Found and fixed two real duplicate-measurement
+> bugs** in the process: `main.rs` was independently re-timing the same `encode_speech`/
+> `encode_env`/video-encode calls `somnus-encoding` already timed and returned via `encode_ms` — now
+> logs that field directly instead of measuring twice. All pre-existing top-level JSON fields
+> (`perc_kwta_us`, `nrem_wall_ms`, `speech_encode_total_ms`, etc.) still populated identically, so
+> `campaign_status.py`/`eval_metrics.py` need no changes; new `"fine_metrics"` key carries the full
+> registry snapshot.
+>
+> **Verified:** `cargo build/clippy/test --release --workspace` clean in both feature states
+> (including 5 `somnus-metrics` unit tests, up from 3). Two isolated-scratch-dir pilot runs (cleaned
+> up after) confirmed correct NDJSON output both before and after the full conversion; the second
+> run cross-checked old-field vs. new-registry values across every converted site (all within
+> expected truncation-order noise — e.g. `perc_kwta_us` 92,976 vs. registry-derived 93,004 — not a
+> bug) and confirmed `kwta_score_matmul` dominates `kwta_select_topk` by ~124–165× at tiny baseline
+> scale, live evidence bearing on ADR 0038's still-open question (not yet at the campaign's actual
+> ~9,660-unit scale).
+>
+> **Deliberately not done:** `somnus-memory` has zero converted call sites — it never had hand-rolled
+> timers (no I/O path was ever individually timed), so there's nothing to convert there; adding
+> instrumentation is future opportunistic work, not part of this pass. Full design writeup:
+> `ai-docs/decisions/0039-unified-metrics-instrumentation.md`. gaps.md §26 has the summary; plan
+> file `/home/falcon/.claude/plans/wild-imagining-thompson.md` ("Plan A") has the blow-by-blow.
+>
+> **ADR 0038 (hierarchical k-WTA encoder scoring) remains status `proposed`, implementation not
+> started** — unaffected by this instrumentation work; still the queued next architectural
+> question. Next natural step (user-driven): run a `fine-metrics` build against the real growth
+> campaign to get `kwta_score_matmul` numbers at actual ~9,660-unit scale, which is what ADR 0038's
+> Phase 0 needs.
+>
+> **This entire session's work — research note, ADR 0038, ADR 0039 + `somnus-metrics` crate + full
+> conversion — is committed to git as of this writeup's timestamp** (see commit history; nothing
+> left uncommitted).
+>
+> ---
+>
+> **Superseded pilot-stage writeup (kept for the discovery trail, not the current state):** the
+> instrumentation work started as a smaller pilot — new crate, dual-write pattern alongside the
+> existing `perf_*_us` fields, only `somnus-perception`'s ingest phases touched. The user then asked
+> to finish the job (convert everything, one system) — see the fully-converted state described
+> above, which supersedes every claim below about what's "not yet done."
+>
+> **✅ Research note written: k-WTA encoder-side scoring-cost scaling.** The queued-next item from
+> the §25 shutdown writeup below — user chose to start the research note this session rather than
+> resume the campaign. Added a new section to `ai-docs/research/sparse-coding.md`
+> ("Encoder-side scaling: why sparsity doesn't save the O(input_dim × n_units) scoring cost")
+> confirming the scoring matmul in `KWtaLayer::forward` (`crates/somnus-perception/src/region.rs`) is
+> inherently linear in `n_units` regardless of `k_active`/`scaled_k` (output sparsity doesn't help —
+> every candidate unit must be scored before top-k can pick winners), and surveying three candidate
+> mechanisms: local/blocked connectivity (MoE-style routing), hierarchical/coarse-to-fine WTA
+> (two-stage scoring, maybe reusable HNSW-style indexing), approximate top-k sampling. Cross-
+> referenced from `gaps.md` §25. **Docs-only, no code changes, nothing to build/test.** Three
+> prerequisites identified before any implementation: (1) benchmark the actual scoring cost on both
+> `burn` and the ORT-exported path (no isolated measurement exists yet), (2) confirm this matters at
+> honeybee scale vs. being a next-order-of-magnitude concern, (3) scope as an ADR (touches growth/
+> duty-cycle/binding assumptions). **Not committed yet this session** — `ai-docs/gaps.md` and
+> `ai-docs/research/sparse-coding.md` both modified, working tree otherwise clean.
+>
+> **✅ ADR 0038 written 2026-07-14 (same session, follow-on to the research note above):**
+> `ai-docs/decisions/0038-sparse-encoder-scoring.md`, status `proposed`. Picks **hierarchical/
+> coarse-to-fine WTA** as the target mechanism for the encoder scoring-cost problem — over MoE-style
+> learned routing (better biological analogue but a bad router reintroduces the dead-unit problem)
+> and approximate top-k sampling (cheapest but breaks the exact-top-k guarantee the growth
+> mechanism's residual-correlation logic depends on). Reasoning: preserves exact top-k within
+> selected blocks, degrades gracefully if the coarse scorer is imprecise, and may be able to reuse
+> existing HNSW machinery (`crates/somnus-memory`) for the coarse stage instead of a bespoke gating
+> network. **Implementation explicitly not started** — same three prerequisites as the research note
+> (benchmark actual scoring cost on both `burn` and ORT-exported paths; confirm this matters at
+> honeybee scale vs. being a next-order-of-magnitude concern; numerical validation that block-local
+> competition doesn't break growth/duty-cycle/binding assumptions), now tracked as the ADR's own
+> prerequisite list. Cross-referenced from `gaps.md` §25 and `sparse-coding.md`; added to
+> `decisions/README.md` index. Docs-only, no code changes.
+>
+> **Growth campaign status unchanged from the shutdown below** — still stopped at session 75/131,
+> 94.7% to target, safe to resume anytime via `scripts/resume_growth_campaign.sh`. Not touched this
+> session.
 > **⏸️ STOPPED (clean, user-requested shutdown).** Campaign was at session 75/131, cycle 6, region
 > sizes 9,151/9,660 ≈ **94.7%** — very close to the 10x target. Stopped via
 > `scripts/stop_graceful.sh`, confirmed clean exit, no data lost. `CAMPAIGN_DIR=memory/campaign_growth10x`,

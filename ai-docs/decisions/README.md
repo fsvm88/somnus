@@ -89,3 +89,5 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0035](0035-qwen3-hidden-size-compile-time.md) | LM hidden size (Qwen2.5 vs Qwen3) is a compile-time choice, not runtime | implemented |
 | [0036](0036-adopt-qwen3-drop-qwen25.md) | Adopt Qwen3-0.6B as the action-decoder LM; drop Qwen2.5 | implemented |
 | [0037](0037-auto-onnx-perception-inference.md) | Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover | accepted |
+| [0038](0038-sparse-encoder-scoring.md) | Sparse (hierarchical) k-WTA encoder scoring for the next scale order | proposed |
+| [0039](0039-unified-metrics-instrumentation.md) | Unified two-tier metrics instrumentation (`somnus-metrics`) | implemented |

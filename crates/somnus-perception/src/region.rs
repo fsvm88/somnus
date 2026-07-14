@@ -114,7 +114,8 @@ impl<B: Backend> KWtaLayer<B> {
     pub fn forward(&mut self, input: &[f32], device: &B::Device) -> SparseActivation {
         let data = TensorData::new(input.to_vec(), [1, input.len()]);
         let t = Tensor::<B, 2>::from_data(data, device);
-        let z: Tensor<B, 2> = self.linear.forward(t);
+        let z: Tensor<B, 2> =
+            somnus_metrics::timed!(somnus_metrics::Metric::KwtaScoreMatmul, self.linear.forward(t));
         let z_vec: Vec<f32> = z.into_data().convert::<f32>().to_vec().unwrap();
         self.select_top_k(z_vec)
     }
@@ -149,39 +150,42 @@ impl<B: Backend> KWtaLayer<B> {
     }
 
     fn select_top_k(&mut self, z_vec: Vec<f32>) -> SparseActivation {
-        let n = self.n_units;
-        let k = self.k_active;
-        let target_dc = k as f32 / n as f32;
-        let mut boosted = z_vec.clone();
-        for (i, dc) in self.duty_cycle.iter().enumerate() {
-            boosted[i] += BOOST_STRENGTH * (target_dc - dc);
-        }
+        somnus_metrics::timed!(somnus_metrics::Metric::KwtaSelectTopK, {
+            let n = self.n_units;
+            let k = self.k_active;
+            let target_dc = k as f32 / n as f32;
+            let mut boosted = z_vec.clone();
+            for (i, dc) in self.duty_cycle.iter().enumerate() {
+                boosted[i] += BOOST_STRENGTH * (target_dc - dc);
+            }
 
-        let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
-        let split = n - k;
-        indexed.select_nth_unstable_by(split, |a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let top_k = &indexed[split..];
+            let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
+            let split = n - k;
+            indexed.select_nth_unstable_by(split, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top_k = &indexed[split..];
 
-        let mut pairs: Vec<(u16, f32)> = top_k.iter().map(|&(i, _)| (i as u16, z_vec[i])).collect();
-        pairs.sort_unstable_by_key(|(i, _)| *i);
+            let mut pairs: Vec<(u16, f32)> =
+                top_k.iter().map(|&(i, _)| (i as u16, z_vec[i])).collect();
+            pairs.sort_unstable_by_key(|(i, _)| *i);
 
-        // Update duty cycles: decay all, then boost active units.
-        // Avoids a HashSet allocation + O(n) membership-test loop.
-        for dc in self.duty_cycle.iter_mut() {
-            *dc *= 1.0 - DUTY_CYCLE_ALPHA;
-        }
-        for &(i, _) in top_k.iter() {
-            self.duty_cycle[i] += DUTY_CYCLE_ALPHA;
-        }
+            // Update duty cycles: decay all, then boost active units.
+            // Avoids a HashSet allocation + O(n) membership-test loop.
+            for dc in self.duty_cycle.iter_mut() {
+                *dc *= 1.0 - DUTY_CYCLE_ALPHA;
+            }
+            for &(i, _) in top_k.iter() {
+                self.duty_cycle[i] += DUTY_CYCLE_ALPHA;
+            }
 
-        SparseActivation {
-            region: self.region,
-            indices: pairs.iter().map(|(i, _)| *i).collect(),
-            values: pairs.iter().map(|(_, v)| *v).collect(),
-            n_units: n,
-        }
+            SparseActivation {
+                region: self.region,
+                indices: pairs.iter().map(|(i, _)| *i).collect(),
+                values: pairs.iter().map(|(_, v)| *v).collect(),
+                n_units: n,
+            }
+        })
     }
 
     fn select_top_k_no_dc(&self, z_vec: Vec<f32>) -> SparseActivation {

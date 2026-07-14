@@ -417,32 +417,33 @@ pub fn run_sleep_cycle(
             )
         })
         .collect();
-    let t_distill = Instant::now();
     // Deduplicate LM inference by token-id content. With lang_oversample=N, each
     // language trace appears N+1 times in raw_traces; without dedup that means N+1
     // identical ORT sessions for the same text. Per-cycle cache collapses within-cycle
     // repeats; text_hidden_states() also maintains a cross-cycle cache so clip-loop
     // repetitions across sleep cycles pay the ORT cost only once per session.
-    let (lm_hidden_targets, lm_hidden_unique): (Vec<Option<Vec<f32>>>, usize) =
-        if let Some(ref mut dec) = decoder {
-            let mut cache: HashMap<Vec<u32>, Option<Vec<f32>>> = HashMap::new();
-            let targets = raw_traces
-                .iter()
-                .map(|(_, _, ids, _)| match ids {
-                    Some(ids) => cache
-                        .entry(ids.clone())
-                        .or_insert_with(|| dec.text_hidden_states(ids).ok())
-                        .clone(),
-                    None => None,
-                })
-                .collect();
-            let unique = cache.len();
-            (targets, unique)
-        } else {
-            (vec![None; raw_traces.len()], 0)
-        };
+    let ((lm_hidden_targets, lm_hidden_unique), d_distill): ((Vec<Option<Vec<f32>>>, usize), _) =
+        somnus_metrics::timed_core!(somnus_metrics::Metric::SleepDistillPrecompute, {
+            if let Some(ref mut dec) = decoder {
+                let mut cache: HashMap<Vec<u32>, Option<Vec<f32>>> = HashMap::new();
+                let targets = raw_traces
+                    .iter()
+                    .map(|(_, _, ids, _)| match ids {
+                        Some(ids) => cache
+                            .entry(ids.clone())
+                            .or_insert_with(|| dec.text_hidden_states(ids).ok())
+                            .clone(),
+                        None => None,
+                    })
+                    .collect();
+                let unique = cache.len();
+                (targets, unique)
+            } else {
+                (vec![None; raw_traces.len()], 0)
+            }
+        });
     let lm_hidden_computed = lm_hidden_targets.iter().filter(|h| h.is_some()).count();
-    let distill_precompute_ms = t_distill.elapsed().as_millis() as u64;
+    let distill_precompute_ms = d_distill.as_millis() as u64;
     let nrem_unique_traces = raw_traces.len();
     tracing::info!(
         lm_hidden_computed,
@@ -535,10 +536,12 @@ pub fn run_sleep_cycle(
     // Without this, backward() cost grows O(total_prior_optimizer_steps) across cycles
     // because the server accumulates stale graph entries keyed by ParamId. Refreshing
     // replaces every ParamId, freeing accumulated entries on the next backward() call.
-    let t_refresh = Instant::now();
-    perception.refresh_autodiff_state();
+    let (_, d_refresh) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::SleepAutodiffRefresh,
+        perception.refresh_autodiff_state()
+    );
     tracing::info!(
-        refresh_ms = t_refresh.elapsed().as_millis(),
+        refresh_ms = d_refresh.as_millis(),
         "NREM: autodiff state refreshed"
     );
 
@@ -675,23 +678,28 @@ pub fn run_sleep_cycle(
                 .iter()
                 .map(|&i| batch[i].0.as_slice())
                 .collect();
-            let t_replay = Instant::now();
-            match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
-                Ok((loss, mse)) => {
-                    loss_ewma = if first_batch_ever {
-                        first_batch_ever = false;
-                        loss
-                    } else {
-                        EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
-                    };
-                    total_train_loss += loss * filtered_indices.len() as f32;
-                    traces_replayed += filtered_indices.len();
-                    total_output_mse += mse;
-                    output_mse_n += 1;
-                }
-                Err(e) => tracing::warn!(?e, "fused_replay_wake_step_batch error — skipping batch"),
-            }
-            let fused_us = t_replay.elapsed().as_micros() as u64;
+            let (_, d_replay) =
+                somnus_metrics::timed_core!(somnus_metrics::Metric::SleepFusedReplayWake, {
+                    match perception.fused_replay_wake_step_batch(&regionals, &ep_slices) {
+                        Ok((loss, mse)) => {
+                            loss_ewma = if first_batch_ever {
+                                first_batch_ever = false;
+                                loss
+                            } else {
+                                EWMA_ALPHA * loss + (1.0 - EWMA_ALPHA) * loss_ewma
+                            };
+                            total_train_loss += loss * filtered_indices.len() as f32;
+                            traces_replayed += filtered_indices.len();
+                            total_output_mse += mse;
+                            output_mse_n += 1;
+                        }
+                        Err(e) => tracing::warn!(
+                            ?e,
+                            "fused_replay_wake_step_batch error — skipping batch"
+                        ),
+                    }
+                });
+            let fused_us = d_replay.as_micros() as u64;
             replay_us_total += fused_us / 2;
             wake_us_total += fused_us / 2;
 
@@ -717,30 +725,31 @@ pub fn run_sleep_cycle(
             }
 
             // ── Projection distillation: LM hidden-state targets (Gap 6) ────────────
-            let t_proj = Instant::now();
-            if let Some(ref mut dec) = decoder {
-                let distill_pairs: Vec<(&[f32], &[f32])> = filtered_indices
-                    .iter()
-                    .filter_map(|&i| {
-                        let (ep, _, _, _, lm_h) = &batch[i];
-                        lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
-                    })
-                    .collect();
-                if !distill_pairs.is_empty() {
-                    match dec.projection_step_batch_distill(&distill_pairs) {
-                        Ok(loss) => {
-                            let cnt = distill_pairs.len();
-                            total_proj_loss += loss * cnt as f32;
-                            proj_loss_n += cnt;
-                            if loss > proj_loss_max {
-                                proj_loss_max = loss;
+            let (_, d_proj) = somnus_metrics::timed_core!(somnus_metrics::Metric::SleepProjDistill, {
+                if let Some(ref mut dec) = decoder {
+                    let distill_pairs: Vec<(&[f32], &[f32])> = filtered_indices
+                        .iter()
+                        .filter_map(|&i| {
+                            let (ep, _, _, _, lm_h) = &batch[i];
+                            lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
+                        })
+                        .collect();
+                    if !distill_pairs.is_empty() {
+                        match dec.projection_step_batch_distill(&distill_pairs) {
+                            Ok(loss) => {
+                                let cnt = distill_pairs.len();
+                                total_proj_loss += loss * cnt as f32;
+                                proj_loss_n += cnt;
+                                if loss > proj_loss_max {
+                                    proj_loss_max = loss;
+                                }
                             }
+                            Err(e) => tracing::warn!(?e, "projection_step_batch_distill error"),
                         }
-                        Err(e) => tracing::warn!(?e, "projection_step_batch_distill error"),
                     }
                 }
-            }
-            proj_us_total += t_proj.elapsed().as_micros() as u64;
+            });
+            proj_us_total += d_proj.as_micros() as u64;
             n_batches += 1;
 
             batch_start = batch_end;
@@ -805,7 +814,12 @@ pub fn run_sleep_cycle(
         None
     };
 
-    let nrem_wall_ms = t_nrem.elapsed().as_millis() as u64;
+    // t_nrem spans the whole NREM loop above (nested loops, early `break`s, many locals
+    // that escape this point) — too structurally entangled for the timed_core! block-wrap
+    // idiom used elsewhere in this file, so record directly against the same registry instead.
+    let d_nrem = t_nrem.elapsed();
+    somnus_metrics::METRICS.record(somnus_metrics::Metric::SleepNrem, d_nrem);
+    let nrem_wall_ms = d_nrem.as_millis() as u64;
     tracing::info!(
         traces_replayed,
         mean_train_loss,
@@ -858,12 +872,11 @@ pub fn run_sleep_cycle(
         let gist_centroids: Vec<Vec<f32>> = if pre_spill_warm_len >= GIST_MIN_WARM {
             let sample = recall.warm.sample_values(GIST_SAMPLE);
             tracing::debug!(sample_n = sample.len(), k = GIST_K, "gist: running k-means");
-            let t0 = Instant::now();
-            let centroids = kmeans(&sample, GIST_K, GIST_MAX_ITER);
-            tracing::debug!(
-                elapsed_ms = t0.elapsed().as_millis(),
-                "gist: k-means complete"
+            let (centroids, d_kmeans) = somnus_metrics::timed_core!(
+                somnus_metrics::Metric::SleepGistKmeans,
+                kmeans(&sample, GIST_K, GIST_MAX_ITER)
             );
+            tracing::debug!(elapsed_ms = d_kmeans.as_millis(), "gist: k-means complete");
             centroids
         } else {
             Vec::new()
@@ -1040,54 +1053,62 @@ pub fn run_sleep_cycle(
     }
 
     // ── Compression: spill hot → cold; consolidate into warm ─────────────────
-    rem_wall_ms += t_rem.elapsed().as_millis() as u64;
-    let t_spill = Instant::now();
-    if !was_interrupted {
-        let mut spilled = 0usize;
-        for record in episodic.iter_records() {
-            if let Err(e) = recall.cold.append(record) {
-                tracing::warn!(?e, "cold archive append error");
-                break;
+    // t_rem/t_rem2 (below) are two non-contiguous REM sub-sections accumulated into one
+    // rem_wall_ms field; same structural-complexity reasoning as t_nrem above — record
+    // directly under the shared Metric::SleepRem, which sums both calls naturally.
+    let d_rem1 = t_rem.elapsed();
+    somnus_metrics::METRICS.record(somnus_metrics::Metric::SleepRem, d_rem1);
+    rem_wall_ms += d_rem1.as_millis() as u64;
+    let (_, d_spill) = somnus_metrics::timed_core!(somnus_metrics::Metric::SleepSpill, {
+        if !was_interrupted {
+            let mut spilled = 0usize;
+            for record in episodic.iter_records() {
+                if let Err(e) = recall.cold.append(record) {
+                    tracing::warn!(?e, "cold archive append error");
+                    break;
+                }
+                recall.warm.insert(record.clone());
+                spilled += 1;
             }
-            recall.warm.insert(record.clone());
-            spilled += 1;
-        }
-        tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
+            tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
 
-        // Warm HNSW size management: rebuild whenever cold has grown past warm.
-        // The previous condition (warm.len() > max_warm_records) silently broke after the
-        // first rebuild: SemanticStore.insert() drops records once max_records is reached,
-        // so warm.len() never exceeds max_warm_records again and the index permanently
-        // diverges from cold. cold.len() > warm.len() fires every cycle once the cap is
-        // hit, keeping warm synchronised with the latest cold records.
-        if max_warm_records > 0 && recall.cold.len() > recall.warm.len() {
-            let t0 = Instant::now();
-            let loaded = recall
-                .warm
-                .rebuild_from_recent(&recall.cold, max_warm_records);
-            tracing::info!(
-                loaded,
-                max_warm_records,
-                elapsed_ms = t0.elapsed().as_millis(),
-                "warm HNSW rebuilt from recent cold records"
-            );
-        }
+            // Warm HNSW size management: rebuild whenever cold has grown past warm.
+            // The previous condition (warm.len() > max_warm_records) silently broke after the
+            // first rebuild: SemanticStore.insert() drops records once max_records is reached,
+            // so warm.len() never exceeds max_warm_records again and the index permanently
+            // diverges from cold. cold.len() > warm.len() fires every cycle once the cap is
+            // hit, keeping warm synchronised with the latest cold records.
+            if max_warm_records > 0 && recall.cold.len() > recall.warm.len() {
+                let (loaded, d_rebuild) =
+                    somnus_metrics::timed_core!(somnus_metrics::Metric::SleepWarmRebuild, {
+                        recall
+                            .warm
+                            .rebuild_from_recent(&recall.cold, max_warm_records)
+                    });
+                tracing::info!(
+                    loaded,
+                    max_warm_records,
+                    elapsed_ms = d_rebuild.as_millis(),
+                    "warm HNSW rebuilt from recent cold records"
+                );
+            }
 
-        // Cold archive size management: evict lowest-salience records (ADR 0020).
-        if max_cold_records > 0 && recall.cold.len() > max_cold_records {
-            let before = recall.cold.len();
-            match recall.cold.evict_lowest_salience(max_cold_records) {
-                Ok(()) => tracing::info!(
-                    before,
-                    after = max_cold_records,
-                    "cold archive: evicted lowest-salience records"
-                ),
-                Err(e) => tracing::warn!(?e, "cold archive eviction failed"),
+            // Cold archive size management: evict lowest-salience records (ADR 0020).
+            if max_cold_records > 0 && recall.cold.len() > max_cold_records {
+                let before = recall.cold.len();
+                match recall.cold.evict_lowest_salience(max_cold_records) {
+                    Ok(()) => tracing::info!(
+                        before,
+                        after = max_cold_records,
+                        "cold archive: evicted lowest-salience records"
+                    ),
+                    Err(e) => tracing::warn!(?e, "cold archive eviction failed"),
+                }
             }
         }
-    }
+    });
 
-    let spill_wall_ms = t_spill.elapsed().as_millis() as u64;
+    let spill_wall_ms = d_spill.as_millis() as u64;
     tracing::info!(spill_wall_ms, "spill complete");
 
     // ── REM-like: measure MSE + trigger growth ────────────────────────────────
@@ -1352,54 +1373,59 @@ pub fn run_sleep_cycle(
         }
     }
 
-    rem_wall_ms += t_rem2.elapsed().as_millis() as u64;
+    let d_rem2 = t_rem2.elapsed();
+    somnus_metrics::METRICS.record(somnus_metrics::Metric::SleepRem, d_rem2);
+    rem_wall_ms += d_rem2.as_millis() as u64;
     tracing::info!(rem_wall_ms, "REM complete");
 
     // ── Snapshot ──────────────────────────────────────────────────────────────
-    let t_snapshot = Instant::now();
-    if !was_interrupted {
-        if let Err(e) = save_snapshot(episodic, memory_dir) {
-            tracing::warn!(?e, "episodic snapshot write failed");
+    let (_, d_snapshot) = somnus_metrics::timed_core!(somnus_metrics::Metric::SleepSnapshot, {
+        if !was_interrupted {
+            if let Err(e) = save_snapshot(episodic, memory_dir) {
+                tracing::warn!(?e, "episodic snapshot write failed");
+            }
+            // Persist warm HNSW index so restart avoids cold-rebuild (~3 min at 100k records).
+            let warm_dir = memory_dir.join("warm");
+            if let Err(e) = recall.warm.dump(&warm_dir) {
+                tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
+            }
+            // Perception weights (BinFileRecorder → weights.bin) written to snapshot dir.
+            let w_path = weights_path(memory_dir);
+            if let Err(e) = perception.save_weights(&w_path) {
+                tracing::warn!(?e, "weight snapshot write failed");
+            }
+            // Region sizes written so restore can pre-grow before loading weights.
+            if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
+                tracing::warn!(?e, "region sizes write failed");
+            }
+            // Growth cooldown counter: reset to growth_cooldown when something grew,
+            // otherwise decrement toward 0.
+            let new_cooldown = if !regions_grown.is_empty() {
+                growth_cooldown
+            } else {
+                cooldown_remaining.saturating_sub(1)
+            };
+            if let Err(e) = save_growth_cooldown_remaining(new_cooldown, memory_dir) {
+                tracing::warn!(?e, "growth cooldown write failed");
+            }
+            tracing::info!("snapshot written");
         }
-        // Persist warm HNSW index so restart avoids cold-rebuild (~3 min at 100k records).
-        let warm_dir = memory_dir.join("warm");
-        if let Err(e) = recall.warm.dump(&warm_dir) {
-            tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
-        }
-        // Perception weights (BinFileRecorder → weights.bin) written to snapshot dir.
-        let w_path = weights_path(memory_dir);
-        if let Err(e) = perception.save_weights(&w_path) {
-            tracing::warn!(?e, "weight snapshot write failed");
-        }
-        // Region sizes written so restore can pre-grow before loading weights.
-        if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
-            tracing::warn!(?e, "region sizes write failed");
-        }
-        // Growth cooldown counter: reset to growth_cooldown when something grew,
-        // otherwise decrement toward 0.
-        let new_cooldown = if !regions_grown.is_empty() {
-            growth_cooldown
-        } else {
-            cooldown_remaining.saturating_sub(1)
-        };
-        if let Err(e) = save_growth_cooldown_remaining(new_cooldown, memory_dir) {
-            tracing::warn!(?e, "growth cooldown write failed");
-        }
-        tracing::info!("snapshot written");
-    }
-    let snapshot_wall_ms = t_snapshot.elapsed().as_millis() as u64;
+    });
+    let snapshot_wall_ms = d_snapshot.as_millis() as u64;
     let growth_cooldown_remaining = if !regions_grown.is_empty() {
         growth_cooldown
     } else {
         cooldown_remaining.saturating_sub(1)
     };
+    let d_total = sleep_start.elapsed();
+    somnus_metrics::METRICS.record(somnus_metrics::Metric::SleepTotal, d_total);
     tracing::info!(
         nrem_wall_ms,
         distill_precompute_ms,
         rem_wall_ms,
         spill_wall_ms,
         snapshot_wall_ms,
-        total_wall_ms = sleep_start.elapsed().as_millis() as u64,
+        total_wall_ms = d_total.as_millis() as u64,
         "sleep cycle phase timings"
     );
 

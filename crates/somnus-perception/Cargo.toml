@@ -7,6 +7,9 @@ edition = "2021"
 # A/B candidate (gaps.md item 9): EfficientAT mn10 env encoder (960-dim) instead of
 # CLAP-HTSAT (512-dim, default). Cold-start required — not runtime-selectable.
 mn10_env = []
+# Fine-grained timing/counters (somnus-metrics). Off by default; forwards to somnus-metrics'
+# own feature of the same name, which is what actually gates the macro bodies.
+fine-metrics = ["somnus-metrics/fine-metrics"]
 
 [dependencies]
 burn         = { workspace = true }
@@ -18,6 +21,7 @@ ort          = { workspace = true }
 ndarray      = { workspace = true }
 anyhow           = { workspace = true }
 matrixmultiply   = "0.3"
+somnus-metrics      = { workspace = true }
 
 [[bin]]
 name = "bench_nrem_batch"

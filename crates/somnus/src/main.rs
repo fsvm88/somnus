@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod action;
 mod sleep;
@@ -101,7 +101,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{Disks, System};
 use tokenizers::Tokenizer;
@@ -620,11 +620,13 @@ impl AudioProcessor {
         if self.buf_16k.len() >= WHISPER_SAMPLES {
             let pcm: Vec<f32> = self.buf_16k.drain(..WHISPER_SAMPLES).collect();
             let ts = self.ts_16k.take().unwrap();
-            let start = std::time::Instant::now();
             let (emb, hidden_flat) = self.encoder.encode_speech(&pcm, ts)?;
+            // encode_ms comes from AudioEncoder::encode_speech itself (somnus_metrics::Metric::
+            // EncodeSpeech) — timing it again here would be a duplicate measurement of the
+            // same call.
             tracing::info!(
                 dim = emb.values.len(),
-                encode_ms = start.elapsed().as_millis(),
+                encode_ms = emb.encode_ms,
                 "speech embedding"
             );
             // ASR: send hidden states to the dedicated ASR thread (non-blocking).
@@ -640,11 +642,12 @@ impl AudioProcessor {
         if self.buf_env.len() >= ENV_SAMPLES {
             let pcm: Vec<f32> = self.buf_env.drain(..ENV_SAMPLES).collect();
             let ts = self.ts_env.take().unwrap();
-            let start = std::time::Instant::now();
             let emb = self.encoder.encode_env(&pcm, ts)?;
+            // encode_ms comes from AudioEncoder::encode_env itself (somnus_metrics::Metric::
+            // EncodeEnv) — same reasoning as encode_speech above.
             tracing::info!(
                 dim = emb.values.len(),
-                encode_ms = start.elapsed().as_millis(),
+                encode_ms = emb.encode_ms,
                 "env embedding"
             );
             embs.push(emb);
@@ -1625,10 +1628,11 @@ async fn main() -> Result<()> {
                     }
                     change_skip_streak = 0;
                 }
-                let start = std::time::Instant::now();
                 match enc.encode(&frame) {
                     Ok(emb) => {
-                        let encode_ms = start.elapsed().as_millis();
+                        // encode_ms comes from VideoEncoder::encode itself
+                        // (somnus_metrics::Metric::EncodeVideo) — avoids a duplicate timer.
+                        let encode_ms = emb.encode_ms as u128;
                         frames_this_sec += 1;
                         total_ms_this_sec += encode_ms;
                         tracing::debug!(dim = emb.values.len(), encode_ms, "video embedding");
@@ -2132,6 +2136,7 @@ async fn main() -> Result<()> {
                             None
                         };
                         let perf_breakdown = perception.take_perf_breakdown();
+                        let fine_metrics = somnus_metrics::METRICS.snapshot_and_reset();
                         let ts = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs_f64())
@@ -2221,6 +2226,7 @@ async fn main() -> Result<()> {
                             "sleep_max_secs_effective": effective_sleep_max_secs,
                             "wake_interval_effective": effective_wake_interval,
                             "s7_mse_ewma":           if s7_ewma_n > 0 { Some(s7_mse_ewma) } else { None },
+                            "fine_metrics":          fine_metrics,
                         })
                         .to_string();
                         use std::io::Write as _;
@@ -2334,12 +2340,14 @@ async fn main() -> Result<()> {
                             AudioEncoderSource::Speech => speech_encode_total_ms += emb.encode_ms,
                             AudioEncoderSource::Env    => env_encode_total_ms    += emb.encode_ms,
                         }
-                        let t_perc = std::time::Instant::now();
-                        let result = match emb.source {
-                            AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
-                            AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
-                        };
-                        perception_total_ms += t_perc.elapsed().as_millis() as u64;
+                        let (result, d_perc) = somnus_metrics::timed_core!(
+                            somnus_metrics::Metric::MainPerceptionIngest,
+                            match emb.source {
+                                AudioEncoderSource::Speech => perception.ingest_speech(&emb.values),
+                                AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
+                            }
+                        );
+                        perception_total_ms += d_perc.as_millis() as u64;
                         match result {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
@@ -2408,9 +2416,11 @@ async fn main() -> Result<()> {
                         let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &video_emb_json(&emb));
                         video_encode_total_ms += emb.encode_ms;
-                        let t_perc = std::time::Instant::now();
-                        let vis_result = perception.ingest_visual(&emb.values);
-                        perception_total_ms += t_perc.elapsed().as_millis() as u64;
+                        let (vis_result, d_perc) = somnus_metrics::timed_core!(
+                            somnus_metrics::Metric::MainPerceptionIngest,
+                            perception.ingest_visual(&emb.values)
+                        );
+                        perception_total_ms += d_perc.as_millis() as u64;
                         match vis_result {
                             Ok(out) => {
                                 accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
@@ -2821,7 +2831,12 @@ fn ingest_language_line(
     let t_perc = std::time::Instant::now();
     match perception.ingest_language(&emb) {
         Ok(out) => {
-            let perception_ms = t_perc.elapsed().as_millis() as u64;
+            // Large match arm with an early function-return shape on Err below — not a clean
+            // single expression to hand to timed_core!, so record directly against the same
+            // Metric::MainPerceptionIngest the other two ingest call sites use.
+            let d_perc = t_perc.elapsed();
+            somnus_metrics::METRICS.record(somnus_metrics::Metric::MainPerceptionIngest, d_perc);
+            let perception_ms = d_perc.as_millis() as u64;
             let ts = Timestamp::now();
             let episode_produced = out.episode.is_some();
             let prior_cosines = out.prior_cosines;
@@ -3070,9 +3085,11 @@ fn record_episode(
     };
 
     // Recollection: find similar past episodes from warm memory.
-    let t_query = Instant::now();
-    let neighbours = recall.query_warm_with_dist(&ep_norm, top_k);
-    let hnsw_query_us = t_query.elapsed().as_micros() as u64;
+    let (neighbours, d_query) = somnus_metrics::timed_core!(
+        somnus_metrics::Metric::MainWarmQuery,
+        recall.query_warm_with_dist(&ep_norm, top_k)
+    );
+    let hnsw_query_us = d_query.as_micros() as u64;
     let (episode_vec, blended, salience) = if let Some(&(dist, rec)) = neighbours.first() {
         tracing::info!(
             top1_id = rec.id,

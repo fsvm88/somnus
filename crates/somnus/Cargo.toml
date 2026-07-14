@@ -11,10 +11,20 @@ path = "src/main.rs"
 # A/B candidate (gaps.md item 9): EfficientAT mn10 env encoder instead of CLAP-HTSAT.
 # Forwards to somnus-encoding/somnus-perception's own mn10_env features (must move together).
 mn10_env = ["somnus-encoding/mn10_env", "somnus-perception/mn10_env"]
+# Fine-grained timing/counters (somnus-metrics). Off by default; forwards uniformly to every
+# crate that has instrumentation call sites (must move together, same shape as mn10_env).
+fine-metrics = [
+    "somnus-metrics/fine-metrics",
+    "somnus-perception/fine-metrics",
+    "somnus-memory/fine-metrics",
+    "somnus-sensory/fine-metrics",
+    "somnus-encoding/fine-metrics",
+]
 
 [dependencies]
 somnus-sensory        = { path = "../somnus-sensory" }
 somnus-encoding       = { path = "../somnus-encoding" }
+somnus-metrics        = { workspace = true }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
 crossbeam-channel  = { workspace = true }

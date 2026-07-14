@@ -1,7 +1,7 @@
 # Sparse coding
 
-> **Contents:** k-WTA (✓ committed, n=1024, k=20), top-k, SAE/L1-penalized autoencoders. Covers dead-unit problem, duty-cycle boosting solution (DUTY_CYCLE_ALPHA=0.001, BOOST_STRENGTH=1.0, TARGET_DC=20/1024), compute overhead, interaction with growth.  
-> **When to read:** Tuning k-WTA hyperparameters; debugging dead units; understanding why duty-cycle boosting was added.
+> **Contents:** k-WTA (✓ committed, n=1024, k=20), top-k, SAE/L1-penalized autoencoders. Covers dead-unit problem, duty-cycle boosting solution (DUTY_CYCLE_ALPHA=0.001, BOOST_STRENGTH=1.0, TARGET_DC=20/1024), compute overhead, interaction with growth. Also covers the encoder-side scoring-cost scaling problem (§"Encoder-side scaling") — why sparsity doesn't reduce the O(input_dim × n_units) k-WTA scoring matmul, and candidate mechanisms (local/blocked connectivity, hierarchical WTA, approximate top-k) for a future ADR.  
+> **When to read:** Tuning k-WTA hyperparameters; debugging dead units; understanding why duty-cycle boosting was added; scoping the next scaling step past the current 10x growth campaign (gaps.md §25/§16).
 
 Research note for somnus. Covers sparse representation schemes for the regional concept areas: k-winner-take-all (k-WTA), top-k activation, and sparse autoencoders (SAE/L1-penalized). All numbers are **engineering estimates**.
 
@@ -144,6 +144,114 @@ A regional concept area with n=2000 units, k=40 active (2% sparsity), d_input=38
 Sparse activation storage is 25× smaller for 2% sparsity. At larger scales (n=10K, k=200), the sparse format is still 50× smaller than dense.
 
 Across 4 regions (audio-speech, audio-env, visual, symbolic) + binding area: total cognitive-layer weight matrices < 100 MB even at n=5000 per region. Entirely negligible relative to the 14 GB VRAM budget.
+
+---
+
+## Encoder-side scaling: why sparsity doesn't save the O(input_dim × n_units) scoring cost
+
+Raised 2026-07-13/14 while looking for genuine scaling levers toward mouse-order size (as opposed
+to just running more GPU cycles on the current architecture). Queued as a research question in
+`gaps.md` §25 ("not pursued here, deliberately queued next"); this section is that write-up. No
+implementation here — this is a design note to be revisited before anything gets built.
+
+### The asymmetry: projection vs. selection
+
+`KWtaLayer` (`crates/somnus-perception/src/region.rs`) has two conceptually separate costs per
+forward pass:
+
+1. **Scoring** — `z = Wx` (`self.linear.forward`, `region.rs:117`): a dense `[d_input] →
+   [n_units]` matmul. Cost: `O(d_input × n_units)`. Every one of the `n_units` candidate units
+   must be scored before top-k can know which ones win — nothing about the *output* being sparse
+   (k active units) makes the *input* projection cheaper to compute, because sparsity is a
+   property of z's post-selection distribution, not of W or x.
+2. **Selection** — `select_top_k` (`region.rs:151`): `select_nth_unstable_by` partition, `O(n_units)`
+   average case. Cheap relative to the matmul once `d_input` is non-trivial (all four sensory
+   regions have `d_input` in the hundreds to low thousands post-encoder).
+
+The binding-projection fix (gaps.md §25, `crates/somnus-perception/src/binding.rs`) sparsified a
+*downstream* consumer of an already-sparse `SparseActivation` — it gathered only the k active rows
+out of the binding weight matrix instead of building a dense `n_units`-length vector and matmul-ing
+all of it. That works because the binding projection's *input* is already sparse (only k of
+n_units entries are nonzero) — the matmul's FLOP count genuinely drops from `O(n_units × d_out)` to
+`O(k × d_out)`.
+
+The k-WTA scoring step has no such input-side sparsity to exploit: `x` (the raw encoder embedding)
+is dense, and every output unit's score is an independent dot product against all of `x`. There is
+no way to know a unit will lose before computing its score — that's the definition of top-k
+selection over an unstructured competition. So `scaled_k` (region.rs:20, keeps `k/n` ≈ 2% constant
+as regions grow) controls storage and downstream FLOPs, but **does nothing for the scoring matmul,
+which scales linearly in `n_units` regardless of `k`.**
+
+### What this means for the 10x campaign and beyond
+
+At `d_input` ~ a few hundred to ~1,500 (varies by region; see `architecture.md` encoder dims) and
+`n_units` growing toward the campaign's ~9,660/region target (honeybee-order, `brain-scale-
+comparison.md`), the scoring matmul is already the dominant per-region FLOP cost, and it grows
+*linearly with n_units* — a 10x region-size increase is a 10x scoring-cost increase, full stop, no
+sparsity discount available under the current all-to-all connectivity. Approaching further scale
+(honeybee → mouse is another ~1,300x in unit count, per `brain-scale-comparison.md`) under this
+architecture would mean a proportional FLOP increase, not a sub-linear one — the opposite of what
+biological scaling looks like (cortical columns are *not* all-to-all; a given input reaches a small,
+structured fan-out of candidate units, not every unit in the area).
+
+This is the real lever: not "make the existing computation faster" (ORT/MIGraphX, §22, already
+did that for the dense case; §25 did it for already-sparse downstream consumers) but "change what
+gets computed at all" — reduce the number of units that must be *scored* per input, not just the
+number that end up *active*.
+
+### Candidate mechanisms (not evaluated in depth — first-pass survey only)
+
+- **Local / blocked connectivity.** Partition `n_units` into blocks (e.g. by locality-sensitive
+  hash of input space, or simply fixed contiguous blocks assigned at growth time) and route each
+  input to a small subset of blocks based on a cheap gating signal, scoring only units within the
+  routed blocks. Closest biological analogue: cortical minicolumns / receptive-field locality —
+  units don't compete globally, they compete within a neighborhood. Engineering analogue: mixture-
+  of-experts routing (sparse MoE gating, e.g. Shazeer et al. 2017 "Outrageously Large Neural
+  Networks," arXiv:1701.06538) or LSH-based approximate nearest-neighbor bucketing. Risk: routing
+  quality determines whether the "right" units are even in the candidate set — a bad router
+  reintroduces the dead-unit problem this codebase already fought once (duty-cycle boosting,
+  `region.rs` `BOOST_STRENGTH`/`DUTY_CYCLE_ALPHA`).
+- **Hierarchical / coarse-to-fine WTA.** Two-stage competition: a cheap coarse scorer over
+  super-units (e.g. `n_units / block_size` groups, each represented by a small summary
+  projection) picks a handful of promising blocks, then full-resolution scoring runs only within
+  those blocks. Reduces the dense matmul from `O(d_input × n_units)` to
+  `O(d_input × n_blocks) + O(d_input × block_size × n_selected_blocks)`. Similar in spirit to
+  ANN search structures already used elsewhere in this codebase for retrieval (HNSW in the
+  warm/cold memory stores) — worth checking whether an existing ANN-style index could double as
+  the coarse stage rather than building a bespoke gating network.
+- **Approximate top-k via sampling/sketching.** Score a random or structured subset of units each
+  forward pass (different subset each time, or importance-weighted by duty cycle / recent
+  activation) instead of all of them, trading exactness for cost. Cheapest to implement, weakest
+  guarantee — units outside the sampled subset can never win on a given input even if they'd have
+  scored highest, which could interact badly with the growth mechanism's assumption that new units
+  get a fair chance to activate (cascade-correlation training assumes the new unit's correlation
+  with residual error is actually measured, not stochastically missed).
+
+### What would need to happen before implementation
+
+1. **Quantify the actual cost.** No isolated benchmark of the k-WTA scoring matmul alone exists yet
+   (unlike the binding-projection fix, which had a clean before/after benchmark at the campaign's
+   real region size). First step for whoever picks this up: measure `KWtaLayer::forward`'s wall-
+   clock at current and projected region sizes, on both the `burn` path and — since ORT owns most
+   live wake-path cost per §22/§24/§25's correction — check whether the exported ONNX encoder graph
+   (`scripts/export_perception_graph.py`) has the same linear-in-n_units scoring cost baked in, since
+   that's what's actually running on this campaign.
+2. **Decide whether this is worth doing at honeybee scale at all.** The current 10x campaign target
+   (~9,660 units/region) is not large enough to make `O(d_input × n_units)` scoring dominate wall-
+   clock catastrophically (it's already linear, not quadratic) — this is a "prepare for the next
+   order of magnitude" question, not an urgent fix for the in-flight campaign. Worth an explicit
+   check against `brain-scale-comparison.md`'s scale ladder before investing design time.
+3. **If pursued, needs an ADR**, not a mechanical fix — this changes representational structure
+   (units are no longer globally competing), which interacts with growth (`grow_region_seeded`),
+   duty-cycle boosting, and the binding area's assumption that any of the `n_units` per region can
+   be "the" active set for a given input. Each candidate mechanism above needs its own numerical
+   validation (does sparsified routing still let `per_region_mse` improve the way pilot-2/3 showed
+   full competition doing) before being adopted.
+
+**ADR written:** `decisions/0038-sparse-encoder-scoring.md` (2026-07-14, status `proposed`) records
+the chosen direction — hierarchical/coarse-to-fine WTA, picked over MoE-style routing and
+approximate sampling — so a future session doesn't have to re-derive the three-way comparison above.
+Implementation remains explicitly not started, gated on the same prerequisites.
 
 ---
 

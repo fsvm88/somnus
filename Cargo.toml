@@ -1,5 +1,5 @@
 [workspace]
-members  = ["crates/somnus", "crates/somnus-sensory", "crates/somnus-encoding", "crates/somnus-perception", "crates/somnus-memory"]
+members  = ["crates/somnus", "crates/somnus-sensory", "crates/somnus-encoding", "crates/somnus-perception", "crates/somnus-memory", "crates/somnus-metrics"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -26,6 +26,7 @@ hnsw_rs            = "0.3"
 memmap2            = "0.9"
 serde              = { version = "1", features = ["derive"] }
 bitcode            = { version = "0.6", features = ["serde"] }
+somnus-metrics        = { path = "crates/somnus-metrics" }
 
 # Profile for flamegraph: release-optimised but with debug symbols intact so
 # perf/flamegraph can map addresses back to source.
