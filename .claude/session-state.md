@@ -1,5 +1,43 @@
 # Session state — somnus
 
+> **⏸️ SHUTDOWN (clean, user-requested), 2026-07-15.** Working tree clean, everything committed
+> and pushed (`5607eb7`). **Next-session entry point: ADR 0038 (hierarchical/coarse-to-fine k-WTA
+> encoder scoring) — explicitly queued next by the user.** It was `proposed`/not-started as of the
+> 2026-07-14 shutdown below; this session's metrics work incidentally produced real numbers for
+> ADR 0038's first prerequisite ("benchmark the actual scoring cost on both `burn` and the
+> ORT-exported path") — `kwta_score_matmul` measured at 2.15s/640 calls (~3.4ms/call) and
+> `measure_mse` at 4.21s/128 calls in a live cycle at ~148k warm records / 9,493-unit regions (see
+> §27 writeup below for how these were pulled from `memory/campaign_growth10x/metrics.jsonl`). Its
+> other two prerequisites (confirm this matters at honeybee scale vs. next-order-of-magnitude;
+> numerical validation that block-local competition doesn't break growth/duty-cycle/binding
+> assumptions) are NOT yet addressed — this session did no new work toward them, just surfaced a
+> number for the first prerequisite as a side effect of unrelated metrics analysis. Full ADR text:
+> `ai-docs/decisions/0038-sparse-encoder-scoring.md`.
+>
+> **This session's actual work — §27, `ai-docs/gaps.md`:** the new `SleepWarmRebuild` Core metric
+> (from the prior session's full-coverage `somnus-metrics` pass) surfaced that
+> `SemanticStore::rebuild_from_recent` (`crates/somnus-memory/src/semantic.rs`) was costing 46-51s per
+> sleep cycle at ~148k warm records — ~70% of total cycle wall-clock — because `hnsw_rs` has no
+> delete API, forcing a full serial-insert rebuild every cycle once the warm cap is hit (every cycle,
+> per the §21 fix). Fixed by switching to `hnsw_rs::parallel_insert_slice` (rayon, already a
+> workspace dep) — same graph, same eviction semantics, spread across cores. **Verified on real
+> production data**, not just a clean build: benchmarked the exact instrumented function against a
+> copy of the campaign's actual cold archive (148,447 records), `git stash`/`pop` to flip old/new
+> code on identical data — 47.6s → 2.85-2.94s, **16.7× speedup**. New
+> `crates/somnus-memory/examples/bench_warm_rebuild.rs` (committed) is a reusable regression-check
+> harness for this metric going forward, not a throwaway. Build/clippy/test clean both feature
+> states. Committed + pushed as `5607eb7`. Full writeup: `ai-docs/gaps.md` §27.
+>
+> **Growth campaign status:** stopped (clean, no process running), session 78/130, cycle 10,
+> region sizes `[9493]×5` — **98.3% to the 10x target** (~9,660 units/region), up from 94.7% at the
+> 2026-07-14 shutdown (it was resumed and run sessions 76-78 as part of validating the
+> full-coverage metrics pass live, then stopped cleanly again). `warm_len=148447`,
+> `cold_len=155256`. Safe to resume anytime via `scripts/resume_growth_campaign.sh` — it will pick
+> up the §27 rebuild fix automatically on its default rebuild-first behavior. Resuming it is the
+> other live option alongside ADR 0038, but the user explicitly named ADR 0038 as next up.
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean, user-requested), 2026-07-14.** Working tree clean, everything committed
 > (`25d8174` full-coverage somnus-metrics expansion, `b5b5849` base somnus-metrics + research note + ADR
 > 0038 — both this session). No `somnus` process running, no stray pilot/scratch directories (all
