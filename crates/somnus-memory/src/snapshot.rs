@@ -77,6 +77,12 @@ fn save_episodic_inner(buf: &EpisodicBuffer, path: &Path) -> MemoryResult<()> {
         w.write_all(&[r.ingest_source as u8])?;
     }
     w.flush()?;
+    if let Ok(meta) = fs::metadata(path) {
+        somnus_metrics::counted_core!(
+            somnus_metrics::Metric::SnapshotEpisodicBytesWritten,
+            meta.len()
+        );
+    }
     Ok(())
 }
 
@@ -89,6 +95,9 @@ pub fn load_episodic(path: &Path, capacity: usize) -> MemoryResult<EpisodicBuffe
 }
 
 fn load_episodic_inner(path: &Path, capacity: usize) -> MemoryResult<EpisodicBuffer> {
+    if let Ok(meta) = fs::metadata(path) {
+        somnus_metrics::counted_core!(somnus_metrics::Metric::SnapshotEpisodicBytesRead, meta.len());
+    }
     let file = fs::File::open(path)?;
     let mut r = BufReader::new(file);
 

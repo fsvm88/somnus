@@ -185,6 +185,14 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
     # All work is written to disk before this crash; treat it as success.
     # 139 = SIGSEGV from MIGraphX destructor race (known, safe to ignore).
     # 120 = pipefail picks up inject_text.py's SIGPIPE exit when somnus exits cleanly.
+    if [ $EXIT -eq 139 ]; then
+        # This restart is otherwise invisible to any Rust-side metric (the crash happens
+        # during process teardown, after somnus's own metrics write) and to campaign_status.py
+        # (it only sees this wrapper's own stdout — see the note that script prints under
+        # "-- health --"). Record it here so both remain the single source of truth.
+        echo "{\"session\":${i},\"exit_code\":${EXIT},\"note\":\"MIGraphX destructor race, restarting\"}" \
+            >> "${CAMPAIGN_DIR}/segfault_restarts.jsonl"
+    fi
     if [ $EXIT -ne 0 ] && [ $EXIT -ne 139 ] && [ $EXIT -ne 120 ]; then
         echo "[campaign] session ${i} exited with code ${EXIT} — check ${SESSION_LOG}"
         echo "[campaign] stopping campaign."

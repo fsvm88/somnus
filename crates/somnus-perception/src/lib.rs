@@ -933,7 +933,10 @@ impl PerceptionProcessor {
                         self.latest[4] = Some(model.language_layer.topk_from_z(z4));
                     }
                 }
-                Err(e) => tracing::warn!(?e, "ORT encoder failed; using burn activations"),
+                Err(e) => {
+                    tracing::warn!(?e, "ORT encoder failed; using burn activations");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::OrtEncoderFallback, 1);
+                }
             }
         }
 
@@ -967,6 +970,7 @@ impl PerceptionProcessor {
                 Ok(ep_vec) => EpisodeVector(ep_vec),
                 Err(e) => {
                     tracing::warn!(?e, "ORT binding failed; falling back to burn");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::OrtBindingFallback, 1);
                     let device = self.device;
                     self.model.as_mut().unwrap().binding.forward(
                         &[sp, en, vi, sy, lang],
@@ -2904,6 +2908,10 @@ impl PerceptionProcessor {
                             }
                             Err(e) => {
                                 tracing::warn!(?e, "ORT binding in settle (encoder path) failed");
+                                somnus_metrics::counted_core!(
+                                    somnus_metrics::Metric::OrtBindingFallback,
+                                    1
+                                );
                                 if let Some(ref h) = saved_hidden {
                                     ort.gru_hidden = h.clone();
                                 }
@@ -2913,6 +2921,7 @@ impl PerceptionProcessor {
                     }
                     Err(e) => {
                         tracing::warn!(?e, "ORT encoder in settle failed; aborting settle");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::OrtEncoderFallback, 1);
                         break;
                     }
                 }
@@ -2968,6 +2977,7 @@ impl PerceptionProcessor {
                                 ?e,
                                 "ORT binding in settle failed; falling back to burn"
                             );
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::OrtBindingFallback, 1);
                             if let Some(ref h) = saved_hidden {
                                 ort.gru_hidden = h.clone();
                             }

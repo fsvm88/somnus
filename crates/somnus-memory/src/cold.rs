@@ -28,7 +28,10 @@ const MAGIC: &[u8; 8] = b"SMNCOLD3";
 //   salience:      f32   4 B
 //   ──────────────────────
 //   total:               665 B
-const RECORD_BYTES: usize = 8 + 8 + 4 + COLD_DIM + 1 + 4;
+/// On-disk bytes per record: id(8) + ts(8) + scale(4) + values(`COLD_DIM`×4) + src(1) +
+/// salience(4). Exposed so callers (the spill loop) can derive bytes-written from a record
+/// count instead of duplicating this layout arithmetic.
+pub const RECORD_BYTES: usize = 8 + 8 + 4 + COLD_DIM + 1 + 4;
 const HEADER_BYTES: usize = 8; // just the magic
 
 /// Append-only cold archive for episode vectors.

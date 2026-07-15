@@ -192,7 +192,18 @@ impl SemanticStore {
     ///   `version`      — 6-byte magic + u16 version tag
     ///   `index.hnsw.data` / `index.hnsw.graph` — hnsw_rs graph dump
     ///   `records.bin`  — bitcode-encoded HashMap<usize, EpisodeRecord>
-    pub fn dump(&self, warm_dir: &Path) -> Result<(), std::io::Error> {
+    pub fn dump(&self, warm_dir: &Path) -> Result<u64, std::io::Error> {
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::SemanticStoreDump,
+            self.dump_inner(warm_dir)
+        );
+        result
+    }
+
+    /// Bytes written by the `index.hnsw.{data,graph}` pair (whatever name `hnsw_rs` picked — see
+    /// the mmap-flag caveat below) plus `records.bin`. Scanned from disk rather than summed from
+    /// in-memory buffer lengths since `hnsw_rs::file_dump` writes its own files internally.
+    fn dump_inner(&self, warm_dir: &Path) -> Result<u64, std::io::Error> {
         fs::create_dir_all(warm_dir)?;
 
         // Version tag
@@ -229,7 +240,19 @@ impl SemanticStore {
             bitcode::serialize(&self.records).map_err(|e| std::io::Error::other(e.to_string()))?;
         fs::write(warm_dir.join("records.bin"), encoded)?;
 
-        Ok(())
+        let bytes_written: u64 = fs::read_dir(warm_dir)?
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with("index")
+                    && (name.ends_with(".hnsw.data") || name.ends_with(".hnsw.graph")))
+                    || name == "records.bin"
+            })
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        Ok(bytes_written)
     }
 
     /// Try to reload from a previously dumped warm index.

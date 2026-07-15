@@ -53,7 +53,9 @@ fn ort_binding_accepts_grown_region_size() {
     // the campaign keeps growing, so this avoids hardcoding (and re-hardcoding) a
     // number that will inevitably go stale again.
     let probe = sess.run_binding(&std::array::from_fn(|_| vec![0.0f32; 1]), &prev_ep);
-    let msg = probe.expect_err("probe with size 1 must mismatch").to_string();
+    let msg = probe
+        .expect_err("probe with size 1 must mismatch")
+        .to_string();
     let expected: usize = msg
         .split("Expected: ")
         .nth(1)

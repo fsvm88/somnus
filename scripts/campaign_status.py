@@ -238,6 +238,26 @@ def scan_panics(campaign_dir):
     return hits
 
 
+def read_segfault_restarts(campaign_dir):
+    """Read train_campaign.sh's segfault_restarts.jsonl sidecar (added 2026-07-15). The
+    MIGraphX-destructor-race restart (exit 139) happens during process teardown, after somnus's
+    own metrics write, so it can never appear in metrics.jsonl — this file is the only record."""
+    path = os.path.join(campaign_dir, "segfault_restarts.jsonl")
+    if not os.path.exists(path):
+        return []
+    hits = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                hits.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return hits
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("campaign_dir", nargs="?", default=None)
@@ -468,9 +488,12 @@ def main():
         print(c("red", f"panics found: {len(panics)} — first: {panics[0][0]}: {panics[0][1][:120]}"))
     else:
         print(c("green", "panics found: 0"))
-    print(c("dim", "note: SIGSEGV (exit 139, known MIGraphX destructor race) doesn't appear in per-session"))
-    print(c("dim", "      logs — it's reported by the wrapper's own stdout, which this script can't see"))
-    print(c("dim", "      after the launching shell exits. Check the task/nohup output for a live count."))
+    segfault_restarts = read_segfault_restarts(campaign_dir)
+    if segfault_restarts:
+        sessions = ", ".join(str(h.get("session", "?")) for h in segfault_restarts)
+        print(c("yellow", f"segfault restarts (exit 139, MIGraphX destructor race): {len(segfault_restarts)} — sessions: {sessions}"))
+    else:
+        print(c("green", "segfault restarts (exit 139): 0"))
 
 
 if __name__ == "__main__":

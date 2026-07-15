@@ -484,7 +484,10 @@ pub fn run_sleep_cycle(
                 }
                 tracing::info!(exported, ?export_path, "training data exported");
             }
-            Err(e) => tracing::warn!(?e, "failed to open training data export file"),
+            Err(e) => {
+                tracing::warn!(?e, "failed to open training data export file");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+            }
         }
     }
 
@@ -642,6 +645,7 @@ pub fn run_sleep_cycle(
                     }
                     Err(e) => {
                         tracing::warn!(?e, "staleness inference failed — keeping sample");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);
                         filtered_indices.push(i);
                     }
                 }
@@ -693,10 +697,13 @@ pub fn run_sleep_cycle(
                             total_output_mse += mse;
                             output_mse_n += 1;
                         }
-                        Err(e) => tracing::warn!(
-                            ?e,
-                            "fused_replay_wake_step_batch error — skipping batch"
-                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                ?e,
+                                "fused_replay_wake_step_batch error — skipping batch"
+                            );
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);
+                        }
                     }
                 });
             let fused_us = d_replay.as_micros() as u64;
@@ -744,7 +751,10 @@ pub fn run_sleep_cycle(
                                     proj_loss_max = loss;
                                 }
                             }
-                            Err(e) => tracing::warn!(?e, "projection_step_batch_distill error"),
+                            Err(e) => {
+                                tracing::warn!(?e, "projection_step_batch_distill error");
+                                somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);
+                            }
                         }
                     }
                 }
@@ -781,7 +791,10 @@ pub fn run_sleep_cycle(
                 proj_weight_norm = n,
                 "NREM complete: projection weight norm"
             ),
-            Err(e) => tracing::warn!(?e, "proj_weight_norm failed"),
+            Err(e) => {
+                tracing::warn!(?e, "proj_weight_norm failed");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);
+            }
         }
     }
 
@@ -1065,11 +1078,16 @@ pub fn run_sleep_cycle(
             for record in episodic.iter_records() {
                 if let Err(e) = recall.cold.append(record) {
                     tracing::warn!(?e, "cold archive append error");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
                     break;
                 }
                 recall.warm.insert(record.clone());
                 spilled += 1;
             }
+            somnus_metrics::counted_core!(
+                somnus_metrics::Metric::ColdArchiveSpillBytesWritten,
+                spilled as u64 * somnus_memory::cold::RECORD_BYTES as u64
+            );
             tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
 
             // Warm HNSW size management: rebuild whenever cold has grown past warm.
@@ -1102,7 +1120,10 @@ pub fn run_sleep_cycle(
                         after = max_cold_records,
                         "cold archive: evicted lowest-salience records"
                     ),
-                    Err(e) => tracing::warn!(?e, "cold archive eviction failed"),
+                    Err(e) => {
+                        tracing::warn!(?e, "cold archive eviction failed");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
+                    }
                 }
             }
         }
@@ -1125,7 +1146,10 @@ pub fn run_sleep_cycle(
                         }
                     }
                 }
-                Err(e) => tracing::warn!(?e, "measure_mse error"),
+                Err(e) => {
+                    tracing::warn!(?e, "measure_mse error");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
+                }
             }
         }
 
@@ -1195,6 +1219,7 @@ pub fn run_sleep_cycle(
                         seeds = cc_seeds[i].len(),
                         "growing region (cascade-correlation)"
                     );
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::GrowthBatchSize, batch as u64);
                     perception.grow_region_seeded(region, batch, &cc_seeds[i]);
                     regions_grown.push(region);
                 }
@@ -1274,7 +1299,10 @@ pub fn run_sleep_cycle(
                     real_mse_total += mse;
                     real_mse_n += 1;
                 }
-                Err(e) => tracing::warn!(?e, "measure_output_mse_inference error (real)"),
+                Err(e) => {
+                    tracing::warn!(?e, "measure_output_mse_inference error (real)");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
+                }
             }
         }
         if real_mse_n > 0 {
@@ -1334,7 +1362,10 @@ pub fn run_sleep_cycle(
                             _ => {}
                         }
                     }
-                    Err(e) => tracing::warn!(?e, "synthesize_episode error"),
+                    Err(e) => {
+                        tracing::warn!(?e, "synthesize_episode error");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
+                    }
                 }
             }
         }
@@ -1383,20 +1414,32 @@ pub fn run_sleep_cycle(
         if !was_interrupted {
             if let Err(e) = save_snapshot(episodic, memory_dir) {
                 tracing::warn!(?e, "episodic snapshot write failed");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
             }
             // Persist warm HNSW index so restart avoids cold-rebuild (~3 min at 100k records).
             let warm_dir = memory_dir.join("warm");
-            if let Err(e) = recall.warm.dump(&warm_dir) {
-                tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
+            match recall.warm.dump(&warm_dir) {
+                Ok(bytes_written) => {
+                    somnus_metrics::counted_core!(
+                        somnus_metrics::Metric::SemanticStoreDumpBytes,
+                        bytes_written
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
+                }
             }
             // Perception weights (BinFileRecorder → weights.bin) written to snapshot dir.
             let w_path = weights_path(memory_dir);
             if let Err(e) = perception.save_weights(&w_path) {
                 tracing::warn!(?e, "weight snapshot write failed");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
             }
             // Region sizes written so restore can pre-grow before loading weights.
             if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
                 tracing::warn!(?e, "region sizes write failed");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
             }
             // Growth cooldown counter: reset to growth_cooldown when something grew,
             // otherwise decrement toward 0.
@@ -1407,6 +1450,7 @@ pub fn run_sleep_cycle(
             };
             if let Err(e) = save_growth_cooldown_remaining(new_cooldown, memory_dir) {
                 tracing::warn!(?e, "growth cooldown write failed");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
             }
             tracing::info!("snapshot written");
         }

@@ -279,10 +279,116 @@ pub enum Metric {
     /// `refresh_language_cache` calls where the `forward_no_dc` call actually ran (burn path,
     /// ORT encoder inactive or has no cached language input).
     RefreshLanguageCacheRun,
+
+    // ── Core: operational health for unattended long-running campaigns (2026-07-15 follow-up)
+    //    — GPU/ORT degradation, resource sampling, growth batch size, and grouped failure
+    //    counters for every recurring warn!/error! site. Grouped by failure *class*, not one
+    //    variant per call site — see doc comments for which sites feed each one. ─────────────
+    /// `PerceptionProcessor::try_bind`'s ORT encoder call failed; fell back to burn CPU
+    /// activations for that ingest. Distinct from `OrtRunEncoder`'s timing, which only covers
+    /// the successful path.
+    OrtEncoderFallback,
+    /// `try_bind`'s ORT binding call failed; fell back to burn `BindingArea::forward`. Distinct
+    /// from `OrtRunBinding`'s timing, same reasoning as `OrtEncoderFallback`.
+    OrtBindingFallback,
+    /// `rebuild_ort_session` failed on first attempt (startup or first post-growth crossover) —
+    /// stays on burn inference for the rest of the process (sticky, per `onnx_failed`).
+    OrtSessionInitFailed,
+    /// `rebuild_ort_session` failed on a rebuild while an ORT session was *already* active
+    /// (post-sleep-cycle weight refresh) — continues with the stale-but-working existing
+    /// session rather than falling back to burn. Distinct from `OrtSessionInitFailed` since the
+    /// failure mode and recovery path differ (keep old session vs. no session at all).
+    OrtSessionRebuildFailed,
+    /// Current process RSS (bytes), sampled once per sleep cycle via `sysinfo`. Was previously
+    /// only computed once at startup (for the auto warm-cap heuristic), never sampled over time
+    /// — a slow leak during a long unattended campaign would have been invisible until OOM.
+    ProcessRssBytes,
+    /// Free disk space (bytes) on the filesystem backing `--memory-dir`, sampled once per sleep
+    /// cycle alongside `ProcessRssBytes`. Same `sysinfo` disk lookup the P1a auto-cold-cap
+    /// heuristic already used at startup, now factored out and re-sampled periodically.
+    MemoryDirDiskFreeBytes,
+    /// The actual novelty-scaled batch size (`growth_batch_size`, gaps.md §19) chosen at each
+    /// growth event, alongside the existing `RegionNUnits`/`RegionKActive` growth-result
+    /// counters — this is the growth *input* they were missing.
+    GrowthBatchSize,
+    /// One end-of-cycle persistence write failed (episodic snapshot, warm HNSW dump, perception
+    /// weights, region sizes, or growth-cooldown counter — all in the same `SleepSnapshot`
+    /// block, all the same failure class: disk write failed, next restart falls back to a
+    /// staler or fresh copy of that one piece of state). A nonzero count is the health signal;
+    /// the log line pinpoints which file.
+    SleepPersistenceWriteFailed,
+    /// `SemanticStore::dump`'s own wall-clock — previously untimed despite being the same class
+    /// of per-cycle I/O as everything else `SleepSnapshot` covers (gaps.md §21's leak lived in
+    /// this exact function). Found while adding `SemanticStoreDumpBytes` below.
+    SemanticStoreDump,
+    /// Bytes actually written by one `SemanticStore::dump` call (`index.hnsw.{data,graph}` +
+    /// `records.bin`, summed from disk since `hnsw_rs::file_dump` picks its own file names).
+    SemanticStoreDumpBytes,
+    /// One NREM training-step operation degraded but the cycle continued: staleness-inference
+    /// failure (keeps the sample instead of filtering it), `fused_replay_wake_step_batch`
+    /// failure (skips the batch), `projection_step_batch_distill` failure (skips the batch), or
+    /// a post-NREM `proj_weight_norm` read failure. All are "this one step didn't happen as
+    /// intended, NREM kept going" — the same operational meaning for a health signal.
+    NremStepError,
+    /// A cold-archive operation failed during the hot→cold spill phase: `ColdArchive::append`
+    /// (aborts the rest of that spill) or `evict_lowest_salience` (cap not enforced this cycle).
+    ColdArchiveOpError,
+    /// A REM self-probe function failed for one sampled trace: `measure_mse`,
+    /// `measure_output_mse_inference`, or `synthesize_episode`. Probe-only — doesn't affect
+    /// training, but a rising count signals a broken region/decoder worth investigating.
+    RemProbeError,
+    /// One `PerceptionProcessor::ingest_*` call failed outright (audio/video/language) — the
+    /// ingest event itself was dropped, not just degraded. The single highest-value counter in
+    /// this batch for an unattended run: a rising rate means real perception data is being lost
+    /// every cycle, not just probed imperfectly.
+    PerceptionIngestError,
+    /// The synchronous `wake_reconstruct_step` fallback path failed for one episode (used when
+    /// no async `WakeReconWorker` is active, or per-episode within it).
+    WakeReconstructError,
+    /// Whisper ASR decode failed or panicked for one audio chunk (the `catch_unwind`-guarded
+    /// path, gaps.md's mitigated-not-root-caused ORT panic) — the chunk is dropped either way.
+    AsrError,
+    /// `ingest_language_line`'s embedding step failed (table mean-pool or `--lang-use-lm`
+    /// hidden-state path) — that language line never reached any region.
+    LangEmbedError,
+    /// `ActionDecoder::generate` failed for one query — covers the interactive path, the
+    /// distillation-only path, and the startup query path uniformly (same failure meaning:
+    /// one generation request produced nothing).
+    ActionGenerationError,
+    /// The async `WakeReconWorker` background thread died and its output heads were never
+    /// merged back in. Rare but high-severity: if this fires, wake-reconstruct training
+    /// silently stopped for the rest of the process with no other visible symptom.
+    WakeReconWorkerDied,
+    /// A startup restore step fell back to a fresh/default value instead of the persisted one:
+    /// perception weight restore, snapshot load, or decoder weight restore. One-time (at
+    /// process start) but explains an otherwise-mysterious "why did region sizes reset" report.
+    StartupRestoreDegraded,
+    /// A media/input-source error: file-loop/file-sequence open failure, microphone
+    /// unavailable, live video capture error, audio/video encoder thread init failure, or a
+    /// per-frame audio/video encode error. Grouped since they're all "this input source
+    /// degraded or dropped a unit of data," the same class `MediaFileDecode`'s own aggregate
+    /// timing already treats per-frame errors within.
+    MediaSourceError,
+    /// Catch-all for the remaining low-frequency `warn!` sites not covered by a more specific
+    /// counter above: embedding-sink write/flush failures, EWMA/decoder-weights per-cycle save
+    /// failures, metrics-file write failures, the top-level sleep-cycle error handler, ORT
+    /// profile flush failures, and auto-ground tokenize failures. A nonzero count here is a
+    /// prompt to grep the log rather than a diagnosis in itself.
+    MiscWarning,
+    /// Bytes written by one `snapshot::save_episodic` call (`fs::metadata` on the written
+    /// file), pairing with the pre-existing `SnapshotSaveEpisodic` timing.
+    SnapshotEpisodicBytesWritten,
+    /// Bytes read by one `snapshot::load_episodic` call, same pairing with
+    /// `SnapshotLoadEpisodic`.
+    SnapshotEpisodicBytesRead,
+    /// Bytes written to the cold archive during one hot→cold spill (`spilled` records ×
+    /// `somnus_memory::cold::RECORD_BYTES`) — derived from the record count already being
+    /// tallied, not a second measurement.
+    ColdArchiveSpillBytesWritten,
 }
 
 impl Metric {
-    pub const COUNT: usize = 74;
+    pub const COUNT: usize = 99;
 
     const fn as_index(self) -> usize {
         match self {
@@ -360,6 +466,31 @@ impl Metric {
             Metric::VideoFramesSkipped => 71,
             Metric::RefreshLanguageCacheSkipped => 72,
             Metric::RefreshLanguageCacheRun => 73,
+            Metric::OrtEncoderFallback => 74,
+            Metric::OrtBindingFallback => 75,
+            Metric::OrtSessionInitFailed => 76,
+            Metric::OrtSessionRebuildFailed => 77,
+            Metric::ProcessRssBytes => 78,
+            Metric::MemoryDirDiskFreeBytes => 79,
+            Metric::GrowthBatchSize => 80,
+            Metric::SleepPersistenceWriteFailed => 81,
+            Metric::SemanticStoreDump => 82,
+            Metric::SemanticStoreDumpBytes => 83,
+            Metric::NremStepError => 84,
+            Metric::ColdArchiveOpError => 85,
+            Metric::RemProbeError => 86,
+            Metric::PerceptionIngestError => 87,
+            Metric::WakeReconstructError => 88,
+            Metric::AsrError => 89,
+            Metric::LangEmbedError => 90,
+            Metric::ActionGenerationError => 91,
+            Metric::WakeReconWorkerDied => 92,
+            Metric::StartupRestoreDegraded => 93,
+            Metric::MediaSourceError => 94,
+            Metric::MiscWarning => 95,
+            Metric::SnapshotEpisodicBytesWritten => 96,
+            Metric::SnapshotEpisodicBytesRead => 97,
+            Metric::ColdArchiveSpillBytesWritten => 98,
         }
     }
 
@@ -439,6 +570,31 @@ impl Metric {
             Metric::VideoFramesSkipped => "video_frames_skipped",
             Metric::RefreshLanguageCacheSkipped => "refresh_language_cache_skipped",
             Metric::RefreshLanguageCacheRun => "refresh_language_cache_run",
+            Metric::OrtEncoderFallback => "ort_encoder_fallback",
+            Metric::OrtBindingFallback => "ort_binding_fallback",
+            Metric::OrtSessionInitFailed => "ort_session_init_failed",
+            Metric::OrtSessionRebuildFailed => "ort_session_rebuild_failed",
+            Metric::ProcessRssBytes => "process_rss_bytes",
+            Metric::MemoryDirDiskFreeBytes => "memory_dir_disk_free_bytes",
+            Metric::GrowthBatchSize => "growth_batch_size",
+            Metric::SleepPersistenceWriteFailed => "sleep_persistence_write_failed",
+            Metric::SemanticStoreDump => "semantic_store_dump",
+            Metric::SemanticStoreDumpBytes => "semantic_store_dump_bytes",
+            Metric::NremStepError => "nrem_step_error",
+            Metric::ColdArchiveOpError => "cold_archive_op_error",
+            Metric::RemProbeError => "rem_probe_error",
+            Metric::PerceptionIngestError => "perception_ingest_error",
+            Metric::WakeReconstructError => "wake_reconstruct_error",
+            Metric::AsrError => "asr_error",
+            Metric::LangEmbedError => "lang_embed_error",
+            Metric::ActionGenerationError => "action_generation_error",
+            Metric::WakeReconWorkerDied => "wake_recon_worker_died",
+            Metric::StartupRestoreDegraded => "startup_restore_degraded",
+            Metric::MediaSourceError => "media_source_error",
+            Metric::MiscWarning => "misc_warning",
+            Metric::SnapshotEpisodicBytesWritten => "snapshot_episodic_bytes_written",
+            Metric::SnapshotEpisodicBytesRead => "snapshot_episodic_bytes_read",
+            Metric::ColdArchiveSpillBytesWritten => "cold_archive_spill_bytes_written",
         }
     }
 
@@ -517,6 +673,31 @@ impl Metric {
         Metric::VideoFramesSkipped,
         Metric::RefreshLanguageCacheSkipped,
         Metric::RefreshLanguageCacheRun,
+        Metric::OrtEncoderFallback,
+        Metric::OrtBindingFallback,
+        Metric::OrtSessionInitFailed,
+        Metric::OrtSessionRebuildFailed,
+        Metric::ProcessRssBytes,
+        Metric::MemoryDirDiskFreeBytes,
+        Metric::GrowthBatchSize,
+        Metric::SleepPersistenceWriteFailed,
+        Metric::SemanticStoreDump,
+        Metric::SemanticStoreDumpBytes,
+        Metric::NremStepError,
+        Metric::ColdArchiveOpError,
+        Metric::RemProbeError,
+        Metric::PerceptionIngestError,
+        Metric::WakeReconstructError,
+        Metric::AsrError,
+        Metric::LangEmbedError,
+        Metric::ActionGenerationError,
+        Metric::WakeReconWorkerDied,
+        Metric::StartupRestoreDegraded,
+        Metric::MediaSourceError,
+        Metric::MiscWarning,
+        Metric::SnapshotEpisodicBytesWritten,
+        Metric::SnapshotEpisodicBytesRead,
+        Metric::ColdArchiveSpillBytesWritten,
     ];
 }
 

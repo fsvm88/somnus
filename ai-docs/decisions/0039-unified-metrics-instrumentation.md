@@ -56,6 +56,64 @@
 > correctly stayed absent since their triggering conditions (change-gate skip, cold eviction, ORT
 > active) didn't occur in that run.
 
+> **Update (2026-07-15, later): operational health for unattended long-running campaigns.** A
+> second, deeper audit — ahead of a long CPU/GPU-intensive growth campaign — targeted signals that
+> matter for catching problems *during* an unattended run rather than after the fact. `Metric`
+> grew 74→99. Five categories:
+> - **GPU/ORT degradation**, previously visible only via manual log-grepping (gaps.md §24's whole
+>   investigation was grepping ~100K lines for two exact strings): `ort_encoder_fallback`/
+>   `ort_binding_fallback` (encoder/binding call failed, fell back to burn — both the `try_bind`
+>   and `settle` call sites), `ort_session_init_failed` (first-attempt build failed, sticky for the
+>   rest of the process), `ort_session_rebuild_failed` (a later rebuild failed while an existing
+>   session stayed active — a different failure mode/recovery path than init failure, so kept
+>   separate). The MIGraphX-destructor-race segfault restart (exit 139) can't be captured this way
+>   at all — it happens during process teardown, after somnus's own metrics write — so it's handled
+>   at the shell level instead: `scripts/train_campaign.sh` now appends a JSON line to
+>   `segfault_restarts.jsonl` in the campaign dir on every exit-139 restart, and
+>   `scripts/campaign_status.py` reads it, replacing the old "this script can't see restarts" note
+>   under `-- health --` with an actual count and session list.
+> - **Resource sampling**: `process_rss_bytes`/`memory_dir_disk_free_bytes`, sampled once per
+>   sleep cycle. `sysinfo` was previously called only once at startup (to size the auto warm/cold
+>   caps) — a slow leak or filling disk during a long unattended campaign would have been invisible
+>   until OOM or ENOSPC. The disk-free lookup was factored into `memory_dir_disk_free_bytes()` and
+>   reused by both the startup auto-cap and the new per-cycle sample.
+> - **Growth input**: `growth_batch_size` — the actual novelty-scaled batch chosen per growth event
+>   (gaps.md §19), pairing with the previous round's `region_n_units`/`region_k_active` (the growth
+>   *result*) to give the full input→output picture.
+> - **Grouped failure counters** for every recurring `warn!`/`error!` site in `somnus`/`somnus-perception`
+>   (not startup-only messages get their own bucket where the failure mode differs; see each
+>   variant's doc comment in `crates/somnus-metrics/src/lib.rs` for the exact call sites folded into
+>   it): `sleep_persistence_write_failed` (any of the 5 end-of-cycle snapshot/HNSW/weights/
+>   region-sizes/cooldown writes), `nrem_step_error` (staleness inference, fused-replay,
+>   projection-distill, proj-weight-norm), `cold_archive_op_error` (append/evict during spill),
+>   `rem_probe_error` (measure_mse/measure_output_mse_inference/synthesize_episode),
+>   `perception_ingest_error` (a whole audio/video/language ingest call failed outright — flagged
+>   as the single highest-value counter in this batch), `wake_reconstruct_error`, `asr_error`,
+>   `lang_embed_error`, `action_generation_error`, `wake_recon_worker_died` (rare, high-severity:
+>   the async worker died silently), `startup_restore_degraded`, `media_source_error` (input-source
+>   failures: file/mic/webcam/encoder-thread), and `misc_warning` (the remaining low-frequency
+>   sites — a nonzero count is a prompt to grep the log, not a diagnosis by itself). Grouping was a
+>   deliberate choice over one variant per call site (~55 sites would have made the enum
+>   unmaintainable without adding proportionate diagnostic value — the log line still pinpoints
+>   which site fired).
+> - **Disk I/O byte volume**: `semantic_store_dump`/`semantic_store_dump_bytes` (the warm HNSW
+>   dump was previously untimed entirely, found while adding the byte counter — same function
+>   gaps.md §21's leak lived in), `snapshot_episodic_bytes_written`/`_read` (via `fs::metadata` on
+>   the written/read file — no per-write-call instrumentation needed), `cold_archive_spill_bytes_written`
+>   (derived from the spill loop's existing record count × `somnus_memory::cold::RECORD_BYTES`, now
+>   `pub` — no second measurement). `SemanticStore::dump`'s signature changed from `Result<(),
+>   io::Error>` to `Result<u64, io::Error>` (bytes written) to support this; both call sites
+>   updated.
+>
+> Verified: `cargo build/clippy/test --release --workspace` clean in both feature states (99
+> variants). Live pilot (2-session, isolated scratch memory dir, cleaned up after) confirmed
+> `process_rss_bytes`, `memory_dir_disk_free_bytes`, `growth_batch_size`, `semantic_store_dump`/
+> `_bytes`, `snapshot_episodic_bytes_written`/`_read`, `cold_archive_spill_bytes_written`, and
+> `misc_warning` all fired with plausible real values (RSS ~11GB, disk-free ~916GB) in a run that
+> happened to hit the disk-not-found auto-cap fallback path. `segfault_restarts.jsonl` and its
+> `campaign_status.py` display verified separately with a hand-crafted fixture (no real segfault
+> was available to trigger one in a short pilot).
+
 ## Context
 
 While scoping ADR 0038's benchmarking prerequisite (measure the k-WTA scoring matmul's real

@@ -1072,6 +1072,34 @@ absent. Channel/queue-depth sampling was considered and deliberately not added �
 per-second throttle point on the audio-thread side, and per-message sampling would violate the
 crate's own per-element guardrail. Full detail in ADR 0039's "Update (2026-07-15)" section.
 
+**Follow-up (2026-07-15, later): operational health ahead of a long unattended campaign.** A
+second audit targeted GPU/ORT degradation, resource exhaustion, and failure visibility — signals
+that matter for catching problems *during* a long run, not just characterizing steady-state cost.
+`Metric::COUNT` 74→99. Added `ort_encoder_fallback`/`ort_binding_fallback`/
+`ort_session_init_failed`/`ort_session_rebuild_failed` (previously only visible via manual
+log-grepping — gaps.md §24's whole investigation was exactly this); `process_rss_bytes`/
+`memory_dir_disk_free_bytes` sampled once per sleep cycle (previously `sysinfo` only ran once at
+startup); `growth_batch_size` (the growth *input*, pairing with the previous round's
+`region_n_units`/`region_k_active` result); 13 grouped failure counters covering literally every
+recurring `warn!`/`error!` site in `somnus`/`somnus-perception` (`sleep_persistence_write_failed`,
+`nrem_step_error`, `cold_archive_op_error`, `rem_probe_error`, `perception_ingest_error` — flagged
+as the single highest-value one, since it means real data is being lost every cycle rather than
+just probed imperfectly — `wake_reconstruct_error`, `asr_error`, `lang_embed_error`,
+`action_generation_error`, `wake_recon_worker_died`, `startup_restore_degraded`,
+`media_source_error`, `misc_warning`); and disk I/O byte counters (`semantic_store_dump`/`_bytes` —
+found `dump()` itself was untimed despite being the exact function §21's leak lived in, fixed in
+passing; `snapshot_episodic_bytes_written`/`_read`; `cold_archive_spill_bytes_written`, derived
+from the spill loop's existing record count, no new measurement). The one gap that can't be
+captured in `somnus-metrics` at all — the MIGraphX-destructor-race segfault restart (exit 139), which
+happens during process teardown after somnus's own metrics write — is now recorded at the shell
+level: `scripts/train_campaign.sh` appends to a new `segfault_restarts.jsonl` sidecar per restart,
+and `scripts/campaign_status.py` displays it, replacing the old "this script can't see restarts"
+caveat note under `-- health --`. Verified: build/clippy/test clean both feature states (99
+variants); live pilot confirmed 7 of the new metrics fired with plausible values (RSS ~11GB,
+disk-free ~916GB); `segfault_restarts.jsonl` display verified with a hand-crafted fixture (no real
+segfault available in a short pilot). Full detail in ADR 0039's second "Update (2026-07-15)"
+section.
+
 ---
 
 ## Priority order (as of 2026-07-11)
@@ -1108,4 +1136,4 @@ crate's own per-element guardrail. Full detail in ADR 0039's "Update (2026-07-15
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
 | ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics. Follow-on research note + ADR 0038 (encoder scoring-cost scaling) written 2026-07-14 — see `sparse-coding.md`; not started |
-| ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion + value metrics** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 74-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR, plus 7 non-duration value/event counters (region size, eviction counts, video skip rate, cache branch); every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14, value metrics added 2026-07-15 — see §26 below |
+| ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion + value/health metrics** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 99-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR, growth/eviction/video value counters, GPU/ORT fallback + resource sampling + grouped failure counters for unattended-campaign health, plus a shell-level segfault-restart tracker; every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14, value metrics + operational health added 2026-07-15 — see §26 below |

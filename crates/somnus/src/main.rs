@@ -576,6 +576,7 @@ impl AudioProcessor {
                     expected = known,
                     "audio sample rate changed mid-stream — frame dropped"
                 );
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
                 return Ok(vec![]);
             }
         }
@@ -742,10 +743,35 @@ fn wall_secs(t: &SystemTime) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Current process RSS in bytes, via a fresh single-process `sysinfo` refresh (not the whole
+/// process table). Returns 0 if the pid or its memory can't be resolved.
+fn current_process_rss_bytes() -> u64 {
+    let Ok(pid) = sysinfo::get_current_pid() else {
+        return 0;
+    };
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), false);
+    sys.process(pid).map(|p| p.memory()).unwrap_or(0)
+}
+
+/// Free space (bytes) on the filesystem backing `memory_dir`, via the most specific
+/// (longest) matching mount point. Returns 0 if sysinfo can't resolve it (btrfs subvolumes,
+/// network fs, etc. — same caveat as the P1a auto-cold-cap lookup this factors out of).
+fn memory_dir_disk_free_bytes(memory_dir: &std::path::Path) -> u64 {
+    let disks = Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|d| memory_dir.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+        .unwrap_or(0)
+}
+
 fn sink_write(sink: &mut Option<BufWriter<std::fs::File>>, line: &str) {
     if let Some(w) = sink {
         if let Err(e) = writeln!(w, "{}", line) {
             tracing::warn!(?e, "embedding sink write failed");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
         }
     }
 }
@@ -754,6 +780,7 @@ fn sink_flush(sink: &mut Option<BufWriter<std::fs::File>>) {
     if let Some(w) = sink {
         if let Err(e) = w.flush() {
             tracing::warn!(?e, "embedding sink flush failed");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
         }
     }
 }
@@ -976,6 +1003,7 @@ async fn main() -> Result<()> {
                 Ok(()) => info!("ORT binding session active"),
                 Err(e) => {
                     tracing::warn!(?e, "ORT session init failed — running with burn inference");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::OrtSessionInitFailed, 1);
                     onnx_failed = true;
                 }
             }
@@ -1009,6 +1037,7 @@ async fn main() -> Result<()> {
                         load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
                     if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
                         tracing::warn!(?e, "weight restore failed — starting with fresh weights");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
                     } else {
                         info!(sizes = ?sizes, "perception weights restored");
                     }
@@ -1024,6 +1053,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 tracing::warn!(?e, "snapshot load failed — starting fresh");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
                 (
                     EpisodicBuffer::new(args.episodic_capacity),
                     SemanticStore::new(EPISODE_DIM),
@@ -1045,18 +1075,12 @@ async fn main() -> Result<()> {
     semantic.set_max_records(effective_max_warm);
 
     // P1a: auto-derive --max-cold-records from disk free space when unset (ADR 0024 ops table).
-    // Formula: free_disk_bytes × 0.20 / RECORD_BYTES (665 = 8+8+4+640+1+4).
-    const COLD_RECORD_BYTES: u64 = 665;
+    // Formula: free_disk_bytes × 0.20 / RECORD_BYTES.
+    let cold_record_bytes = somnus_memory::cold::RECORD_BYTES as u64;
     let effective_max_cold = if args.max_cold_records > 0 {
         args.max_cold_records
     } else {
-        let disks = Disks::new_with_refreshed_list();
-        let free_bytes = disks
-            .iter()
-            .filter(|d| args.memory_dir.starts_with(d.mount_point()))
-            .max_by_key(|d| d.mount_point().as_os_str().len())
-            .map(|d| d.available_space())
-            .unwrap_or(0);
+        let free_bytes = memory_dir_disk_free_bytes(&args.memory_dir);
         if free_bytes == 0 {
             // Disk not found via sysinfo (btrfs subvolumes, network fs, etc.).
             // Fall back to unlimited so we don't cap too aggressively.
@@ -1064,9 +1088,10 @@ async fn main() -> Result<()> {
                 memory_dir = %args.memory_dir.display(),
                 "auto cold cap: disk not found via sysinfo — cap disabled"
             );
+            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
             0
         } else {
-            let auto = ((free_bytes as f64 * 0.20) / COLD_RECORD_BYTES as f64) as usize;
+            let auto = ((free_bytes as f64 * 0.20) / cold_record_bytes as f64) as usize;
             auto.clamp(10_000, 10_000_000)
         }
     };
@@ -1078,6 +1103,7 @@ async fn main() -> Result<()> {
             "settling active but no prior snapshot — output heads are random; \
              settle noise expected until output_mse converges"
         );
+        somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
     }
 
     // ── action decoder ────────────────────────────────────────────────────────
@@ -1096,6 +1122,7 @@ async fn main() -> Result<()> {
                 if dec_w.with_extension("bin").exists() {
                     if let Err(e) = d.load_weights(&dec_w) {
                         tracing::warn!(?e, "decoder weight restore failed — starting fresh");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
                     } else {
                         info!("decoder projection weights restored");
                     }
@@ -1104,12 +1131,14 @@ async fn main() -> Result<()> {
                         "snapshot found but no decoder_weights.bin — \
                          projection starts fresh; generation incoherent until trained"
                     );
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
                 }
                 info!("action decoder ready");
                 Some(d)
             }
             Err(e) => {
                 tracing::warn!(?e, "action decoder init failed — decoder disabled");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                 None
             }
         }
@@ -1300,6 +1329,7 @@ async fn main() -> Result<()> {
                     ?e,
                     "whisper ASR decoder not available — text-only language ingestion"
                 );
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                 None
             }
         }
@@ -1374,6 +1404,7 @@ async fn main() -> Result<()> {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!(?e, file = ?path, "file loop: failed to open");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
                             break;
                         }
                     };
@@ -1412,6 +1443,7 @@ async fn main() -> Result<()> {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!(?e, file = ?path, "file sequence: failed to open");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
                             return;
                         }
                     };
@@ -1450,6 +1482,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 tracing::warn!(?e, "microphone unavailable — running without mic audio");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
             }
         }
     }
@@ -1474,6 +1507,7 @@ async fn main() -> Result<()> {
                         },
                         Err(e) => {
                             tracing::error!(?e, "video capture error");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
                             break;
                         }
                     }
@@ -1485,6 +1519,7 @@ async fn main() -> Result<()> {
                     webcam = args.webcam,
                     "webcam unavailable — running audio-only"
                 );
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
             }
         }
     }
@@ -1548,8 +1583,14 @@ async fn main() -> Result<()> {
                             );
                         }
                         Ok(Ok(_)) => {}
-                        Ok(Err(e)) => tracing::warn!(?e, "whisper ASR failed"),
-                        Err(_) => tracing::warn!("whisper ASR panicked — dropping this cycle"),
+                        Ok(Err(e)) => {
+                            tracing::warn!(?e, "whisper ASR failed");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::AsrError, 1);
+                        }
+                        Err(_) => {
+                            tracing::warn!("whisper ASR panicked — dropping this cycle");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::AsrError, 1);
+                        }
                     }
                 }
             });
@@ -1569,6 +1610,7 @@ async fn main() -> Result<()> {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(?e, "audio encoder init failed");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
                     return;
                 }
             };
@@ -1583,7 +1625,10 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    Err(e) => tracing::error!(?e, "audio encode error"),
+                    Err(e) => {
+                        tracing::error!(?e, "audio encode error");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
+                    }
                 }
             }
         });
@@ -1607,6 +1652,7 @@ async fn main() -> Result<()> {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!(?e, "video encoder init failed");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
                     return;
                 }
             };
@@ -1673,7 +1719,10 @@ async fn main() -> Result<()> {
                             return;
                         }
                     }
-                    Err(e) => tracing::error!(?e, "video encode error"),
+                    Err(e) => {
+                        tracing::error!(?e, "video encode error");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
+                    }
                 }
             }
         });
@@ -1748,7 +1797,13 @@ async fn main() -> Result<()> {
                                     })
                                 );
                             }
-                            Err(e) => tracing::warn!(?e, "generation failed"),
+                            Err(e) => {
+                                tracing::warn!(?e, "generation failed");
+                                somnus_metrics::counted_core!(
+                                    somnus_metrics::Metric::ActionGenerationError,
+                                    1
+                                );
+                            }
                         }
                     }
                 }
@@ -1919,7 +1974,10 @@ async fn main() -> Result<()> {
                             perception.apply_ema_flat(flat);
                         }
                     }
-                    None => tracing::warn!("wake-recon worker died — heads not merged"),
+                    None => {
+                        tracing::warn!("wake-recon worker died — heads not merged");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::WakeReconWorkerDied, 1);
+                    }
                 }
             }
             // P1b: auto --sleep-max-secs: cap = max(300, 3 × mean_sleep_secs) after first cycle.
@@ -1964,9 +2022,11 @@ async fn main() -> Result<()> {
                     cooldown_remaining = stats.growth_cooldown_remaining;
                     if let Err(e) = save_sal_ewma(sal_mu, sal_sigma, sal_n, &args.memory_dir) {
                         tracing::warn!(?e, "sal_ewma save failed");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
                     if let Err(e) = save_settle_ewma(settle_mu, settle_n, &args.memory_dir) {
                         tracing::warn!(?e, "settle_ewma save failed");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
                     // S6: update wake-duration EWMA (per-cycle α=0.3; ADR 0024).
                     const WAKE_EWMA_ALPHA: f32 = 0.3;
@@ -1978,6 +2038,7 @@ async fn main() -> Result<()> {
                     wake_ewma_n += 1;
                     if let Err(e) = save_wake_ewma(wake_ewma_mu, wake_ewma_n, &args.memory_dir) {
                         tracing::warn!(?e, "wake_ewma save failed");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
                     // Recompute max_wake from updated EWMA (floor until n≥3).
                     let new_max_secs = if wake_ewma_n >= 3 {
@@ -1996,6 +2057,14 @@ async fn main() -> Result<()> {
                     .clamp(0.0, 0.5);
                     wakefulness_pressure = (wakefulness_pressure - consolidation).max(0.0);
                     sleep_cycle_count += 1;
+                    somnus_metrics::counted_core!(
+                        somnus_metrics::Metric::ProcessRssBytes,
+                        current_process_rss_bytes()
+                    );
+                    somnus_metrics::counted_core!(
+                        somnus_metrics::Metric::MemoryDirDiskFreeBytes,
+                        memory_dir_disk_free_bytes(&args.memory_dir)
+                    );
                     let cycle_asr = asr_count.swap(0, Ordering::Relaxed);
                     info!(
                         cycle         = sleep_cycle_count,
@@ -2021,6 +2090,7 @@ async fn main() -> Result<()> {
                             .join("decoder_weights.safetensors");
                         if let Err(e) = dec.save_weights(&dec_w) {
                             tracing::warn!(?e, "decoder weights snapshot failed");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                         }
                         // Push updated projection weights to gain worker (non-blocking).
                         if let Some(ref gw) = gain_worker {
@@ -2246,6 +2316,7 @@ async fn main() -> Result<()> {
                         use std::io::Write as _;
                         if let Err(e) = writeln!(mf, "{line}") {
                             tracing::warn!(?e, "metrics write failed");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                         }
                     }
                     // Reset per-wake-cycle counters.
@@ -2285,7 +2356,10 @@ async fn main() -> Result<()> {
                     cosine_baseline_n = 0;
                     perf_sleep_flag = false;
                 }
-                Err(e) => tracing::warn!(?e, "sleep cycle error"),
+                Err(e) => {
+                    tracing::warn!(?e, "sleep cycle error");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+                }
             }
             // Push NREM-trained head weights back to the worker for the next
             // wake phase (also after a failed cycle — partial training counts).
@@ -2318,14 +2392,24 @@ async fn main() -> Result<()> {
                                 );
                             }
                         }
-                        Err(e) if already_active => tracing::warn!(
-                            ?e,
-                            "ORT session rebuild failed — continuing with existing session"
-                        ),
+                        Err(e) if already_active => {
+                            tracing::warn!(
+                                ?e,
+                                "ORT session rebuild failed — continuing with existing session"
+                            );
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::OrtSessionRebuildFailed,
+                                1
+                            );
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 ?e,
                                 "ORT session init failed — running with burn inference"
+                            );
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::OrtSessionInitFailed,
+                                1
                             );
                             onnx_failed = true;
                         }
@@ -2391,7 +2475,13 @@ async fn main() -> Result<()> {
                                                         wake_output_mse_n += 1;
                                                         tracing::info!(output_mse = mse, "wake reconstruction");
                                                     }
-                                                    Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                                                    Err(e) => {
+                                                        tracing::warn!(?e, "wake reconstruct error");
+                                                        somnus_metrics::counted_core!(
+                                                            somnus_metrics::Metric::WakeReconstructError,
+                                                            1
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -2418,7 +2508,13 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            Err(e) => tracing::error!(?e, "perception error (audio)"),
+                            Err(e) => {
+                                tracing::error!(?e, "perception error (audio)");
+                                somnus_metrics::counted_core!(
+                                    somnus_metrics::Metric::PerceptionIngestError,
+                                    1
+                                );
+                            }
                         }
                     }
                     None => { audio_emb_closed = true; }
@@ -2464,7 +2560,13 @@ async fn main() -> Result<()> {
                                                         wake_output_mse_n += 1;
                                                         tracing::info!(output_mse = mse, "wake reconstruction");
                                                     }
-                                                    Err(e) => tracing::warn!(?e, "wake reconstruct error"),
+                                                    Err(e) => {
+                                                        tracing::warn!(?e, "wake reconstruct error");
+                                                        somnus_metrics::counted_core!(
+                                                            somnus_metrics::Metric::WakeReconstructError,
+                                                            1
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -2491,7 +2593,13 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            Err(e) => tracing::error!(?e, "perception error (video)"),
+                            Err(e) => {
+                                tracing::error!(?e, "perception error (video)");
+                                somnus_metrics::counted_core!(
+                                    somnus_metrics::Metric::PerceptionIngestError,
+                                    1
+                                );
+                            }
                         }
                     }
                     None => { video_emb_closed = true; }
@@ -2627,7 +2735,13 @@ async fn main() -> Result<()> {
                                         "response": response,
                                     }));
                                 }
-                                Err(e) => tracing::warn!(?e, "generation failed"),
+                                Err(e) => {
+                                    tracing::warn!(?e, "generation failed");
+                                    somnus_metrics::counted_core!(
+                                        somnus_metrics::Metric::ActionGenerationError,
+                                        1
+                                    );
+                                }
                             }
                         }
                     }
@@ -2655,7 +2769,10 @@ async fn main() -> Result<()> {
         if let Some(ref mut dec) = decoder {
             match dec.end_profiling() {
                 Ok(path) => info!(path, "ORT lm_session profile written"),
-                Err(e) => tracing::warn!(?e, "ORT profile flush failed"),
+                Err(e) => {
+                    tracing::warn!(?e, "ORT profile flush failed");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+                }
             }
         }
     }
@@ -2829,6 +2946,7 @@ fn ingest_language_line(
                     Ok(v) => Some(v),
                     Err(e) => {
                         tracing::warn!(?e, "language embed failed");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::LangEmbedError, 1);
                         None
                     }
                 },
@@ -2838,6 +2956,7 @@ fn ingest_language_line(
                 Ok(v) => Some(v),
                 Err(e) => {
                     tracing::warn!(?e, "language embed failed");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::LangEmbedError, 1);
                     None
                 }
             }
@@ -2888,6 +3007,10 @@ fn ingest_language_line(
                                     }
                                     Err(e) => {
                                         tracing::warn!(?e, "wake reconstruct error");
+                                        somnus_metrics::counted_core!(
+                                            somnus_metrics::Metric::WakeReconstructError,
+                                            1
+                                        );
                                         None
                                     }
                                 }
@@ -2912,7 +3035,10 @@ fn ingest_language_line(
                         Ok(ids) => {
                             episodic.set_last_text_target(ids);
                         }
-                        Err(e) => tracing::warn!(?e, "auto-ground tokenize failed"),
+                        Err(e) => {
+                            tracing::warn!(?e, "auto-ground tokenize failed");
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+                        }
                     }
                 }
             }
@@ -2931,6 +3057,7 @@ fn ingest_language_line(
         }
         Err(e) => {
             tracing::error!(?e, "perception error (language)");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::PerceptionIngestError, 1);
             None
         }
     }
@@ -3052,7 +3179,10 @@ fn maybe_startup_query(
                 })
             );
         }
-        Err(e) => tracing::warn!(?e, "startup query generation failed"),
+        Err(e) => {
+            tracing::warn!(?e, "startup query generation failed");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::ActionGenerationError, 1);
+        }
     }
     true
 }
