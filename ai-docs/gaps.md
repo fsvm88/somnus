@@ -1156,6 +1156,99 @@ campaign is currently stopped (session 78); next resume will pick up the fix aut
 
 ---
 
+## §28 — ADR 0038 prerequisite 1: exported encoder graph and live scoring cost
+
+ADR 0038 (hierarchical/coarse-to-fine k-WTA encoder scoring) lists three prerequisites before
+implementation. Prerequisite 1 ("quantify the actual cost... check whether the exported ONNX
+encoder graph has the same linear-in-n_units cost, not just the `burn` path") is now answered from
+two sources: reading `scripts/export_perception_graph.py` and pulling live numbers from the
+production growth campaign (`memory/campaign_growth10x/metrics.jsonl`, cycles at
+`region_sizes=[9385..9493]×5`, i.e. current honeybee-order scale).
+
+**The exported graph has the identical dense cost.** `build_encoder_graph` (`export_perception_graph.py:92`)
+emits one `MatMul` node per region — `speech_enc @ W_enc_0`, etc. — with `W_enc_i` shaped
+`[region_dims[i], n_units[i]]`. No top-k, gating, or sparsity is applied before this matmul; it is
+the same `O(d_input × n_units)` computation as `KWtaLayer::forward`'s `self.linear.forward` in
+`burn`, just executed by ORT instead. Switching backends did not change the scaling law — ADR
+0038's premise holds for the live path too, not just the training-side `burn` path.
+
+**But the live cost is small in absolute terms, and not the dominant one.** `OrtRunEncoder` is
+already a Core metric (`crates/somnus-perception/src/onnx_session.rs:68`), firing once per wake
+episode for the whole 5-region step (not per-region). Over the last 10 recorded cycles at
+~9,400-9,493 units/region: **~0.85-1.8ms per call** (mean ~1.28ms across 1,585 calls, session
+`campaign_growth10x`). For comparison, `OrtRunBinding` (the fixed-size, region-count-independent
+GRU+attention step) costs **2-3× more per call** at the same scale — binding `total_ns` runs
+consistently 2-3.3× encoder `total_ns` per cycle in the raw data. Encoder+binding together account
+for 28-73% of `perception_total_ms` across sampled cycles (wide variance likely reflects
+ASR/video decode load competing for CPU in the same window, not the ORT calls themselves changing
+cost).
+
+**Read on prerequisite 2 (deferred to a separate pass, not resolved here):** at *this* scale, the
+encoder matmul is cheap and is not even the largest ORT cost — the fixed-size binding graph is.
+A 10x further region-size increase (mouse-order, per `research/brain-scale-comparison.md`) would
+scale the encoder matmul roughly 10x (~10-18ms/call) while binding stays flat, so the balance would
+shift toward the encoder mattering more — but that's prerequisite 2's question ("does this matter
+at the scale actually being targeted"), not fully answered by this benchmark alone.
+
+**Bearing on ADR 0038's "what would invalidate this" list:** this data is evidence *for* the
+"ORT/GPU already absorbs a lot of wasted FLOPs" invalidation bullet at the *current* scale — 1.28ms
+is not something a user-facing wake loop with ~1-3s total perception time per cycle needs rescuing
+from. It does not resolve whether that remains true after another 10x. Recommendation: don't
+implement hierarchical WTA on the strength of prerequisite 1 alone; prerequisite 2 (scale-ladder
+check) should run next and is the cheaper of the two remaining gates.
+
+No code changes. `ai-docs/decisions/0038-sparse-encoder-scoring.md` prerequisite 1 updated to
+point here instead of carrying inline numbers, so this doesn't need re-deriving.
+
+---
+
+## §29 — ADR 0038 prerequisite 2: does this matter at the targeted scale?
+
+Prerequisite 2 ("confirm this matters at the scale actually being targeted... check against
+`brain-scale-comparison.md`'s scale ladder before investing implementation time") is answered by
+combining §28's numbers with what the project's own docs say the near-term target actually is.
+
+**The stated target is honeybee-order, not mouse-order.** `gaps.md` §16 states the growth
+campaign's goal explicitly: scale toward "~54,000 units, ~9,660 units/region... rather than
+mouse-order (~71M neurons, a ~400x jump)." Grepped the rest of `ai-docs/` for any roadmap item,
+follow-on campaign, or stated ambition beyond the current 10x campaign (`"next campaign"`,
+`"20x"`, `"100x"`, `"beyond honeybee"`, `"scale ambition"`) — nothing exists. The current campaign
+is at 98.3% of its own honeybee-order target as of the last shutdown; there is no in-flight or
+planned next step past it.
+
+**Combined with §28: doesn't matter yet, at the scale actually in flight.** §28 already showed the
+encoder scoring cost is small (~1.28ms/call) and not even the dominant ORT cost at honeybee-order
+scale (~9,493 units/region) — the fixed-size binding graph costs more. Since honeybee-order is also
+the actual target (not a milestone en route to something bigger that's already been decided),
+prerequisite 2 resolves negative: **hierarchical WTA is not worth building for the campaign this
+project is actually running.**
+
+**This is a "doesn't matter yet" finding, not a "wrong direction" finding — ADR stays `proposed`,
+not closed.** The distinction matters: "no roadmap item currently names mouse-order" is not the
+same claim as "honeybee-order is a decided ceiling." `brain-scale-comparison.md`'s own framing is
+that the project's 5-6-order-of-magnitude gap to brain-scale "only narrows through (a) the growth
+mechanism shipping and (b) algorithmic efficiency techniques" — hierarchical WTA is exactly a (b)
+technique, and nothing in the docs says the project has decided to stop at honeybee-order
+permanently. Absence of a next-campaign plan while the current campaign is still at 98.3% is
+"haven't scoped the next step," not "decided there is no next step." Marking this ADR "closed — not
+needed" would overstate the finding and invite a future session to silently drop a live-ish
+direction; the correct status is the same `proposed`/deferred pattern CLAUDE.md already uses for
+items A-N, with an explicit, nameable trigger instead of an open-ended "revisit sometime."
+
+**Trigger for revisiting, recorded so a future session doesn't need to re-derive this:** the
+growth campaign's target scale moves past honeybee-order (a follow-on campaign targeting mouse-order
+or an intermediate step gets scoped/launched), or the encoder-vs-binding cost balance shifts back
+toward the encoder mattering (e.g. binding-side wins land that shrink `OrtRunBinding` further while
+region size keeps growing under an even-bigger honeybee-order campaign).
+
+Prerequisite 3 (numerical validation plan — does block-local competition break growth/duty-cycle/
+binding assumptions) remains open and unaffected by this finding; it would still need to be worked
+out before implementation if/when the trigger above fires.
+
+No code changes.
+
+---
+
 ## Priority order (as of 2026-07-11)
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -1192,3 +1285,5 @@ campaign is currently stopped (session 78); next resume will pick up the fix aut
 | ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics. Follow-on research note + ADR 0038 (encoder scoring-cost scaling) written 2026-07-14 — see `sparse-coding.md`; not started |
 | ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion + value/health metrics, audited** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 100-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR, growth/eviction/video value counters, GPU/ORT fallback + resource sampling + grouped failure counters + NaN/Inf detection for unattended-campaign health, all surfaced in `campaign_status.py`'s health section, plus a shell-level segfault-restart tracker; every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14, value metrics + operational health added 2026-07-15, correctness-audited and NaN detection + status-script surfacing added 2026-07-15 — see §26 below |
 | ✅ §27 | **Parallelized warm-store HNSW rebuild** (`SemanticStore::rebuild_from_recent`) | Low | Sleep-cycle wall-clock — rebuild was ~70% of cycle time (46-51s at ~148k warm records) | Deployed 2026-07-15 — `parallel_insert_slice` (rayon), confirmed 16.7× speedup (47.6s→2.9s) on real production-scale data — see §27 below |
+| 🔍 §28 | **ADR 0038 prerequisite 1: exported encoder graph + live scoring cost** | — | Informs whether hierarchical/coarse-to-fine k-WTA scoring is worth building | Answered 2026-07-15 — exported ONNX graph has the same O(d_input×n_units) cost as `burn`, but live cost is small (~1.28ms/call) and not the dominant ORT cost at current scale (binding costs 2-3× more) — see §28 below; prerequisites 2/3 still open |
+| 🔍 §29 | **ADR 0038 prerequisite 2: does this matter at the targeted scale?** | — | Informs whether hierarchical/coarse-to-fine k-WTA scoring is worth building | Answered 2026-07-15 — no, not at honeybee-order (the actual current target, not just current progress); ADR stays `proposed`/deferred with an explicit trigger (scale ambitions moving past honeybee-order), not closed — see §29 below; prerequisite 3 still open |

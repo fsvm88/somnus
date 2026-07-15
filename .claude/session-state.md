@@ -1,8 +1,46 @@
 # Session state — somnus
 
+> **⏸️ SHUTDOWN (clean, user-requested), 2026-07-16.** Working tree clean, everything committed
+> and pushed (commit below). **Next-session entry point: ADR 0038 prerequisite 3** (numerical
+> validation plan — does block-local competition break growth/duty-cycle/binding assumptions) is
+> the only prerequisite left open, but it's now gated behind a trigger that hasn't fired (see
+> below) — **not** a live next step to just pick up. If nothing else is queued, the other live
+> option is resuming the growth campaign (98.3% to its 10x target, see further below).
+>
+> **This session's work — §28/§29, `ai-docs/gaps.md`, resolving 2 of ADR 0038's 3 prerequisites:**
+> user asked to work through ADR 0038's prerequisites in order.
+> - **Prereq 1 (§28):** read `scripts/export_perception_graph.py` — the exported ONNX encoder graph
+>   has the identical `O(d_input × n_units)` dense matmul as the `burn` path, no sparsity/gating
+>   applied before scoring, so switching to ORT didn't change the scaling law. But live cost,
+>   pulled from the already-existing `OrtRunEncoder`/`OrtRunBinding` Core metrics in the production
+>   campaign's `memory/campaign_growth10x/metrics.jsonl` (~9,400-9,493 units/region), is small in
+>   absolute terms (~1.28ms/call mean, 1,585 calls) and not even the dominant ORT cost — the
+>   fixed-size `OrtRunBinding` graph (GRU+attention, independent of region size) costs 2-3× more per
+>   call at this scale.
+> - **Prereq 2 (§29):** checked `gaps.md` §16 (states the campaign's own goal is honeybee-order,
+>   explicitly *not* mouse-order) and grepped all of `ai-docs/` for any roadmap item past the
+>   current 10x campaign — none exists. Combined with prereq 1: hierarchical WTA isn't worth
+>   building for the campaign this project is actually running, *right now*.
+> - **Important correction caught by advisor before finalizing:** initial instinct was to mark the
+>   ADR "closed — not needed." Advisor flagged this overstates the finding — "no roadmap names
+>   mouse-order yet" is not the same claim as "honeybee-order is a decided ceiling," and
+>   `brain-scale-comparison.md` frames the whole project around eventually closing the scale gap via
+>   exactly this kind of algorithmic-efficiency technique. **Kept the ADR `proposed`/deferred
+>   instead**, added an explicit, nameable trigger (growth campaign's target scale moves past
+>   honeybee-order, or the encoder/binding cost balance shifts back toward the encoder mattering) —
+>   same deferred-with-trigger pattern CLAUDE.md already uses for items A-N, not an open-ended
+>   "revisit sometime." **Do not mark this ADR closed on the strength of §28/§29 alone** — that
+>   requires someone affirmatively deciding honeybee-order is the ceiling, which hasn't happened.
+> - No code changes (pure analysis using metrics that already existed) — consistent with the
+>   metrics-discipline policy's "if a change doesn't touch any measurable data-handling operation,
+>   say so explicitly" clause. `ai-docs/decisions/0038-sparse-encoder-scoring.md` updated in place
+>   (status line, prerequisites section, "what would invalidate this" section) rather than leaving
+>   the resolved prerequisites to drift from the ADR text.
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean, user-requested), 2026-07-15.** Working tree clean, everything committed
-> and pushed (`5607eb7`). **Next-session entry point: ADR 0038 (hierarchical/coarse-to-fine k-WTA
-> encoder scoring) — explicitly queued next by the user.** It was `proposed`/not-started as of the
+> and pushed (`5607eb7`). It was `proposed`/not-started as of the
 > 2026-07-14 shutdown below; this session's metrics work incidentally produced real numbers for
 > ADR 0038's first prerequisite ("benchmark the actual scoring cost on both `burn` and the
 > ORT-exported path") — `kwta_score_matmul` measured at 2.15s/640 calls (~3.4ms/call) and

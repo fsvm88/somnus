@@ -1,7 +1,9 @@
 # 0038. Sparse (hierarchical) k-WTA encoder scoring for the next scale order
 
 - **Status:** proposed — direction decided, implementation deliberately not started (gated on
-  prerequisites below).
+  prerequisites below). As of 2026-07-15, prerequisites 1 and 2 both resolved negative at the
+  scale currently in flight (see below) — **deferred, not closed**, pending the explicit trigger
+  recorded under prerequisite 2.
 - **Date:** 2026-07-14
 
 ## Context
@@ -53,19 +55,27 @@ Chosen over the other two surveyed mechanisms:
 **Implementation is explicitly NOT started.** This ADR records the chosen direction so a future
 session doesn't re-litigate the three-way comparison, not a commitment to build it now.
 
-## Prerequisites before implementation (all currently open)
+## Prerequisites before implementation (2 resolved, 1 still open)
 
-1. **Quantify the actual cost.** No isolated benchmark of `KWtaLayer::forward`'s scoring matmul
-   exists yet (unlike §25, which had a clean before/after number at the campaign's real region
-   size). Also unresolved: whether the *live* wake-path cost even runs this code path at all —
-   per §22/§24/§25's correction, ORT owns most live inference once a campaign crosses the
-   CPU/GPU threshold, so the exported ONNX encoder graph
-   (`scripts/export_perception_graph.py`) needs checking for the same linear-in-n_units cost,
-   not just the `burn` path.
-2. **Confirm this matters at the scale actually being targeted.** The in-flight 10x campaign
-   (~9,660 units/region) keeps scoring cost linear, not catastrophic — this is a "prepare for the
-   next order of magnitude" question, not an urgent fix. Check against
-   `research/brain-scale-comparison.md`'s scale ladder before investing implementation time.
+1. **Quantify the actual cost. RESOLVED 2026-07-15 — see `gaps.md` §28.** The exported ONNX
+   encoder graph (`scripts/export_perception_graph.py`) has the identical `O(d_input × n_units)`
+   dense matmul as the `burn` path — no sparsity or gating applied before scoring. But the live
+   wake-path cost, measured from the production campaign's `OrtRunEncoder` Core metric at
+   ~9,400-9,493 units/region, is small in absolute terms (~1.28ms/call mean) and is not even the
+   dominant ORT cost — the fixed-size `OrtRunBinding` graph costs 2-3× more per call at this scale.
+   This is evidence for (not proof of) the "ORT/GPU already absorbs the wasted FLOPs" invalidation
+   condition below, at *current* scale specifically — does not resolve prerequisite 2.
+2. **Confirm this matters at the scale actually being targeted. RESOLVED 2026-07-15 — see
+   `gaps.md` §29.** It doesn't, yet. `gaps.md` §16 states the growth campaign's own goal
+   explicitly as honeybee-order (~9,660 units/region), *not* mouse-order — and there is no
+   documented roadmap item, planned follow-on campaign, or stated ambition anywhere in `ai-docs/`
+   to go past honeybee-order. Combined with prerequisite 1's finding (scoring cost is small and
+   non-dominant at this scale), hierarchical WTA is not worth building for the campaign this
+   project is actually running. **This is a "doesn't matter yet" finding, not "wrong direction" —
+   see the updated "what would invalidate this" section: the correct status is deferred with an
+   explicit trigger, the same pattern CLAUDE.md uses for items A-N, not "closed."** The trigger:
+   the growth campaign's target scale moves past honeybee-order, or the encoder/binding cost
+   balance shifts back toward the encoder mattering.
 3. **Numerical validation plan.** Hierarchical routing changes which units are even candidates for
    a given input — needs validation that `per_region_mse` still improves the way full competition
    does in the §16 pilots (2/3), and that the growth mechanism (`grow_region_seeded`) and duty-cycle
@@ -105,10 +115,15 @@ session doesn't re-litigate the three-way comparison, not a commitment to build 
 
 ## What would invalidate this
 
-- Benchmarking (prerequisite 1) shows the scoring matmul is *not* actually a bottleneck at any
-  scale this project will realistically reach (e.g. if the project's scale ambitions stay
-  honeybee-order rather than pushing toward mouse-order) — in which case this is solved by doing
-  nothing, and the ADR should be marked "closed — not needed."
+- **Confirmed 2026-07-15 (prerequisites 1 and 2):** the scoring matmul is not currently a
+  bottleneck — small in absolute terms (~1.28ms/call), not even the dominant ORT cost at
+  honeybee-order scale, which is also the project's actual current target (no documented plan to
+  push toward mouse-order). This does **not** mean the direction was wrong or that mouse-order
+  ambitions have been abandoned — see the prerequisite 2 write-up above and `gaps.md` §29 for why
+  this stays `proposed`/deferred rather than "closed — not needed." Only mark this "closed" if a
+  future session establishes affirmatively that honeybee-order is a decided ceiling (not merely
+  that no next campaign has been scoped yet) — that's a judgment call for whoever is running the
+  project at the time, not something derivable from doc silence alone.
 - The live wake-path benchmark shows ORT/MIGraphX already handles the exported encoder graph's
   scoring cost well enough (sub-linear in practice due to GPU parallelism across `n_units`) that a
   software-side hierarchical scheme adds complexity without a measurable win — GPU matmul
