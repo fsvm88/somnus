@@ -140,6 +140,16 @@
 > `metrics.jsonl` (showed the same `misc_warning: 1` disk-cap-fallback edge case from the round-2
 > pilot); a hand-crafted fixture confirmed multi-cycle summing and severity coloring both work.
 
+> **Policy (2026-07-15): this ADR's two-tier split is now the standing demarcation line for all
+> future ADRs/architectural changes/algorithm switches** (see `CLAUDE.md`'s "Metrics discipline"
+> section). No operation touching data ships unmeasured. **Core** (`timed_core!`/`counted_core!`)
+> = normal performance/health monitoring, always on — the tier a new ADR's implementation should
+> default to. **Fine** (`timed!`/`counted!`, `fine-metrics` feature) = investigation-grade
+> evaluation for actively debugging a regression or validating a specific improvement claim, not
+> worth its (small but nonzero) always-on cost otherwise. Every future ADR should name which
+> existing metrics already cover the affected path and which new ones the change needs, and treat
+> "wired + verified live in a short pilot" as part of done, not a follow-up.
+
 ## Context
 
 While scoping ADR 0038's benchmarking prerequisite (measure the k-WTA scoring matmul's real

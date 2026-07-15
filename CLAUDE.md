@@ -34,6 +34,15 @@ Everything durable belongs in `ai-docs/`. Treat docs as the project's long-term 
 - Public APIs of shared crates get rustdoc. Internal modules: only when *why* is non-obvious.
 - Seeds fixed in experiments. Configs and dataset versions recorded. We don't yet need MLflow-grade infra, but we should always be able to answer "how did you get this number?"
 
+## Metrics discipline (standing policy as of 2026-07-15)
+
+Every ADR, architectural improvement/fix, or algorithm-switch proposal must account for metrics before it's considered complete — no operation touching data ships unmeasured. Use `crates/somnus-metrics`'s existing two-tier design (`ai-docs/decisions/0039-unified-metrics-instrumentation.md`) as the demarcation line, don't invent a parallel system:
+
+- **Core tier** (`timed_core!`/`counted_core!`, always-on) = normal performance/health monitoring. What you'd want firing on every production campaign run to know the system is behaving: wall-clock of every operation-granularity phase, resource sampling (RSS, disk), degradation/fallback counters, failure counters. This is the tier a new ADR's implementation should land in by default.
+- **Fine tier** (`timed!`/`counted!`, behind `fine-metrics`, default off) = investigation-grade evaluation. Granular sub-breakdowns, A/B-comparison-specific counters, anything only worth the (small but nonzero) always-on cost when actively debugging a regression or validating a specific improvement claim.
+
+When proposing or implementing a change: name which existing metrics already cover the affected code path, name what new Core/Fine metrics the change needs (new operations, new failure modes, new tunable-value counters), and don't declare the change done until those are wired and verified live (a short pilot run showing the metric fire with a plausible value, not just a clean build). If a change doesn't touch any measurable data-handling operation, say so explicitly rather than silently skipping this step.
+
 ## Working with the user
 
 - Exploratory prompts ("how should we…", "what about X") get a recommendation + the main trade-off in a few sentences, not a finished plan. Wait for the go-ahead before implementing.
