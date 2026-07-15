@@ -865,6 +865,7 @@ impl PerceptionProcessor {
             // Phase 1.5: when encoder ORT is active, skip — the language z comes from
             // run_encoder in try_bind, which uses latest_inputs[Language] directly.
             if !self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
+                somnus_metrics::counted_core!(somnus_metrics::Metric::RefreshLanguageCacheRun, 1);
                 let device = self.device;
                 if let Some(emb) = self.last_language_input.clone() {
                     let act = self
@@ -876,6 +877,8 @@ impl PerceptionProcessor {
                     self.latest[RegionId::Language.as_index()] = Some(act);
                     self.latest_inputs[RegionId::Language.as_index()] = Some(emb);
                 }
+            } else {
+                somnus_metrics::counted_core!(somnus_metrics::Metric::RefreshLanguageCacheSkipped, 1);
             }
         });
     }
@@ -1869,6 +1872,11 @@ impl PerceptionProcessor {
         // ParamIds, so they naturally start with fresh (zero) Adam state on the next
         // step; every other param's id is untouched and keeps its accumulated momentum
         // instead of being wiped for no reason (gaps.md §18).
+        somnus_metrics::counted_core!(somnus_metrics::Metric::RegionNUnits, new_n as u64);
+        somnus_metrics::counted_core!(
+            somnus_metrics::Metric::RegionKActive,
+            Self::layer_mut(model, region).k_active as u64
+        );
         tracing::info!(region = ?region, n_new, "region grown");
     }
 
@@ -1964,6 +1972,11 @@ impl PerceptionProcessor {
         }
 
         // See grow_region: no optimizer reset needed, ParamId-keyed state handles it (gaps.md §18).
+        somnus_metrics::counted_core!(somnus_metrics::Metric::RegionNUnits, new_n as u64);
+        somnus_metrics::counted_core!(
+            somnus_metrics::Metric::RegionKActive,
+            Self::layer_mut(model, region).k_active as u64
+        );
         tracing::info!(region = ?region, n_new, "region grown (seeded)");
     }
 
@@ -2153,6 +2166,11 @@ impl PerceptionProcessor {
         }
 
         // See grow_region: no optimizer reset needed, ParamId-keyed state handles it (gaps.md §18).
+        somnus_metrics::counted_core!(somnus_metrics::Metric::RegionNUnits, new_n as u64);
+        somnus_metrics::counted_core!(
+            somnus_metrics::Metric::RegionKActive,
+            Self::layer_mut(model, region).k_active as u64
+        );
         tracing::info!(region = ?region, old_n = current_n, new_n, n_pruned = n_prune, "region pruned");
         n_prune
     }

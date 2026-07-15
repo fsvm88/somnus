@@ -248,10 +248,41 @@ pub enum Metric {
     /// recall-blend arithmetic, episodic-buffer push, sink JSON write. Wraps the whole function;
     /// `MainWarmQuery` nests inside it as before.
     MainRecordEpisode,
+
+    // ── Core: value/event counters (not durations) — first real use of the "counted" side of
+    //    the two-tier design; everything above this point is exclusively duration-based ───────
+    /// A region's `n_units` immediately after a `grow_region`/`grow_region_seeded`/`prune_region`
+    /// call. Recorded as a raw value (not an event count) via `counted_core!`, once per growth/
+    /// prune event (bounded ≤5/cycle) — answers "how big are the regions actually getting"
+    /// without a one-off validation script.
+    RegionNUnits,
+    /// The paired `k_active` (from `region::scaled_k`) at the same growth/prune event as
+    /// `RegionNUnits` — together they give the live sparsity ratio (`k_active / n_units`) that
+    /// ADR 0037/0038's scoring-cost analysis depends on.
+    RegionKActive,
+    /// Number of records actually removed by one `ColdArchive::evict_lowest_salience` call.
+    /// Distinct from `ColdArchiveEvict`'s timing, which only counts how many times the function
+    /// ran, not how many records it touched.
+    ColdArchiveEvictedRecords,
+    /// Frames the video-encoder thread actually encoded, accumulated locally and flushed once
+    /// per second alongside the existing throttled `tracing::info!` log (same cadence, no new
+    /// per-frame overhead).
+    VideoFramesEncoded,
+    /// Frames the video-encoder thread's change-gate skipped, same per-second flush as
+    /// `VideoFramesEncoded` — together they give the change-gate's actual skip rate, previously
+    /// visible only in a log line, never in the metrics file.
+    VideoFramesSkipped,
+    /// `refresh_language_cache` calls where the ORT-active branch skipped the `forward_no_dc`
+    /// call entirely. `RefreshLanguageCache`'s own timing wraps both branches uniformly and
+    /// can't distinguish them; this plus `RefreshLanguageCacheRun` closes that gap.
+    RefreshLanguageCacheSkipped,
+    /// `refresh_language_cache` calls where the `forward_no_dc` call actually ran (burn path,
+    /// ORT encoder inactive or has no cached language input).
+    RefreshLanguageCacheRun,
 }
 
 impl Metric {
-    pub const COUNT: usize = 67;
+    pub const COUNT: usize = 74;
 
     const fn as_index(self) -> usize {
         match self {
@@ -322,6 +353,13 @@ impl Metric {
             Metric::AsrDecode => 64,
             Metric::AudioResample => 65,
             Metric::MainRecordEpisode => 66,
+            Metric::RegionNUnits => 67,
+            Metric::RegionKActive => 68,
+            Metric::ColdArchiveEvictedRecords => 69,
+            Metric::VideoFramesEncoded => 70,
+            Metric::VideoFramesSkipped => 71,
+            Metric::RefreshLanguageCacheSkipped => 72,
+            Metric::RefreshLanguageCacheRun => 73,
         }
     }
 
@@ -394,6 +432,13 @@ impl Metric {
             Metric::AsrDecode => "asr_decode",
             Metric::AudioResample => "audio_resample",
             Metric::MainRecordEpisode => "main_record_episode",
+            Metric::RegionNUnits => "region_n_units",
+            Metric::RegionKActive => "region_k_active",
+            Metric::ColdArchiveEvictedRecords => "cold_archive_evicted_records",
+            Metric::VideoFramesEncoded => "video_frames_encoded",
+            Metric::VideoFramesSkipped => "video_frames_skipped",
+            Metric::RefreshLanguageCacheSkipped => "refresh_language_cache_skipped",
+            Metric::RefreshLanguageCacheRun => "refresh_language_cache_run",
         }
     }
 
@@ -465,6 +510,13 @@ impl Metric {
         Metric::AsrDecode,
         Metric::AudioResample,
         Metric::MainRecordEpisode,
+        Metric::RegionNUnits,
+        Metric::RegionKActive,
+        Metric::ColdArchiveEvictedRecords,
+        Metric::VideoFramesEncoded,
+        Metric::VideoFramesSkipped,
+        Metric::RefreshLanguageCacheSkipped,
+        Metric::RefreshLanguageCacheRun,
     ];
 }
 

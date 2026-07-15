@@ -184,6 +184,10 @@ impl ColdArchive {
         if n >= self.len {
             return Ok(());
         }
+        somnus_metrics::counted_core!(
+            somnus_metrics::Metric::ColdArchiveEvictedRecords,
+            (self.len - n) as u64
+        );
         // Salience field offset within each record: after id(8)+ts(8)+scale(4)+values(640)+src(1).
         const SAL_OFFSET: usize = 8 + 8 + 4 + COLD_DIM + 1;
         let file = File::open(&self.path)?;

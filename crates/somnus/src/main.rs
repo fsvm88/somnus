@@ -1651,6 +1651,14 @@ async fn main() -> Result<()> {
                                 avg_encode_ms = avg_ms,
                                 "video embeddings/s"
                             );
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::VideoFramesEncoded,
+                                frames_this_sec as u64
+                            );
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::VideoFramesSkipped,
+                                skipped_this_sec as u64
+                            );
                             last_log = std::time::Instant::now();
                             frames_this_sec = 0;
                             total_ms_this_sec = 0;

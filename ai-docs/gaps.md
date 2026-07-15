@@ -1057,6 +1057,21 @@ rather than silently missing. Full design rationale, the two new patterns, and t
 use direct `METRICS.record()` instead of the macro" explanation:
 `ai-docs/decisions/0039-unified-metrics-instrumentation.md`.
 
+**Follow-up (2026-07-15): the "counted" tier's first real use.** All 67 variants above were
+duration-based — `counted_core!`/`counted!` had zero call sites anywhere despite existing in the
+macro API. Added 7 value/event metrics (`Metric::COUNT` 67→74): `region_n_units`/`region_k_active`
+(recorded at each growth/prune event — gives the live sparsity ratio ADR 0037/0038 needs, no
+one-off script required), `cold_archive_evicted_records` (how many records one eviction call
+actually removed, vs. `ColdArchiveEvict`'s existing call-count timing), `video_frames_encoded`/
+`video_frames_skipped` (piggybacked on the video thread's existing once-per-second throttle point,
+no new per-frame cost), and `refresh_language_cache_run`/`_skipped` (which branch fired — the
+existing timing wraps both uniformly). Verified: build/clippy/test clean both feature states; a
+2-session pilot confirmed 4 of the 7 fired with real values (including `region_n_units`/
+`region_k_active`, unexpectedly, in such a short run) and the 3 conditional ones correctly stayed
+absent. Channel/queue-depth sampling was considered and deliberately not added — no existing
+per-second throttle point on the audio-thread side, and per-message sampling would violate the
+crate's own per-element guardrail. Full detail in ADR 0039's "Update (2026-07-15)" section.
+
 ---
 
 ## Priority order (as of 2026-07-11)
@@ -1093,4 +1108,4 @@ use direct `METRICS.record()` instead of the macro" explanation:
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
 | ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics. Follow-on research note + ADR 0038 (encoder scoring-cost scaling) written 2026-07-14 — see `sparse-coding.md`; not started |
-| ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 67-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR; every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14 — see §26 below |
+| ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion + value metrics** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 74-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR, plus 7 non-duration value/event counters (region size, eviction counts, video skip rate, cache branch); every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14, value metrics added 2026-07-15 — see §26 below |

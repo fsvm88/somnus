@@ -22,6 +22,40 @@
 > thread, no locking needed) and metrics that correctly stayed at zero for conditions the pilot
 > didn't trigger (region growth, `--action`, cold-archive eviction).
 
+> **Update (2026-07-15): first real use of the "counted" tier.** Auditing coverage after the
+> full-coverage pass found every one of the 67 variants above was duration-based —
+> `counted_core!`/`counted!` existed in the macro API but had zero call sites anywhere in the
+> workspace, so the design's value/event half was dead code. Added 7 new Core-tier value metrics,
+> `Metric::COUNT` 67→74, all via `counted_core!` (a raw `.add()`, no timing):
+> - `region_n_units`/`region_k_active` — a region's live `n_units`/`k_active` recorded at each
+>   `grow_region`/`grow_region_seeded`/`prune_region` event (bounded ≤5/cycle each). Gives the
+>   actual sparsity ratio (`k_active / n_units`) that ADR 0037/0038's scoring-cost analysis needs,
+>   without a one-off validation script — previously that ratio was only ever printed manually.
+> - `cold_archive_evicted_records` — how many records `ColdArchive::evict_lowest_salience`
+>   actually removed. Distinct from `ColdArchiveEvict`'s existing timing, which only counts how
+>   many times the function *ran*, not how much it evicted.
+> - `video_frames_encoded`/`video_frames_skipped` — flushed once per second at the same point the
+>   video-encoder thread already throttle-logs (`tracing::info!("video embeddings/s")`), so no new
+>   per-frame overhead. Exposes the change-gate's actual skip rate in the metrics file instead of
+>   only a log line.
+> - `refresh_language_cache_run`/`refresh_language_cache_skipped` — which branch fired inside
+>   `refresh_language_cache`. The existing `RefreshLanguageCache` timing wraps both the ORT-active
+>   skip and the real `forward_no_dc` call uniformly and can't tell them apart; these two counters
+>   close that gap.
+>
+> Deliberately not added: per-message channel/queue-depth sampling (`audio_tx`/`video_tx`/etc. in
+> `main.rs`) — no existing per-second throttle point exists on the audio-thread side to piggyback
+> on the way the video thread's did, and sampling at message-send frequency would violate this
+> crate's own per-element guardrail. Left as a candidate for later, not implemented.
+>
+> Verified: `cargo build/clippy/test --release --workspace` clean in both feature states. Live
+> pilot (2-session, isolated scratch memory dir, cleaned up after) confirmed
+> `video_frames_encoded`, `refresh_language_cache_run`, and — unexpectedly, in only 2 tiny-capacity
+> sessions — `region_n_units`/`region_k_active` all fired with real values; the conditional ones
+> (`video_frames_skipped`, `cold_archive_evicted_records`, `refresh_language_cache_skipped`)
+> correctly stayed absent since their triggering conditions (change-gate skip, cold eviction, ORT
+> active) didn't occur in that run.
+
 ## Context
 
 While scoping ADR 0038's benchmarking prerequisite (measure the k-WTA scoring matmul's real
