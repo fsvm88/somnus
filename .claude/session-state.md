@@ -1,7 +1,7 @@
 # Session state — somnus
 
 > **⏸️ SHUTDOWN (clean, user-requested), 2026-07-16.** Working tree clean, everything committed
-> and pushed (commit below). **Next-session entry point: ADR 0038 prerequisite 3** (numerical
+> and pushed (`3b06375`). **Next-session entry point: ADR 0038 prerequisite 3** (numerical
 > validation plan — does block-local competition break growth/duty-cycle/binding assumptions) is
 > the only prerequisite left open, but it's now gated behind a trigger that hasn't fired (see
 > below) — **not** a live next step to just pick up. If nothing else is queued, the other live
