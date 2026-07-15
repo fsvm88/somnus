@@ -1115,6 +1115,47 @@ fixture both confirmed the health-section display. Full detail in ADR 0039's thi
 
 ---
 
+## §27 — Parallelized warm-store HNSW rebuild (`SemanticStore::rebuild_from_recent`)
+
+The new `SleepWarmRebuild` Core metric added in §26 was the first thing to ever measure this
+operation directly, and it immediately surfaced a large, previously-invisible cost: once
+`cold.len() > warm.len()` (i.e. once the warm cap is hit, which — per the §21 fix — is every cycle
+thereafter), `rebuild_from_recent` (`crates/somnus-memory/src/semantic.rs`) does a full from-scratch
+HNSW rebuild of all `max_warm_records` records, one at a time in a serial loop. Live campaign data
+(sessions 76-78, `memory/campaign_growth10x/metrics.jsonl`) showed this costing **46-51 seconds per
+cycle at ~145-148k warm records — roughly 70% of total cycle wall-clock**, dwarfing
+`nrem_wall_ms`/`rem_wall_ms`/`snapshot_wall_ms` combined.
+
+`hnsw_rs` 0.3.4 has no delete/update API (insert-only), which is why a full rebuild is the only way
+to enforce the "most recent N" eviction policy in the first place — ruled out a true incremental
+delta (add new, evict old in the same graph) without either switching HNSW crates or adding a
+tombstone/soft-delete scheme (dropping evicted ids from the `records` sidecar map alone already
+masks them from `query()` — a cheap future option if rebuild frequency itself needs reducing, not
+pursued here). The cheap, zero-risk lever taken instead: `hnsw_rs::parallel_insert_slice`
+(rayon-backed, `rayon` already a workspace dependency) replaces the serial per-record insert loop
+— same graph, same eviction semantics, spread across cores instead of one.
+
+**Verified on real production data**, not just a clean build: benchmarked `rebuild_from_recent`
+(through the same `somnus_metrics::timed_core!(SleepWarmRebuild, ..)` wrapper `sleep.rs` uses at its
+real call site) against a copy of the campaign's actual cold archive (148,447 records), `git
+stash`/`pop` to flip between old and new code on identical data:
+
+- Old (serial insert): **47.6s** — matches the live campaign's 46-51s range exactly.
+- New (`parallel_insert_slice`, 32-core box): **2.85-2.94s**.
+- **~16.7× speedup** on the rebuild itself; expected to cut total cycle wall-clock from ~70s to
+  roughly ~24s once redeployed (nrem ~7-8s + rem ~6-13s + snapshot ~3s + rebuild ~3s).
+
+`crates/somnus-memory/examples/bench_warm_rebuild.rs` (new, committed) is a small standalone harness
+for this — points at any cold-archive directory + record count, runs `rebuild_from_recent` through
+the real metric wrapper, prints the elapsed time and registry snapshot. Kept in the tree as a
+reusable regression check for this specific metric, not a one-off throwaway.
+
+Build/clippy/test clean in both feature states. **Not yet redeployed to the live campaign** — the
+campaign is currently stopped (session 78); next resume will pick up the fix automatically via
+`scripts/resume_growth_campaign.sh`'s default rebuild-first behavior.
+
+---
+
 ## Priority order (as of 2026-07-11)
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -1150,3 +1191,4 @@ fixture both confirmed the health-section display. Full detail in ADR 0039's thi
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
 | ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics. Follow-on research note + ADR 0038 (encoder scoring-cost scaling) written 2026-07-14 — see `sparse-coding.md`; not started |
 | ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion + value/health metrics, audited** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 100-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR, growth/eviction/video value counters, GPU/ORT fallback + resource sampling + grouped failure counters + NaN/Inf detection for unattended-campaign health, all surfaced in `campaign_status.py`'s health section, plus a shell-level segfault-restart tracker; every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14, value metrics + operational health added 2026-07-15, correctness-audited and NaN detection + status-script surfacing added 2026-07-15 — see §26 below |
+| ✅ §27 | **Parallelized warm-store HNSW rebuild** (`SemanticStore::rebuild_from_recent`) | Low | Sleep-cycle wall-clock — rebuild was ~70% of cycle time (46-51s at ~148k warm records) | Deployed 2026-07-15 — `parallel_insert_slice` (rayon), confirmed 16.7× speedup (47.6s→2.9s) on real production-scale data — see §27 below |

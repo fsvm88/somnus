@@ -83,6 +83,10 @@ impl SemanticStore {
     /// Replace warm with a fresh HNSW built from the most recent `n` records in `cold`.
     /// Called during sleep when warm has exceeded its cap. Returns the number of
     /// records loaded. Does nothing (returns 0) if cold is empty or n == 0.
+    ///
+    /// Inserts via `parallel_insert_slice` (rayon-backed, `hnsw_rs` has no delete/update
+    /// API so a full rebuild is the only way to enforce the "most recent N" eviction
+    /// policy) instead of a serial loop — same graph, same result, spread across cores.
     pub fn rebuild_from_recent(&mut self, cold: &crate::cold::ColdArchive, n: usize) -> usize {
         if n == 0 || cold.is_empty() {
             return 0;
@@ -92,15 +96,21 @@ impl SemanticStore {
 
         let mut fresh = SemanticStore::with_max(self.dim, self.max_records);
         fresh.search_ef = self.search_ef;
-        let mut loaded = 0usize;
+
         // iter_from seeks directly to the tail offset — no soft-skip loop over earlier records.
-        if let Ok(iter) = cold.iter_from(skip) {
-            for record in iter.flatten() {
-                fresh.index.insert((&record.values, record.id as usize));
-                fresh.records.insert(record.id as usize, record);
-                loaded += 1;
-            }
-        }
+        let records: Vec<EpisodeRecord> = match cold.iter_from(skip) {
+            Ok(iter) => iter.flatten().collect(),
+            Err(_) => Vec::new(),
+        };
+        let loaded = records.len();
+
+        let insert_data: Vec<(&[f32], usize)> = records
+            .iter()
+            .map(|r| (r.values.as_slice(), r.id as usize))
+            .collect();
+        fresh.index.parallel_insert_slice(&insert_data);
+
+        fresh.records = records.into_iter().map(|r| (r.id as usize, r)).collect();
         *self = fresh;
         loaded
     }
