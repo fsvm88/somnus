@@ -1100,6 +1100,19 @@ disk-free ~916GB); `segfault_restarts.jsonl` display verified with a hand-crafte
 segfault available in a short pilot). Full detail in ADR 0039's second "Update (2026-07-15)"
 section.
 
+**Follow-up (2026-07-15, final): third-pass correctness audit before campaign launch.** Verified
+(not extended) the two prior rounds: no orphan `Metric` variants, no `recursion_limit` fragility,
+JSON-tolerant Python scripts. Found and fixed two real gaps: (1) no NaN/Inf check anywhere on
+`mean_train_loss`/`mean_output_mse`/`mean_proj_loss` before writing them to the metrics JSON —
+added `training_nan_detected` (`Metric::COUNT` 99→100); (2) every round-2 failure counter was
+recorded but never displayed to a human — `campaign_status.py`'s `-- health --` section only
+showed panics/segfault restarts. Added `summarize_failure_counters()`, summing each failure
+counter across all cycles (each `fine_metrics` snapshot is per-cycle, drained on write) and
+printing any nonzero ones, with `wake_recon_worker_died`/`training_nan_detected` flagged red.
+Verified: build/clippy/test clean both feature states (100 variants); live pilot + a hand-crafted
+fixture both confirmed the health-section display. Full detail in ADR 0039's third "Update
+(2026-07-15)" section.
+
 ---
 
 ## Priority order (as of 2026-07-11)
@@ -1136,4 +1149,4 @@ section.
 | 🔮 §23 | **Native Rust ONNX graph construction** (replace `export_perception_graph.py`) | High | Removes Python runtime dependency + subprocess overhead | Scoped, not started — see §23 below |
 | ✅ §24 | **ORT sparse→dense N_UNITS bug + encoder LANG_HIDDEN dim drift** | Low | Correctness/perf — ORT silently no-oped past baseline, worse than CPU-only | Both bugs found/fixed 2026-07-12/13, confirmed live: zero fallback occurrences, ~3-4× real speedup — see §24 below |
 | ✅ §25 | **Sparse-aware binding projection** (exploit k-WTA sparsity computationally) | Low | Verified 11.4× win for `burn`'s binding path (pre-crossover/CPU-only/ORT-fallback), but dormant on this ORT-active campaign — see correction in §25 below | Deployed 2026-07-13, correction 2026-07-14: not currently moving this campaign's live metrics. Follow-on research note + ADR 0038 (encoder scoring-cost scaling) written 2026-07-14 — see `sparse-coding.md`; not started |
-| ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion + value/health metrics** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 99-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR, growth/eviction/video value counters, GPU/ORT fallback + resource sampling + grouped failure counters for unattended-campaign health, plus a shell-level segfault-restart tracker; every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14, value metrics + operational health added 2026-07-15 — see §26 below |
+| ✅ §26 | **Unified two-tier metrics instrumentation + full-coverage expansion + value/health metrics, audited** (`somnus-metrics`, ADR 0039) | Med–High | Ops visibility — 100-variant `Metric` enum covers binding/ORT/training/growth/EMA, all memory I/O, media decode, action/ASR, growth/eviction/video value counters, GPU/ORT fallback + resource sampling + grouped failure counters + NaN/Inf detection for unattended-campaign health, all surfaced in `campaign_status.py`'s health section, plus a shell-level segfault-restart tracker; every hand-rolled timer shares one registry/macro system | Implemented + expanded 2026-07-14, value metrics + operational health added 2026-07-15, correctness-audited and NaN detection + status-script surfacing added 2026-07-15 — see §26 below |

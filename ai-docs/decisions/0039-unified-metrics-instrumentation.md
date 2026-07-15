@@ -114,6 +114,32 @@
 > `campaign_status.py` display verified separately with a hand-crafted fixture (no real segfault
 > was available to trigger one in a short pilot).
 
+> **Update (2026-07-15, final): third-pass correctness audit before campaign launch.** Rather
+> than hunt for more things to instrument, this pass verified everything already built. Checked:
+> every one of the 99 variants above has a live call site (no orphan/no-op variants — spot-checked
+> all 24 round-2 additions individually); `main.rs`'s `#![recursion_limit = "512"]` has enormous
+> headroom against the 85-field metrics `json!{}` literal (no fragility); `campaign_status.py`/
+> `eval_metrics.py` tolerate unknown JSON fields fine via `.get()` with no schema validation. Two
+> real gaps found and fixed:
+> - **Numerical health**: no code path anywhere checked `mean_train_loss`/`mean_output_mse`/
+>   `mean_proj_loss` for NaN/Inf before writing them to the metrics JSON — a training blowup on an
+>   unattended run would have rendered as a weird number with no alarm. Added `Metric::COUNT`
+>   99→100: `training_nan_detected`, checked and recorded once per NREM replay
+>   (`crates/somnus/src/sleep.rs`, right after these three values are computed) alongside a
+>   `tracing::error!` with the offending values.
+> - **Surfacing gap**: every round-2 failure counter was faithfully recorded but never displayed
+>   anywhere a human running the campaign would see it — `campaign_status.py`'s `-- health --`
+>   section only showed `scan_panics()`/`read_segfault_restarts()`, not any `fine_metrics` content.
+>   Added `summarize_failure_counters()` (sums each failure counter's `count` across every cycle's
+>   drained-per-cycle `fine_metrics` snapshot, since each snapshot only covers the cycle it was
+>   taken in) and a new health-section block listing any nonzero ones, `wake_recon_worker_died`/
+>   `training_nan_detected` flagged red as the two most severe.
+>
+> Verified: `cargo build/clippy/test --release --workspace` clean in both feature states (100
+> variants). Live pilot confirmed the health-section display renders correctly against a real
+> `metrics.jsonl` (showed the same `misc_warning: 1` disk-cap-fallback edge case from the round-2
+> pilot); a hand-crafted fixture confirmed multi-cycle summing and severity coloring both work.
+
 ## Context
 
 While scoping ADR 0038's benchmarking prerequisite (measure the k-WTA scoring matmul's real

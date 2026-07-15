@@ -385,10 +385,15 @@ pub enum Metric {
     /// `somnus_memory::cold::RECORD_BYTES`) — derived from the record count already being
     /// tallied, not a second measurement.
     ColdArchiveSpillBytesWritten,
+    /// A NaN/Inf value was detected in `mean_train_loss`/`mean_output_mse`/`mean_proj_loss` at
+    /// the end of one NREM replay. Without this, a training blowup on an unattended run would
+    /// just render as a weird number (or `null`, since `serde_json` serializes non-finite
+    /// floats that way) with no alarm — this is the alarm.
+    TrainingNanDetected,
 }
 
 impl Metric {
-    pub const COUNT: usize = 99;
+    pub const COUNT: usize = 100;
 
     const fn as_index(self) -> usize {
         match self {
@@ -491,6 +496,7 @@ impl Metric {
             Metric::SnapshotEpisodicBytesWritten => 96,
             Metric::SnapshotEpisodicBytesRead => 97,
             Metric::ColdArchiveSpillBytesWritten => 98,
+            Metric::TrainingNanDetected => 99,
         }
     }
 
@@ -595,6 +601,7 @@ impl Metric {
             Metric::SnapshotEpisodicBytesWritten => "snapshot_episodic_bytes_written",
             Metric::SnapshotEpisodicBytesRead => "snapshot_episodic_bytes_read",
             Metric::ColdArchiveSpillBytesWritten => "cold_archive_spill_bytes_written",
+            Metric::TrainingNanDetected => "training_nan_detected",
         }
     }
 
@@ -698,6 +705,7 @@ impl Metric {
         Metric::SnapshotEpisodicBytesWritten,
         Metric::SnapshotEpisodicBytesRead,
         Metric::ColdArchiveSpillBytesWritten,
+        Metric::TrainingNanDetected,
     ];
 }
 

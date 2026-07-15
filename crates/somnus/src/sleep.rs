@@ -827,6 +827,22 @@ pub fn run_sleep_cycle(
         None
     };
 
+    // A NaN/Inf blowup here would otherwise just render as a weird number (or `null`, since
+    // serde_json serializes non-finite floats that way) in the metrics JSON — no alarm on an
+    // unattended run. Count it explicitly so it's visible as a nonzero counter instead.
+    if !mean_train_loss.is_finite()
+        || !mean_output_mse.is_finite()
+        || mean_proj_loss.is_some_and(|v| !v.is_finite())
+    {
+        tracing::error!(
+            mean_train_loss,
+            mean_output_mse,
+            ?mean_proj_loss,
+            "non-finite training value detected (NaN/Inf)"
+        );
+        somnus_metrics::counted_core!(somnus_metrics::Metric::TrainingNanDetected, 1);
+    }
+
     // t_nrem spans the whole NREM loop above (nested loops, early `break`s, many locals
     // that escape this point) — too structurally entangled for the timed_core! block-wrap
     // idiom used elsewhere in this file, so record directly against the same registry instead.

@@ -238,6 +238,33 @@ def scan_panics(campaign_dir):
     return hits
 
 
+# fine_metrics counters that represent a degraded/failed condition (somnus-metrics ADR 0039's
+# 2026-07-15 operational-health round) — summed across the whole campaign and surfaced under
+# "-- health --" so they're an alert, not just JSON a human would have to go grep for.
+FAILURE_COUNTERS = [
+    "ort_encoder_fallback", "ort_binding_fallback", "ort_session_init_failed",
+    "ort_session_rebuild_failed", "sleep_persistence_write_failed", "nrem_step_error",
+    "cold_archive_op_error", "rem_probe_error", "perception_ingest_error",
+    "wake_reconstruct_error", "asr_error", "lang_embed_error", "action_generation_error",
+    "wake_recon_worker_died", "startup_restore_degraded", "media_source_error",
+    "misc_warning", "training_nan_detected",
+]
+
+
+def summarize_failure_counters(records):
+    """Sum each FAILURE_COUNTERS entry's "count" across every cycle's fine_metrics snapshot
+    (each snapshot is drained/reset per cycle by somnus_metrics::Registry, so summing gives the
+    campaign-lifetime total). Returns only the nonzero ones, in FAILURE_COUNTERS order."""
+    totals = {name: 0 for name in FAILURE_COUNTERS}
+    for rec in records:
+        fm = rec.get("fine_metrics") or {}
+        for name in FAILURE_COUNTERS:
+            entry = fm.get(name)
+            if entry:
+                totals[name] += entry.get("count", 0)
+    return {name: n for name, n in totals.items() if n > 0}
+
+
 def read_segfault_restarts(campaign_dir):
     """Read train_campaign.sh's segfault_restarts.jsonl sidecar (added 2026-07-15). The
     MIGraphX-destructor-race restart (exit 139) happens during process teardown, after somnus's
@@ -494,6 +521,14 @@ def main():
         print(c("yellow", f"segfault restarts (exit 139, MIGraphX destructor race): {len(segfault_restarts)} — sessions: {sessions}"))
     else:
         print(c("green", "segfault restarts (exit 139): 0"))
+    failure_counters = summarize_failure_counters(records)
+    if failure_counters:
+        print(c("yellow", "fine_metrics failure counters (campaign lifetime):"))
+        for name, total in failure_counters.items():
+            severity = "red" if name in ("wake_recon_worker_died", "training_nan_detected") else "yellow"
+            print("  " + c(severity, f"{name}: {total}"))
+    else:
+        print(c("green", "fine_metrics failure counters: none recorded"))
 
 
 if __name__ == "__main__":
