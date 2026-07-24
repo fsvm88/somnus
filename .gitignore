@@ -52,16 +52,18 @@ test.mp4
 
 # Runtime data — everything under memory/ is regenerable at runtime.
 # Nothing here belongs in version control.
-memory/
+# No trailing slash: these are symlinks to /data/somnus/* (see ai-docs), and a
+# trailing-slash pattern only matches real directories, not symlinks to them.
+/memory
 memory_baseline_backup/
 
 # Python bytecode
 __pycache__/
 *.pyc
 
-# Input data and large binary assets
-data/
-clips/
+# Input data and large binary assets (symlinks to /data/somnus/*, see note above)
+/data
+/clips
 models/*.safetensors
 models/qwen25_tokenizer.json
 models/whisper_tokenizer.json
