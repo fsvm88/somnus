@@ -10,14 +10,17 @@ use somnus_memory::semantic::SemanticStore;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let cold_dir = args.next().expect("usage: bench_warm_rebuild <cold_dir> <n>");
+    let cold_dir = args
+        .next()
+        .expect("usage: bench_warm_rebuild <cold_dir> <n>");
     let n: usize = args
         .next()
         .expect("usage: bench_warm_rebuild <cold_dir> <n>")
         .parse()
         .expect("n must be a positive integer");
 
-    let cold = ColdArchive::open(std::path::Path::new(&cold_dir)).expect("failed to open cold archive");
+    let cold =
+        ColdArchive::open(std::path::Path::new(&cold_dir)).expect("failed to open cold archive");
     println!("cold.len() = {}", cold.len());
     assert_eq!(COLD_DIM, 640, "sanity check on cold dim const");
 
