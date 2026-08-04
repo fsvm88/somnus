@@ -1,5 +1,47 @@
 # Session state — somnus
 
+> **⏸️ SHUTDOWN (clean, user-requested), 2026-08-04.** Working tree clean, no code changes this
+> session (docs-only session-state update). No `somnus` process running.
+> - **Housekeeping discovered, not done by this session:** between the 2026-07-16 shutdown below and
+>   now, two commits landed outside any recorded session — `215b7b5` (git-filter-repo history purge:
+>   dropped `mind.mv2`/old logs/backups, moved some fixtures to LFS) and `2c423dd` (migrated
+>   `memory`/`clips`/`data`/`models` to a new persistent location, `/data/somnus/`). `models/` is now a
+>   real directory there; `memory`/`clips`/`data` are meant to be symlinks from the project root into
+>   `/data/somnus/*`, per `.gitignore`'s comment.
+> - **Found the `memory`/`clips`/`data` symlinks missing from the working tree** (not even present as
+>   broken links) — would have silently blocked `scripts/resume_growth_campaign.sh`. **Recreated
+>   them this session**: `memory -> /data/somnus/memory`, `clips -> /data/somnus/clips`,
+>   `data -> /data/somnus/data`. Campaign data at `/data/somnus/memory/campaign_growth10x` was untouched
+>   and intact the whole time (last-modified timestamps matched the 2026-07-16 shutdown state).
+>   Symlinks aren't git-tracked (by design, per `.gitignore`) so this isn't a commit — just a
+>   filesystem fix, done, not queued.
+> - **Campaign explicitly NOT resumed** — user asked to recreate symlinks only, hold off starting.
+>   Still safely resumable anytime via `scripts/resume_growth_campaign.sh` once desired (state as of
+>   last data: session 78/130, cycle 10, 98.3% to the 10x target — see the 2026-07-16 writeup below
+>   for full detail, unchanged since).
+> - **Reviewed a Cloudflare blog post** (`blog.cloudflare.com/smaller-faster-safer-models/`, user-
+>   supplied URL) on their Workers AI inference stack — FP8 KV-cache quantization, INT4 weight
+>   compression, cache-integrity checking for multi-tenant MoE LLM serving (Kimi K2.6/GLM 5.2).
+>   **Assessed as not directly applicable to somnus**: those techniques target multi-tenant GPU
+>   cache-sharing pressure at serving scale; somnus runs single-session inference with no comparable
+>   KV-cache contention. No action taken, nothing to save beyond this note — mentioned here only so
+>   a future session doesn't re-read the same link cold if it resurfaces.
+> - **Discussed further k-WTA encoder-scoring optimization** (user-initiated follow-up to ADR 0038).
+>   Laid out three options: (1) quantize the scoring weights (INT8/INT4 via ORT/MIGraphX) — cheap,
+>   no architecture change, but §28 already found this matmul isn't the dominant cost at current
+>   scale (~1.28ms/call vs. the ORT binding graph's 2-3× larger share), so the ceiling on this win is
+>   low; (2) hierarchical/coarse-to-fine WTA, ADR 0038's already-chosen target mechanism — real
+>   asymptotic upside but still blocked on its own prerequisite 3 (numerical validation) and its
+>   trigger (campaign scale past honeybee-order) hasn't fired; (3) batch/fuse the 5 regions' ORT
+>   calls into one dispatch — an op-level lever, orthogonal to the sparsity question. **No decision
+>   made, nothing implemented** — user was asked what's actually motivating "faster" (campaign
+>   wall-clock vs. something else) before spending effort here; answer not yet given as of shutdown.
+>   **Next-session entry point if this resumes:** get that clarification first, don't default to
+>   option 2 just because it's the "real" one — §28's own finding argues against prioritizing this
+>   matmul specifically right now.
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean, user-requested), 2026-07-16.** Working tree clean, everything committed
 > and pushed (`3b06375`). **Next-session entry point: ADR 0038 prerequisite 3** (numerical
 > validation plan — does block-local competition break growth/duty-cycle/binding assumptions) is
