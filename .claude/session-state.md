@@ -39,6 +39,25 @@
 >   **Next-session entry point if this resumes:** get that clarification first, don't default to
 >   option 2 just because it's the "real" one — §28's own finding argues against prioritizing this
 >   matmul specifically right now.
+> - **Clarification received, same session:** goal is to scale up on the *same* hardware — reach the
+>   hardware's ceiling via a super-optimized architecture, not add more hardware. This reprioritizes
+>   the three options above:
+>   1. **Do first (recommended): quantization (INT8/INT4 via ORT/MIGraphX) + batching/fusing the 5
+>      regions' ORT calls into fewer dispatches — targeted at the ORT *binding* graph (GRU+attention),
+>      not the encoder scoring matmul.** §28 already found the binding graph is the actual dominant
+>      cost at current scale (2-3× the scoring matmul's share), so a hardware-utilization win lands
+>      there first. Pure engineering, no architecture change. Tradeoff: buys headroom on the current
+>      asymptotic shape, doesn't change the scaling law itself.
+>   2. **Second, longer-horizon: hierarchical/coarse-to-fine WTA (ADR 0038)** — the lever that
+>      actually changes `O(input_dim × n_units)`, relevant if "scale up" means going well past
+>      honeybee-order on the same GPU. Still blocked on ADR 0038's own prerequisite 3 (numerical
+>      validation) and its trigger hasn't fired — recommended not to front-load this before the
+>      cheaper utilization wins above are tried and measured.
+>   - **Proposed next concrete step (not yet agreed/started):** benchmark the ORT binding graph
+>     specifically with the same fine-metrics treatment §28 gave the scoring matmul, to confirm
+>     quantization/fusion targets are correctly ranked before implementing anything.
+>   - **Nothing implemented, no decision finalized as of this shutdown** — session ended before user
+>     confirmed whether to scope the binding-graph benchmark as the next concrete step.
 >
 > ---
 >
