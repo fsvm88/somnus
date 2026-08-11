@@ -1,5 +1,71 @@
 # Session state — somnus
 
+> **⏸️ SHUTDOWN (clean, user-requested), 2026-08-11.** User wants to scale further/faster on the
+> *same* hardware (following up on the 2026-08-04 k-WTA discussion below). This session redirected
+> that goal through several corrections and landed on a validated, queued next step.
+>
+> - **Corrected two wrong premises before writing any code.** (1) Initial framing ("quantize the
+>   ORT binding graph, since §28 called it fixed-size GRU+attention") was wrong: reading
+>   `crates/somnus-perception/src/onnx_session.rs` directly showed both `run_encoder` and `run_binding`
+>   are already single fused ORT calls across all 5 regions — there was never a "5 separate
+>   dispatches" to batch, so the batching/fusion option from the 2026-08-04 plan is moot. (2) Advisor
+>   caught that the binding graph is **not** region-size-independent — `sp_i @ W_region_i`
+>   (`scripts/export_perception_graph.py`'s `build_binding_graph`) scales with `n_units`, and at
+>   campaign scale is the dominant cost inside `run_binding`, not GRU+attention. This is a live
+>   correction to §28/ADR 0038's "fixed-size, region-count-independent" characterization — still
+>   needs to be fixed in those docs, not yet done.
+> - **Read all of `ai-docs/` (ADRs + research + gaps.md) before committing to a direction**, per user
+>   request, to vet "port §25's sparse-gather fix (burn/CPU path, 11.4x speedup) into the ONNX
+>   binding graph." Verdict: no hard blocker, but two real edge cases must be in scope — a
+>   `lang_zero` placeholder path (`lib.rs:944` and 3 similar sites) feeds `run_binding` with
+>   `indices: vec![]` (k=0, breaks a static-shape `Gather`), and a dense→sparse re-derivation path
+>   (`lib.rs:2758`) can yield fewer than `k_active` nonzeros on an exact-zero tie. Everywhere else
+>   (including §17's growth-bootstrap placeholders) k is exactly `k_active` by construction. MIGraphX
+>   `Gather`-as-input is untested (not documented-broken — the known gfx1201 bugs are
+>   ScatterElements/INT64 as graph *outputs*); `experiments/migraphx-op-probe/probe.py` exists for
+>   exactly this check and hasn't been run yet. `k` must travel via `weights_manifest.json` from
+>   Rust, never re-derived in Python (this class of bug has hit the repo three times already: §17,
+>   §22, §24).
+> - **Built and ran a real benchmark** (new `scripts/bench_binding_projection.py`, committed) to
+>   settle whether the rewrite is worth it before implementing: builds two ONNX graphs from
+>   identical random weights — the real `build_binding_graph` vs. a variant with the 5
+>   region-projection matmuls removed (`proj_0..4 [1,128]` taken as direct graph inputs instead) —
+>   and times both on the real `MIGraphXExecutionProvider`. **Result, at campaign scale
+>   (n_units=9,660): the dense projection matmul is 75-76% of the binding graph's per-call cost**
+>   (1.19-1.32ms full vs. 0.29-0.31ms GRU+attention-only), confirmed stable across two reruns and
+>   scaling down correctly at baseline n_units=1,024 (only 28% there). This reverses an earlier FLOP-
+>   based estimate (~24%/~5-10% win) that assumed the matmul was compute-bound — it's actually
+>   **memory-bandwidth-bound** (each call reads the full `W_region_i` weight matrix, ~4.9MB × 5
+>   regions, regardless of input sparsity), which is exactly the kind of cost a `Gather`-based
+>   rewrite (reading only ~190 of 9,660 rows) should cut close to proportionally. **Conclusion: the
+>   sparse-gather binding rewrite is a real, large, validated win — not a marginal one.**
+> - **Queued next (not started, explicit user request — "put it in queue"):**
+>   1. Run `experiments/migraphx-op-probe/probe.py` to confirm `Gather` (fed by CPU-computed index
+>      inputs) is clean on this MIGraphX/gfx1201 setup — the one remaining unknown.
+>   2. If clean: implement — modify `build_binding_graph` to replace each region's dense
+>      `sp_i @ W_region_i` with `Gather(W_region_i, active_indices_i, axis=0)` → small matmul on
+>      just the nonzero values; thread `k`/`active_indices` through `weights_manifest.json` (never
+>      re-derive in Python); change `run_binding`'s Rust signature
+>      (`crates/somnus-perception/src/onnx_session.rs:119`) to take `SparseActivation` directly instead
+>      of `&[Vec<f32>; 5]` (gets exact-k by construction, deletes the `to_dense_n` calls behind
+>      §24); fix the `lang_zero`/`lib.rs:2758` edge cases above so k is always exactly `k_active` on
+>      every path feeding `run_binding`.
+>   3. Verify via the **existing** `OrtRunBinding` Core metric (already covers this exact call path;
+>      metrics discipline note: no new metric needed, this is a before/after A/B on a metric that
+>      already exists) — plus numerical parity, which should be exact (~1e-6), not an approximation
+>      budget like quantization would need.
+>   4. Write this up as an ADR (changes the ONNX graph contract and the Rust caller) and correct
+>      §28/ADR 0038's "fixed-size, region-count-independent" mischaracterization in the same pass —
+>      note ADR 0038's own revisit trigger is phrased in terms of binding-side cost movement, so a
+>      successful rewrite here partially informs (may partially fire) that trigger.
+> - **Not done, explicitly deferred:** the actual Gather rewrite, the MIGraphX probe run, any ADR/
+>   doc corrections beyond this writeup, and the growth campaign (still stopped at 98.3% to target,
+>   untouched this session, resumable anytime via `scripts/resume_growth_campaign.sh`).
+> - **Committed this session:** `scripts/bench_binding_projection.py` only (new, self-contained
+>   benchmark script + this session-state writeup). No production code changed.
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean, user-requested), 2026-08-04.** Working tree clean, no code changes this
 > session (docs-only session-state update). No `somnus` process running.
 > - **Housekeeping discovered, not done by this session:** between the 2026-07-16 shutdown below and
