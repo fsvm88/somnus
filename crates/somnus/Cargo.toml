@@ -47,3 +47,7 @@ safetensors        = { workspace = true }
 ndarray            = { workspace = true }
 tokenizers         = { version = "0.23", default-features = false, features = ["onig"] }
 sysinfo            = { version = "0.39", default-features = false, features = ["disk", "system"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

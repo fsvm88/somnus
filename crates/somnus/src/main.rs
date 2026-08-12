@@ -3504,3 +3504,640 @@ mod ort_crossover_tests {
         assert!(should_use_ort_inference(&[0, 0, 0, 0, 0], 0));
     }
 }
+
+#[cfg(test)]
+mod main_helpers_tests {
+    use super::*;
+    use somnus_memory::IngestSource;
+    use proptest::prelude::*;
+
+    // ── onnx_thread_budget ────────────────────────────────────────────────────
+
+    #[test]
+    fn onnx_thread_budget_never_zero_and_intra_gte_inter() {
+        let (intra, inter) = onnx_thread_budget();
+        assert!(intra >= 1);
+        assert!(inter >= 1);
+        assert!(intra >= inter, "intra={intra} inter={inter}");
+    }
+
+    // ── wall_secs ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wall_secs_epoch_is_zero() {
+        assert_eq!(wall_secs(&UNIX_EPOCH), 0.0);
+    }
+
+    #[test]
+    fn wall_secs_matches_known_offset() {
+        let t = UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        assert_eq!(wall_secs(&t), 1_000.0);
+    }
+
+    // ── current_process_rss_bytes / memory_dir_disk_free_bytes ──────────────────
+    // Real syscall-backed, machine-dependent — assert the invariants a caller
+    // actually relies on, not exact values (see gaps.md/session notes on
+    // sysinfo's feature trim: these were live-verified against a real process
+    // this same session; here we just guard the *contract*, not re-verify the
+    // OS integration end to end).
+
+    #[test]
+    fn current_process_rss_bytes_is_nonzero_for_this_process() {
+        // This test process itself has nonzero RSS; a 0 return means the sysinfo
+        // lookup silently failed, which is the actual regression this guards.
+        assert!(current_process_rss_bytes() > 0);
+    }
+
+    #[test]
+    fn memory_dir_disk_free_bytes_does_not_panic_on_nonexistent_path() {
+        // Contract: unresolvable mount points return 0, never panic.
+        let _ = memory_dir_disk_free_bytes(std::path::Path::new("/definitely/not/a/real/path"));
+    }
+
+    // ── sink_write / sink_flush ───────────────────────────────────────────────
+
+    #[test]
+    fn sink_write_appends_lines_and_flush_persists_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sink.jsonl");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut sink = Some(BufWriter::new(file));
+
+        sink_write(&mut sink, "line one");
+        sink_write(&mut sink, "line two");
+        sink_flush(&mut sink);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "line one\nline two\n");
+    }
+
+    #[test]
+    fn sink_write_and_flush_are_noop_on_none() {
+        // Must not panic when no sink is configured (the common case).
+        let mut sink: Option<BufWriter<std::fs::File>> = None;
+        sink_write(&mut sink, "ignored");
+        sink_flush(&mut sink);
+    }
+
+    // ── audio_emb_json / video_emb_json ──────────────────────────────────────
+
+    fn fixed_timestamp() -> Timestamp {
+        Timestamp {
+            monotonic: std::time::Instant::now(),
+            wall: UNIX_EPOCH + std::time::Duration::from_secs(42),
+        }
+    }
+
+    #[test]
+    fn audio_emb_json_has_expected_shape() {
+        let emb = AudioEmbedding {
+            source: AudioEncoderSource::Speech,
+            values: vec![1.0, 2.0, 3.0],
+            timestamp: fixed_timestamp(),
+            encode_ms: 5,
+        };
+        let json = audio_emb_json(&emb);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "speech");
+        assert_eq!(parsed["timestamp_secs"], 42.0);
+        assert_eq!(parsed["dim"], 3);
+        assert_eq!(parsed["values"], serde_json::json!([1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn audio_emb_json_env_source_label() {
+        let emb = AudioEmbedding {
+            source: AudioEncoderSource::Env,
+            values: vec![],
+            timestamp: fixed_timestamp(),
+            encode_ms: 0,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&audio_emb_json(&emb)).unwrap();
+        assert_eq!(parsed["type"], "env");
+        assert_eq!(parsed["dim"], 0);
+    }
+
+    #[test]
+    fn video_emb_json_has_expected_shape() {
+        let emb = VideoEmbedding {
+            values: vec![0.5; 4],
+            timestamp: fixed_timestamp(),
+            encode_ms: 7,
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&video_emb_json(&emb)).unwrap();
+        assert_eq!(parsed["type"], "video");
+        assert_eq!(parsed["dim"], 4);
+        assert_eq!(parsed["timestamp_secs"], 42.0);
+    }
+
+    // ── accumulate_wakefulness_pressure ──────────────────────────────────────
+
+    #[test]
+    fn wakefulness_pressure_ignores_sentinel_salience() {
+        let mut pressure = 1.0;
+        accumulate_wakefulness_pressure(f32::MAX, 0.5, &mut pressure);
+        assert_eq!(
+            pressure, 1.0,
+            "f32::MAX sentinel (no warm neighbours) must not move pressure"
+        );
+    }
+
+    #[test]
+    fn wakefulness_pressure_ignores_zero_threshold() {
+        let mut pressure = 1.0;
+        accumulate_wakefulness_pressure(2.0, 0.0, &mut pressure);
+        assert_eq!(pressure, 1.0);
+    }
+
+    #[test]
+    fn wakefulness_pressure_accumulates_novelty_above_threshold() {
+        let mut pressure = 0.0;
+        accumulate_wakefulness_pressure(1.5, 0.5, &mut pressure);
+        // novelty = (1.5 - 0.5) / 0.5 = 2.0
+        assert!((pressure - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wakefulness_pressure_clamps_at_p_max() {
+        let mut pressure = P_MAX - 0.1;
+        accumulate_wakefulness_pressure(100.0, 0.1, &mut pressure);
+        assert_eq!(pressure, P_MAX);
+    }
+
+    #[test]
+    fn wakefulness_pressure_below_threshold_contributes_nothing() {
+        let mut pressure = 1.0;
+        accumulate_wakefulness_pressure(0.2, 0.5, &mut pressure);
+        assert_eq!(
+            pressure, 1.0,
+            "novelty is clamped to 0 below threshold, no decrease either"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn wakefulness_pressure_never_exceeds_p_max(
+            salience in 0.0f32..1000.0,
+            sal_threshold in 0.001f32..10.0,
+            start in 0.0f32..P_MAX,
+        ) {
+            let mut pressure = start;
+            accumulate_wakefulness_pressure(salience, sal_threshold, &mut pressure);
+            prop_assert!(pressure <= P_MAX);
+            prop_assert!(pressure >= start, "pressure must be monotonically non-decreasing");
+        }
+    }
+
+    // ── write_training_pair ──────────────────────────────────────────────────
+
+    #[test]
+    fn write_training_pair_escapes_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pairs.jsonl");
+
+        write_training_pair(
+            &path,
+            &[1.0, 2.5],
+            "line one\nwith \"quotes\" and \\backslash",
+        );
+        write_training_pair(&path, &[0.0], "second");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["episode"], serde_json::json!([1.0, 2.5]));
+        assert_eq!(first["text"], "line one\nwith \"quotes\" and \\backslash");
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["text"], "second");
+    }
+
+    // ── sal_gate / settle_gate_val ────────────────────────────────────────────
+
+    #[test]
+    fn sal_gate_cold_start_below_100_samples() {
+        assert_eq!(sal_gate(10.0, 10.0, 99), SAL_EWMA_COLD_START);
+    }
+
+    #[test]
+    fn sal_gate_uses_formula_at_100_samples() {
+        assert_eq!(
+            sal_gate(1.0, 0.2, 100),
+            (1.0 + 0.5 * 0.2f32).clamp(0.3, 3.0)
+        );
+    }
+
+    #[test]
+    fn sal_gate_clamps_to_bounds() {
+        assert_eq!(sal_gate(-10.0, 0.0, 100), 0.3);
+        assert_eq!(sal_gate(100.0, 100.0, 100), 3.0);
+    }
+
+    #[test]
+    fn settle_gate_cold_start_below_100_samples() {
+        assert_eq!(settle_gate_val(0.9, 50, 0.6), 0.6);
+    }
+
+    #[test]
+    fn settle_gate_uses_formula_and_clamps_at_100_samples() {
+        assert_eq!(settle_gate_val(0.5, 100, 0.6), 0.4);
+        assert_eq!(settle_gate_val(0.05, 100, 0.6), 0.0); // clamped
+        assert_eq!(settle_gate_val(1.5, 100, 0.6), 1.0); // clamped
+    }
+
+    proptest! {
+        #[test]
+        fn sal_gate_always_in_valid_range(mu in -10.0f32..10.0, sigma in 0.0f32..10.0, n in 0u64..1000) {
+            let g = sal_gate(mu, sigma, n);
+            prop_assert!(g == SAL_EWMA_COLD_START || (0.3..=3.0).contains(&g));
+        }
+
+        #[test]
+        fn settle_gate_val_always_in_unit_range_or_cold_start(
+            mu in -10.0f32..10.0, n in 0u64..1000, cold_start in 0.0f32..1.0,
+        ) {
+            let g = settle_gate_val(mu, n, cold_start);
+            prop_assert!(g == cold_start || (0.0..=1.0).contains(&g));
+        }
+    }
+
+    // ── update_settle_ewma / update_sal_ewma ─────────────────────────────────
+
+    #[test]
+    fn update_settle_ewma_moves_toward_new_value() {
+        let mut mu = 0.0f32;
+        let mut n = 0u64;
+        update_settle_ewma(1.0, &mut mu, &mut n);
+        assert!((mu - 0.01).abs() < 1e-6);
+        assert_eq!(n, 1);
+        update_settle_ewma(1.0, &mut mu, &mut n);
+        assert_eq!(n, 2);
+        assert!(mu > 0.01, "mu should keep moving toward 1.0");
+    }
+
+    #[test]
+    fn update_sal_ewma_ignores_sentinel() {
+        let mut mu = 0.5f32;
+        let mut sigma = 0.1f32;
+        let mut n = 5u64;
+        update_sal_ewma(f32::MAX, &mut mu, &mut sigma, &mut n);
+        assert_eq!((mu, sigma, n), (0.5, 0.1, 5));
+    }
+
+    #[test]
+    fn update_sal_ewma_updates_on_real_salience() {
+        let mut mu = 0.0f32;
+        let mut sigma = 0.0f32;
+        let mut n = 0u64;
+        update_sal_ewma(1.0, &mut mu, &mut sigma, &mut n);
+        assert!(mu > 0.0);
+        assert_eq!(n, 1);
+    }
+
+    proptest! {
+        #[test]
+        fn update_settle_ewma_stays_bounded_by_inputs(
+            mus in prop::collection::vec(0.0f32..1.0, 1..20),
+        ) {
+            // Feeding only values in [0,1] must keep the EWMA in [0,1] (convex combination).
+            let mut mu = 0.5f32;
+            let mut n = 0u64;
+            for m in &mus {
+                update_settle_ewma(*m as f64, &mut mu, &mut n);
+            }
+            prop_assert!((0.0..=1.0).contains(&mu), "mu={mu} escaped [0,1]");
+            prop_assert_eq!(n, mus.len() as u64);
+        }
+
+        #[test]
+        fn update_sal_ewma_n_only_increments_on_real_samples(
+            samples in prop::collection::vec(prop::bool::ANY, 1..20),
+        ) {
+            let mut mu = 0.0f32;
+            let mut sigma = 0.0f32;
+            let mut n = 0u64;
+            let mut expected_n = 0u64;
+            for is_sentinel in samples {
+                let salience = if is_sentinel { f32::MAX } else { 0.3 };
+                if !is_sentinel { expected_n += 1; }
+                update_sal_ewma(salience, &mut mu, &mut sigma, &mut n);
+            }
+            prop_assert_eq!(n, expected_n);
+        }
+    }
+
+    // ── is_introspective_query ────────────────────────────────────────────────
+
+    #[test]
+    fn introspective_query_detects_known_phrases() {
+        assert!(is_introspective_query("What did you hear just now?"));
+        assert!(is_introspective_query("Give me a RECAP"));
+        assert!(is_introspective_query("what have you seen"));
+    }
+
+    #[test]
+    fn introspective_query_rejects_unrelated_text() {
+        assert!(!is_introspective_query("What's the weather like?"));
+        assert!(!is_introspective_query(""));
+    }
+
+    // ── accumulate_salience ───────────────────────────────────────────────────
+
+    fn recorded_episode(salience: f32, blended: bool, source: IngestSource) -> RecordedEpisode {
+        RecordedEpisode {
+            salience,
+            blended,
+            source,
+            hnsw_query_us: 0,
+        }
+    }
+
+    #[test]
+    fn accumulate_salience_counts_by_source_and_blend() {
+        let mut salience_sum = 0.0;
+        let mut salience_n = 0;
+        let mut salience_min = f32::MAX;
+        let mut high = 0;
+        let mut blend = 0;
+        let (mut speech, mut env, mut visual, mut lang, mut mixed) = (0, 0, 0, 0, 0);
+
+        let rec = recorded_episode(0.9, true, IngestSource::Speech);
+        accumulate_salience(
+            &rec,
+            0.5,
+            &mut salience_sum,
+            &mut salience_n,
+            &mut salience_min,
+            &mut high,
+            &mut blend,
+            &mut speech,
+            &mut env,
+            &mut visual,
+            &mut lang,
+            &mut mixed,
+        );
+
+        assert_eq!(salience_n, 1);
+        assert!((salience_sum - 0.9).abs() < 1e-6);
+        assert_eq!(salience_min, 0.9);
+        assert_eq!(high, 1, "0.9 > threshold 0.5");
+        assert_eq!(blend, 1);
+        assert_eq!(speech, 1);
+        assert_eq!((env, visual, lang, mixed), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn accumulate_salience_sentinel_skips_salience_stats_but_not_source() {
+        let mut salience_sum = 0.0;
+        let mut salience_n = 0;
+        let mut salience_min = f32::MAX;
+        let mut high = 0;
+        let mut blend = 0;
+        let (mut speech, mut env, mut visual, mut lang, mut mixed) = (0, 0, 0, 0, 0);
+
+        let rec = recorded_episode(f32::MAX, false, IngestSource::Mixed);
+        accumulate_salience(
+            &rec,
+            0.5,
+            &mut salience_sum,
+            &mut salience_n,
+            &mut salience_min,
+            &mut high,
+            &mut blend,
+            &mut speech,
+            &mut env,
+            &mut visual,
+            &mut lang,
+            &mut mixed,
+        );
+
+        assert_eq!(
+            salience_n, 0,
+            "sentinel must not count toward salience stats"
+        );
+        assert_eq!(salience_min, f32::MAX);
+        assert_eq!(mixed, 1, "source tagging happens regardless of salience");
+    }
+
+    // ── accumulate_cosines / episode_cosine_mean ─────────────────────────────
+
+    #[test]
+    fn accumulate_cosines_only_counts_present_values() {
+        let cosines = [Some(0.5), None, Some(0.9), None, Some(0.1)];
+        let mut sums = [0.0; 5];
+        let mut counts = [0; 5];
+        accumulate_cosines(&cosines, &mut sums, &mut counts);
+        assert_eq!(counts, [1, 0, 1, 0, 1]);
+        assert!((sums[0] - 0.5).abs() < 1e-6);
+        assert!((sums[2] - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn accumulate_cosines_is_additive_across_calls() {
+        let mut sums = [0.0; 5];
+        let mut counts = [0; 5];
+        accumulate_cosines(&[Some(1.0), None, None, None, None], &mut sums, &mut counts);
+        accumulate_cosines(&[Some(2.0), None, None, None, None], &mut sums, &mut counts);
+        assert_eq!(counts[0], 2);
+        assert!((sums[0] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn episode_cosine_mean_none_when_all_absent() {
+        assert_eq!(episode_cosine_mean(&[None, None, None, None, None]), None);
+    }
+
+    #[test]
+    fn episode_cosine_mean_averages_present_values() {
+        let mean = episode_cosine_mean(&[Some(1.0), Some(3.0), None, None, None]).unwrap();
+        assert!((mean - 2.0).abs() < 1e-9);
+    }
+
+    // ── update_perf_ewma ──────────────────────────────────────────────────────
+
+    #[test]
+    fn update_perf_ewma_seeds_from_first_episode() {
+        let mut ewma = None;
+        let mut baseline = None;
+        let mut baseline_accum = 0.0;
+        let mut baseline_n = 0;
+        let mut flag = false;
+        update_perf_ewma(
+            0.7,
+            &mut ewma,
+            &mut baseline,
+            &mut baseline_accum,
+            &mut baseline_n,
+            &mut flag,
+            0.1,
+        );
+        assert_eq!(ewma, Some(0.7));
+        assert_eq!(
+            baseline, None,
+            "baseline not captured until COSINE_BASELINE_N samples"
+        );
+        assert_eq!(baseline_n, 1);
+        assert!(!flag);
+    }
+
+    #[test]
+    fn update_perf_ewma_captures_baseline_after_threshold_count() {
+        let mut ewma = None;
+        let mut baseline = None;
+        let mut baseline_accum = 0.0;
+        let mut baseline_n = 0;
+        let mut flag = false;
+        for _ in 0..COSINE_BASELINE_N {
+            update_perf_ewma(
+                0.8,
+                &mut ewma,
+                &mut baseline,
+                &mut baseline_accum,
+                &mut baseline_n,
+                &mut flag,
+                0.1,
+            );
+        }
+        assert!(baseline.is_some());
+        assert!((baseline.unwrap() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_perf_ewma_sets_flag_when_degraded_below_threshold() {
+        let mut ewma = None;
+        let mut baseline = None;
+        let mut baseline_accum = 0.0;
+        let mut baseline_n = 0;
+        let mut flag = false;
+        // Establish a healthy baseline at 0.9.
+        for _ in 0..COSINE_BASELINE_N {
+            update_perf_ewma(
+                0.9,
+                &mut ewma,
+                &mut baseline,
+                &mut baseline_accum,
+                &mut baseline_n,
+                &mut flag,
+                0.1,
+            );
+        }
+        assert!(!flag);
+        // Now feed a sharply degraded value repeatedly — EWMA should eventually
+        // drop more than 0.1 below the 0.9 baseline and raise the flag.
+        for _ in 0..200 {
+            update_perf_ewma(
+                0.0,
+                &mut ewma,
+                &mut baseline,
+                &mut baseline_accum,
+                &mut baseline_n,
+                &mut flag,
+                0.1,
+            );
+        }
+        assert!(flag, "ewma={:?} baseline={:?}", ewma, baseline);
+    }
+
+    #[test]
+    fn update_perf_ewma_zero_threshold_never_flags() {
+        let mut ewma = None;
+        let mut baseline = None;
+        let mut baseline_accum = 0.0;
+        let mut baseline_n = 0;
+        let mut flag = false;
+        for _ in 0..COSINE_BASELINE_N {
+            update_perf_ewma(
+                0.9,
+                &mut ewma,
+                &mut baseline,
+                &mut baseline_accum,
+                &mut baseline_n,
+                &mut flag,
+                0.0,
+            );
+        }
+        for _ in 0..200 {
+            update_perf_ewma(
+                0.0,
+                &mut ewma,
+                &mut baseline,
+                &mut baseline_accum,
+                &mut baseline_n,
+                &mut flag,
+                0.0,
+            );
+        }
+        assert!(!flag, "threshold=0.0 must mean the flag is never set");
+    }
+
+    // ── forward_frames / forward_frames_blocking ─────────────────────────────
+
+    #[test]
+    fn forward_frames_blocking_relays_all_frames_in_order() {
+        let (src_tx, src_rx) = bounded::<i32>(8);
+        let (dst_tx, dst_rx) = bounded::<i32>(8);
+        for i in 0..5 {
+            src_tx.send(i).unwrap();
+        }
+        drop(src_tx); // close source so recv() returns Err after draining
+
+        let exhausted = forward_frames_blocking(src_rx, dst_tx);
+        assert!(exhausted, "source closed normally, not downstream");
+
+        let received: Vec<i32> = dst_rx.try_iter().collect();
+        assert_eq!(received, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn forward_frames_blocking_returns_false_when_downstream_closed() {
+        let (src_tx, src_rx) = bounded::<i32>(8);
+        let (dst_tx, dst_rx) = bounded::<i32>(1);
+        src_tx.send(1).unwrap();
+        src_tx.send(2).unwrap();
+        drop(src_tx);
+        drop(dst_rx); // downstream closed before forwarding starts
+
+        let exhausted = forward_frames_blocking(src_rx, dst_tx);
+        assert!(
+            !exhausted,
+            "downstream closed first, source was not exhausted normally"
+        );
+    }
+
+    #[test]
+    fn forward_frames_drops_oldest_when_full_not_when_room_available() {
+        let (src_tx, src_rx) = bounded::<i32>(8);
+        let (dst_tx, dst_rx) = bounded::<i32>(8); // plenty of room, nothing should drop
+        let (_drain_tx, drain_rx) = bounded::<i32>(8);
+        for i in 0..3 {
+            src_tx.send(i).unwrap();
+        }
+        drop(src_tx);
+
+        forward_frames(src_rx, dst_tx, drain_rx);
+
+        let received: Vec<i32> = dst_rx.try_iter().collect();
+        assert_eq!(
+            received,
+            vec![0, 1, 2],
+            "no drops expected when downstream has room"
+        );
+    }
+
+    #[test]
+    fn forward_frames_exits_cleanly_when_downstream_disconnects() {
+        let (src_tx, src_rx) = bounded::<i32>(8);
+        let (dst_tx, dst_rx) = bounded::<i32>(1);
+        let (_drain_tx, drain_rx) = bounded::<i32>(8);
+        src_tx.send(1).unwrap();
+        src_tx.send(2).unwrap();
+        drop(src_tx);
+        drop(dst_rx);
+
+        // Must return (not hang) once the downstream is gone, regardless of how
+        // many source frames remain.
+        forward_frames(src_rx, dst_tx, drain_rx);
+    }
+}

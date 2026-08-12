@@ -36,6 +36,10 @@ serde              = { version = "1", features = ["derive"] }
 bitcode            = { version = "0.6", default-features = false, features = ["std", "serde"] }
 somnus-metrics        = { path = "crates/somnus-metrics" }
 
+# dev-dependencies only (property-based / fixture testing, per CLAUDE.md's testing policy)
+proptest           = "1"
+tempfile           = "3"
+
 # Profile for flamegraph: release-optimised but with debug symbols intact so
 # perf/flamegraph can map addresses back to source.
 [profile.release-debug]
