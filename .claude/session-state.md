@@ -1,5 +1,42 @@
 # Session state — somnus
 
+> **▶️ IN PROGRESS, 2026-08-12.** Continuation of the 2026-08-11 session below: implemented the
+> queued sparse-gather binding-graph rewrite. Committed as `19e0f52` (ADR 0040,
+> `ai-docs/decisions/0040-sparse-gather-binding-projection.md` has full detail; `gaps.md` §30 has
+> the narrative writeup).
+> - **MIGraphX probe (the one open unknown from 08-11): PASS.** `Gather` fed by a runtime int64
+>   index input, at campaign scale (n=9,660, k=190) — max abs diff 1.49e-07.
+> - **Implemented, numerically verified exact** (~1e-8 vs. the dense numpy reference, kept
+>   deliberately unrewritten as the ground truth, both CPU and MIGraphX EP, baseline and campaign
+>   scale). Found and worked around a genuine MIGraphX compiler bug along the way (`Reshape`+matmul
+>   combo crashed `simplify_reshapes`) — unrelated to the Gather question the probe checked, only
+>   caught by the full-graph parity check, not the isolated op probe.
+> - **Measured win, via a new 3rd arm on the already-committed `bench_binding_projection.py`:
+>   54-59% reduction in `OrtRunBinding`'s per-call cost at campaign scale** (0.85ms → 0.35-0.39ms),
+>   stable across two reruns.
+> - **`gaps.md` §28/§29 and ADR 0038 corrected** — both had characterized `OrtRunBinding` as
+>   "fixed-size, region-count-independent"; the dense projection this change replaces was actually
+>   75-76% of that graph's cost. Correction is inline in both docs plus `gaps.md` §30.
+> - **Rust contract change:** `SparseActivation::to_exact_k` (new), `run_binding` now takes
+>   `&[SparseActivation; 5]` directly. `k_active` travels via `weights_manifest.json` from Rust
+>   (never re-derived in Python — the §17/§22/§24 drift bug class). All 3 `run_binding` call sites
+>   in `lib.rs` updated; `binding_only` (burn-only, never ORT) untouched.
+> - **Verified:** `cargo build/test/clippy/fmt -p somnus-perception` clean (whole-workspace build
+>   blocked by an unrelated pre-existing `ffmpeg-next` version mismatch, not touched here).
+>   `ort_grown_region.rs`'s grown-region test rewritten (old one parsed an ORT error message that
+>   no longer exists under the new contract) and both integration tests correctly skip against the
+>   campaign's still-pre-rewrite on-disk ONNX artifact.
+> - **Deliberately NOT done, needs explicit go-ahead next:** (1) a live `OrtRunBinding` A/B in an
+>   isolated pilot memory dir against real campaign data (only a synthetic benchmark has been run
+>   so far); (2) deploying this to the actual production campaign (98.3% to its 10x target, still
+>   stopped, untouched this session) — this requires `rebuild_ort_session` to regenerate that
+>   campaign's ONNX artifacts in the new manifest format, a mutation to a long-running production
+>   run's on-disk state that wasn't taken without asking first.
+> - **Next-session entry point if this resumes:** ask whether to run the isolated-pilot live A/B
+>   and/or deploy to the campaign, or whether something else is now the priority.
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean, user-requested), 2026-08-11.** User wants to scale further/faster on the
 > *same* hardware (following up on the 2026-08-04 k-WTA discussion below). This session redirected
 > that goal through several corrections and landed on a validated, queued next step.
