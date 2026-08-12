@@ -1,9 +1,41 @@
 # Session state — somnus
 
-> **▶️ IN PROGRESS, 2026-08-12.** Continuation of the 2026-08-11 session below: implemented the
-> queued sparse-gather binding-graph rewrite. Committed as `19e0f52` (ADR 0040,
+> **⏸️ SHUTDOWN (clean), 2026-08-12.** Continuation of the 2026-08-11 session below: implemented
+> AND deployed the queued sparse-gather binding-graph rewrite to the live production campaign.
+> Committed as `19e0f52`, `3949b52`, `ad69560` (ADR 0040,
 > `ai-docs/decisions/0040-sparse-gather-binding-projection.md` has full detail; `gaps.md` §30 has
 > the narrative writeup).
+> - **Deployed live, confirmed via the real `OrtRunBinding` metric:** a short 2-cycle verification
+>   leg (session 79) since the campaign's own session budget was already exhausted at 98.3% growth.
+>   Zero ORT fallback, clean rebuild both cycles. **40-59% reduction in `OrtRunBinding`'s real
+>   per-call cost** (2.15-2.83ms/call → 1.17-1.30ms/call), including one cycle that caught a live
+>   growth event mid-run (9,493→9,549 units/region) with a correct re-export at the new size.
+> - **Campaign state now:** session 79, region sizes `[9549]×5`, **98.9% to the 10x target** (up
+>   from 98.3%), `somnus` process exited cleanly on its own (`max-sleep-cycles reached`), zero panics/
+>   segfaults, confirmed idle via `resume_growth_campaign.sh` (reports already at target — same
+>   "session budget exhausted before growth fully converges" situation as before, now one session
+>   later).
+> - **Two unrelated pre-existing environment blockers found and fixed along the way, neither
+>   caused by the binding rewrite:**
+>   1. `ffmpeg-next` 8 didn't build at all against the locally installed `ffmpeg` 9.0 (missing/
+>      renamed `AVCodec` fields, new enum variants). Fixed by bumping `ffmpeg-next` to `"9"`
+>      (workspace `Cargo.toml`) — **not** downgrading the installed ffmpeg, per explicit user
+>      instruction. Commit `3949b52`. Full workspace build/test/clippy/fmt clean afterward.
+>   2. `models/` (project root) had silently diverged from `/data/somnus/models` — unlike `memory`/
+>      `clips`/`data`, `models/` is **git-tracked in part** (`README.md`, `qwen3_tokenizer.json`
+>      are real tracked files; only specific artifact globs are gitignored). **First attempt was
+>      wrong and self-corrected within the session**: replacing the whole directory with a symlink
+>      (the `memory`/`clips`/`data` pattern) would have silently detached those 2 tracked files
+>      from the working tree. Fixed correctly: restored `models/` as a real directory, symlinked
+>      only the individual large artifacts from `/data/somnus/models` (each matches an existing
+>      `.gitignore` glob). Filesystem-only, not committed itself — flagged for any future session
+>      that touches `models/`, since the wrong version would have looked fine until the next
+>      `git status`/commit.
+> - **Next-session entry point:** nothing queued as a bug. The binding rewrite is fully done
+>   (implemented + deployed + verified live). The campaign is once again at its session-budget
+>   ceiling short of its unit-count target (98.9% now) — same standing question as always: resume
+>   with more sessions to actually finish reaching 9,660 units/region, or leave it here. Not asked
+>   this session since it wasn't the point of the work; ask if it comes up.
 > - **MIGraphX probe (the one open unknown from 08-11): PASS.** `Gather` fed by a runtime int64
 >   index input, at campaign scale (n=9,660, k=190) — max abs diff 1.49e-07.
 > - **Implemented, numerically verified exact** (~1e-8 vs. the dense numpy reference, kept
