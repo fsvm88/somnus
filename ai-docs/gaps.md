@@ -1339,10 +1339,14 @@ through `run_binding`. Both integration tests correctly skip (not fail) against 
 still-pre-rewrite on-disk ONNX artifact, which needs a `rebuild_ort_session` to pick up the new
 manifest format — not yet done to the actual campaign, see below.
 
-**Not yet done:** a live `OrtRunBinding` before/after A/B against the real `OrtRunBinding` Core
-metric (the synthetic benchmark above stands in for this for now), and deploying the rewrite to the
-live 98.3%-to-target growth campaign — deliberately not done without asking first, since it mutates
-a long-running production run's on-disk ONNX artifacts. Full design and status: ADR 0040.
+**Deployed live to the production campaign the same session, on request.** A short 2-cycle
+verification leg (session 79) confirmed a clean rebuild (zero ORT fallback) and a real **40-59%
+reduction** in `OrtRunBinding`'s per-call cost on actual production traffic (2.15-2.83ms/call →
+1.17-1.30ms/call), including one cycle that caught a live growth event mid-run with a correct
+re-export at the new size. Two unrelated pre-existing environment blockers (an `ffmpeg-next`/
+system-`ffmpeg` version mismatch preventing `somnus` from building at all, and a `models/` directory
+that had silently diverged from its `/data/somnus/models` symlink target) were found and fixed along
+the way — neither caused by this change. Full detail, numbers, and the fix writeups: ADR 0040.
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
 > order. Table numbering used to drift from the section headers — corrected 2026-07-11; if you're

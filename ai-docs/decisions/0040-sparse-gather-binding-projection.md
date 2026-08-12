@@ -1,8 +1,7 @@
 # 0040. Sparse-gather binding projection (ONNX/MIGraphX)
 
-- **Status:** implemented (Python graph + Rust caller + numerical parity + synthetic benchmark);
-  live production A/B against the growth campaign's real `OrtRunBinding` metric, and deployment to
-  the campaign itself, deliberately not yet done — see "Not yet done" below.
+- **Status:** implemented and deployed live to the production growth campaign; confirmed via the
+  real `OrtRunBinding` metric (see "Live deployment and verification" below).
 - **Date:** 2026-08-12
 
 ## Context
@@ -140,16 +139,60 @@ inside the ORT call (including a hypothetical MIGraphX-side Gather issue) still 
 `run_binding`'s existing `anyhow::Result<Vec<f32>>` and is already caught by all 3 call sites'
 existing `OrtBindingFallback` counter + fallback-to-burn logic — unchanged by this ADR.
 
-## Not yet done
+## Live deployment and verification
 
-- **Live A/B against the real `OrtRunBinding` Core metric**, in an isolated pilot memory directory
-  (the established precedent for this kind of validation run in this repo) rather than the
-  synthetic benchmark above. Not run this session.
-- **Deployment to the live growth campaign** (98.3% to its 10x target as of the last shutdown,
-  currently stopped). This mutates a long-running production run's on-disk ONNX artifacts
-  (`rebuild_ort_session` regenerates `weights_manifest.json` in the new format) — deliberately not
-  done without explicit confirmation, since it's exactly the kind of hard-to-casually-reverse
-  action this project's working conventions ask to check before taking.
+User asked to deploy straight to the production campaign rather than stage through an isolated
+pilot first. Two unrelated pre-existing environment blockers were found and fixed before this
+could happen at all (neither caused by this ADR's change):
+
+- **`somnus` couldn't build at all**: `ffmpeg-next` 8 doesn't compile against the locally installed
+  `ffmpeg` 9.0 (missing/renamed `AVCodec` fields, new `AVFrameSideDataType`/`AVPacketSideDataType`
+  enum variants ffmpeg-next 8's match arms don't cover). Fixed by bumping the crate to
+  `ffmpeg-next = "9"` (not touching the installed ffmpeg) — full workspace build/test/clippy/fmt
+  clean afterward, including `somnus-sensory`'s real-file decode integration tests against ffmpeg 9.0
+  itself. Committed separately (`3949b52`).
+- **`models/` (project root) had silently diverged from `/data/somnus/models`**: unlike `memory`/
+  `clips`/`data` (fully gitignored, symlinked wholesale back to `/data/somnus/*` in the 2026-08-04
+  session), `models/` is git-tracked in part — `.gitignore` only excludes specific artifact
+  patterns (`*.onnx`, `*.onnx.data`, `*.safetensors`, etc.), not the directory itself, and
+  `models/README.md` + `models/qwen3_tokenizer.json` are real tracked files. The project-root
+  directory had only those 2 tracked files; the actual 13GB of encoder weights lived at
+  `/data/somnus/models` with neither of them present there. **First attempt (wrong, corrected within
+  the same session): replaced the whole `models/` directory with a symlink** — same pattern as
+  `memory`/`clips`/`data`, but wrong here since it silently detached the two git-tracked files
+  from the working tree (`git status` would show them as deleted on the next commit). **Fixed
+  correctly**: restored `models/` as a real directory (`git checkout` on the two tracked files),
+  then symlinked only the individual large artifacts from `/data/somnus/models` — each matches an
+  existing `.gitignore` glob, so `git status` stays clean. Filesystem-only, not a commit itself
+  (same as the 2026-08-04 precedent), but worth flagging since the first attempt would have been a
+  real mistake had it been committed.
+
+**Deployed via a short 2-cycle verification leg** (`train_campaign.sh SESSION_START=79 SESSIONS=1
+CYCLES=2`, same `CAMPAIGN_DIR`/`MEMORY_DIR`/`CLIPS`/other params as the campaign's existing
+`params.txt`) rather than a fresh isolated pilot dir, since the campaign's own session budget had
+already been exhausted at 98.3% growth (`resume_growth_campaign.sh` refused to restart it as
+already-at-target) and the user chose a short verification-only extension over either fully
+resuming growth or leaving the campaign untouched.
+
+**Result: clean, zero fallback, real measured win.** Both cycles' `rebuild_ort_session` picked up
+the new manifest format and rebuilt the Gather-based binding graph without incident (log: "ORT
+encoder+binding sessions loaded" / "ORT sessions rebuilt after sleep cycle", zero `ORT binding
+failed` / `ORT encoder failed` occurrences across the whole run). `OrtRunBinding`'s real per-call
+cost:
+
+| | pre-rewrite (session 78, dense) | post-rewrite (session 79, gather) |
+|---|---|---|
+| cycle 9/1 | 2.151 ms/call (n=136) | 1.298 ms/call (n=230) |
+| cycle 10/2 | 2.828 ms/call (n=167) | 1.169 ms/call (n=121) |
+
+A **40-59% reduction** on real production traffic (the synthetic benchmark's 54-59% was close but
+not identical — expected, since real k-WTA index distributions and concurrent GPU load differ from
+the synthetic benchmark's fixed random pattern). Cycle 2 also happened to catch a live growth event
+mid-run (region sizes 9,493→9,549 units/region) with a clean re-export and rebuild at the new size
+— incidental confirmation that the `k_active`-in-manifest re-export coupling holds across an actual
+growth event, not just in the static benchmarks above. Campaign state after: session 79, region
+sizes `[9549]×5`, 98.9% to the 10x target, `somnus` process exited cleanly on its own
+(`max-sleep-cycles reached`), zero panics/segfaults, `resume_growth_campaign.sh` confirms idle.
 
 ## What would invalidate this
 
