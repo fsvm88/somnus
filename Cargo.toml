@@ -7,7 +7,7 @@ anyhow             = "1"
 clap               = { version = "4", features = ["derive"] }
 cpal               = "0.18"
 crossbeam-channel  = "0.5"
-ffmpeg-next        = "8"
+ffmpeg-next        = "9"
 ndarray            = "0.17"
 rayon              = "1.12"
 nokhwa             = { version = "0.10", features = ["input-native"] }
