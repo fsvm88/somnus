@@ -882,16 +882,7 @@ pub async fn run() -> Result<()> {
     // ── perception processor ──────────────────────────────────────────────────
     let mut perception = PerceptionProcessor::new(NdArrayDevice::Cpu);
     let prior_beta_regions_static: Option<[f32; 5]> = if let Some(ref s) = args.prior_beta_regions {
-        let parts: Vec<&str> = s.split(',').collect();
-        if parts.len() != 5 {
-            anyhow::bail!("--prior-beta-regions requires exactly 5 comma-separated floats");
-        }
-        let mut betas = [0.0f32; 5];
-        for (i, p) in parts.iter().enumerate() {
-            betas[i] = p.trim().parse::<f32>().with_context(|| {
-                format!("--prior-beta-regions: cannot parse '{}' as f32", p.trim())
-            })?;
-        }
+        let betas = parse_prior_beta_regions(s)?;
         perception.set_prior_beta(0.0); // clear base first
         for (i, &b) in betas.iter().enumerate() {
             perception.set_prior_beta_region(i, b);
@@ -1932,16 +1923,12 @@ pub async fn run() -> Result<()> {
         let pressure_hit = sal_n >= P_COLD_START_N
             && wake_episodes >= P_MIN_EPISODES
             && wakefulness_pressure >= P_THRESHOLD;
-        let should_sleep = high_water_hit || schedule_hit || perf_degradation_hit || pressure_hit;
-        let sleep_trigger = if high_water_hit {
-            "high_water"
-        } else if pressure_hit {
-            "pressure"
-        } else if perf_degradation_hit {
-            "perf_degradation"
-        } else {
-            "schedule"
-        };
+        let (should_sleep, sleep_trigger) = decide_should_sleep(
+            high_water_hit,
+            schedule_hit,
+            perf_degradation_hit,
+            pressure_hit,
+        );
 
         if should_sleep && !episodic.is_empty() {
             let this_wake_secs = wake_start.elapsed().as_secs_f32();
@@ -1980,15 +1967,8 @@ pub async fn run() -> Result<()> {
                 }
             }
             // P1b: auto --sleep-max-secs: cap = max(300, 3 × mean_sleep_secs) after first cycle.
-            let effective_sleep_max_secs: u64 = if args.sleep_max_secs > 0 {
-                args.sleep_max_secs
-            } else if sleep_dur_secs_history.is_empty() {
-                0 // no history yet — no cap
-            } else {
-                let mean = sleep_dur_secs_history.iter().sum::<f64>()
-                    / sleep_dur_secs_history.len() as f64;
-                (mean * 3.0).max(300.0) as u64
-            };
+            let effective_sleep_max_secs: u64 =
+                compute_effective_sleep_max_secs(args.sleep_max_secs, &sleep_dur_secs_history);
             // Clear conversation history at sleep entry (R2 — wake-local by design).
             if let Some(ref mut dec) = decoder {
                 dec.clear_conversation();
@@ -2028,33 +2008,24 @@ pub async fn run() -> Result<()> {
                         somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
                     // S6: update wake-duration EWMA (per-cycle α=0.3; ADR 0024).
-                    const WAKE_EWMA_ALPHA: f32 = 0.3;
-                    wake_ewma_mu = if wake_ewma_n == 0 {
-                        this_wake_secs
-                    } else {
-                        WAKE_EWMA_ALPHA * this_wake_secs + (1.0 - WAKE_EWMA_ALPHA) * wake_ewma_mu
-                    };
-                    wake_ewma_n += 1;
+                    update_wake_ewma(this_wake_secs, &mut wake_ewma_mu, &mut wake_ewma_n);
                     if let Err(e) = save_wake_ewma(wake_ewma_mu, wake_ewma_n, &args.memory_dir) {
                         tracing::warn!(?e, "wake_ewma save failed");
                         somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
                     // Recompute max_wake from updated EWMA (floor until n≥3).
-                    let new_max_secs = if wake_ewma_n >= 3 {
-                        wake_ewma_floor.max((3.0 * wake_ewma_mu) as u64)
-                    } else {
-                        wake_ewma_floor
-                    };
-                    max_wake = Duration::from_secs(new_max_secs);
+                    max_wake = Duration::from_secs(recompute_max_wake_secs(
+                        wake_ewma_mu,
+                        wake_ewma_n,
+                        wake_ewma_floor,
+                    ));
                     // Dissipate wakefulness pressure by NREM consolidation quality (ADR 0024 S3).
                     // Prefer within-session gist (clean signal); fall back to cross-session at c1.
-                    let consolidation = (0.5
-                        * stats
-                            .within_session_gist_rate
-                            .or(stats.gist_recall_rate)
-                            .unwrap_or(0.0))
-                    .clamp(0.0, 0.5);
-                    wakefulness_pressure = (wakefulness_pressure - consolidation).max(0.0);
+                    wakefulness_pressure = dissipate_wakefulness_pressure(
+                        wakefulness_pressure,
+                        stats.within_session_gist_rate,
+                        stats.gist_recall_rate,
+                    );
                     sleep_cycle_count += 1;
                     somnus_metrics::counted_core!(
                         somnus_metrics::Metric::ProcessRssBytes,
@@ -2101,22 +2072,8 @@ pub async fn run() -> Result<()> {
                     // for 3 consecutive cycles; drops back to base when any cycle < 0.40.
                     // Disabled in static per-region mode (--prior-beta-regions).
                     if prior_beta_regions_static.is_none() && args.prior_beta < 0.05 {
-                        let global_cosine: Option<f64> = {
-                            let vals: Vec<f64> = (0..5)
-                                .filter_map(|i| {
-                                    if prior_cosine_counts[i] > 0 {
-                                        Some(prior_cosine_sums[i] / prior_cosine_counts[i] as f64)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            if vals.is_empty() {
-                                None
-                            } else {
-                                Some(vals.iter().sum::<f64>() / vals.len() as f64)
-                            }
-                        };
+                        let global_cosine: Option<f64> =
+                            global_prior_cosine(&prior_cosine_sums, &prior_cosine_counts);
                         s4_ring[s4_ring_pos % 3] = global_cosine;
                         s4_ring_pos += 1;
                         if let Some(c) = global_cosine {
@@ -2128,7 +2085,7 @@ pub async fn run() -> Result<()> {
                                     "S4: prior-beta scaled down to base (< 0.40)"
                                 );
                             } else if !s4_beta_active && s4_ring_pos >= 3 {
-                                let all_high = s4_ring.iter().all(|v| v.is_some_and(|x| x > 0.65));
+                                let all_high = s4_ring_all_high(&s4_ring);
                                 if all_high {
                                     s4_beta_active = true;
                                     perception.set_prior_beta(0.05);
@@ -3471,6 +3428,122 @@ fn forward_frames_blocking<T: Send>(src: Receiver<T>, tx: Sender<T>) -> bool {
     true // source exhausted normally
 }
 
+// ── pure logic extracted from run()'s orchestration shell ──────────────────────
+
+/// Parses `--prior-beta-regions`'s five comma-separated floats.
+fn parse_prior_beta_regions(s: &str) -> Result<[f32; 5]> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 5 {
+        anyhow::bail!("--prior-beta-regions requires exactly 5 comma-separated floats");
+    }
+    let mut betas = [0.0f32; 5];
+    for (i, p) in parts.iter().enumerate() {
+        betas[i] = p
+            .trim()
+            .parse::<f32>()
+            .with_context(|| format!("--prior-beta-regions: cannot parse '{}' as f32", p.trim()))?;
+    }
+    Ok(betas)
+}
+
+/// Which trigger (if any) fires the sleep transition, and whether to sleep at
+/// all. `sleep_trigger` falls back to "schedule" whenever none of the other
+/// three fired but `should_sleep` is true — that combination is only
+/// reachable via `schedule_hit`.
+fn decide_should_sleep(
+    high_water_hit: bool,
+    schedule_hit: bool,
+    perf_degradation_hit: bool,
+    pressure_hit: bool,
+) -> (bool, &'static str) {
+    let should_sleep = high_water_hit || schedule_hit || perf_degradation_hit || pressure_hit;
+    let trigger = if high_water_hit {
+        "high_water"
+    } else if pressure_hit {
+        "pressure"
+    } else if perf_degradation_hit {
+        "perf_degradation"
+    } else {
+        "schedule"
+    };
+    (should_sleep, trigger)
+}
+
+/// P1b auto `--sleep-max-secs`: an explicit override wins; otherwise cap at
+/// `max(300, 3 * mean(history))`, or 0 (no cap) before any history exists.
+fn compute_effective_sleep_max_secs(
+    configured: u64,
+    history: &std::collections::VecDeque<f64>,
+) -> u64 {
+    if configured > 0 {
+        configured
+    } else if history.is_empty() {
+        0
+    } else {
+        let mean = history.iter().sum::<f64>() / history.len() as f64;
+        (mean * 3.0).max(300.0) as u64
+    }
+}
+
+const WAKE_EWMA_ALPHA: f32 = 0.3;
+
+/// S6: per-cycle EWMA of wake duration (ADR 0024).
+fn update_wake_ewma(this_wake_secs: f32, mu: &mut f32, n: &mut u64) {
+    *mu = if *n == 0 {
+        this_wake_secs
+    } else {
+        WAKE_EWMA_ALPHA * this_wake_secs + (1.0 - WAKE_EWMA_ALPHA) * *mu
+    };
+    *n += 1;
+}
+
+/// Recomputes `max_wake` from the wake-duration EWMA, floored until `n >= 3`.
+fn recompute_max_wake_secs(wake_ewma_mu: f32, wake_ewma_n: u64, wake_ewma_floor: u64) -> u64 {
+    if wake_ewma_n >= 3 {
+        wake_ewma_floor.max((3.0 * wake_ewma_mu) as u64)
+    } else {
+        wake_ewma_floor
+    }
+}
+
+/// S3: dissipates wakefulness pressure by NREM consolidation quality. Prefers
+/// within-session gist (clean signal); falls back to cross-session at c1.
+fn dissipate_wakefulness_pressure(
+    pressure: f32,
+    within_session_gist_rate: Option<f32>,
+    gist_recall_rate: Option<f32>,
+) -> f32 {
+    let consolidation =
+        (0.5 * within_session_gist_rate.or(gist_recall_rate).unwrap_or(0.0)).clamp(0.0, 0.5);
+    (pressure - consolidation).max(0.0)
+}
+
+/// S4: mean of per-region prior-cosine means (regions with zero samples are
+/// excluded, not treated as zero).
+fn global_prior_cosine(sums: &[f64; 5], counts: &[usize; 5]) -> Option<f64> {
+    let vals: Vec<f64> = (0..5)
+        .filter_map(|i| {
+            if counts[i] > 0 {
+                Some(sums[i] / counts[i] as f64)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if vals.is_empty() {
+        None
+    } else {
+        Some(vals.iter().sum::<f64>() / vals.len() as f64)
+    }
+}
+
+/// S4: true once the 3-cycle ring is full of cosines all above the scale-up
+/// threshold (0.65). `None` slots (not-yet-filled ring positions) count as
+/// not-high.
+fn s4_ring_all_high(ring: &[Option<f64>; 3]) -> bool {
+    ring.iter().all(|v| v.is_some_and(|x| x > 0.65))
+}
+
 #[cfg(test)]
 mod ort_crossover_tests {
     use super::should_use_ort_inference;
@@ -4173,5 +4246,197 @@ mod main_helpers_tests {
         // Must return (not hang) once the downstream is gone, regardless of how
         // many source frames remain.
         forward_frames(src_rx, dst_tx, drain_rx);
+    }
+
+    // ── parse_prior_beta_regions ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_prior_beta_regions_accepts_five_floats() {
+        let betas = parse_prior_beta_regions("0.05,0.04,0.03,0.05,0.01").unwrap();
+        assert_eq!(betas, [0.05, 0.04, 0.03, 0.05, 0.01]);
+    }
+
+    #[test]
+    fn parse_prior_beta_regions_trims_whitespace() {
+        let betas = parse_prior_beta_regions(" 0.1 , 0.2, 0.3 ,0.4,0.5").unwrap();
+        assert_eq!(betas, [0.1, 0.2, 0.3, 0.4, 0.5]);
+    }
+
+    #[test]
+    fn parse_prior_beta_regions_rejects_wrong_count() {
+        assert!(parse_prior_beta_regions("0.1,0.2,0.3").is_err());
+        assert!(parse_prior_beta_regions("0.1,0.2,0.3,0.4,0.5,0.6").is_err());
+    }
+
+    #[test]
+    fn parse_prior_beta_regions_rejects_non_numeric() {
+        assert!(parse_prior_beta_regions("a,0.2,0.3,0.4,0.5").is_err());
+    }
+
+    // ── decide_should_sleep ───────────────────────────────────────────────────
+
+    #[test]
+    fn decide_should_sleep_no_trigger_means_no_sleep() {
+        let (should, _) = decide_should_sleep(false, false, false, false);
+        assert!(!should);
+    }
+
+    #[test]
+    fn decide_should_sleep_high_water_takes_priority() {
+        let (should, trigger) = decide_should_sleep(true, true, true, true);
+        assert!(should);
+        assert_eq!(trigger, "high_water");
+    }
+
+    #[test]
+    fn decide_should_sleep_pressure_beats_perf_and_schedule() {
+        let (should, trigger) = decide_should_sleep(false, true, true, true);
+        assert!(should);
+        assert_eq!(trigger, "pressure");
+    }
+
+    #[test]
+    fn decide_should_sleep_perf_degradation_beats_schedule() {
+        let (should, trigger) = decide_should_sleep(false, true, true, false);
+        assert!(should);
+        assert_eq!(trigger, "perf_degradation");
+    }
+
+    #[test]
+    fn decide_should_sleep_schedule_is_the_fallback() {
+        let (should, trigger) = decide_should_sleep(false, true, false, false);
+        assert!(should);
+        assert_eq!(trigger, "schedule");
+    }
+
+    // ── compute_effective_sleep_max_secs ──────────────────────────────────────
+
+    #[test]
+    fn effective_sleep_max_secs_configured_override_wins() {
+        let history = std::collections::VecDeque::from([10.0, 20.0]);
+        assert_eq!(compute_effective_sleep_max_secs(42, &history), 42);
+    }
+
+    #[test]
+    fn effective_sleep_max_secs_no_cap_before_any_history() {
+        let history = std::collections::VecDeque::new();
+        assert_eq!(compute_effective_sleep_max_secs(0, &history), 0);
+    }
+
+    #[test]
+    fn effective_sleep_max_secs_floors_at_300() {
+        let history = std::collections::VecDeque::from([10.0, 20.0]); // mean=15, *3=45 < 300
+        assert_eq!(compute_effective_sleep_max_secs(0, &history), 300);
+    }
+
+    #[test]
+    fn effective_sleep_max_secs_scales_above_floor() {
+        let history = std::collections::VecDeque::from([200.0, 200.0]); // mean=200, *3=600
+        assert_eq!(compute_effective_sleep_max_secs(0, &history), 600);
+    }
+
+    // ── update_wake_ewma / recompute_max_wake_secs ────────────────────────────
+
+    #[test]
+    fn update_wake_ewma_first_sample_sets_mu_directly() {
+        let mut mu = 0.0;
+        let mut n = 0u64;
+        update_wake_ewma(120.0, &mut mu, &mut n);
+        assert_eq!(mu, 120.0);
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn update_wake_ewma_blends_subsequent_samples() {
+        let mut mu = 100.0;
+        let mut n = 1u64;
+        update_wake_ewma(200.0, &mut mu, &mut n);
+        assert_eq!(mu, 0.3 * 200.0 + 0.7 * 100.0);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn recompute_max_wake_secs_uses_floor_before_n_reaches_3() {
+        assert_eq!(recompute_max_wake_secs(1000.0, 2, 300), 300);
+    }
+
+    #[test]
+    fn recompute_max_wake_secs_uses_ewma_once_n_reaches_3() {
+        assert_eq!(recompute_max_wake_secs(200.0, 3, 300), 600); // 3*200=600 > floor
+        assert_eq!(recompute_max_wake_secs(10.0, 3, 300), 300); // 3*10=30 < floor, floor wins
+    }
+
+    // ── dissipate_wakefulness_pressure ────────────────────────────────────────
+
+    #[test]
+    fn dissipate_wakefulness_pressure_prefers_within_session_rate() {
+        let p = dissipate_wakefulness_pressure(0.9, Some(1.0), Some(0.0));
+        // consolidation = clamp(0.5*1.0, 0, 0.5) = 0.5
+        assert!((p - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dissipate_wakefulness_pressure_falls_back_to_cross_session() {
+        let p = dissipate_wakefulness_pressure(0.9, None, Some(0.2));
+        // consolidation = clamp(0.5*0.2, 0, 0.5) = 0.1
+        assert!((p - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dissipate_wakefulness_pressure_never_goes_negative() {
+        let p = dissipate_wakefulness_pressure(0.1, Some(1.0), None);
+        assert_eq!(p, 0.0);
+    }
+
+    #[test]
+    fn dissipate_wakefulness_pressure_zero_with_no_gist_data() {
+        let p = dissipate_wakefulness_pressure(0.5, None, None);
+        assert_eq!(p, 0.5);
+    }
+
+    // ── global_prior_cosine ────────────────────────────────────────────────────
+
+    #[test]
+    fn global_prior_cosine_none_when_all_counts_zero() {
+        assert_eq!(global_prior_cosine(&[0.0; 5], &[0; 5]), None);
+    }
+
+    #[test]
+    fn global_prior_cosine_excludes_zero_count_regions_from_mean() {
+        // Only regions 0 and 2 have samples: means 0.8 and 0.4 -> mean 0.6.
+        let sums = [0.8, 0.0, 0.4, 0.0, 0.0];
+        let counts = [1, 0, 1, 0, 0];
+        let g = global_prior_cosine(&sums, &counts).unwrap();
+        assert!((g - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn global_prior_cosine_averages_per_region_means() {
+        let sums = [4.0, 6.0];
+        let mut sums5 = [0.0; 5];
+        sums5[..2].copy_from_slice(&sums);
+        let counts = [2usize, 3usize];
+        let mut counts5 = [0usize; 5];
+        counts5[..2].copy_from_slice(&counts);
+        // region means: 4/2=2.0, 6/3=2.0 -> mean of means 2.0
+        let g = global_prior_cosine(&sums5, &counts5).unwrap();
+        assert!((g - 2.0).abs() < 1e-9);
+    }
+
+    // ── s4_ring_all_high ───────────────────────────────────────────────────────
+
+    #[test]
+    fn s4_ring_all_high_true_when_all_above_threshold() {
+        assert!(s4_ring_all_high(&[Some(0.7), Some(0.9), Some(0.66)]));
+    }
+
+    #[test]
+    fn s4_ring_all_high_false_with_any_none_slot() {
+        assert!(!s4_ring_all_high(&[Some(0.9), None, Some(0.9)]));
+    }
+
+    #[test]
+    fn s4_ring_all_high_false_when_one_below_threshold() {
+        assert!(!s4_ring_all_high(&[Some(0.9), Some(0.65), Some(0.9)]));
     }
 }
