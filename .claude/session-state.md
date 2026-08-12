@@ -1,5 +1,50 @@
 # Session state — somnus
 
+> **⏸️ SHUTDOWN (clean), 2026-08-13.** Continuation of the 2026-08-12 session below (dependency
+> upgrade/trim sweep) into the user's "test every function properly" push.
+> - **Dependency sweep wrap-up (start of this session):** advisor review of the prior session's 45
+>   new `somnus/main.rs` tests caught two real issues, both fixed and committed (`f98e670`):
+>   `current_process_rss_bytes` test now skips rather than fails on a 0 RSS reading (environment-
+>   dependent, same pattern as `ort_grown_region.rs`'s artifact-skip), and the `forward_frames`
+>   "drops oldest when full" test was rewritten — the original used an unrelated `drain` channel and
+>   only ever exercised the no-drop path; real call sites (e.g. `audio_drain = audio_cb_rx.clone()`)
+>   pass `drain` as a clone of `dst`'s own receiver, so draining actually frees a slot in `dst`
+>   itself. Fixed to model that correctly; confirms the drop path really does work (oldest frame
+>   discarded via drain, newest still lands downstream).
+> - **`somnus` split into `src/lib.rs` + thin `src/main.rs`** (`01581f6`), per explicit user choice
+>   (asked via AskUserQuestion: lib-split-first vs. skip-main-extraction vs. stop). All logic (mods,
+>   `Args`, helpers, the ~2000-line orchestration loop, all existing tests) moved into `lib.rs` as
+>   `pub async fn run()`; `main.rs` is now a 4-line `#[tokio::main]` entry point calling `somnus::run()`.
+>   This unblocks `cargo test -p somnus --lib` (previously impossible — no lib target existed) and gives
+>   future extractions somewhere to land instead of piling onto one ever-growing file. No behavior
+>   change: verified via full workspace build/clippy/fmt/test plus a real `somnus --help` run.
+> - **8 pure functions extracted from `run()`'s sleep-trigger/EWMA/S4-controller logic and unit
+>   tested** (`66c23a0`): `parse_prior_beta_regions` (CLI CSV parsing), `decide_should_sleep`
+>   (high_water/pressure/perf/schedule trigger priority), `compute_effective_sleep_max_secs` (P1b
+>   auto-cap), `update_wake_ewma`/`recompute_max_wake_secs` (S6), `dissipate_wakefulness_pressure`
+>   (S3), `global_prior_cosine` (S4 per-region mean-of-means), `s4_ring_all_high` (S4 3-cycle gate).
+>   27 new tests (`somnus` lib: 64 → 91). Verified via full build/clippy/fmt/test plus a real
+>   `somnus --prior-beta-regions` smoke run confirming both the valid-input and error paths are
+>   byte-identical to pre-extraction behavior.
+> - **Most of the remaining ~2000 lines in `run()` is I/O/setup wiring (channel construction, thread
+>   spawning, model loading), not pure logic** — diminishing returns from digging further there.
+>   Flagged to the user as a checkpoint; they chose to stop the session here rather than continue
+>   into `somnus-encoding`/`whisper_asr.rs`/`somnus-metrics` (the advisor-recommended next targets, still
+>   0-3 tests each) or keep digging in `run()`.
+> - **Next-session entry point:** the "test every function" push is paused, not finished. Highest-
+>   value remaining gaps, in priority order per the advisor's read: (1) `somnus-encoding` — 0 unit
+>   tests on the lib itself, including `resample.rs` (touched this same broader work-session for the
+>   rubato 3→5 major-version bump, verified only via a manual smoke run, never unit tested); (2)
+>   `whisper_asr.rs` — 0 tests, on every request's critical path; (3) `somnus-metrics` — only 3-5 tests
+>   for a 67-variant `Metric` enum, a proptest round-trip over `as_index()`/`name()` uniqueness would
+>   be cheap and mechanical. Ask which of these (or continuing deeper into `run()`) is next.
+> - **Not committed:** nothing outstanding — working tree clean, all three commits above pushed to
+>   local `main` only (not asked to push this session; last confirmed push to `origin/main` was
+>   `3d785d8` per the prior session's summary — check `git status`/`git log origin/main..HEAD` before
+>   assuming push state next session).
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean), 2026-08-12.** Continuation of the 2026-08-11 session below: implemented
 > AND deployed the queued sparse-gather binding-graph rewrite to the live production campaign.
 > Committed as `19e0f52`, `3949b52`, `ad69560` (ADR 0040,
