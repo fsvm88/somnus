@@ -15,7 +15,7 @@ impl SincResampler {
         let ratio = out_rate as f64 / in_rate as f64;
         let params = SincInterpolationParameters {
             sinc_len: 256,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256,
             window: WindowFunction::BlackmanHarris2,
@@ -30,7 +30,7 @@ impl SincResampler {
     pub fn process(&mut self, input: &[f32]) -> anyhow::Result<Vec<f32>> {
         let in_buf = InterleavedSlice::new(input, 1, input.len())
             .map_err(|e| anyhow::anyhow!("rubato in_buf: {e}"))?;
-        let out = self.inner.process(&in_buf, 0, None)?;
+        let out = self.inner.process(&in_buf, None)?;
         Ok(out.take_data())
     }
 }

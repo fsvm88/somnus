@@ -11,8 +11,8 @@ ffmpeg-next        = "9"
 ndarray            = "0.17"
 rayon              = "1.12"
 nokhwa             = { version = "0.10", features = ["input-native"] }
-ort                = { version = "2.0.0-rc.12", features = ["load-dynamic", "ndarray"] }
-rubato             = "3.0"
+ort                = { version = "2.0.0-rc.13", features = ["load-dynamic", "ndarray"] }
+rubato             = "5.0"
 rustfft            = "6"
 thiserror          = "2"
 tokio              = { version = "1", features = ["full"] }
