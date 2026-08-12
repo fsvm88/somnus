@@ -91,3 +91,4 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 | [0037](0037-auto-onnx-perception-inference.md) | Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover | accepted |
 | [0038](0038-sparse-encoder-scoring.md) | Sparse (hierarchical) k-WTA encoder scoring for the next scale order | proposed |
 | [0039](0039-unified-metrics-instrumentation.md) | Unified two-tier metrics instrumentation (`somnus-metrics`) | implemented |
+| [0040](0040-sparse-gather-binding-projection.md) | Sparse-gather binding projection (ONNX/MIGraphX) | implemented (pending live campaign deploy) |

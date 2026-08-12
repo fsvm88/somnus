@@ -1176,15 +1176,20 @@ the same `O(d_input × n_units)` computation as `KWtaLayer::forward`'s `self.lin
 already a Core metric (`crates/somnus-perception/src/onnx_session.rs:68`), firing once per wake
 episode for the whole 5-region step (not per-region). Over the last 10 recorded cycles at
 ~9,400-9,493 units/region: **~0.85-1.8ms per call** (mean ~1.28ms across 1,585 calls, session
-`campaign_growth10x`). For comparison, `OrtRunBinding` (the fixed-size, region-count-independent
-GRU+attention step) costs **2-3× more per call** at the same scale — binding `total_ns` runs
-consistently 2-3.3× encoder `total_ns` per cycle in the raw data. Encoder+binding together account
-for 28-73% of `perception_total_ms` across sampled cycles (wide variance likely reflects
-ASR/video decode load competing for CPU in the same window, not the ORT calls themselves changing
-cost).
+`campaign_growth10x`). For comparison, `OrtRunBinding` costs **2-3× more per call** at the same
+scale — binding `total_ns` runs consistently 2-3.3× encoder `total_ns` per cycle in the raw data.
+Encoder+binding together account for 28-73% of `perception_total_ms` across sampled cycles (wide
+variance likely reflects ASR/video decode load competing for CPU in the same window, not the ORT
+calls themselves changing cost). **Correction (2026-08-12, §30/ADR 0040): this section originally
+called `OrtRunBinding` "the fixed-size, region-count-independent GRU+attention step" — that
+undercounted it. The graph as exported also ran a dense, `n_units`-scaling region-projection
+matmul that turned out to be 75-76% of `OrtRunBinding`'s own cost at this scale (§30), not the
+GRU+attention part. Since fixed by a sparse-gather rewrite (ADR 0040, 54-59% reduction measured);
+the 2-3× comparison above predates that fix.**
 
 **Read on prerequisite 2 (deferred to a separate pass, not resolved here):** at *this* scale, the
-encoder matmul is cheap and is not even the largest ORT cost — the fixed-size binding graph is.
+encoder matmul is cheap and is not even the largest ORT cost — the binding graph is (see §30's
+correction above on what was actually driving that cost).
 A 10x further region-size increase (mouse-order, per `research/brain-scale-comparison.md`) would
 scale the encoder matmul roughly 10x (~10-18ms/call) while binding stays flat, so the balance would
 shift toward the encoder mattering more — but that's prerequisite 2's question ("does this matter
@@ -1218,7 +1223,8 @@ planned next step past it.
 
 **Combined with §28: doesn't matter yet, at the scale actually in flight.** §28 already showed the
 encoder scoring cost is small (~1.28ms/call) and not even the dominant ORT cost at honeybee-order
-scale (~9,493 units/region) — the fixed-size binding graph costs more. Since honeybee-order is also
+scale (~9,493 units/region) — the binding graph costs more (see §30 for a 2026-08-12 correction on
+what was actually driving that cost, since fixed). Since honeybee-order is also
 the actual target (not a milestone en route to something bigger that's already been decided),
 prerequisite 2 resolves negative: **hierarchical WTA is not worth building for the campaign this
 project is actually running.**
@@ -1249,7 +1255,94 @@ No code changes.
 
 ---
 
-## Priority order (as of 2026-07-11)
+## §30 — Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040 — correction to §28/§29
+
+**Correction to §28/§29's "fixed-size, region-count-independent" characterization of
+`OrtRunBinding`.** Both sections described the binding graph's GRU+attention step as independent of
+region size. That's true of the GRU/attention nodes themselves, but not of the graph as a whole:
+`build_binding_graph` (`scripts/export_perception_graph.py`) also ran each region's projection,
+`sp_i [1, n_units] @ W_region_i [n_units, D_PROJ]` — a dense matmul that **does** scale with
+`n_units`, and (per the benchmark below) was the dominant cost inside `OrtRunBinding` at campaign
+scale, not the GRU+attention part §28/§29 attributed the whole cost to. The "region-count-
+independent" framing should have said "GRU+attention is region-count-independent; the region
+*projection* isn't" — this section is that correction, on top of implementing the fix.
+
+**Implemented the sparse-gather rewrite queued at the end of the previous session** (§25's
+already-shipped burn/CPU-path fix, ported to the ONNX/MIGraphX binding graph): replaced each
+region's dense `sp_i @ W_region_i` with `Gather(W_region_i, active_idx_i, axis=0)` followed by a
+`[1,k] @ [k,D_PROJ]` weighted-sum matmul over only the k_active active rows — mathematically
+identical to the dense form (every other row contributes exactly zero) but reads `~k/n_units` of
+the weight matrix per call instead of all of it.
+
+**MIGraphX probe (the one open unknown from the previous session):** extended
+`experiments/migraphx-op-probe/probe.py` with a `Gather` fed by a runtime int64 index input (not
+an initializer), at campaign scale (n=9,660, k=190). **PASS**, max abs diff 1.49e-07 — clean on
+this MIGraphX/gfx1201 setup.
+
+**Design detail found during implementation (not anticipated going in):** the natural design used
+a `Reshape` node to turn `active_val_i`'s `[k]` graph input into `[1,k]` for the matmul. That
+combination triggered a genuine MIGraphX compiler bug (`simplify_reshapes: cannot create
+std::vector larger than max_size()`, a crash inside MIGraphX's own graph-simplification pass, not
+an ORT or somnus bug) — orthogonal to the Gather-index question the probe checked. Fixed by declaring
+`active_val_i` as a `[1,k]` graph input directly, eliminating the `Reshape` node entirely. No
+functional change, but confirms probing one op in isolation doesn't guarantee the exact node
+combination a real graph needs is clean — the real graph's own numerical-parity check (next) is
+what actually caught this.
+
+**Numerical parity: exact, both CPU and MIGraphX EP, both baseline and campaign scale.**
+`scripts/export_perception_graph.py --validate-numpy --validate-migraphx` (baseline, n=1024) and a
+standalone campaign-scale check (n=9,660, k=190, not committed as a script — ad hoc verification)
+both diff against the dense `numpy_binding` reference at ~1e-8, not the 1e-3 tolerance the harness
+allows. `numpy_binding` was deliberately kept in its original dense form as the reference (not
+also rewritten to Gather) so the parity check proves equivalence to the pre-rewrite computation,
+not just self-consistency of the new code.
+
+**Measured win: real and large, confirmed via a 3rd arm added to the already-committed
+`scripts/bench_binding_projection.py`.** At campaign scale (n_units=9,660, k_active=189) on the
+real `MIGraphXExecutionProvider`, two reruns:
+
+| arm | run 1 | run 2 |
+|---|---|---|
+| full (dense projection + GRU + attention) | 0.856 ms/call | 0.853 ms/call |
+| gather (sparse-gather projection + GRU + attention) | 0.393 ms/call | 0.350 ms/call |
+| projected (GRU + attention only, lower bound) | 0.289 ms/call | 0.276 ms/call |
+| **headline: full → gather** | **54.1% reduction** | **59.0% reduction** |
+
+Roughly a 2.2-2.4× speedup on `OrtRunBinding`'s per-call cost at campaign scale, stable across
+reruns. This also is the answer to §29's stated trigger condition ("binding-side wins land that
+shrink `OrtRunBinding` further") — recorded here rather than re-litigating §29's status, since the
+trigger was about the encoder-vs-binding balance shifting, and this makes binding cheaper, which
+if anything pushes further *away* from hierarchical-WTA urgency, not toward it.
+
+**Rust caller contract change:** `SparseActivation` gained `to_exact_k(k) -> (Vec<i64>, Vec<f32>)`
+(`region.rs`) — pads with `(index 0, value 0.0)` or truncates to exactly `k`, one helper covering
+both edge cases the previous session flagged (the `lang_zero` placeholder for a missing modality,
+and any future dense→sparse re-derivation that ties at exactly zero) with no branching on either
+path. `OnnxPerceptionSession::run_binding` (`onnx_session.rs`) now takes `&[SparseActivation; 5]`
+directly instead of `&[Vec<f32>; 5]` dense vectors, and applies `to_exact_k` internally using a new
+per-region `k_active: [usize; 5]` field loaded once at session-load time from
+`weights/weights_manifest.json` (sibling to the `.onnx` file) — **not** recomputed from `n_units`
+in either Rust or Python, since that's exactly the "value re-derived from Rust ground truth drifts"
+bug class gaps.md §17/§22/§24 hit three times already. `PerceptionProcessor::export_weights_for_onnx`
+writes `k_active` straight from each `KWtaLayer`'s live field. All 3 `run_binding` call sites in
+`lib.rs` updated (the `lang_zero`-feeding wake-loop path, and both settle-loop encoder/no-encoder
+paths); `binding_only` (the burn-only validation helper, never on the ORT path) untouched.
+
+**Verified:** `cargo build/test/clippy --workspace` clean for the affected crates (whole-workspace
+build currently blocked by an unrelated pre-existing `ffmpeg-next` version mismatch, not touched by
+this change). `cargo fmt` clean. All `somnus-perception` unit tests pass (3 new `to_exact_k` tests
+added). The `ort_grown_region.rs` integration test's grown-region regression test was rewritten
+(the old one parsed ORT's dense-shape-mismatch error message to find the graph's expected size —
+that mechanism no longer exists under the new fixed-`k` contract) to instead prove the new
+contract directly: a deliberately mismatched-length `SparseActivation` still round-trips correctly
+through `run_binding`. Both integration tests correctly skip (not fail) against the live campaign's
+still-pre-rewrite on-disk ONNX artifact, which needs a `rebuild_ort_session` to pick up the new
+manifest format — not yet done to the actual campaign, see below.
+
+**Not yet done:** a live `OrtRunBinding` before/after A/B against the real `OrtRunBinding` Core
+metric (the synthetic benchmark above stands in for this for now), and deploying the rewrite to the
+live 98.3%-to-target growth campaign — deliberately not done without asking first, since it mutates
+a long-running production run's on-disk ONNX artifacts. Full design and status: ADR 0040.
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
 > order. Table numbering used to drift from the section headers — corrected 2026-07-11; if you're

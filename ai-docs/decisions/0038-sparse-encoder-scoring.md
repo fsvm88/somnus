@@ -62,9 +62,15 @@ session doesn't re-litigate the three-way comparison, not a commitment to build 
    dense matmul as the `burn` path — no sparsity or gating applied before scoring. But the live
    wake-path cost, measured from the production campaign's `OrtRunEncoder` Core metric at
    ~9,400-9,493 units/region, is small in absolute terms (~1.28ms/call mean) and is not even the
-   dominant ORT cost — the fixed-size `OrtRunBinding` graph costs 2-3× more per call at this scale.
-   This is evidence for (not proof of) the "ORT/GPU already absorbs the wasted FLOPs" invalidation
-   condition below, at *current* scale specifically — does not resolve prerequisite 2.
+   dominant ORT cost — `OrtRunBinding` costs 2-3× more per call at this scale. **Correction
+   (2026-08-12, `gaps.md` §30 / ADR 0040): `OrtRunBinding` was mischaracterized here as
+   "fixed-size, region-count-independent" — the GRU/attention nodes are, but the graph as
+   exported also ran a dense region-projection matmul that scales with `n_units`, and was in fact
+   75-76% of `OrtRunBinding`'s own cost at campaign scale. That matmul has since been replaced
+   with a sparse-gather rewrite (ADR 0040), so the finding here (binding costs more than encoder)
+   still holds, and now holds by a smaller, gather-rewrite-reduced margin.** This is evidence for
+   (not proof of) the "ORT/GPU already absorbs the wasted FLOPs" invalidation condition below, at
+   *current* scale specifically — does not resolve prerequisite 2.
 2. **Confirm this matters at the scale actually being targeted. RESOLVED 2026-07-15 — see
    `gaps.md` §29.** It doesn't, yet. `gaps.md` §16 states the growth campaign's own goal
    explicitly as honeybee-order (~9,660 units/region), *not* mouse-order — and there is no

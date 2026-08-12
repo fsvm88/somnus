@@ -75,6 +75,21 @@ impl SparseActivation {
         }
         out
     }
+
+    /// Indices/values padded (with `(0, 0.0)`) or truncated to exactly `k` entries —
+    /// the ONNX binding graph's sparse-gather inputs have static shape `[k]`, so
+    /// every caller of `run_binding` must supply exactly `k` regardless of how
+    /// many units are genuinely active (e.g. the `lang_zero` placeholder for a
+    /// missing modality, or a dense→sparse re-derivation that ties at exactly
+    /// zero). A padding row of `(index 0, value 0.0)` contributes exactly nil
+    /// through the Gather + weighted-sum binding rewrite.
+    pub fn to_exact_k(&self, k: usize) -> (Vec<i64>, Vec<f32>) {
+        let mut idx: Vec<i64> = self.indices.iter().take(k).map(|&i| i as i64).collect();
+        let mut val: Vec<f32> = self.values.iter().take(k).copied().collect();
+        idx.resize(k, 0);
+        val.resize(k, 0.0);
+        (idx, val)
+    }
 }
 
 /// k-WTA linear layer with per-unit duty-cycle boosting.
@@ -417,5 +432,46 @@ mod tests {
         assert_eq!(dense.len(), 512);
         assert_eq!(dense[0], 1.0);
         assert!(dense.iter().skip(1).all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn to_exact_k_pads_when_short() {
+        let act = SparseActivation {
+            region: RegionId::Language,
+            indices: vec![],
+            values: vec![],
+            n_units: 1024,
+        };
+        let (idx, val) = act.to_exact_k(20);
+        assert_eq!(idx.len(), 20);
+        assert_eq!(val.len(), 20);
+        assert!(idx.iter().all(|&i| i == 0));
+        assert!(val.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn to_exact_k_truncates_when_long() {
+        let act = SparseActivation {
+            region: RegionId::Visual,
+            indices: vec![0, 1, 2, 3],
+            values: vec![1.0, 2.0, 3.0, 4.0],
+            n_units: 1024,
+        };
+        let (idx, val) = act.to_exact_k(2);
+        assert_eq!(idx, vec![0, 1]);
+        assert_eq!(val, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn to_exact_k_passes_through_when_exact() {
+        let act = SparseActivation {
+            region: RegionId::AudioSpeech,
+            indices: vec![5, 10],
+            values: vec![1.5, 2.5],
+            n_units: 1024,
+        };
+        let (idx, val) = act.to_exact_k(2);
+        assert_eq!(idx, vec![5, 10]);
+        assert_eq!(val, vec![1.5, 2.5]);
     }
 }

@@ -8,6 +8,7 @@ use std::path::Path;
 use ndarray::{Array2, Array3};
 use ort::{session::Session, value::TensorRef};
 
+use crate::region::SparseActivation;
 use crate::{ENV_DIM, EPISODE_DIM, LANG_HIDDEN};
 
 const GRU_HIDDEN: usize = 256;
@@ -21,6 +22,13 @@ pub struct OnnxPerceptionSession {
     sess_bind: Session,
     sess_enc: Option<Session>, // Phase 1.5: encoder session
     pub gru_hidden: Vec<f32>,
+    /// Per-region active-unit count baked into the binding graph's sparse-gather
+    /// inputs at export time ([speech, env, visual, symbolic, language] order).
+    /// Read from `weights/weights_manifest.json` (sibling to `bind_path`) at load
+    /// time — never recomputed from n_units in this Rust caller either, since
+    /// Rust's own `KWtaLayer::k_active` field (not `scaled_k(n_units)`) is what
+    /// the exported graph's shape actually reflects.
+    k_active: [usize; 5],
 }
 
 impl OnnxPerceptionSession {
@@ -32,10 +40,12 @@ impl OnnxPerceptionSession {
         } else {
             cpu_session(bind_path)?
         };
+        let k_active = load_k_active(bind_path)?;
         Ok(Self {
             sess_bind: sess,
             sess_enc: None,
             gru_hidden: vec![0.0f32; GRU_HIDDEN],
+            k_active,
         })
     }
 
@@ -112,42 +122,64 @@ impl OnnxPerceptionSession {
 
     /// Run the binding graph.
     ///
-    /// `sparse_z`:   5 dense [N_UNITS] vectors from burn k-WTA → dense conversion
-    /// `prev_ep`:    previous episode [EPISODE_DIM]; zeros for first call
+    /// `sparse`:   5 region k-WTA activations, in [speech, env, visual, symbolic,
+    ///             language] order. Each is padded/truncated to this session's
+    ///             per-region `k_active` (see `SparseActivation::to_exact_k`) to
+    ///             match the static shape the binding graph's Gather inputs were
+    ///             exported with — callers do not need to pad themselves.
+    /// `prev_ep`:  previous episode [EPISODE_DIM]; zeros for first call
     ///
     /// Returns new episode [EPISODE_DIM]. Updates `self.gru_hidden`.
     pub fn run_binding(
         &mut self,
-        sparse_z: &[Vec<f32>; 5],
+        sparse: &[SparseActivation; 5],
         prev_ep: &[f32],
     ) -> anyhow::Result<Vec<f32>> {
         let (episode, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::OrtRunBinding, {
-            // Shape from each vector's own length, not the baseline N_UNITS constant — the
-            // ONNX graph's actual input dims match each region's size at export time, which
-            // may be larger than baseline for a grown region (gaps.md §24).
+            let exact: Vec<(Vec<i64>, Vec<f32>)> = (0..5)
+                .map(|i| sparse[i].to_exact_k(self.k_active[i]))
+                .collect();
+
             // Each ndarray must outlive the TensorRef that borrows it.
-            let sp0 = Array2::from_shape_vec((1, sparse_z[0].len()), sparse_z[0].clone())?;
-            let sp1 = Array2::from_shape_vec((1, sparse_z[1].len()), sparse_z[1].clone())?;
-            let sp2 = Array2::from_shape_vec((1, sparse_z[2].len()), sparse_z[2].clone())?;
-            let sp3 = Array2::from_shape_vec((1, sparse_z[3].len()), sparse_z[3].clone())?;
-            let sp4 = Array2::from_shape_vec((1, sparse_z[4].len()), sparse_z[4].clone())?;
+            let idx_arrs: Vec<ndarray::Array1<i64>> = exact
+                .iter()
+                .map(|(idx, _)| ndarray::Array1::from_vec(idx.clone()))
+                .collect();
+            let val_arrs: Vec<Array2<f32>> = exact
+                .iter()
+                .map(|(_, val)| Array2::from_shape_vec((1, val.len()), val.clone()))
+                .collect::<Result<_, _>>()?;
             let prev_arr = Array2::from_shape_vec((1, EPISODE_DIM), prev_ep.to_vec())?;
             let gru_arr = Array3::from_shape_vec((1, 1, GRU_HIDDEN), self.gru_hidden.clone())?;
 
-            let t_sp0 = TensorRef::from_array_view(sp0.view())?;
-            let t_sp1 = TensorRef::from_array_view(sp1.view())?;
-            let t_sp2 = TensorRef::from_array_view(sp2.view())?;
-            let t_sp3 = TensorRef::from_array_view(sp3.view())?;
-            let t_sp4 = TensorRef::from_array_view(sp4.view())?;
+            let t_idx: Vec<TensorRef<'_, i64>> = idx_arrs
+                .iter()
+                .map(|a| TensorRef::from_array_view(a.view()))
+                .collect::<Result<_, _>>()?;
+            let t_val: Vec<TensorRef<'_, f32>> = val_arrs
+                .iter()
+                .map(|a| TensorRef::from_array_view(a.view()))
+                .collect::<Result<_, _>>()?;
+            let [i0, i1, i2, i3, i4]: [TensorRef<'_, i64>; 5] = t_idx
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("expected 5 active_idx tensors"))?;
+            let [v0, v1, v2, v3, v4]: [TensorRef<'_, f32>; 5] = t_val
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("expected 5 active_val tensors"))?;
             let t_prev = TensorRef::from_array_view(prev_arr.view())?;
             let t_gru = TensorRef::from_array_view(gru_arr.view())?;
 
             let outputs = self.sess_bind.run(ort::inputs![
-                "sp_0"         => t_sp0,
-                "sp_1"         => t_sp1,
-                "sp_2"         => t_sp2,
-                "sp_3"         => t_sp3,
-                "sp_4"         => t_sp4,
+                "active_idx_0" => i0,
+                "active_idx_1" => i1,
+                "active_idx_2" => i2,
+                "active_idx_3" => i3,
+                "active_idx_4" => i4,
+                "active_val_0" => v0,
+                "active_val_1" => v1,
+                "active_val_2" => v2,
+                "active_val_3" => v3,
+                "active_val_4" => v4,
                 "prev_episode" => t_prev,
                 "gru_hidden"   => t_gru,
             ])?;
@@ -166,6 +198,31 @@ impl OnnxPerceptionSession {
     pub fn reset_gru(&mut self) {
         self.gru_hidden.fill(0.0);
     }
+}
+
+/// Read the per-region `k_active` list written by
+/// `PerceptionProcessor::export_weights_for_onnx` into
+/// `weights_manifest.json`, from the `weights/` dir sibling to the binding
+/// graph's own directory (same lookup pattern as `with_encoder`'s sibling
+/// `perception_encoder.onnx` search).
+fn load_k_active(bind_path: &Path) -> anyhow::Result<[usize; 5]> {
+    let manifest_path = bind_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("weights")
+        .join("weights_manifest.json");
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", manifest_path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_str(&text)?;
+    let k_active: Vec<usize> = serde_json::from_value(
+        manifest
+            .get("k_active")
+            .ok_or_else(|| anyhow::anyhow!("weights_manifest.json missing \"k_active\""))?
+            .clone(),
+    )?;
+    k_active
+        .try_into()
+        .map_err(|v: Vec<usize>| anyhow::anyhow!("expected 5 k_active entries, got {}", v.len()))
 }
 
 /// MIGraphX EP session via raw C API (matches migraphx_session in crates/somnus/src/main.rs).

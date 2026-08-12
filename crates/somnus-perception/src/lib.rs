@@ -954,19 +954,15 @@ impl PerceptionProcessor {
         let lang = self.latest[4].as_ref().unwrap_or(&lang_zero);
 
         let ep = if let Some(ref mut ort) = self.ort_session {
-            // ORT binding path — use each region's own (possibly grown) size, not the
-            // baseline N_UNITS constant (gaps.md §24: this silently mismatched the ONNX
-            // graph's actual input dims for any region grown past the baseline).
-            let sparse_z: [Vec<f32>; 5] = [
-                sp.to_dense_n(sp.n_units),
-                en.to_dense_n(en.n_units),
-                vi.to_dense_n(vi.n_units),
-                sy.to_dense_n(sy.n_units),
-                lang.to_dense_n(lang.n_units),
-            ];
+            // ORT binding path — each SparseActivation is padded/truncated to the
+            // session's per-region k_active by run_binding itself (gaps.md §24's
+            // n_units-mismatch fix generalized: no dense conversion or size lookup
+            // needed here at all now).
+            let sparse: [SparseActivation; 5] =
+                [sp.clone(), en.clone(), vi.clone(), sy.clone(), lang.clone()];
             let prev_zeros = vec![0.0f32; EPISODE_DIM];
             let prev = latest_episode.map(|v| v.as_slice()).unwrap_or(&prev_zeros);
-            match ort.run_binding(&sparse_z, prev) {
+            match ort.run_binding(&sparse, prev) {
                 Ok(ep_vec) => EpisodeVector(ep_vec),
                 Err(e) => {
                     tracing::warn!(?e, "ORT binding failed; falling back to burn");
@@ -2644,8 +2640,24 @@ impl PerceptionProcessor {
         }
 
         // ── Write manifest ────────────────────────────────────────────────────
-        let manifest_json = serde_json::to_string_pretty(&manifest)
-            .map_err(|e| PerceptionError::Burn(e.to_string()))?;
+        // k_active per region (speech/env/visual/symbolic/language order, matching
+        // W_region_{i}/sp_{i}): the ONNX binding graph's sparse-gather inputs need a
+        // static per-region k baked in at export time. Read directly from each
+        // KWtaLayer's live field rather than recomputed in Python from n_units — this
+        // codebase has hit the "value re-derived in Python drifts from Rust ground
+        // truth" bug three times already (§17, §22, §24).
+        let k_active = [
+            m.speech_layer.k_active,
+            m.env_layer.k_active,
+            m.visual_layer.k_active,
+            m.symbolic_layer.k_active,
+            m.language_layer.k_active,
+        ];
+        let manifest_json = serde_json::to_string_pretty(&serde_json::json!({
+            "tensors": manifest,
+            "k_active": k_active,
+        }))
+        .map_err(|e| PerceptionError::Burn(e.to_string()))?;
         std::fs::write(dir.join("weights_manifest.json"), manifest_json)
             .map_err(|e| PerceptionError::Burn(e.to_string()))?;
 
@@ -2882,24 +2894,19 @@ impl PerceptionProcessor {
                 match enc_result {
                     Ok([z0, z1, z2, z3, z4]) => {
                         // topk_no_dc: immutable model borrow, dropped before binding.
-                        let sparse_z: [Vec<f32>; 5] = {
+                        let sparse: [SparseActivation; 5] = {
                             let m = self.model.as_ref().unwrap();
-                            let a0 = m.speech_layer.topk_from_z_no_dc(z0);
-                            let a1 = m.env_layer.topk_from_z_no_dc(z1);
-                            let a2 = m.visual_layer.topk_from_z_no_dc(z2);
-                            let a3 = m.symbolic_layer.topk_from_z_no_dc(z3);
-                            let a4 = m.language_layer.topk_from_z_no_dc(z4);
                             [
-                                a0.to_dense_n(a0.n_units),
-                                a1.to_dense_n(a1.n_units),
-                                a2.to_dense_n(a2.n_units),
-                                a3.to_dense_n(a3.n_units),
-                                a4.to_dense_n(a4.n_units),
+                                m.speech_layer.topk_from_z_no_dc(z0),
+                                m.env_layer.topk_from_z_no_dc(z1),
+                                m.visual_layer.topk_from_z_no_dc(z2),
+                                m.symbolic_layer.topk_from_z_no_dc(z3),
+                                m.language_layer.topk_from_z_no_dc(z4),
                             ]
                         };
                         // ORT binding — restore hidden so settle doesn't advance live GRU.
                         let ort = self.ort_session.as_mut().unwrap();
-                        match ort.run_binding(&sparse_z, &current.0) {
+                        match ort.run_binding(&sparse, &current.0) {
                             Ok(ep_vec) => {
                                 if let Some(ref h) = saved_hidden {
                                     ort.gru_hidden = h.clone();
@@ -2955,17 +2962,27 @@ impl PerceptionProcessor {
                 } // model borrow dropped
 
                 if use_ort {
-                    // ── Path B: ORT binding ── each region's own (possibly grown) size,
-                    // not the baseline N_UNITS constant (gaps.md §24).
+                    // ── Path B: ORT binding ── missing regions become an empty
+                    // placeholder SparseActivation; run_binding pads it to exactly
+                    // k_active with zero-contribution entries itself.
                     let region_sizes = self.region_sizes();
-                    let sparse_z: [Vec<f32>; 5] = std::array::from_fn(|i| {
-                        acts[i]
-                            .as_ref()
-                            .map(|a| a.to_dense_n(a.n_units))
-                            .unwrap_or_else(|| vec![0.0f32; region_sizes[i]])
+                    let region_ids = [
+                        RegionId::AudioSpeech,
+                        RegionId::AudioEnv,
+                        RegionId::Visual,
+                        RegionId::Symbolic,
+                        RegionId::Language,
+                    ];
+                    let sparse: [SparseActivation; 5] = std::array::from_fn(|i| {
+                        acts[i].clone().unwrap_or_else(|| SparseActivation {
+                            region: region_ids[i],
+                            indices: vec![],
+                            values: vec![],
+                            n_units: region_sizes[i],
+                        })
                     });
                     let ort = self.ort_session.as_mut().unwrap();
-                    match ort.run_binding(&sparse_z, &current.0) {
+                    match ort.run_binding(&sparse, &current.0) {
                         Ok(ep_vec) => {
                             if let Some(ref h) = saved_hidden {
                                 ort.gru_hidden = h.clone();

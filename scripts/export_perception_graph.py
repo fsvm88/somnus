@@ -146,20 +146,33 @@ def build_encoder_graph(weights: dict) -> onnx.ModelProto:
 
 # ── Graph 2: binding ──────────────────────────────────────────────────────────
 
-def build_binding_graph(weights: dict) -> onnx.ModelProto:
+def build_binding_graph(weights: dict, k_active: list) -> onnx.ModelProto:
     """
     Inputs:
-      sp_0 .. sp_4   [1, n_units[i]] — sparse activations (after CPU topk/mask;
-                     n_units[i] from the actual weight shapes, see infer_dims())
+      active_idx_0 .. active_idx_4   [k_active[i]] int64 — indices of the k active
+                     units in region i (CPU topk/mask output), sorted ascending
+      active_val_0 .. active_val_4   [1, k_active[i]] float — their activation values
       prev_episode   [1, EPISODE_DIM]
       gru_hidden     [1, 1, GRU_HIDDEN]
 
     Outputs:
       episode        [1, EPISODE_DIM]
       gru_hidden_out [1, 1, GRU_HIDDEN]
+
+    Region projection (sp_i @ W_region_i in the old dense form) is rewritten as a
+    Gather over only the k_active[i] active rows of W_region_i, followed by a small
+    [1,k] @ [k,D_PROJ] matmul — numerically identical to the dense form (Gather then
+    weighted-sum over the gathered rows is exactly what the dense matmul computes,
+    since all other rows contribute zero), but reads ~k/n_units of the weight matrix
+    per call instead of all of it. See ai-docs/decisions (sparse-gather binding ADR)
+    and scripts/bench_binding_projection.py for the measured win. k_active[i] is
+    static per exported graph — a region-size OR k_active change requires a
+    re-export (already true today for n_units via W_region_i's shape).
+    Callers must supply EXACTLY k_active[i] entries per region (pad with
+    (index 0, value 0.0) if fewer are genuinely active — contributes exactly zero).
     """
     w = weights
-    _region_dims, n_units, _cross_modal_dim = infer_dims(weights)
+    _region_dims, _n_units, _cross_modal_dim = infer_dims(weights)
 
     # GRU weights: burn stores [in, out]; ONNX needs transposed + stacked per gate.
     # Gate order: update(z), reset(r), new(n) — same in burn and ONNX.
@@ -172,10 +185,15 @@ def build_binding_graph(weights: dict) -> onnx.ModelProto:
     )[None].astype(np.float32)  # [1, 3H, H]
 
     nodes = [
-        # Project each sparse region to D_PROJ
+        # Project each sparse region to D_PROJ: Gather active rows, then
+        # [1,k] @ [k,D_PROJ] weighted sum → proj_i [1, D_PROJ].
     ] + [
-        h.make_node("MatMul", [f"sp_{i}", f"W_region_{i}"], [f"proj_{i}"])
+        node
         for i in range(5)
+        for node in [
+            h.make_node("Gather", [f"W_region_{i}", f"active_idx_{i}"], [f"gathered_{i}"], axis=0),
+            h.make_node("MatMul", [f"active_val_{i}", f"gathered_{i}"], [f"proj_{i}"]),
+        ]
     ] + [
         # x = concat([proj_0..4], axis=0) → [5, D_PROJ]
         h.make_node("Concat", [f"proj_{i}" for i in range(5)], ["x"], axis=0),
@@ -240,8 +258,12 @@ def build_binding_graph(weights: dict) -> onnx.ModelProto:
     ]
 
     graph_inputs = [
-        h.make_tensor_value_info(f"sp_{i}", TensorProto.FLOAT, [1, n_units[i]])
+        info
         for i in range(5)
+        for info in [
+            h.make_tensor_value_info(f"active_idx_{i}", TensorProto.INT64, [k_active[i]]),
+            h.make_tensor_value_info(f"active_val_{i}", TensorProto.FLOAT, [1, k_active[i]]),
+        ]
     ] + [
         h.make_tensor_value_info("prev_episode",  TensorProto.FLOAT, [1, EPISODE_DIM]),
         h.make_tensor_value_info("gru_hidden",    TensorProto.FLOAT, [1, 1, GRU_HIDDEN]),
@@ -333,15 +355,23 @@ def numpy_binding(sparse_zs, prev_ep, gru_hidden, weights):
 
 # ── Weight loading ────────────────────────────────────────────────────────────
 
-def load_weights_from_dir(weights_dir: str) -> dict:
-    """Load weight bundle written by PerceptionProcessor::export_weights_for_onnx()."""
+def load_weights_from_dir(weights_dir: str):
+    """Load weight bundle written by PerceptionProcessor::export_weights_for_onnx().
+
+    Returns (weights, k_active) — k_active is the per-region active-unit count
+    ([speech, env, visual, symbolic, language] order), written by Rust from each
+    KWtaLayer's live k_active field. NOT recomputed here from n_units: k_active
+    is architecturally always scaled_k(n_units) today, but re-deriving Rust
+    ground truth in Python is exactly the bug class gaps.md §17/§22/§24 hit
+    three times already — Rust is the only source of truth for this value.
+    """
     with open(os.path.join(weights_dir, "weights_manifest.json")) as f:
         manifest = json.load(f)
     weights = {}
-    for entry in manifest:
+    for entry in manifest["tensors"]:
         data = np.fromfile(os.path.join(weights_dir, entry["file"]), dtype=np.float32)
         weights[entry["name"]] = data.reshape(entry["shape"])
-    return weights
+    return weights, manifest["k_active"]
 
 def make_random_weights(seed: int = 42) -> dict:
     """Random weights in baseline (unqrown) shapes, for --validate-numpy only."""
@@ -366,6 +396,25 @@ def make_random_weights(seed: int = 42) -> dict:
         w[f"gru_{gate}_input_W"]  = randn(GRU_INPUT, GRU_HIDDEN)
         w[f"gru_{gate}_hidden_W"] = randn(GRU_HIDDEN, GRU_HIDDEN)
     return w
+
+def dense_to_active(sp_dense: np.ndarray, k: int):
+    """Convert a dense post-mask sparse activation [1, N] to exactly-k (indices, values).
+
+    Mirrors SparseActivation::to_exact_k on the Rust side: pads with (index 0,
+    value 0.0) if fewer than k entries are nonzero (e.g. an exact-zero tie on the
+    selected units) — contributes exactly nil through the Gather+weighted-sum
+    rewrite regardless of which row index is used for padding.
+    """
+    idx = np.flatnonzero(sp_dense[0]).astype(np.int64)
+    val = sp_dense[0, idx].astype(np.float32)
+    if len(idx) > k:
+        idx, val = idx[:k], val[:k]
+    elif len(idx) < k:
+        pad = k - len(idx)
+        idx = np.concatenate([idx, np.zeros(pad, dtype=np.int64)])
+        val = np.concatenate([val, np.zeros(pad, dtype=np.float32)])
+    return idx, val.reshape(1, k)
+
 
 def make_random_feeds(rng=None) -> dict:
     if rng is None: rng = np.random.default_rng(7)
@@ -397,10 +446,11 @@ def main():
 
     if args.weights_dir:
         print(f"Loading weights from {args.weights_dir}")
-        weights = load_weights_from_dir(args.weights_dir)
+        weights, k_active = load_weights_from_dir(args.weights_dir)
     elif args.validate_numpy:
         print("Using random weights for numpy validation")
         weights = make_random_weights()
+        k_active = [BASELINE_K_ACTIVE] * 5
     else:
         ap.error("Provide --weights-dir or --validate-numpy")
 
@@ -412,7 +462,7 @@ def main():
     print(f"  Saved: {enc_path}")
 
     print("Building binding graph...")
-    bind_model = build_binding_graph(weights)
+    bind_model = build_binding_graph(weights, k_active)
     onnx.checker.check_model(bind_model)
     bind_path = os.path.join(args.out_dir, "perception_binding.onnx")
     onnx.save(bind_model, bind_path)
@@ -436,14 +486,17 @@ def main():
 
     def validate_ep(name, sess_enc, sess_bind, atol=1e-3):
         z_out = sess_enc.run(None, enc_feeds)
-        # CPU topk (matching numpy path for this comparison)
-        sps = []
+        # CPU topk (matching numpy path for this comparison), then converted to
+        # exactly-k (indices, values) for the Gather-based binding graph — proves
+        # the sparse-gather rewrite matches the dense numpy_binding reference,
+        # not just self-consistency, and exercises MatMul-on-a-gathered-operand
+        # (not just Gather alone) at real scale on whichever EP is under test.
+        bind_feeds = {"prev_episode": feeds["prev_episode"], "gru_hidden": feeds["gru_hidden"]}
         for i, z in enumerate(z_out):
             sp, _ = numpy_topk_mask(z, feeds["dc"][i])
-            sps.append(sp)
-        bind_feeds = {f"sp_{i}": sps[i] for i in range(5)}
-        bind_feeds["prev_episode"] = feeds["prev_episode"]
-        bind_feeds["gru_hidden"]   = feeds["gru_hidden"]
+            idx, val = dense_to_active(sp, k_active[i])
+            bind_feeds[f"active_idx_{i}"] = idx
+            bind_feeds[f"active_val_{i}"] = val
         ep_ort, h_ort = sess_bind.run(None, bind_feeds)
         diff_ep = float(np.max(np.abs(ep_np - ep_ort)))
         diff_h  = float(np.max(np.abs(h_np  - h_ort)))

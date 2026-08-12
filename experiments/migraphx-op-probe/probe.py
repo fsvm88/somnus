@@ -287,11 +287,57 @@ def build_kwta_full():
     return model, feeds
 
 
+# ── 5. Sparse-gather binding projection (Gather + small MatMul) ───────────────
+def build_gather_binding():
+    """
+    Candidate rewrite for the ORT binding graph's dense sp_i @ W_region_i:
+      gathered = Gather(W_region, active_indices, axis=0)  [K_ACTIVE_CAMPAIGN, D_PROJ]
+      proj     = ReduceSum(gathered * vals[:, None], axis=0)  # weighted sum of gathered rows
+    active_indices is an int64 GRAPH INPUT (CPU-computed at runtime), not an
+    initializer — this is the untested part: Gather fed by a runtime index
+    input, at campaign scale (n_units=9660, k=190), on MIGraphX/gfx1201.
+    """
+    n_units_campaign = 9660
+    k_active_campaign = 190
+
+    rng = np.random.default_rng(7)
+    W_region = rng.normal(0, 0.01, (n_units_campaign, D_PROJ)).astype(np.float32)
+    active_indices = np.sort(
+        rng.choice(n_units_campaign, size=k_active_campaign, replace=False)
+    ).astype(np.int64)
+    active_vals = rng.normal(0, 1, (k_active_campaign,)).astype(np.float32)
+
+    W_init = nph.from_array(W_region, name="W_region")
+
+    nodes = [
+        h.make_node("Gather", ["W_region", "active_indices"], ["gathered"], axis=0),
+        h.make_node("Unsqueeze", ["active_vals", "unsq_axis"], ["vals_col"]),
+        h.make_node("Mul", ["gathered", "vals_col"], ["weighted"]),
+        h.make_node("ReduceSum", ["weighted", "reduce_axis"], ["proj"], keepdims=0),
+    ]
+    unsq_axis_init = nph.from_array(np.array([1], dtype=np.int64), name="unsq_axis")
+    reduce_axis_init = nph.from_array(np.array([0], dtype=np.int64), name="reduce_axis")
+
+    graph = h.make_graph(
+        nodes, "gather_binding_test",
+        inputs=[
+            h.make_tensor_value_info("active_indices", TensorProto.INT64, [k_active_campaign]),
+            h.make_tensor_value_info("active_vals", TensorProto.FLOAT, [k_active_campaign]),
+        ],
+        outputs=[h.make_tensor_value_info("proj", TensorProto.FLOAT, [D_PROJ])],
+        initializer=[W_init, unsq_axis_init, reduce_axis_init],
+    )
+    model = h.make_model(graph, opset_imports=[h.make_opsetid("", 14)])
+    feeds = {"active_indices": active_indices, "active_vals": active_vals}
+    return model, feeds
+
+
 # ── Run all probes ─────────────────────────────────────────────────────────────
 probe("GRU (one step, 640→256, no bias)",            build_gru,       atol=1e-3)
 probe("TopK (N=1024, K=20, largest-first)",          build_topk,      atol=0.0)  # exact
 probe("Multi-head cross-attention (5×10, 4 heads)",  build_attention, atol=1e-3)
 probe("Full k-WTA (MatMul+TopK+ScatterElements)",    build_kwta_full, atol=1e-4)
+probe("Sparse-gather binding (Gather+Mul+ReduceSum, n=9660 k=190)", build_gather_binding, atol=1e-3)
 
 print("\n" + "="*60)
 print("SUMMARY")
