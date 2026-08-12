@@ -7,25 +7,33 @@ anyhow             = "1"
 clap               = { version = "4", features = ["derive"] }
 cpal               = "0.18"
 crossbeam-channel  = "0.5"
-ffmpeg-next        = "9"
+ffmpeg-next        = { version = "9", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 ndarray            = "0.17"
 rayon              = "1.12"
 nokhwa             = { version = "0.10", features = ["input-native"] }
-ort                = { version = "2.0.0-rc.13", features = ["load-dynamic", "ndarray"] }
+ort                = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "ndarray", "api-27"] }
 rubato             = "5.0"
 rustfft            = "6"
 thiserror          = "2"
-tokio              = { version = "1", features = ["full"] }
+tokio              = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde_json         = "1"
-burn               = { version = "0.21", features = ["wgpu", "autodiff", "ndarray", "simd"] }
-burn-ndarray       = { version = "0.21", features = ["multi-threads", "simd"] }
+# "wgpu" deliberately dropped (ADR 0023): tried once (commit 5dbf9c9), abandoned — wgpu
+# can't claim the AMD device once MIGraphX/ORT already owns it. All GPU inference goes
+# through ORT/MIGraphX instead; burn now only runs its CPU (ndarray) backend.
+burn               = { version = "0.21", default-features = false, features = ["std", "autodiff", "ndarray", "simd"] }
+# burn's own dependency on burn-ndarray sets default-features=false, so this direct
+# workspace dependency is what actually requests "multi-threads"/"simd" onto the shared
+# build-graph instance — dropping it (e.g. because no crate imports `burn_ndarray`
+# directly; NdArray/NdArrayDevice come from burn::backend instead) would silently lose
+# CPU threading. See [package.metadata.cargo-machete] in somnus/somnus-perception's Cargo.toml.
+burn-ndarray       = { version = "0.21", default-features = false, features = ["std", "multi-threads", "simd"] }
 safetensors        = "0.8"
 hnsw_rs            = "0.3"
 memmap2            = "0.9"
 serde              = { version = "1", features = ["derive"] }
-bitcode            = { version = "0.6", features = ["serde"] }
+bitcode            = { version = "0.6", default-features = false, features = ["std", "serde"] }
 somnus-metrics        = { path = "crates/somnus-metrics" }
 
 # Profile for flamegraph: release-optimised but with debug symbols intact so

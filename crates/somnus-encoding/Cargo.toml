@@ -21,4 +21,3 @@ ort         = { workspace = true }
 rubato      = { workspace = true }
 rustfft     = { workspace = true }
 thiserror   = { workspace = true }
-tracing     = { workspace = true }

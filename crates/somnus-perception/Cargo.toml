@@ -11,6 +11,15 @@ mn10_env = []
 # own feature of the same name, which is what actually gates the macro bodies.
 fine-metrics = ["somnus-metrics/fine-metrics"]
 
+# burn-ndarray is never directly imported here — NdArray/NdArrayDevice come from
+# burn::backend (re-exported via burn's own "ndarray" feature). It stays a direct
+# dependency purely to request "multi-threads"/"simd" on the shared build-graph
+# instance: burn's own dependency on burn-ndarray sets default-features=false, so
+# without this line the CPU backend silently loses rayon threading + SIMD. See
+# Cargo.toml comment at the workspace level for the same note.
+[package.metadata.cargo-machete]
+ignored = ["burn-ndarray"]
+
 [dependencies]
 burn         = { workspace = true }
 burn-ndarray = { workspace = true }
