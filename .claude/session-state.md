@@ -1,7 +1,33 @@
 # Session state — somnus
 
-> **⏸️ SHUTDOWN (clean), 2026-08-13.** Continuation of the 2026-08-12 session below (dependency
-> upgrade/trim sweep) into the user's "test every function properly" push.
+> **⏸️ SHUTDOWN (clean), 2026-08-13 (second session this day).** Continuation of the earlier
+> 2026-08-13 session below: completed the entire remaining advisor-ranked test-target list from
+> the "test every function properly" push. **54 new tests, workspace 254 passing / 0 failed.**
+> - **`somnus-encoding` (0 unit tests → 41):** 38 inline lib tests + new `tests/encode_models.rs`
+>   (3 model-gated integration tests, skip-don't-fail when the gitignored `models/` artifacts are
+>   absent, same pattern as `ort_grown_region.rs`). Coverage: `resample.rs` (the flagged rubato
+>   3→5 gap, previously verified only by a manual smoke run — rate-ratio tracking, DC passthrough
+>   both directions, 440 Hz frequency preservation 48k→16k, identity-ratio path, chunk-length
+>   contract, zero-rate rejection); `mel.rs` internals (windows, reflect padding, HTK/Slaney/Kaldi
+>   mel scales, pre-emphasis, both filterbank builders incl. an exact hand-computed case and a
+>   kaldi≠HTK structural pin, power-STFT frame-count/DC/tone-bin, compute() lengths + silence
+>   constants + dynamic-range clamp); `image.rs` (YUYV conversion incl. clamping, Bgr8/Yuyv422
+>   paths — previously 0 coverage, parity tests only exercised Rgb8 — unsupported-format error,
+>   ImageNet normalisation, bilinear resize incl. a hand-computed PyTorch `align_corners=False`
+>   case); `audio.rs` `mean_pool_2d`. `encode_models.rs` pins the real whisper/CLAP/DINOv3 encode
+>   contracts (input lengths, output dims, mean-pool invariant, determinism).
+> - **Two small production changes the resample tests forced** (rubato 5 silently broke the
+>   documented contract, same drift class as §17/§22/§24): `SincResampler::new` now rejects zero
+>   rates, and `process` enforces `input.len() == chunk_frames` (rubato 5 silently accepts longer
+>   input, which would mask caller chunking bugs). Behavior on every production path unchanged —
+>   `AudioProcessor` passes valid rates and exact `AUDIO_CHUNK` slices.
+> - **`whisper_asr.rs` (0 → 8 tests, somnus lib 91 → 99):** argmax (strict max/negative/single/empty/
+>   tie-safety); a **special-token-ID drift pin** asserting SOT/EOT/EN/TRANSCRIBE/NO_TIMESTAMPS
+>   map to the expected strings in the real `whisper_tokenizer.json` (guards the re-exported-model
+>   drift bug class); `max_tokens=0` → empty without ORT calls; wrong-hidden-length → clean error;
+>   determinism on zeros hidden and on **real encoder output** (full encode_speech → decode_greedy
+>   critical path, exactly the data AudioProcessor sends to the ASR thread). Note for future
+>   reference: Whisper's EOT is id 50257 = `
 > - **Dependency sweep wrap-up (start of this session):** advisor review of the prior session's 45
 >   new `somnus/main.rs` tests caught two real issues, both fixed and committed (`f98e670`):
 >   `current_process_rss_bytes` test now skips rather than fails on a 0 RSS reading (environment-
