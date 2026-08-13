@@ -20,14 +20,48 @@
 >   documented contract, same drift class as §17/§22/§24): `SincResampler::new` now rejects zero
 >   rates, and `process` enforces `input.len() == chunk_frames` (rubato 5 silently accepts longer
 >   input, which would mask caller chunking bugs). Behavior on every production path unchanged —
->   `AudioProcessor` passes valid rates and exact `AUDIO_CHUNK` slices.
+>   `AudioProcessor` passes valid rates and exact `AUDIO_CHUNK` slices. Full writeup: gaps.md §31.
 > - **`whisper_asr.rs` (0 → 8 tests, somnus lib 91 → 99):** argmax (strict max/negative/single/empty/
 >   tie-safety); a **special-token-ID drift pin** asserting SOT/EOT/EN/TRANSCRIBE/NO_TIMESTAMPS
 >   map to the expected strings in the real `whisper_tokenizer.json` (guards the re-exported-model
 >   drift bug class); `max_tokens=0` → empty without ORT calls; wrong-hidden-length → clean error;
 >   determinism on zeros hidden and on **real encoder output** (full encode_speech → decode_greedy
 >   critical path, exactly the data AudioProcessor sends to the ASR thread). Note for future
->   reference: Whisper's EOT is id 50257 = `
+>   reference: Whisper's EOT is id 50257, token string "<endoftext>" (decodes to two newlines, hence the trim in decode_greedy).
+> - **`somnus-metrics` (3 → 8 tests; 10 with `fine-metrics`):** exhaustive enum invariants over all
+>   100 `Metric` variants (session-state previously said 67 — the 2026-07-15 operational-health
+>   batch grew it to 100): `COUNT == ALL.len()`, `as_index()` uniqueness + full 0..COUNT slot
+>   coverage, `name()` uniqueness + snake_case well-formedness (names are JSON keys parsed by
+>   `campaign_status.py`/`eval_metrics.py`), and an exhaustive record-every-variant-once snapshot
+>   check that catches duplicate indices and duplicate names in one shot. Plus a proptest
+>   record/snapshot/reset round-trip for arbitrary variant × count × duration. `proptest` added as
+>   a dev-dep (already a pinned workspace dep used by `crates/somnus`, AGENTS.md-mandated for stateful
+>   logic — no ADR needed).
+> - **Verified:** `cargo fmt` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean,
+>   `cargo test --workspace` 254 passed / 0 failed, both `mn10_env` and `fine-metrics` feature
+>   states checked where they change compiled code, plus a `somnus --help` smoke run.
+> - **Metrics discipline:** tests-only changes plus two error-path guards; no data-handling
+>   operation changed behavior. `AudioResample` (Core) already covers `SincResampler::process` via
+>   `AudioProcessor`; the new early-return errors propagate through the existing `resample_result?`
+>   path. No new metrics needed — stated explicitly per the standing policy.
+> - **Docs (same commit as this writeup):** gaps.md §31 (rubato-5 contract drift + the drift-pin
+>   test pattern); `tech-stack.md` staleness fixed in passing (rubato candidate→committed v5,
+>   ffmpeg-next 8→9, rayon candidate→committed, clap candidate→committed, dead candle declarations
+>   note removed — they were trimmed in the 08-12 dependency sweep).
+> - **Next-session entry point:** the "test every function properly" push has no remaining
+>   advisor-ranked targets — the queued list is empty. Known thin spots if the push ever resumes:
+>   `somnus-perception` burn-path training functions and `somnus-memory` I/O paths (neither flagged).
+>   Otherwise: nothing queued as a bug. Standing open threads unchanged: growth campaign at 98.9%
+>   of its 10x target (session-budget question), ADR 0038 prerequisite 3 (trigger-gated), deferred
+>   items A-N.
+> - **Not pushed:** all commits this session are on local `main` only (`88be92e`, `451e8dd`,
+>   `5670a70`, plus this docs/session-state commit). Last confirmed push to `origin/main` was
+>   `4115bf9` — check `git status`/`git log origin/main..HEAD` before assuming push state.
+>
+> ---
+>
+> **⏸️ SHUTDOWN (clean), 2026-08-13.** Continuation of the 2026-08-12 session below (dependency
+> upgrade/trim sweep) into the user's "test every function properly" push.
 > - **Dependency sweep wrap-up (start of this session):** advisor review of the prior session's 45
 >   new `somnus/main.rs` tests caught two real issues, both fixed and committed (`f98e670`):
 >   `current_process_rss_bytes` test now skips rather than fails on a 0 RSS reading (environment-

@@ -1348,6 +1348,52 @@ system-`ffmpeg` version mismatch preventing `somnus` from building at all, and a
 that had silently diverged from its `/data/somnus/models` symlink target) were found and fixed along
 the way — neither caused by this change. Full detail, numbers, and the fix writeups: ADR 0040.
 
+---
+
+## §31 — Test-coverage push finds rubato-5 contract drift; drift-pin test pattern (2026-08-13)
+
+**Context:** the "test every function properly" push (started 2026-08-12) reached its last three
+advisor-ranked targets: `somnus-encoding` (0 unit tests on the lib itself), `whisper_asr.rs` (0 tests,
+on every request's critical path), and `somnus-metrics` (3-5 tests for a 100-variant enum). All three
+closed in one session: **54 new tests** (somnus-encoding 0→41 incl. 3 model-gated integration tests
+against the real ONNX encoders; somnus lib 91→99; somnus-metrics 3→8, 10 with `fine-metrics`). Workspace
+254 passing / 0 failed. This section records the two durable findings.
+
+**Finding 1 — rubato 5 silently broke `SincResampler`'s documented contract.** The rubato 3→5
+major-version bump (08-12 dependency sweep) had been verified only by a manual smoke run. Writing
+the unit tests showed rubato 5's `Async` resampler **accepts input longer than the configured chunk
+size without error** (processes it silently) and `new_sinc` **accepts degenerate ratios** (in_rate=0
+→ infinite ratio) at construction. The old code's doc contract ("input length must equal
+chunk_frames") was therefore unenforced after the upgrade — same silent-contract-drift bug class as
+§17/§22/§24, just across a dependency boundary instead of a Rust/Python one. Fixed by enforcing the
+contract in `SincResampler` itself (`crates/somnus-encoding/src/preprocess/resample.rs`): `new`
+rejects zero rates, `process` rejects wrong-length input. No production behavior change
+(`AudioProcessor` always passes valid rates and exact `AUDIO_CHUNK` slices) — the guards exist so a
+future caller bug fails loudly instead of resampling garbage. Pinned by 7 tests incl. frequency
+preservation (440 Hz 48k→16k), DC passthrough both directions, the identity-ratio path (media
+already at 16 kHz — a real production case), and rate-ratio tracking over many chunks.
+
+**Finding 2 — the "drift pin" test pattern.** `whisper_asr.rs` hardcodes five Whisper special-token
+IDs (SOT/EOT/EN/TRANSCRIBE/NO_TIMESTAMPS) that must match `models/whisper_tokenizer.json`. A
+re-exported model with a different vocabulary would otherwise decode garbage silently — the same
+"value maintained in two places drifts" class as §17/§22/§24/§30's `k_active`-via-manifest rule.
+New test asserts each ID maps to its expected token string in the real tokenizer file on disk
+(model-gated, skip-don't-fail). The pattern generalizes: **any hardcoded constant that must match an
+on-disk artifact gets a test asserting the match against that artifact**, not against a copy of the
+constant. (The same session's `encode_models.rs` applies the shape side of this: real-encoder output
+dims, mean-pool invariant, determinism.)
+
+**Metrics discipline:** tests-only changes plus the two error-path guards; no data-handling
+operation changed behavior. `AudioResample` (Core) already covers `SincResampler::process`; the new
+early-return errors propagate through the existing `resample_result?` path in
+`AudioProcessor::ingest`. No new metrics needed — stated explicitly per the standing policy.
+
+**Remaining thin spots (not advisor-flagged, not queued):** `somnus-perception`'s burn-path training
+functions and `somnus-memory`'s I/O paths still have comparatively little direct coverage. The queued
+test list itself is now empty.
+
+---
+
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
 > order. Table numbering used to drift from the section headers — corrected 2026-07-11; if you're
 > reading an old cached copy of this table, re-fetch rather than trust remembered numbers.
@@ -1384,3 +1430,5 @@ the way — neither caused by this change. Full detail, numbers, and the fix wri
 | ✅ §27 | **Parallelized warm-store HNSW rebuild** (`SemanticStore::rebuild_from_recent`) | Low | Sleep-cycle wall-clock — rebuild was ~70% of cycle time (46-51s at ~148k warm records) | Deployed 2026-07-15 — `parallel_insert_slice` (rayon), confirmed 16.7× speedup (47.6s→2.9s) on real production-scale data — see §27 below |
 | 🔍 §28 | **ADR 0038 prerequisite 1: exported encoder graph + live scoring cost** | — | Informs whether hierarchical/coarse-to-fine k-WTA scoring is worth building | Answered 2026-07-15 — exported ONNX graph has the same O(d_input×n_units) cost as `burn`, but live cost is small (~1.28ms/call) and not the dominant ORT cost at current scale (binding costs 2-3× more) — see §28 below; prerequisites 2/3 still open |
 | 🔍 §29 | **ADR 0038 prerequisite 2: does this matter at the targeted scale?** | — | Informs whether hierarchical/coarse-to-fine k-WTA scoring is worth building | Answered 2026-07-15 — no, not at honeybee-order (the actual current target, not just current progress); ADR stays `proposed`/deferred with an explicit trigger (scale ambitions moving past honeybee-order), not closed — see §29 below; prerequisite 3 still open |
+| ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
+| ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |

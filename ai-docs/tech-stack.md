@@ -25,7 +25,7 @@ Order of preference when the ecosystem has a gap:
 
 Candidates not adopted:
 
-- `candle` — originally planned for cognitive-layer training; `burn` chosen instead. `candle-core`/`candle-nn` remain declared in `[workspace.dependencies]` but no crate depends on them — dead declarations, safe to remove when convenient.
+- `candle` — originally planned for cognitive-layer training; `burn` chosen instead. Removed from `[workspace.dependencies]` in the 2026-08-12 dependency sweep.
 - `tch-rs` — full libtorch; fallback if `burn` can't support a needed op.
 - `dfdx` — pure-Rust autograd; slower-moving.
 
@@ -37,8 +37,8 @@ Lower-level math (candidates, no commitment yet):
 ## Audio
 
 - **`cpal`** — **[committed]** real-time microphone capture (Phase 1). Cross-platform audio I/O; callback model bridged to crossbeam channel.
-- **`ffmpeg-next = "8"`** — **[committed]** audio track decoding from media files (Phase 1, via `MediaFile`). Also the video decoder; one dep for both.
-- **`rubato`** — candidate for sample-rate resampling at encoding time (Phase 2), when audio must be normalized to 16 kHz for Whisper.
+- **`ffmpeg-next = "9"`** — **[committed]** audio track decoding from media files (Phase 1, via `MediaFile`). Also the video decoder; one dep for both. Bumped 8→9 on 2026-08-12 to build against the locally installed ffmpeg 9.0.
+- **`rubato = "5"`** — **[committed]** sample-rate resampling at encoding time (`somnus-encoding`'s `SincResampler`: media rate → 16 kHz speech path + env-encoder rate). Bumped 3→5 in the 2026-08-12 dependency sweep; rubato 5 silently stopped enforcing the chunk-length/valid-ratio contract, so `SincResampler` enforces it itself — pinned by tests, see gaps.md §31.
 - **`hound`** — WAV read/write for offline experiments only.
 
 `symphonia` (pure-Rust audio decoder) is superseded by `ffmpeg-next` for the file-input use case. Revisit only if we need a pure-Rust build without system ffmpeg.
@@ -46,7 +46,7 @@ Lower-level math (candidates, no commitment yet):
 ## Video / camera
 
 - **`nokhwa`** (feature: `input-native`) — **[committed]** live webcam capture (Phase 1). Cross-platform v4l2/AVFoundation/MSMF wrapper.
-- **`ffmpeg-next = "8"`** — **[committed]** video frame decoding from media files (Phase 1, via `MediaFile`). Shared dep with audio above.
+- **`ffmpeg-next = "9"`** — **[committed]** video frame decoding from media files (Phase 1, via `MediaFile`). Shared dep with audio above.
 - `image`, `imageproc` — pure-Rust image ops; candidates for preprocessing in Phase 2.
 
 System requirement: `libavcodec`, `libavformat`, `libavutil`, `libswresample`, `libswscale` (Arch: `pacman -S ffmpeg`).
@@ -76,7 +76,7 @@ Embedded KV (`redb`, `fjall`, `sled`) and SQL (`rusqlite`, `sqlx`) are candidate
 - **`tokio`** — **[committed]** async runtime in the binary (Phase 1). `features = ["full"]` for signals, timers, and task scheduling.
 - **`crossbeam-channel`** — **[committed]** bounded sync channels bridging cpal callbacks and decoder threads to the async runtime (Phase 1). Chosen for cloneable Sender + Receiver (enables drop-oldest pattern and multi-source fan-in).
 - `std::thread` — for decoder and capture threads that must not be async.
-- `rayon` — candidate for compute-heavy parallel work in sleep cycle (Phase 5+).
+- **`rayon`** — **[committed]** parallel warm-store HNSW rebuild (`parallel_insert_slice`, gaps.md §27, 16.7× speedup).
 
 ## Observability
 
@@ -90,13 +90,13 @@ Embedded KV (`redb`, `fjall`, `sled`) and SQL (`rusqlite`, `sqlx`) are candidate
 - `cargo-nextest` — for faster test runs.
 - `criterion` — benches when we have a latency target to hit.
 - `proptest` — property tests for stateful logic (memory, learning rules).
-- `clap` — candidate for CLI argument parsing in the binary (Phase 1; alternative: manual `std::env::args` parse).
+- **`clap = "4"`** (derive) — **[committed]** CLI argument parsing in the binary.
 
 ## Python tooling (committed)
 
 A Python venv lives at `.venv/` — used only for model export and fine-tuning scripts, not for runtime inference.
 
-- **`peft`** + **`transformers`** + **`torch`** — LoRA fine-tuning of Qwen2.5-0.5B (ADR 0033). `scripts/train_lora.py`, `scripts/export_models.py`.
+- **`peft`** + **`transformers`** + **`torch`** — LoRA fine-tuning (ADR 0033; written for Qwen2.5, base model since upgraded to Qwen3-0.6B per ADR 0036 — the LoRA work itself is deferred item L). `scripts/train_lora.py`, `scripts/export_models.py`.
 - **`onnxruntime`** — KV-cache model quantization to INT8. `scripts/quantize_kv.py`, `scripts/export_kv_cache.py`.
 
 ## Things we will *not* do (yet)
