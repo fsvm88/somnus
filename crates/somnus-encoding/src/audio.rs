@@ -180,3 +180,33 @@ pub(crate) fn mean_pool_2d(tensor: &[f32], seq_len: usize, dim: usize) -> Vec<f3
     out.iter_mut().for_each(|v| *v /= n);
     out
 }
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mean_pool_2d_exact_small_case() {
+        // seq_len=2, dim=3: column-wise means of [[1,2,3],[4,5,6]] = [2.5, 3.5, 4.5].
+        let flat = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        assert_eq!(mean_pool_2d(&flat, 2, 3), [2.5, 3.5, 4.5]);
+    }
+
+    #[test]
+    fn mean_pool_2d_single_row_is_identity() {
+        let flat = [0.5f32, -1.0, 2.0];
+        assert_eq!(mean_pool_2d(&flat, 1, 3), flat.to_vec());
+    }
+
+    #[test]
+    fn mean_pool_2d_constant_rows_yield_constant() {
+        // 1500×384 is the real Whisper hidden-state shape; constant rows must
+        // pool to exactly that constant.
+        let flat = vec![0.75f32; 1500 * 384];
+        let out = mean_pool_2d(&flat, 1500, 384);
+        assert_eq!(out.len(), 384);
+        assert!(out.iter().all(|&v| v == 0.75));
+    }
+}

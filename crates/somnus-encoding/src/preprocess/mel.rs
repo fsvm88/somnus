@@ -392,3 +392,359 @@ impl Mn10Mel {
         mel.iter().map(|&v| ((v + 4.5) / 5.0) as f32).collect()
     }
 }
+
+// ── tests ────────────────────────────────────────────────────────────────────
+//
+// End-to-end parity against HuggingFace fixtures lives in tests/mel_parity.rs;
+// these unit tests pin the individual pieces so a parity failure localises.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+        (a - b).abs() <= tol
+    }
+
+    // ── windows ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hann_periodic_endpoints_and_symmetry() {
+        let n = 400; // WhisperMel's window
+        let w = hann_window_f64(n);
+        assert_eq!(w.len(), n);
+        assert!(approx_eq(w[0], 0.0, 1e-12), "w[0]={}", w[0]);
+        // Periodic Hann: w[i] = w[n-i], and w[n/2] = 1 exactly.
+        assert!(approx_eq(w[n / 2], 1.0, 1e-12), "w[n/2]={}", w[n / 2]);
+        for i in 1..n / 2 {
+            assert!(
+                approx_eq(w[i], w[n - i], 1e-12),
+                "asymmetry at {i}: {} vs {}",
+                w[i],
+                w[n - i]
+            );
+        }
+        // Periodic, not symmetric: w[0] == 0 but the window never returns to 0 at i=n-1+1.
+        assert!(w[n - 1] > 0.0);
+    }
+
+    #[test]
+    fn hann_symmetric_endpoints_and_peak() {
+        let n = 800; // Mn10Mel's win_length
+        let w = hann_window_symmetric_f64(n);
+        assert_eq!(w.len(), n);
+        assert!(approx_eq(w[0], 0.0, 1e-12));
+        assert!(approx_eq(w[n - 1], 0.0, 1e-12));
+        // Even n: the peak sits between the two middle samples, so they are equal
+        // and just under 1.0 (odd n would hit 1.0 exactly).
+        assert!(approx_eq(w[n / 2 - 1], w[n / 2], 1e-12));
+        assert!(
+            w[n / 2] < 1.0 && approx_eq(w[n / 2], 1.0, 1e-4),
+            "mid={}",
+            w[n / 2]
+        );
+        for i in 1..n / 2 {
+            assert!(approx_eq(w[i], w[n - 1 - i], 1e-12), "asymmetry at {i}");
+        }
+    }
+
+    #[test]
+    fn center_pad_window_even_and_odd_padding() {
+        let even = center_pad_window(&[1.0, 2.0], 4);
+        assert_eq!(even, [0.0, 1.0, 2.0, 0.0]);
+        // Odd total padding: floor on the left, extra sample on the right
+        // (matches torch.stft's win_length < n_fft padding).
+        let odd = center_pad_window(&[1.0, 2.0, 3.0], 6);
+        assert_eq!(odd, [0.0, 1.0, 2.0, 3.0, 0.0, 0.0]);
+        // The real Mn10Mel case: 800 → 1024, symmetric pad 112/112.
+        let w = center_pad_window(&hann_window_symmetric_f64(800), 1024);
+        assert_eq!(w.len(), 1024);
+        assert!(w[..112].iter().all(|&v| v == 0.0));
+        assert!(w[912..].iter().all(|&v| v == 0.0));
+        assert!(approx_eq(w[112], 0.0, 1e-12)); // window start
+        assert!(approx_eq(w[112 + 400], 1.0, 1e-4)); // window mid (even length: just under 1)
+    }
+
+    // ── reflect padding ──────────────────────────────────────────────────────
+
+    #[test]
+    fn reflect_pad_matches_numpy_reflect() {
+        // numpy.pad([1,2,3,4,5], 2, mode='reflect') == [3,2,1,2,3,4,5,4,3]
+        let out = reflect_pad(&[1.0, 2.0, 3.0, 4.0, 5.0], 2);
+        assert_eq!(out, [3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0]);
+    }
+
+    #[test]
+    fn reflect_pad_zero_is_identity() {
+        let sig = [0.5f32, -1.0, 0.25];
+        assert_eq!(reflect_pad(&sig, 0), sig.to_vec());
+    }
+
+    // ── mel scales ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn htk_scale_roundtrip_and_anchor() {
+        for hz in [0.0, 100.0, 700.0, 1000.0, 4000.0, 8000.0, 16000.0] {
+            let m = hz_to_mel_htk(hz);
+            let back = mel_to_hz_htk(m);
+            assert!(
+                approx_eq(back, hz, 1e-9 * hz.max(1.0)),
+                "htk roundtrip at {hz}: {back}"
+            );
+        }
+        // HTK anchor: 1000 Hz ≈ 1000 mel.
+        assert!(approx_eq(hz_to_mel_htk(1000.0), 1000.0, 0.1));
+    }
+
+    #[test]
+    fn slaney_scale_roundtrip_and_continuity() {
+        // Roundtrip on both the linear branch (< 1000 Hz) and the log branch.
+        for hz in [0.0, 200.0, 666.666, 999.0, 1000.0, 2500.0, 8000.0, 24000.0] {
+            let m = hz_to_mel_slaney(hz);
+            let back = mel_to_hz_slaney(m);
+            assert!(
+                approx_eq(back, hz, 1e-9 * hz.max(1.0)),
+                "slaney roundtrip at {hz}: {back}"
+            );
+        }
+        // The two branches meet at exactly 15 mel / 1000 Hz.
+        assert!(approx_eq(hz_to_mel_slaney(1000.0), 15.0, 1e-12));
+        assert!(approx_eq(hz_to_mel_slaney(999.999), 15.0, 1e-3));
+        assert!(approx_eq(mel_to_hz_slaney(15.0), 1000.0, 1e-9));
+    }
+
+    #[test]
+    fn kaldi_scale_anchors() {
+        assert!(approx_eq(hz_to_mel_kaldi(0.0), 0.0, 1e-12));
+        // 1127·ln(2) at 700 Hz; the literal 1127 constant (not 2595/ln(10) ≈ 1126.97)
+        // is the point — compare against the exact constant to pin it.
+        assert!(approx_eq(
+            hz_to_mel_kaldi(700.0),
+            1127.0 * 2.0_f64.ln(),
+            1e-12
+        ));
+        assert!(hz_to_mel_kaldi(8000.0) > hz_to_mel_kaldi(1000.0));
+    }
+
+    // ── pre-emphasis ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn preemphasis_exact_values() {
+        // out[t] = x[t+1] - 0.97·x[t], PyTorch conv1d([-0.97, 1]) with no padding.
+        let out = preemphasis(&[1.0, 2.0, 3.0]);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - (2.0 - 0.97)).abs() < 1e-6);
+        assert!((out[1] - (3.0 - 0.97 * 2.0)).abs() < 1e-6);
+        assert!(preemphasis(&[1.0]).is_empty());
+        assert!(preemphasis(&[]).is_empty());
+    }
+
+    // ── filterbanks ──────────────────────────────────────────────────────────
+
+    /// Structural properties shared by both filterbank builders: triangular
+    /// (unimodal) rows, non-negative, ordered centre frequencies, support
+    /// bounded by [fmin, fmax].
+    fn assert_bank_shape(bank: &[Vec<f64>], n_mels: usize, n_bins: usize, sr: u32, n_fft: usize) {
+        assert_eq!(bank.len(), n_mels);
+        let mut prev_argmax = None;
+        for (m, row) in bank.iter().enumerate() {
+            assert_eq!(row.len(), n_bins, "row {m} width");
+            assert!(row.iter().all(|&v| v >= 0.0), "row {m} negative");
+            let peak = row.iter().cloned().fold(f64::MIN, f64::max);
+            if peak <= 0.0 {
+                continue; // degenerate row (can happen for tiny test configs)
+            }
+            // Unimodal: non-decreasing up to the argmax, non-increasing after.
+            let argmax = row.iter().position(|&v| v == peak).unwrap();
+            for k in 1..=argmax {
+                assert!(row[k] >= row[k - 1] - 1e-12, "row {m} not rising at {k}");
+            }
+            for k in argmax + 1..n_bins {
+                assert!(row[k] <= row[k - 1] + 1e-12, "row {m} not falling at {k}");
+            }
+            if let Some(prev) = prev_argmax {
+                assert!(argmax >= prev, "centre frequencies not ordered at row {m}");
+            }
+            prev_argmax = Some(argmax);
+            // Support stays inside [fmin, fmax]: bin freqs outside must be zero.
+            for (k, &v) in row.iter().enumerate() {
+                let hz = k as f64 * sr as f64 / n_fft as f64;
+                if v > 0.0 {
+                    assert!(hz > 0.0 || m == 0 || v == 0.0, "row {m} nonzero at DC");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mel_filterbank_htk_exact_small_case() {
+        // Hand-checkable config: sr=8, n_fft=8 → bins at 0,1,2,3,4 Hz; one mel
+        // filter spanning 0–4 Hz. Triangle vertices from the (roundtrip-tested)
+        // HTK scale; this pins the interpolation loop itself.
+        let bank = mel_filterbank_f64(8, 8, 1, 0.0, 4.0, false);
+        assert_eq!(bank.len(), 1);
+        let row = &bank[0];
+        assert_eq!(row.len(), 5);
+
+        let mel_max = hz_to_mel_htk(4.0);
+        let f_peak = mel_to_hz_htk(mel_max / 2.0);
+        let expected = [
+            0.0,
+            1.0 / f_peak,
+            (4.0 - 2.0) / (4.0 - f_peak),
+            (4.0 - 3.0) / (4.0 - f_peak),
+            0.0,
+        ];
+        for (k, &e) in expected.iter().enumerate() {
+            assert!(
+                approx_eq(row[k], e, 1e-12),
+                "bin {k}: {} vs expected {e}",
+                row[k]
+            );
+        }
+        // HTK branch: unit peak height (no area normalisation).
+        assert!(row.iter().cloned().fold(0.0f64, f64::max) <= 1.0 + 1e-12);
+    }
+
+    #[test]
+    fn mel_filterbank_slaney_structure() {
+        // Whisper config: 80 mels, 16 kHz, n_fft 400.
+        let bank = mel_filterbank_f64(16_000, 400, 80, 0.0, 8_000.0, true);
+        assert_bank_shape(&bank, 80, 201, 16_000, 400);
+        // Slaney area normalisation makes peak heights shrink with frequency
+        // (filters get wider in Hz); check first-row peak > last-row peak.
+        let peak = |row: &Vec<f64>| row.iter().cloned().fold(0.0f64, f64::max);
+        assert!(peak(&bank[0]) > peak(&bank[79]));
+    }
+
+    #[test]
+    fn kaldi_mel_filterbank_structure_and_difference() {
+        // Mn10 config: 128 mels, 32 kHz, n_fft 1024.
+        let kaldi = kaldi_mel_filterbank_f64(32_000, 1024, 128, 0.0, 15_000.0);
+        assert_bank_shape(&kaldi, 128, 513, 32_000, 1024);
+        // Kaldi triangles peak at ≤ 1 (min of the two slopes).
+        for row in &kaldi {
+            assert!(row.iter().cloned().fold(0.0f64, f64::max) <= 1.0 + 1e-12);
+        }
+        // Pin the doc claim: Kaldi banks are NOT the same filter shapes as the
+        // Hz-interpolated HTK branch at identical parameters.
+        let htk = mel_filterbank_f64(32_000, 1024, 128, 0.0, 15_000.0, false);
+        let differ = kaldi
+            .iter()
+            .zip(htk.iter())
+            .any(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-6));
+        assert!(differ, "kaldi and htk banks unexpectedly identical");
+    }
+
+    // ── power STFT ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn power_stft_frame_count() {
+        let sig = vec![0.0f32; 1000];
+        let win = vec![1.0f64; 64];
+        let frames = power_stft_f64(&sig, 64, 100, &win);
+        assert_eq!(frames.len(), 1 + 1000 / 100);
+        assert!(frames.iter().all(|f| f.len() == 64 / 2 + 1));
+    }
+
+    #[test]
+    fn power_stft_dc_concentrates_in_bin_zero() {
+        // Rectangular window + constant signal: every interior frame is a pure
+        // DC block, whose unnormalised FFT is exactly n_fft at bin 0, 0 elsewhere.
+        let sig = vec![0.75f32; 1024];
+        let win = vec![1.0f64; 64];
+        let frames = power_stft_f64(&sig, 64, 64, &win);
+        let mid = &frames[frames.len() / 2];
+        let expect = (0.75 * 64.0) * (0.75 * 64.0);
+        assert!(
+            approx_eq(mid[0], expect, 1e-9),
+            "bin0={} expect {expect}",
+            mid[0]
+        );
+        for (k, &p) in mid.iter().enumerate().skip(1) {
+            assert!(p < 1e-18 * expect, "bin {k} power {p} not ~0");
+        }
+    }
+
+    #[test]
+    fn power_stft_tone_lands_on_its_bin() {
+        // Cosine at exactly bin 5 (5 Hz with sr=64, n_fft=64): power (A·N/2)² at bin 5.
+        let n_fft = 64;
+        let sr = 64.0;
+        let sig: Vec<f32> = (0..1024)
+            .map(|i| (2.0 * std::f64::consts::PI * 5.0 * i as f64 / sr).cos() as f32)
+            .collect();
+        let win = vec![1.0f64; n_fft];
+        let frames = power_stft_f64(&sig, n_fft, 64, &win);
+        let mid = &frames[frames.len() / 2];
+        // f32 input rounding limits absolute precision (~1e-5 of the peak power).
+        let expect = (n_fft as f64 / 2.0) * (n_fft as f64 / 2.0);
+        assert!(
+            approx_eq(mid[5], expect, 1e-2),
+            "bin5={} expect {expect}",
+            mid[5]
+        );
+        for (k, &p) in mid.iter().enumerate() {
+            if k != 5 {
+                assert!(p < 1e-12 * expect, "bin {k} power {p} not ~0");
+            }
+        }
+    }
+
+    // ── public mel structs ───────────────────────────────────────────────────
+
+    #[test]
+    fn whisper_mel_silence_is_constant() {
+        let mel = WhisperMel::new();
+        let out = mel.compute(&vec![0.0f32; 480_000]);
+        assert_eq!(out.len(), 80 * 3000);
+        // Silence: power floored to 1e-10 → log10 = -10 → clamped (max-8) stays -10
+        // → normalised (-10 + 4) / 4 = -1.5 everywhere.
+        assert!(
+            out.iter().all(|&v| v == -1.5),
+            "non-constant silence output"
+        );
+    }
+
+    #[test]
+    fn whisper_mel_dynamic_range_clamped() {
+        let mel = WhisperMel::new();
+        let pcm: Vec<f32> = (0..480_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let out = mel.compute(&pcm);
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for &v in &out {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        // The max(log, global_max - 8) clamp bounds the range to 8 log10 units
+        // = 2.0 after the (x + 4) / 4 normalisation.
+        assert!(hi - lo <= 2.0 + 1e-5, "range {} exceeds clamp", hi - lo);
+    }
+
+    #[test]
+    fn clap_mel_silence_is_constant() {
+        let mel = ClapMel::new();
+        let out = mel.compute(&vec![0.0f32; 480_000]);
+        assert_eq!(out.len(), 1001 * 64);
+        // Silence: 10·log10(1e-10) = -100 dB everywhere.
+        assert!(
+            out.iter().all(|&v| v == -100.0),
+            "non-constant silence output"
+        );
+    }
+
+    #[test]
+    fn mn10_mel_silence_is_constant() {
+        let mel = Mn10Mel::new();
+        let out = mel.compute(&vec![0.0f32; 320_000]);
+        assert_eq!(out.len(), 128 * 1000);
+        // Silence: ln(0 + 1e-5) normalised by (x + 4.5) / 5.
+        let expect = ((1e-5_f64.ln()) + 4.5) / 5.0;
+        assert!(
+            out.iter().all(|&v| (v as f64 - expect).abs() < 1e-6),
+            "non-constant silence output"
+        );
+    }
+}
