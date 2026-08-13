@@ -132,3 +132,133 @@ fn argmax(logits: &[f32]) -> u32 {
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
 }
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn models_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+    }
+
+    /// Skip-with-message when the decoder artifacts aren't on disk (gitignored
+    /// models tree, same pattern as somnus-encoding's encode_models.rs).
+    fn decoder() -> Option<WhisperDecoder> {
+        let dir = models_dir();
+        if !dir.join("whisper_tiny_decoder.onnx").exists()
+            || !dir.join("whisper_tokenizer.json").exists()
+        {
+            eprintln!("skipping: whisper decoder artifacts not present (gitignored)");
+            return None;
+        }
+        Some(WhisperDecoder::new(&dir).expect("WhisperDecoder::new"))
+    }
+
+    // ── argmax (pure) ────────────────────────────────────────────────────────
+
+    #[test]
+    fn argmax_picks_strict_maximum() {
+        assert_eq!(argmax(&[0.1, 0.9, 0.3]), 1);
+        assert_eq!(argmax(&[-3.0, -1.0, -2.0]), 1);
+        assert_eq!(argmax(&[5.0]), 0);
+    }
+
+    #[test]
+    fn argmax_empty_is_zero() {
+        assert_eq!(argmax(&[]), 0);
+    }
+
+    #[test]
+    fn argmax_tie_returns_some_max_index() {
+        let logits = [1.0f32, 2.0, 2.0, 0.5];
+        let i = argmax(&logits);
+        assert_eq!(logits[i as usize], 2.0, "tie broke to a non-max index {i}");
+    }
+
+    // ── decoder (model-gated) ────────────────────────────────────────────────
+
+    /// Drift pin (§17/§22/§24 bug class): the hardcoded special-token IDs must
+    /// match the actual tokenizer file on disk. A re-exported model with a
+    /// different vocabulary would otherwise fail silently at runtime by decoding
+    /// garbage.
+    #[test]
+    fn special_token_ids_match_tokenizer() {
+        let Some(dec) = decoder() else { return };
+        let expect = [
+            (SOT, "<|startoftranscript|>"),
+            (EOT, "<|endoftext|>"),
+            (EN, "<|en|>"),
+            (TRANSCRIBE, "<|transcribe|>"),
+            (NO_TIMESTAMPS, "<|notimestamps|>"),
+        ];
+        for (id, name) in expect {
+            let got = dec.tokenizer.id_to_token(id as u32);
+            assert_eq!(got.as_deref(), Some(name), "token id {id} drifted");
+        }
+    }
+
+    /// max_tokens = 0 never runs the decoder loop: empty text out, no ORT call.
+    #[test]
+    fn decode_max_tokens_zero_is_empty() {
+        let Some(mut dec) = decoder() else { return };
+        let hidden = vec![0.0f32; WHISPER_ENC_SEQ * WHISPER_ENC_DIM];
+        let text = dec.decode_greedy(&hidden, 0).expect("decode max_tokens=0");
+        assert_eq!(text, "");
+    }
+
+    /// Wrong-length encoder hidden must be a clean error, not a panic or a
+    /// mis-shaped ORT call (encode_speech always produces exactly 1500×384).
+    #[test]
+    fn decode_wrong_hidden_length_errors() {
+        let Some(mut dec) = decoder() else { return };
+        assert!(dec.decode_greedy(&vec![0.0f32; 100], 8).is_err());
+        assert!(dec
+            .decode_greedy(&vec![0.0f32; WHISPER_ENC_SEQ * WHISPER_ENC_DIM + 1], 8)
+            .is_err());
+    }
+
+    /// Full decode loop against the real CPU decoder session on synthetic input:
+    /// must not error and must be deterministic (frozen model, greedy search).
+    #[test]
+    fn decode_zeros_hidden_deterministic() {
+        let Some(mut dec) = decoder() else { return };
+        let hidden = vec![0.0f32; WHISPER_ENC_SEQ * WHISPER_ENC_DIM];
+        let a = dec.decode_greedy(&hidden, 8).expect("decode run 1");
+        let b = dec.decode_greedy(&hidden, 8).expect("decode run 2");
+        assert_eq!(a, b, "ASR decode not deterministic on identical input");
+    }
+
+    /// End-to-end critical path: real encoder hidden states (from the actual
+    /// whisper encoder ONNX) fed to the decoder — exactly the shape of the data
+    /// AudioProcessor sends to the ASR thread. Content is input-dependent (a
+    /// sine may transcribe or hallucinate), so only determinism is asserted.
+    #[test]
+    fn decode_real_encoder_hidden_deterministic() {
+        let dir = models_dir();
+        // AudioEncoder::new loads both the whisper encoder and the env encoder.
+        #[cfg(not(feature = "mn10_env"))]
+        let env_file = "clap_audio_encoder_fp16.onnx";
+        #[cfg(feature = "mn10_env")]
+        let env_file = "efficientat_mn10_encoder_fp16.onnx";
+        if !dir.join("whisper_tiny_encoder.onnx").exists() || !dir.join(env_file).exists() {
+            eprintln!("skipping: whisper/env encoder artifacts not present (gitignored)");
+            return;
+        }
+        let Some(mut dec) = decoder() else { return };
+
+        let mut enc = somnus_encoding::AudioEncoder::new(&dir).expect("AudioEncoder::new");
+        let pcm: Vec<f32> = (0..480_000)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin())
+            .collect();
+        let (_emb, hidden) = enc
+            .encode_speech(&pcm, somnus_sensory::Timestamp::now())
+            .expect("encode_speech");
+        assert_eq!(hidden.len(), WHISPER_ENC_SEQ * WHISPER_ENC_DIM);
+
+        let a = dec.decode_greedy(&hidden, 16).expect("decode run 1");
+        let b = dec.decode_greedy(&hidden, 16).expect("decode run 2");
+        assert_eq!(a, b, "ASR decode not deterministic on real encoder output");
+    }
+}
