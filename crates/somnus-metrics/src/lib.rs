@@ -902,4 +902,111 @@ mod tests {
         let second = METRICS.snapshot_and_reset();
         assert_eq!(second, serde_json::json!({}));
     }
+
+    // ── enum invariants ──────────────────────────────────────────────────────
+    //
+    // The Registry is a fixed-size array indexed by as_index(), and snapshots are
+    // a JSON object keyed by name(). A duplicate index silently aliases two
+    // counters into one slot; a duplicate name silently drops one of them from
+    // the JSON. Both failure classes are data corruption in metrics.jsonl, so
+    // pin the invariants exhaustively (all variants, not a sample — the set is
+    // closed and small).
+
+    #[test]
+    fn count_matches_all_len() {
+        assert_eq!(Metric::ALL.len(), Metric::COUNT);
+    }
+
+    #[test]
+    fn indices_are_unique_and_cover_every_slot() {
+        let mut seen = [false; Metric::COUNT];
+        for m in Metric::ALL {
+            let i = m.as_index();
+            assert!(i < Metric::COUNT, "{m:?} index {i} out of range");
+            assert!(!seen[i], "{m:?} duplicates index {i}");
+            seen[i] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "some registry slot is never used — ALL is missing a variant"
+        );
+    }
+
+    #[test]
+    fn names_are_unique_and_well_formed() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for m in Metric::ALL {
+            let n = m.name();
+            assert!(seen.insert(n), "{m:?} duplicates name {n:?}");
+            // Names are JSON keys in metrics.jsonl, parsed by
+            // scripts/campaign_status.py and scripts/eval_metrics.py: non-empty
+            // snake_case ASCII, no leading/trailing/double underscores.
+            assert!(!n.is_empty(), "{m:?} has empty name");
+            assert!(
+                n.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{m:?} name {n:?} not snake_case"
+            );
+            assert!(
+                !n.starts_with('_') && !n.ends_with('_') && !n.contains("__"),
+                "{m:?} name {n:?} has stray underscores"
+            );
+        }
+        assert_eq!(seen.len(), Metric::COUNT);
+    }
+
+    /// The full as_index()/name() round-trip, exhaustively: recording every
+    /// variant once must produce exactly COUNT snapshot entries, each under its
+    /// own name. Catches both duplicate indices (fewer entries than COUNT) and
+    /// duplicate names (JSON key collision) in one shot.
+    #[test]
+    fn add_every_variant_appears_exactly_once_in_snapshot() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        METRICS.snapshot_and_reset();
+        for m in Metric::ALL {
+            METRICS.add(m, 1);
+        }
+        let snap = METRICS.snapshot_and_reset();
+        let obj = snap.as_object().unwrap();
+        assert_eq!(obj.len(), Metric::COUNT, "snapshot lost entries");
+        for m in Metric::ALL {
+            let entry = &snap[m.name()];
+            assert_eq!(entry["count"], 1, "{}", m.name());
+            assert_eq!(entry["total_ns"], 0, "{}", m.name());
+        }
+        assert_eq!(METRICS.snapshot_and_reset(), serde_json::json!({}));
+    }
+
+    // ── property-based registry round-trip ───────────────────────────────────
+
+    use proptest::prelude::*;
+
+    fn any_metric() -> impl Strategy<Value = Metric> {
+        (0..Metric::COUNT).prop_map(|i| Metric::ALL[i])
+    }
+
+    proptest! {
+        /// For any variant, any call count, and any duration: the registry must
+        /// report exactly that work under the variant's own name, then reset
+        /// cleanly — the record/snapshot cycle the sleep-cycle flush depends on.
+        #[test]
+        fn record_roundtrip_exact_count_and_duration(
+            m in any_metric(),
+            n in 1u64..50,
+            micros in 0u64..10_000,
+        ) {
+            let _guard = TEST_LOCK.lock().unwrap();
+            METRICS.snapshot_and_reset();
+            for _ in 0..n {
+                METRICS.record(m, Duration::from_micros(micros));
+            }
+            let snap = METRICS.snapshot_and_reset();
+            prop_assert_eq!(snap.as_object().unwrap().len(), 1);
+            let entry = &snap[m.name()];
+            prop_assert_eq!(entry["count"].as_u64().unwrap(), n);
+            prop_assert_eq!(entry["total_ns"].as_u64().unwrap(), n * micros * 1_000);
+            prop_assert_eq!(METRICS.snapshot_and_reset(), serde_json::json!({}));
+        }
+    }
 }
