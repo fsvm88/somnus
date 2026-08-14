@@ -345,6 +345,38 @@ mod tests {
     }
 
     #[test]
+    fn iter_from_seeks_to_offset_and_clamps() {
+        let dir = TempDir::new().unwrap();
+        let mut archive = ColdArchive::open(dir.path()).unwrap();
+        for i in 0..5u64 {
+            archive.append(&make_record(i, i as f32 * 0.1)).unwrap();
+        }
+
+        let ids: Vec<u64> = archive
+            .iter_from(2)
+            .unwrap()
+            .map(|r| r.unwrap().id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4], "iter_from(2) skips records 0-1");
+
+        // Data at the seek offset must be the real record, not a misaligned read.
+        let first = archive.iter_from(3).unwrap().next().unwrap().unwrap();
+        assert_eq!(first.id, 3);
+        assert!((first.values[0] - 0.3).abs() < 0.005);
+
+        assert_eq!(
+            archive.iter_from(5).unwrap().count(),
+            0,
+            "start == len yields nothing"
+        );
+        assert_eq!(
+            archive.iter_from(100).unwrap().count(),
+            0,
+            "start > len clamps to len"
+        );
+    }
+
+    #[test]
     fn truncate_to_recent_keeps_tail() {
         let dir = TempDir::new().unwrap();
         let mut archive = ColdArchive::open(dir.path()).unwrap();

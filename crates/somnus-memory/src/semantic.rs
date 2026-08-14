@@ -460,4 +460,38 @@ mod tests {
         assert_eq!(loaded, 5, "should load exactly 5 (the cap)");
         assert_eq!(store.len(), 5);
     }
+
+    /// Warm store stops accepting inserts once `max_records` is hit (skip-don't-evict;
+    /// eviction happens via cold rebuild, gaps.md §21/§27). Uncapped stores (max=0)
+    /// never stop.
+    #[test]
+    fn insert_respects_max_records_cap() {
+        let mut capped = SemanticStore::with_max(8, 3);
+        for i in 0..10u64 {
+            capped.insert(make_record(i, i as f32));
+        }
+        assert_eq!(capped.len(), 3, "inserts beyond the cap are skipped");
+        // First-writer-wins: records 0-2 kept, later ones dropped.
+        let ids: Vec<u64> = capped.query(&[0.0f32; 8], 3).iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        let mut uncapped = SemanticStore::new(8);
+        for i in 0..10u64 {
+            uncapped.insert(make_record(i, i as f32));
+        }
+        assert_eq!(uncapped.len(), 10, "max_records=0 means unlimited");
+    }
+
+    /// records_since is the within-session gist probe's exclusion filter —
+    /// it must compare inclusive against the session start timestamp.
+    #[test]
+    fn records_since_filters_by_timestamp() {
+        let mut store = SemanticStore::new(8);
+        for i in 0..5u64 {
+            store.insert(make_record(i, i as f32));
+        }
+        assert_eq!(store.records_since(2.0).len(), 3, "ids 2,3,4 (inclusive)");
+        assert_eq!(store.records_since(0.0).len(), 5);
+        assert_eq!(store.records_since(99.0).len(), 0);
+    }
 }

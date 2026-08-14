@@ -590,4 +590,115 @@ mod tests {
             "next_id should be above max cold ID"
         );
     }
+
+    /// Create the `snapshot/` subdir these helpers write into (in production
+    /// `save_snapshot` creates it first).
+    fn snap_dir(dir: &TempDir) -> std::path::PathBuf {
+        let p = dir.path().join("snapshot");
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn region_sizes_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let _ = snap_dir(&dir);
+        let sizes = [9549usize, 1024, 2048, 1024, 9660];
+        save_region_sizes(sizes, dir.path()).unwrap();
+        assert_eq!(load_region_sizes(dir.path()), Some(sizes));
+    }
+
+    #[test]
+    fn region_sizes_missing_or_malformed_returns_none() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(load_region_sizes(dir.path()), None, "absent file");
+
+        let _ = snap_dir(&dir);
+        std::fs::write(region_sizes_path(dir.path()), [0u8; 39]).unwrap();
+        assert_eq!(load_region_sizes(dir.path()), None, "39-byte file");
+    }
+
+    #[test]
+    fn growth_cooldown_round_trip_and_defaults() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            load_growth_cooldown_remaining(dir.path()),
+            0,
+            "absent file defaults to 0"
+        );
+
+        let _ = snap_dir(&dir);
+        save_growth_cooldown_remaining(7, dir.path()).unwrap();
+        assert_eq!(load_growth_cooldown_remaining(dir.path()), 7);
+
+        // Malformed (short) file falls back to 0, not a panic/garbage value.
+        std::fs::write(
+            dir.path().join("snapshot").join("growth_cooldown.bin"),
+            [0xFFu8; 4],
+        )
+        .unwrap();
+        assert_eq!(load_growth_cooldown_remaining(dir.path()), 0);
+    }
+
+    #[test]
+    fn sal_ewma_round_trip_and_defaults() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            load_sal_ewma(dir.path()),
+            (0.8, 0.2, 0),
+            "absent file returns the documented S1 seed"
+        );
+
+        let _ = snap_dir(&dir);
+        save_sal_ewma(0.631, 0.187, 12_345, dir.path()).unwrap();
+        let (mu, sigma, n) = load_sal_ewma(dir.path());
+        assert_eq!(mu, 0.631f32);
+        assert_eq!(sigma, 0.187f32);
+        assert_eq!(n, 12_345);
+
+        std::fs::write(dir.path().join("snapshot").join("sal_ewma.bin"), [0u8; 15]).unwrap();
+        assert_eq!(load_sal_ewma(dir.path()), (0.8, 0.2, 0), "15-byte file");
+    }
+
+    #[test]
+    fn settle_ewma_round_trip_and_defaults() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            load_settle_ewma(dir.path()),
+            (0.85, 0),
+            "absent file returns the documented S2 seed"
+        );
+
+        let _ = snap_dir(&dir);
+        save_settle_ewma(0.902, 777, dir.path()).unwrap();
+        let (mu, n) = load_settle_ewma(dir.path());
+        assert_eq!(mu, 0.902f32);
+        assert_eq!(n, 777);
+
+        std::fs::write(
+            dir.path().join("snapshot").join("settle_ewma.bin"),
+            [0u8; 11],
+        )
+        .unwrap();
+        assert_eq!(load_settle_ewma(dir.path()), (0.85, 0), "11-byte file");
+    }
+
+    #[test]
+    fn wake_ewma_round_trip_and_defaults() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            load_wake_ewma(dir.path()),
+            (0.0, 0),
+            "absent file returns the documented S6 seed"
+        );
+
+        let _ = snap_dir(&dir);
+        save_wake_ewma(412.5, 42, dir.path()).unwrap();
+        let (mu, n) = load_wake_ewma(dir.path());
+        assert_eq!(mu, 412.5f32);
+        assert_eq!(n, 42);
+
+        std::fs::write(dir.path().join("snapshot").join("wake_ewma.bin"), [0u8; 11]).unwrap();
+        assert_eq!(load_wake_ewma(dir.path()), (0.0, 0), "11-byte file");
+    }
 }
