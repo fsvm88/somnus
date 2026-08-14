@@ -1392,6 +1392,59 @@ early-return errors propagate through the existing `resample_result?` path in
 functions and `somnus-memory`'s I/O paths still have comparatively little direct coverage. The queued
 test list itself is now empty.
 
+## §32 — Test-coverage push round 2: burn-path contracts + memory persistence I/O (2026-08-14)
+
+**Context:** §31 closed the advisor-ranked test list but named two remaining thin spots:
+`somnus-perception`'s burn-path training functions and `somnus-memory`'s I/O paths. Both closed this
+session: **27 new tests** (somnus-memory 35→47; somnus-perception gains a new
+`tests/burn_path_contracts.rs` with 15 tests). Workspace 281 passing / 0 failed, clippy/fmt clean,
+both `mn10_env` and `fine-metrics` feature states re-verified (the new tests are dimension-generic
+via `REGION_DIMS`, confirmed by running them under `mn10_env`'s 960-dim env layout).
+
+**somnus-memory — persistence paths the campaign restart depends on (12 tests):**
+- `snapshot.rs` (3 → 9): round-trip + absent/malformed-file fallback pins for every small state
+  file the growth campaign persists across restarts — `region_sizes.bin`, `growth_cooldown.bin`,
+  and the three ADR 0024 controller EWMA files (`sal_ewma`/`settle_ewma`/`wake_ewma`), each
+  asserting its documented default seed ((0.8, 0.2, 0), (0.85, 0), (0.0, 0)). A format drift here
+  would silently reset the campaign's controllers or lose grown sizes on restart — previously
+  zero coverage.
+- `recollection.rs` (0 → 3): `promote()` moves a cold record into warm (and is a copy — cold stays
+  a ledger), unknown-id promote is a no-op, `query_warm_with_dist` ordering.
+- `cold.rs` (13 → 14): `iter_from` seek correctness — this is the tail-seek
+  `SemanticStore::rebuild_from_recent` relies on every sleep cycle (§27's hot path); pins record
+  alignment at the offset plus the `start >= len` clamps.
+- `semantic.rs` (8 → 10): `insert`'s skip-at-cap semantics (`max_records`, §21/§27 eviction
+  policy — first-writer-wins, uncapped stores never stop) and `records_since`'s inclusive
+  timestamp filter (the within-session gist probe's exclusion condition).
+
+**somnus-perception — burn-path contracts (15 tests, new `tests/burn_path_contracts.rs`):**
+- `measure_mse` (the growth-gate signal): finite/non-negative with empty-slot skip, and — the real
+  contract — **strictly decreases on every region after replay training** on the same inputs. A
+  growth gate reading a number that doesn't track learning would grow regions for no reason.
+- Head weights ↔ inference: heads are bias-free `Linear`, so `head_weights_flat`/
+  `set_head_weights_flat` fully determine the outputs — pinned as exact linearity (double weights
+  → double outputs, zero weights → zero outputs), round-trip no-op, and
+  `measure_output_mse_inference` ≡ manual MSE over `infer_episode_outputs` predictions (DER++
+  staleness detection reads this).
+- Save/load (campaign restart path): `save_weights`/`load_weights` round-trip exactly incl. the
+  `.sizes` sidecar; `load_weights_with_sizes` pre-grows then restores a grown model (sizes,
+  duty-cycle lengths, weights all consistent); a failed load (missing file) rebuilds a fresh model
+  and leaves the processor fully functional (the `lib.rs` error path).
+- Growth: `grow_region_seeded` size/duty-cycle bookkeeping + empty-seed fallback;
+  `collect_high_residual_inputs` cap/skip-empty/content preservation; duty cycles start zero,
+  update on ingest, extend with zeros on growth.
+- Burn-only paths: `encoder_z_only` dims/determinism and `language: None` ≡ explicit zeros;
+  `binding_only` shapes, temporal-context effect, and **grown region sizes travelling via the dense
+  vector lengths** (the §24 drift class, burn-side).
+
+**No production code changed** (one dev-dependency added: `tempfile` for the new perception
+integration tests). Metrics discipline: nothing touching data-handling operations changed, so no
+new metrics — stated explicitly per the standing policy.
+
+**Test-coverage state after this round:** no remaining named thin spots. Every crate with
+data-handling logic now has direct coverage of its contracts; the two known untestable-in-CI
+surfaces stay skip-don't-fail model-gated (`encode_models.rs`, `ort_grown_region.rs`).
+
 ---
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -1432,3 +1485,4 @@ test list itself is now empty.
 | 🔍 §29 | **ADR 0038 prerequisite 2: does this matter at the targeted scale?** | — | Informs whether hierarchical/coarse-to-fine k-WTA scoring is worth building | Answered 2026-07-15 — no, not at honeybee-order (the actual current target, not just current progress); ADR stays `proposed`/deferred with an explicit trigger (scale ambitions moving past honeybee-order), not closed — see §29 below; prerequisite 3 still open |
 | ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
 | ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |
+| ✅ §32 | **Test-coverage push round 2: burn-path contracts + memory persistence I/O** | Low | Correctness hardening — 27 new tests (somnus-memory 35→47, somnus-perception +15 in new `burn_path_contracts.rs`); campaign-restart persistence files, growth-gate `measure_mse`, save/load round-trips all pinned | Done 2026-08-14 — see §32 above; no remaining named thin spots |

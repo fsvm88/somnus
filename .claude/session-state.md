@@ -1,5 +1,47 @@
 # Session state — somnus
 
+> **⏸️ SHUTDOWN (clean), 2026-08-14.** Test-coverage push round 2 — closed the two remaining thin
+> spots §31 named (neither advisor-flagged): `somnus-perception` burn-path training functions and
+> `somnus-memory` I/O paths. **27 new tests, workspace 281 passing / 0 failed.**
+> - **`somnus-memory` (35 → 47):** `snapshot.rs` (3→9) — round-trip + absent/malformed fallback pins
+>   for every small state file the growth campaign persists across restarts (`region_sizes.bin`,
+>   `growth_cooldown.bin`, the three ADR 0024 controller EWMA files, each asserting its documented
+>   default seed); `recollection.rs` (0→3) — `promote()` cold→warm copy semantics (cold stays a
+>   ledger), unknown-id no-op, `query_warm_with_dist` ordering; `cold.rs` (13→14) — `iter_from`
+>   seek correctness + clamps (the tail-seek `rebuild_from_recent` relies on every sleep cycle);
+>   `semantic.rs` (8→10) — `insert` skip-at-cap semantics (§21/§27 eviction policy) +
+>   `records_since` inclusive timestamp filter.
+> - **`somnus-perception` (+15, new `tests/burn_path_contracts.rs`):** `measure_mse` strictly
+>   decreases with replay training (it is the growth-gate signal); bias-free head linearity pins
+>   (double weights → double outputs, zero → zero), `head_weights_flat` round-trip no-op,
+>   `measure_output_mse_inference` ≡ manual MSE over `infer_episode_outputs`; `save_weights`/
+>   `load_weights` exact round-trip + `.sizes` sidecar, `load_weights_with_sizes` grown-model
+>   restore (the campaign restart path), failed load rebuilds a functional model;
+>   `grow_region_seeded` bookkeeping + empty-seed fallback; `collect_high_residual_inputs`
+>   cap/skip-empty; duty cycles zero-init/ingest-update/growth-extend; `encoder_z_only`
+>   dims/determinism/None≡zero-language; `binding_only` shapes/temporal context/grown sizes via
+>   data lengths (§24 drift class, burn side).
+> - **No production code changed** — one dev-dep added (`tempfile`, pinned workspace dep, for the
+>   new perception integration tests). Verified: fmt clean, `cargo clippy --workspace
+>   --all-targets -- -D warnings` clean, `cargo test --workspace` 281 passed, `mn10_env` +
+>   `fine-metrics` feature states re-verified (tests are dimension-generic via `REGION_DIMS`,
+>   run under `mn10_env`'s 960-dim layout).
+> - **Metrics discipline:** tests-only, no data-handling operation touched — no new metrics
+>   needed, stated explicitly per the standing policy.
+> - **Docs:** gaps.md §32 + priority-table row.
+> - **Next-session entry point:** the queued item is the **final growth campaign session** — user
+>   stated intent to run it ("lets keep testing before we run the last session") but chose
+>   "commit only" at this break point, so it hasn't been launched yet. Campaign: session 79
+>   done, `[9549]×5` = 98.9% of the 10x target (9,660), ~2 growth events (~10 cycles) to go,
+>   stopped cleanly, resumable via `scripts/resume_growth_campaign.sh`. Test push has no
+>   remaining named thin spots. Standing open threads otherwise unchanged: ADR 0038 prerequisite 3
+>   (trigger-gated), deferred items A-N.
+> - **Not pushed:** this session's commits (somnus-memory tests, somnus-perception tests, docs) are on
+>   local `main` only; `origin/main` was in sync at `b684eec` before them — check
+>   `git log origin/main..HEAD` before assuming push state.
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean), 2026-08-13 (second session this day).** Continuation of the earlier
 > 2026-08-13 session below: completed the entire remaining advisor-ranked test-target list from
 > the "test every function properly" push. **54 new tests, workspace 254 passing / 0 failed.**
