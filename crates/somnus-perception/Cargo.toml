@@ -32,6 +32,9 @@ anyhow           = { workspace = true }
 matrixmultiply   = "0.3"
 somnus-metrics      = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [[bin]]
 name = "bench_nrem_batch"
 path = "src/bin/bench_nrem_batch.rs"
