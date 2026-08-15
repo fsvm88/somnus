@@ -9,9 +9,18 @@
   episode vectors, not regional inputs, so they can't be re-formed through a new binder; the
   real absorption mechanism is warm-store turnover (~30 cycles) plus a slower binder change rate.
   Flag stays opt-in (`--binding-replay`, default off) until adoption.
-  **2026-08-15 (later): adoption-path step 1 done** — `--binding-replay-steps N` (default 1)
-  caps `binding_replay_step_batch` calls per sleep cycle; only meaningful with `--binding-replay`
-  set. Next: repeat the isolated A/B pilot at N=1, ≥20 cycles, n≥2/arm.
+  **2026-08-15 (later): adoption-path step budget tried and FAILED (gaps.md §36).**
+  `--binding-replay-steps N` (default 1) caps `binding_replay_step_batch` calls per sleep cycle;
+  the repeat pilot at N=1 (20 cycles, n=1) cut NREM wall-clock (−24.8%, the cap works as a cost
+  lever) but made quality *worse* than the unbounded §35 pilot: ~10× same-cycle `mean_output_mse`
+  on cycles where the (now rarer, larger) step fires, plus a new failure mode — 6/20 treatment
+  cycles replayed zero traces, a cascade through the salience/settle homeostatic controllers
+  reacting to the degraded output. The §33 fix still engages under the cap (grown rows 30–78%
+  nonzero, confirmed via `binding_row_norms`), so the mechanism isn't broken — but step-count
+  capping decoupled cost from drift instead of taming both as hypothesized. **Step-count capping
+  abandoned as the lever.** Candidates queued, none chosen yet: reduce step *magnitude* (lower LR/
+  loss-scale on the term) instead of count; fuse into the existing `fused_replay_wake_step_batch`
+  step rather than a separate optimizer pass; decouple the salience/settle cascade directly.
 - **Date:** 2026-08-15
 
 ## Context
@@ -204,13 +213,20 @@ that A/B runs always use full debugging metrics and record deviations:
    episode-drift monitoring above kept on for the first production leg. **Blocked by item 2's
    outcome — the adoption path now requires the warm-store rebuild-from-cold mitigation and cost
    reduction first, then a repeat pilot (gaps.md §35 verdict).**
-4. **Cost/drift-reduction step — DONE 2026-08-15:** new `--binding-replay-steps N` CLI flag
-   (default 1) caps `binding_replay_step_batch` calls per sleep cycle via a step-budget counter in
-   the NREM loop (`sleep.rs::binding_replay_step_budget_remaining`); `N=0` disables the pass even
-   with `--binding-replay` set. No new metric needed — `NremBindingReplay`/`binding_replay_loss`
-   already cover the (now capped) call count and cost, per the standing metrics-discipline policy.
-   Next: repeat the isolated A/B pilot at the new default (N=1), ≥20 cycles, n≥2/arm, checking
-   binding still learns, grown rows still move, and cross-session gist is stable-or-recovering.
+4. **Cost/drift-reduction step — implemented 2026-08-15, repeat pilot FAILED (gaps.md §36):** new
+   `--binding-replay-steps N` CLI flag (default 1) caps `binding_replay_step_batch` calls per
+   sleep cycle via a step-budget counter in the NREM loop
+   (`sleep.rs::binding_replay_step_budget_remaining`); `N=0` disables the pass even with
+   `--binding-replay` set. No new metric needed — `NremBindingReplay`/`binding_replay_loss`
+   already cover the (now capped) call count and cost. **Repeat pilot at N=1 (20 cycles, n=1):
+   wall-clock goal met (NREM −24.8%) but quality got worse, not better** — ~10× same-cycle
+   `mean_output_mse` on cycles where the step fires, plus a new failure mode (6/20 cycles
+   trace-starved via a salience/settle homeostatic cascade reacting to the degraded output). §33
+   fix still engages under the cap (grown rows 30–78% nonzero). **Verdict: step-count capping
+   decouples cost from drift instead of taming both — abandoned as the lever.** Not adopted.
+   Candidates queued for the next attempt: reduce step magnitude (LR/loss-scale) instead of count;
+   fuse into the existing fused-replay step instead of a separate optimizer pass; decouple the
+   salience/settle cascade directly. No path chosen yet.
 
 ## What would invalidate this
 

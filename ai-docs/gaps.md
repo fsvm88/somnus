@@ -1646,6 +1646,71 @@ simultaneously cuts cost and per-generation drift.
 3. Only then adopt (default-on or new control), with drift monitoring kept on for the first
    production leg. Option (c) temporal-prediction loss remains sequenced behind adoption.
 
+**Adoption-path step 1 done, 2026-08-15:** `--binding-replay-steps N` (default 1) added — a step-
+budget counter in the NREM loop (`sleep.rs::binding_replay_step_budget_remaining`) caps
+`binding_replay_step_batch` calls per sleep cycle. See §36 for the repeat pilot at N=1, which
+**failed** — the cap did not reproduce the hoped-for tamer drift.
+
+## §36 — ADR 0041 repeat pilot at `--binding-replay-steps 1`: wall-clock improved, quality got worse (2026-08-15)
+
+**Setup:** same `ab_binding_replay.sh` harness as §35, trained production state (post-§35 state:
+control/treatment both started from the campaign's `[9821]×5` snapshot), CYCLES=20 (vs §35's 10,
+per the queued adoption-path pass criterion), n=1/arm, both arms `fine-metrics`, sequential.
+Treatment adds `--binding-replay` (steps now capped at the new default N=1; previously unbounded,
+~2.8 steps/cycle in §35).
+
+**Wall-clock goal met:** `nrem_wall_ms` **−24.8%** (control 6,784ms/cycle mean vs treatment
+5,099ms/cycle) — a real reversal of §35's +34.5%. The cap does reduce NREM cost as intended.
+
+**But the quality/stability picture is worse than §35, not better, once decomposed per-cycle rather
+than read as an aggregate.** Two compounding effects the headline numbers hide:
+
+1. **On the 13/20 cycles where `binding_replay` actually fired, `mean_output_mse` was ~10× control
+   on the same cycle** (e.g. cycle 3: control 0.0098 vs treatment 0.314; cycle 17: 0.0118 vs
+   0.215). Concentrating the same total training into fewer, larger steps did not make each
+   intervention gentler — it made the ones that do fire more disruptive than §35's smaller, more
+   frequent steps were.
+2. **Treatment's wake-phase dynamics diverged hard: 6/20 cycles replayed zero traces**
+   (`traces_replayed=0`, vs control's steady 460–512 every cycle) — the episodic buffer was
+   effectively empty going into NREM on those cycles. This tracks a cascade through the
+   homeostatic controllers, not a metrics artifact: `sal_threshold` +39%, `settle_gate_dynamic`
+   −44%, `settle_iters_sum` +154%, `prior_beta_effective` −41%, `mean_salience_wake` +37% — the
+   degraded encoder/head outputs shifted salience/settle signals enough to change when sleep
+   triggers and how much accumulates beforehand. This confound wasn't visible at this magnitude in
+   §35's unbounded run.
+3. Aggregate deltas: `mean_output_mse` +445%, `mean_real_inference_mse` +655%,
+   `gist_recall_rate` −32.5% (same direction as §35's −53% cross-session collapse, comparable
+   order), `per_region_mse` +20–159% across all 5 regions, `blend_count` −52%,
+   `traces_replayed` −58% (worse displacement than §35's −30%). `within_session_gist_rate` still
+   improves (+6.6%, weaker than §35's +13.3%) — same-generation recall still works, consistent
+   with the drift-not-breakage read.
+
+**The §33 fix still engages under the cap** (checked directly via `binding_row_norms` on the final
+weights, not inferred from the loss curve): control stays 0/9,089 grown rows nonzero across all
+regions (clean); treatment shows 30–78% nonzero (AudioSpeech 3,228/9,118, AudioEnv 7,070/9,118,
+Visual 4,317/9,118, Symbolic 6,359/9,118, Language 2,992/9,118), `grown_max` 0.029–0.057 — lower
+than §35's 0.04–0.14, consistent with less total training under the cap. So the cap doesn't break
+the mechanism; it just doesn't tame the side effects the adoption plan bet it would.
+
+**Verdict per the queued pass criterion — FAIL.** "Binding still learning" ✓, "grown rows still
+moving" ✓, but "cross-session gist stable-or-recovering" ✗ (still regressing, comparable magnitude
+to §35) and "replay displacement contained" ✗ (−58%, worse than §35's −30%). **Not adopted.** n=1
+per arm — a 10× same-cycle MSE gap and a 6-cycle trace-starvation pattern are far beyond plausible
+run-to-run noise, but a second seed would strengthen this before it's treated as fully settled.
+
+**What this changes about the adoption path:** the hypothesis that capping *step count* would
+proportionally tame both cost and drift was wrong — it decoupled them instead, trading cost for
+concentrated-step instability. Capping step *count* is not obviously the right lever; candidates
+worth trying before another repeat pilot: (a) reduce step *magnitude* instead (lower LR or a
+loss-scale multiplier on the binding-replay term specifically, so each step — however often it
+fires — perturbs the encoder/heads less), (b) fuse the binding-replay term into
+`fused_replay_wake_step_batch`'s existing step rather than running it as a separate optimizer pass
+(the ADR's own deferred optimization — a separate AdamW step per fire may itself be part of what
+makes each intervention feel "large" to the rest of the system), (c) investigate the
+salience/settle cascade directly — a control-side clamp so wake-phase triggering doesn't react so
+sharply to NREM-quality-driven output_mse swings might decouple the two dynamics regardless of
+which of (a)/(b) is also tried. No path chosen yet — needs a decision before further pilots.
+
 ---
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -1687,6 +1752,7 @@ simultaneously cuts cost and per-generation drift.
 | ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
 | ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |
 | ✅ §32 | **Test-coverage push round 2: burn-path contracts + memory persistence I/O** | Low | Correctness hardening — 27 new tests (somnus-memory 35→47, somnus-perception +15 in new `burn_path_contracts.rs`); campaign-restart persistence files, growth-gate `measure_mse`, save/load round-trips all pinned | Done 2026-08-14 — see §32 above; no remaining named thin spots |
-| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision (b) 2026-08-15, ADR 0041 implemented; **pilot ran (§35): fix engages (47–96% of grown rows learn in 10 cycles), but predicted episode-drift recall regression materialized and NREM cost displaced 30% of replay — not adopted**; adoption path queued (§35): step budget → longer repeat pilot (turnover absorbs drift; the cold-rebuild mitigation doesn't work as written — cold lacks regional inputs) |
+| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision (b) 2026-08-15, ADR 0041 implemented; **pilot ran (§35): fix engages, but drift regression + cost — not adopted; step-budget cap tried (§36): wall-clock improved but quality got WORSE (10× same-cycle MSE, wake-dynamics cascade) — also not adopted**; step-count capping abandoned as the lever, step-magnitude/fusion/cascade-decoupling candidates queued, no path chosen |
 | ✅ §34 | **10x growth campaign complete** — `[9821]×5` = 101.7% of the 9,660 target | — | Growable-core capacity milestone | Done 2026-08-15 — see §34 above; 791 cycles, 188 growth events, 0 panics/segfaults/ORT-fallbacks, output_mse −74% first-vs-last-10; unblocks §33's decision |
 | 🔍 §35 | **ADR 0041 isolated A/B pilot** (trained state, 10 cycles/arm, fine-metrics both arms) | — | Validates/invalidates live-episode binding training before adoption | Done 2026-08-15 — mechanism validated (§33 fix engages in production state), predicted episode-drift materialized (cross-session gist −53%, warm_l2 rising), cost +34.5% NREM displacing 30% of replay; adoption path: warm-rebuild mitigation + fused/cheaper step + repeat pilot |
+| 🔍 §36 | **ADR 0041 repeat pilot at `--binding-replay-steps 1`** (trained state, 20 cycles/arm, fine-metrics both arms) | — | Tests whether step-count capping tames §35's cost/drift before adoption | Done 2026-08-15 — **FAIL, worse than §35**: NREM wall-clock did improve (−24.8%, cap works as a cost lever) but quality got worse (10× same-cycle `mean_output_mse` on fired cycles, 6/20 cycles trace-starved via a salience/settle cascade); §33 fix still engages (grown rows 30–78% nonzero) but drift/displacement criteria both fail, worse than §35's; step-count capping abandoned, magnitude/fusion/cascade-decoupling candidates queued instead |

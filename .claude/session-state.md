@@ -1,5 +1,52 @@
 # Session state — somnus
 
+> **✅ CHECKPOINT (clean), 2026-08-15 (same day, later still) — pre-commit hook re-established;
+> ADR 0041 adoption-path step 1 (`--binding-replay-steps N`) implemented AND repeat-piloted — FAIL,
+> worse than the original pilot. Full detail: gaps.md §36, ADR 0041 status.**
+> - **Pre-commit hook:** CI was red on the last 2 pushes (`cargo fmt --check` failure,
+>   `binding_row_norms.rs` committed unformatted — no hook had ever caught this, `.git/hooks` isn't
+>   versioned so there was nothing to "re-setup" from). Fixed the formatting, added a tracked
+>   `scripts/hooks/pre-commit` (fmt --check + clippy, mirrors `ci.yml`) + `scripts/setup-hooks.sh`
+>   to install it (`.git/hooks/pre-commit` itself stays untracked/local, as normal for git). CI
+>   green again (`ba642b2`). **If hooks ever go missing again (fresh clone, `.git` recreated),
+>   re-run `scripts/setup-hooks.sh`.**
+> - **`--binding-replay-steps N` (default 1), commit `a1ea230`:** step-budget counter in the NREM
+>   loop (`sleep.rs::binding_replay_step_budget_remaining`, tested) caps `binding_replay_step_batch`
+>   calls per cycle. Full workspace test/clippy/fmt clean, `fine-metrics`/`mn10_env` feature states
+>   verified, CI green.
+> - **Repeat pilot at N=1 (`ab_binding_replay.sh`, CYCLES=20, n=1/arm, both fine-metrics) — FAILS,
+>   worse than the original §35 pilot:** NREM wall-clock did improve as hoped (−24.8%, vs §35's
+>   +34.5% — the cap works as a pure cost lever). But quality got *worse*, not better, once read
+>   per-cycle rather than as an aggregate: on the 13/20 cycles where the (now rarer, larger) step
+>   actually fired, `mean_output_mse` was ~10× control on the same cycle; a new failure mode also
+>   showed up — 6/20 treatment cycles replayed **zero** traces (episodic buffer starved going into
+>   NREM), traced to a cascade through the salience/settle homeostatic controllers reacting to the
+>   degraded output (`sal_threshold` +39%, `settle_gate_dynamic` −44%, `settle_iters_sum` +154%).
+>   The §33 fix still engages under the cap — checked directly via `binding_row_norms` on final
+>   weights, not inferred: control 0/9,089 grown rows nonzero (clean), treatment 30–78% nonzero.
+>   So the mechanism isn't broken; capping *step count* just decoupled cost from drift instead of
+>   taming both, which was the whole bet. **Verdict: step-count capping abandoned as the adoption
+>   lever.** n=1 — can't fully rule out variance, but a 10× same-cycle MSE gap and a 6-cycle
+>   trace-starvation pattern are far past plausible noise.
+> - **No path chosen yet for the next attempt** — three candidates queued in gaps.md §36/ADR 0041,
+>   undecided: (a) reduce step *magnitude* (lower LR/loss-scale on the binding-replay term) instead
+>   of count, (b) fuse the term into the existing `fused_replay_wake_step_batch` optimizer step
+>   instead of a separate pass (the ADR's own deferred optimization — a separate AdamW step per
+>   fire may itself be part of what makes each intervention land "large"), (c) decouple the
+>   salience/settle cascade directly so wake-phase triggering doesn't react so sharply to
+>   NREM-output_mse swings, regardless of which of (a)/(b) is also tried. **Ask the user which to
+>   try next before writing more code here** — this is a judgment call about mechanism, not a
+>   queued default.
+> - **Docs:** gaps.md §36 (new, full writeup) + §33/§35 table rows corrected; ADR 0041 status line
+>   + validation-plan item 4 updated to record the fail. Pilot artifacts (`memory/ab_binding_replay/`,
+>   2.9G) `rm -rf`'d after the writeup, same as §35's pattern — production `memory/` untouched
+>   throughout (pilot always copies to a separate scratch dir, never touches production state).
+> - **Committed + pushed:** hook-fix commit `ba642b2` (CI verified green), `a1ea230` (feature +
+>   tests, CI verified green), plus this session's docs/cleanup commit (gaps.md §36, ADR 0041
+>   update, session-state) — check `git log` for the exact hash if resuming.
+>
+> ---
+>
 > **✅ CHECKPOINT (clean), 2026-08-15 (same day, later) — ADR 0041 isolated A/B pilot RUN,
 > written up as gaps.md §35. Verdict: mechanism validated, §33 fix engages in production state,
 > predicted episode-drift materialized → NOT adopted yet.**
