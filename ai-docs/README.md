@@ -20,6 +20,7 @@ For *behavioral* expectations on the assistant, see `../CLAUDE.md`. This folder 
 
 - [`research/`](research/) — research notes, by topic. Each file cites primary sources.
 - [`decisions/`](decisions/) — ADRs, numbered sequentially.
+- [`gaps.md`](gaps.md) — open, undecided backlog items. [`gaps-resolved.md`](gaps-resolved.md) — the same numbered items once decided (accepted/deployed or rejected/not-pursued), moved verbatim so `gaps.md` stays open-only.
   - 0024: Neuromodulatory self-regulation — accepted; replaces most fixed CLI thresholds
     (salience gate, settle-rate, wakefulness pressure, prior-beta, growth controller) with
     derived EWMA signals. Large, multi-phase, amended 2026-06-14.

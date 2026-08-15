@@ -2,7 +2,7 @@
 
 > **✅ CHECKPOINT (clean), 2026-08-15 (latest) — pre-commit hook restored; ADR 0041 adoption-path
 > step 1 (`--binding-replay-steps N`) implemented and repeat-piloted — FAIL, worse than the
-> original pilot. Detail: gaps.md §36, ADR 0041 status.**
+> original pilot. Detail: gaps-resolved.md §36, ADR 0041 status.**
 > - **Pre-commit hook:** CI was red on the last 2 pushes (`cargo fmt --check` failure —
 >   `binding_row_norms.rs` committed unformatted; no hook had ever caught this — `.git/hooks` isn't
 >   versioned, so there was nothing to "re-setup" from). Fixed formatting; added tracked
@@ -22,18 +22,18 @@
 >   control 0/9,089 grown rows nonzero, treatment 30–78%). **Verdict: step-count capping decouples
 >   cost from drift instead of taming both — abandoned as the lever.** n=1, but a 10× same-cycle MSE
 >   gap and 6-cycle trace starvation are far past plausible noise.
-> - **No path chosen for the next attempt** — three candidates queued (gaps.md §36/ADR 0041),
+> - **No path chosen for the next attempt** — three candidates queued (gaps-resolved.md §36/ADR 0041),
 >   undecided: (a) reduce step *magnitude* (LR/loss-scale) instead of count, (b) fuse into the
 >   existing `fused_replay_wake_step_batch` step instead of a separate optimizer pass, (c) decouple
 >   the salience/settle cascade directly. **Ask the user before writing more code here.**
-> - **Docs:** gaps.md §36 (new) + §33/§35 rows corrected; ADR 0041 status + validation item 4
+> - **Docs:** gaps-resolved.md §36 (new) + §33/§35 rows corrected; ADR 0041 status + validation item 4
 >   updated. Pilot artifacts (`memory/ab_binding_replay/`, 2.9G) `rm -rf`'d after writeup —
 >   production `memory/` untouched throughout (pilot always uses a separate scratch copy).
 > - **Pushed:** `ba642b2`, `a1ea230`, `0dcf023` — all CI-green.
 >
 > ---
 >
-> **✅ CHECKPOINT (clean), 2026-08-15 — ADR 0041 isolated A/B pilot run, written up as gaps.md §35.
+> **✅ CHECKPOINT (clean), 2026-08-15 — ADR 0041 isolated A/B pilot run, written up as gaps-resolved.md §35.
 > Verdict: mechanism validated, §33 fix engages in production state, predicted episode-drift
 > materialized → NOT adopted.**
 > - **Setup:** `scripts/ab_binding_replay.sh` (new) — production state copied per arm (snapshot+
@@ -60,7 +60,7 @@
 >   only, so the documented "count=steps, total=loss" semantics were impossible; doc now says count
 >   accumulates summed scaled loss, step count rides `NremBindingReplay`. Comparison script fixed
 >   accordingly.
-> - **Committed + pushed:** `35a2346` (pilot infra) + writeup commit (gaps.md §35, ADR 0041, somnus-
+> - **Committed + pushed:** `35a2346` (pilot infra) + writeup commit (gaps-resolved.md §35, ADR 0041, somnus-
 >   metrics doc fix). Production `memory/` untouched.
 > - **Queued next (superseded by the entry above — see it for what actually happened):** step
 >   budget (`--binding-replay-steps N`, start N=1) → repeat pilot (≥20 cycles, n≥2) → adopt only on
@@ -116,7 +116,7 @@
 >   growth events (mean batch 46.8, cadence 1/4.21), 82 sessions, 2026-07-12→2026-08-15. Health: 0
 >   panics, 0 segfault restarts, 0 ORT fallbacks (final session), 7 `misc_warning` lifetime.
 >   `mean_output_mse` 0.0430→0.0112 (−74.0%) first-vs-last-10; warm 151,725/cold 158,534 records.
-> - **Docs:** gaps.md §16 complete, §20 pointer, new §34 + priority row; architecture.md updated.
+> - **Docs:** gaps-resolved.md §16 complete, §20 pointer, new §34 + priority row; architecture.md updated.
 >   SVG untouched (depicts the n=1024/k=20 baseline, not production campaign state).
 > - **Next-session entry point:** campaign completion unblocks gaps.md §33 (BindingArea weights
 >   never trained) — ask the user. Whisper-ASR-panic root cause also queued (§5). Standing threads
@@ -137,13 +137,13 @@
 >   `collect_high_residual_inputs`; duty cycles; `encoder_z_only`/`binding_only` dims/determinism.
 > - **No production code changed** — one dev-dep added (`tempfile`, pinned). Verified: fmt/clippy/
 >   281 tests clean, both feature states re-verified.
-> - **Docs:** gaps.md §32 + priority row.
+> - **Docs:** gaps-resolved.md §32 + priority row.
 > - **Same-day continuation:** (1) investigated the §25 note that binding weights never train —
 >   **CONFIRMED REAL, gaps.md §33** — all training paths consume episodes as stored data; ADR 0008's
 >   "revisit in Phase 6" never happened; grown units' zero-init binding rows never learn (8,797/9,821
 >   units/region invisible to episodes). Options a/b/c listed, decision pending until campaign
 >   finishes. (2) Pushed local commits. (3) Cold-archive btrfs fallback — ok for now. (4) Whisper ASR
->   panic — queued in gaps.md §5.
+>   panic — queued in gaps.md §40 (open).
 > - **Not pushed at shutdown:** this session's commits were local-only; check `git log
 >   origin/main..HEAD` before assuming push state.
 >
@@ -160,7 +160,7 @@
 > - **Two small production changes the resample tests forced:** rubato 5 silently broke the
 >   documented contract (same drift class as §17/§22/§24) — `SincResampler::new` now rejects zero
 >   rates, `process` enforces `input.len()==chunk_frames`. Behavior on every production path
->   unchanged. Full writeup: gaps.md §31.
+>   unchanged. Full writeup: gaps-resolved.md §31.
 > - **`whisper_asr.rs` (0→8, somnus lib 91→99):** argmax edge cases; special-token-ID drift pin
 >   (SOT/EOT/EN/TRANSCRIBE/NO_TIMESTAMPS map to expected strings); `max_tokens=0` short-circuit;
 >   determinism on zeros and on real encoder output. Note: Whisper EOT is id 50257, "<endoftext>"
@@ -169,7 +169,7 @@
 >   variants (COUNT==ALL.len(), index/name uniqueness, snake_case well-formedness) + proptest
 >   record/snapshot/reset round-trip. `proptest` added as dev-dep.
 > - **Verified:** fmt/clippy/254 tests clean, both feature states, `somnus --help` smoke run.
-> - **Docs:** gaps.md §31; `tech-stack.md` staleness fixed (rubato candidate→committed v5,
+> - **Docs:** gaps-resolved.md §31; `tech-stack.md` staleness fixed (rubato candidate→committed v5,
 >   ffmpeg-next 8→9, rayon/clap candidate→committed, dead candle declarations removed).
 > - **Next-session entry point:** test push has no remaining advisor-ranked targets. Otherwise
 >   nothing queued as a bug. Growth campaign at 98.9% of 10x target.
@@ -203,7 +203,7 @@
 > ---
 >
 > **⏸️ SHUTDOWN (clean), 2026-08-12.** Implemented AND deployed the sparse-gather binding-graph
-> rewrite live. Committed `19e0f52`, `3949b52`, `ad69560` (ADR 0040, gaps.md §30).
+> rewrite live. Committed `19e0f52`, `3949b52`, `ad69560` (ADR 0040, gaps-resolved.md §30).
 > - **Deployed live, confirmed via `OrtRunBinding`:** 2-cycle verification leg (session 79, budget
 >   already exhausted at 98.3%). Zero ORT fallback, clean rebuilds. **40-59% reduction in
 >   `OrtRunBinding`'s real per-call cost** (2.15-2.83ms→1.17-1.30ms), including one cycle catching a
@@ -225,7 +225,7 @@
 >   crashed `simplify_reshapes`), unrelated to the Gather question.
 > - **Measured win** via a 3rd arm on `bench_binding_projection.py`: **54-59% reduction in
 >   `OrtRunBinding`'s per-call cost** at campaign scale (0.85ms→0.35-0.39ms).
-> - **gaps.md §28/§29 and ADR 0038 corrected** — both mischaracterized `OrtRunBinding` as
+> - **gaps-resolved.md §28/§29 and ADR 0038 corrected** — both mischaracterized `OrtRunBinding` as
 >   "fixed-size, region-count-independent"; the dense projection this replaces was actually 75-76%
 >   of that graph's cost.
 > - **Rust contract change:** `SparseActivation::to_exact_k` (new), `run_binding` now takes
@@ -335,7 +335,7 @@
 > immediately-invoked-closure wrap. Verified incrementally (rebuild/retest after every conversion);
 > live pilot recorded 40 distinct metrics simultaneously, cross-thread ones confirmed safe, untriggered
 > conditions correctly stayed at zero. Docs: ADR 0039 (Update + Implementation-patterns sections),
-> gaps.md §26.
+> gaps-resolved.md §26.
 >
 > **Base conversion (superseded by the above, kept for the discovery trail):** ADR 0039, two tiers
 > sharing one `Registry` — Core (`timed_core!`/`counted_core!`, unconditional, the "always reported"
@@ -422,12 +422,12 @@
 >   export precedent anywhere (dynamic positional-embedding interpolation, nnAudio STFT frontend —
 >   same fragility class mn10 was chosen to avoid), non-commercial license. +3 mAP claim judged not
 >   worth the export/license risk given item 9's precedent (paper-benchmark quality and somnus-pipeline
->   quality diverge). Docs-only, gaps.md §8.
+>   quality diverge). Docs-only, gaps-resolved.md §8.
 > - **2026-07-09, EfficientAT mn10 (item 9) — ❌ REJECTED:** A/B (5 sessions × 2 cycles, fresh memory
 >   both arms): control (CLAP-HTSAT) avg MSE 0.011966 vs. treatment (mn10) 0.030588, **+155.6%
 >   worse**, 9/10 cycles regressed, no reversals. Default env encoder stays CLAP-HTSAT.
 >   Implementation kept as an opt-in `mn10_env` Cargo feature (clean, parity-tested, may be useful
->   for deployment-size later). gaps.md §9.
+>   for deployment-size later). gaps-resolved.md §9.
 > - **2026-07-08, DER++ auto-λ Phase 3 — implemented then A/B REJECTED:** EWMA 1/variance weighting
 >   for `sae_loss`+`wake_loss` combination (`--der-auto-lambda`, default false). A/B: control avg
 >   0.0487 vs. treatment 0.0847, **+73.8% worse**, 10/10 cycles regressed, no reversals — likely
@@ -436,7 +436,7 @@
 >   stray un-killed background process once collided with a clean rerun writing to the same path.
 > - **2026-07-06:** change-gated video encoder + SVD null-result shipped (`9bba42b`, `b410ad7`).
 >   High replay ratio (N=1/2/4) validated, **N=4 adopted** (`d5ce2ab`, `f0fa9c6`): -70.9% output_mse
->   for +16.6% wall-clock vs N=1; N=2 more efficient (-49.1%/+7.6%) but not chosen. gaps.md §2.
+>   for +16.6% wall-clock vs N=1; N=2 more efficient (-49.1%/+7.6%) but not chosen. gaps-resolved.md §2.
 > - **EfficientAT mn10 implementation detail (2026-07-08, now A/B'd above):** new `Mn10Mel` mel
 >   frontend (EfficientAT's `AugmentMelSTFT`, Kaldi-style filterbank, parity-tested at 1e-4). Export
 >   script bakes in only the MobileNetV3 backbone (no mel frontend — avoids reintroducing an STFT op
@@ -446,13 +446,13 @@
 >
 > **Earlier baseline (pre-2026-07-06), for reference:**
 > - DINOv3-ViT-S adopted (drop-in 384-dim replacement for DINOv2-S): visual-region MSE -95.6%,
->   `warm_recall_l2` +61.5%, no confound. `ai-docs/a_b_dinov3_findings.md`, gaps.md §6.
+>   `warm_recall_l2` +61.5%, no confound. `ai-docs/a_b_dinov3_findings.md`, gaps-resolved.md §6.
 > - Qwen3-0.6B adopted as sole action-decoder LM (ADR 0036, supersedes ADR 0035); Qwen2.5 support
 >   fully removed. ~22% lower `mean_proj_loss`, coherent generation vs. Qwen2.5's token salad.
->   `ai-docs/a_b_qwen3_findings.md`, gaps.md §5.
+>   `ai-docs/a_b_qwen3_findings.md`, gaps-resolved.md §5.
 > - Whisper ASR panic (intermittent `decode_greedy` "GetElementType is not implemented") mitigated
 >   not root-caused — `catch_unwind` stops it from killing the ASR thread. Unverified whether it
->   fully recovers or downgrades to a per-cycle WARN. gaps.md §5.
+>   fully recovers or downgrades to a per-cycle WARN. gaps.md §40 (open).
 
 ## Key files
 
@@ -476,9 +476,9 @@ table covers everything not listed here.
 | F | ADR 0010 | Post-k-WTA prior injection | Pre-k-WTA injection shows poor `prior_cosine` uptake |
 | I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
 | J | ADR 0003 | Whisper-tiny → Whisper-base / WavLM-base (audio quality) | — (Tier 3, revisit opportunistically) |
-| K | ADR 0003 | DINOv2-S → SigLIP-B (language-aligned visual embeddings, Phase 7+) | — (superseded in spirit by DINOv3-ViT-S, gaps.md §6; SigLIP2-ViT-B/16 tracked separately as §7) |
-| L | ADR 0012 | LoRA fine-tuning of Qwen for episode-vector prefix | — (Tier 3) — **confirmed still open 2026-08-15 (gaps.md §37):** done 2026-06-25 for Qwen2.5 (ADR 0033), orphaned when Qwen2.5 was dropped (ADR 0036); `train_lora_qwen3.py` exists (committed 2026-06-27, same session as the abandoned KV-cache-decode half) but was never run — `qwen3_lm.onnx` is the corrected-export base model, not a LoRA merge |
-| M | ADR 0012 | MLP projection (640→5×896) instead of linear | **RESOLVED 2026-08-15 (gaps.md §37) — not actually open.** Confirmed via code: `--linear-proj` defaults false, the MLP (ADR 0032) is the default production path, dimension-parameterized by `LM_HIDDEN` (now 1024/Qwen3) — works unmodified. Remove from any future copy of this table. |
+| K | ADR 0003 | DINOv2-S → SigLIP-B (language-aligned visual embeddings, Phase 7+) | — (superseded in spirit by DINOv3-ViT-S, gaps-resolved.md §6; SigLIP2-ViT-B/16 tracked separately as §7) |
+| L | ADR 0012 | LoRA fine-tuning of Qwen for episode-vector prefix | — (Tier 3) — **confirmed still open 2026-08-15 (gaps-resolved.md §37):** done 2026-06-25 for Qwen2.5 (ADR 0033), orphaned when Qwen2.5 was dropped (ADR 0036); `train_lora_qwen3.py` exists (committed 2026-06-27, same session as the abandoned KV-cache-decode half) but was never run — `qwen3_lm.onnx` is the corrected-export base model, not a LoRA merge |
+| M | ADR 0012 | MLP projection (640→5×896) instead of linear | **RESOLVED 2026-08-15 (gaps-resolved.md §37) — not actually open.** Confirmed via code: `--linear-proj` defaults false, the MLP (ADR 0032) is the default production path, dimension-parameterized by `LM_HIDDEN` (now 1024/Qwen3) — works unmodified. Remove from any future copy of this table. |
 | N | ADR 0014 | Visual/audio region grounding (captions, env sound labels) | — (Tier 3) |
 
 Items B, D, G, H (language last-token pooling, full differentiable SAE, learned per-region gate,

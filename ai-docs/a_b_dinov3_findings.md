@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-05
 **Duration:** 2 sleep cycles per session, 5 sessions each model (`scripts/ab_dinov3.sh`)
-**Prerequisite:** Fixed the CWD-relative external-data bug that previously made DINOv3 look broken (gaps.md §6) and the register-token pooling bug in `somnus-encoding/src/video.rs`.
+**Prerequisite:** Fixed the CWD-relative external-data bug that previously made DINOv3 look broken (gaps-resolved.md §6) and the register-token pooling bug in `somnus-encoding/src/video.rs`.
 
 ## Results
 

@@ -4,7 +4,7 @@
 
 ## Original run (2026-06-28) — INVALIDATED, kept only as an incident record
 
-> Reported Qwen3 "underperforming" on `warm_recall_l2` (0.550→0.498, -9.6%). **Not trustworthy**: `LM_HIDDEN` had been bumped 896→1024 (`6335b42`) the day before, but `ActionDecoder` still loaded Qwen2.5's real 896-wide embed table by hardcoded filename — `embed_flat()` sliced it at stride 1024, silently corrupting every token embedding in **both** arms. Qwen3 also had no GPU-path export of its own and ran via a file-swap trick whose restore step failed (`qwen25_lm.onnx` on disk was actually the Qwen3 model). The -9.6% reflects a broken pipeline, not either architecture. DINOv2 was used as the visual encoder for both arms (DINOv3 was believed MIGraphX-incompatible then — later found to be a CWD-relative path bug, gaps.md §6).
+> Reported Qwen3 "underperforming" on `warm_recall_l2` (0.550→0.498, -9.6%). **Not trustworthy**: `LM_HIDDEN` had been bumped 896→1024 (`6335b42`) the day before, but `ActionDecoder` still loaded Qwen2.5's real 896-wide embed table by hardcoded filename — `embed_flat()` sliced it at stride 1024, silently corrupting every token embedding in **both** arms. Qwen3 also had no GPU-path export of its own and ran via a file-swap trick whose restore step failed (`qwen25_lm.onnx` on disk was actually the Qwen3 model). The -9.6% reflects a broken pipeline, not either architecture. DINOv2 was used as the visual encoder for both arms (DINOv3 was believed MIGraphX-incompatible then — later found to be a CWD-relative path bug, gaps-resolved.md §6).
 
 ## Redo take 1 (2026-07-05): pipeline fixed, comparison inconclusive
 
@@ -23,7 +23,7 @@ Fixed before re-running: (1) restored a genuine Qwen2.5 baseline (on-disk `qwen2
 
 **Verdict: inconclusive, not "Qwen3 loses."** The 4 stock clips have too little speech — lang-ingest fires ~once per 5-cycle session regardless of LM, so `mean_proj_loss` has almost no samples and language MSE is indistinguishable. The large `mean_output_mse`/`warm_recall_l2` gaps aren't a Qwen3 effect — per-region breakdown (speech 0.567→0.470, env 0.034→0.028, visual 0.088→0.076, symbolic 0.035→0.016, language 0.0011→0.0010) shows every region, including three with zero LM dependency, moving similarly — independent-seed noise from cold-started weights.
 
-**Aside:** an unrelated intermittent panic in `WhisperDecoder::decode_greedy` (ORT "GetElementType is not implemented" escalating past its caught-WARN path) hit 1-2 sessions/arm — no data lost (50/50 cycles present, each session a separate process) — flagged, mitigated later (gaps.md §5).
+**Aside:** an unrelated intermittent panic in `WhisperDecoder::decode_greedy` (ORT "GetElementType is not implemented" escalating past its caught-WARN path) hit 1-2 sessions/arm — no data lost (50/50 cycles present, each session a separate process) — flagged, mitigated later (gaps.md §40, open).
 
 ## Redo take 2 (2026-07-05): speech-dense `clips/long/` corpus — Qwen3 wins on proj_loss
 
@@ -44,7 +44,7 @@ Swapped the 4 sparse-speech clips for 6 lecture/podcast clips (Stanford CS229, B
 
 **Verdict: worth adopting Qwen3-0.6B.** proj_loss is the one metric this run isolates to LM choice, and the direction held with no reversals. Recommended: confirm with a longer run and/or direct generation-quality test (proj_loss is a grounding surrogate, not generation quality) — take 3.
 
-**Aside:** the Whisper panic recurred more on this denser corpus (~1/5 sessions control, ~3/5 treatment) — still no data loss (20/20 cycles present both arms), still unrelated, but the higher rate made it worth mitigating (gaps.md §5).
+**Aside:** the Whisper panic recurred more on this denser corpus (~1/5 sessions control, ~3/5 treatment) — still no data loss (20/20 cycles present both arms), still unrelated, but the higher rate made it worth mitigating (gaps.md §40, open).
 
 Files: `memory/qwen25_ab_control_longclips/metrics.jsonl`, `memory/qwen3_ab_treatment_longclips/metrics.jsonl`, `scripts/ab_qwen3_longclips.sh`.
 
