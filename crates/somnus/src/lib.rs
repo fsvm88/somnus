@@ -784,6 +784,27 @@ fn memory_dir_disk_free_bytes(memory_dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// gaps.md §40: dump the encoder-hidden-state input that made `decode_greedy` panic, so a
+/// future occurrence leaves a reproducible input instead of vanishing with the dropped cycle.
+/// Best-effort — a failure here must never mask or replace the original panic-recovery path.
+fn capture_asr_panic_input(memory_dir: &std::path::Path, hidden: &[f32]) {
+    let dir = memory_dir.join("asr_panic_captures");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(?e, "failed to create asr_panic_captures dir");
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("panic_input_{ts}.bin"));
+    let bytes: Vec<u8> = hidden.iter().flat_map(|f| f.to_le_bytes()).collect();
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => tracing::warn!(path = %path.display(), "captured ASR panic input"),
+        Err(e) => tracing::warn!(?e, "failed to write ASR panic capture"),
+    }
+}
+
 fn sink_write(sink: &mut Option<BufWriter<std::fs::File>>, line: &str) {
     if let Some(w) = sink {
         if let Err(e) = writeln!(w, "{}", line) {
@@ -1566,17 +1587,32 @@ pub async fn run() -> Result<()> {
             let lang_tx_asr = lang_tx.clone();
             let asr_cnt = Arc::clone(&asr_count);
             let asr_min_chars = args.asr_min_chars;
+            let memory_dir = args.memory_dir.clone();
             std::thread::spawn(move || {
                 let mut dec = dec;
+                // gaps.md §40: does one ORT panic leave the Session's ORT-internal state
+                // (not a Rust Mutex — no poisoning primitive is involved) permanently
+                // degraded, or does the thread fully recover? Tracked in-thread since this
+                // is the only thread that ever touches `dec`/`Session`.
+                let mut panicked_this_session = false;
                 while let Ok(hidden) = rx.recv() {
                     // ORT's Whisper decoder occasionally panics instead of returning Err
                     // (e.g. "GetElementType is not implemented") — an intermittent, unfixed
                     // ORT-side issue (see ai-docs/a_b_qwen3_findings.md). catch_unwind stops
                     // that from silently killing this thread and ending ASR for the rest of
                     // the session; we just drop the one bad cycle and keep decoding.
+                    let hidden_for_capture = hidden.clone();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         dec.decode_greedy(&hidden, 200)
                     }));
+                    let failed = !matches!(result, Ok(Ok(_)));
+                    if panicked_this_session {
+                        if failed {
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::AsrPostPanicFailure, 1);
+                        } else {
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::AsrPostPanicSuccess, 1);
+                        }
+                    }
                     match result {
                         Ok(Ok(text)) if text.len() >= asr_min_chars.max(1) => {
                             tracing::info!(chars = text.len(), "whisper ASR");
@@ -1596,7 +1632,9 @@ pub async fn run() -> Result<()> {
                         }
                         Err(_) => {
                             tracing::warn!("whisper ASR panicked — dropping this cycle");
-                            somnus_metrics::counted_core!(somnus_metrics::Metric::AsrError, 1);
+                            somnus_metrics::counted_core!(somnus_metrics::Metric::AsrPanic, 1);
+                            panicked_this_session = true;
+                            capture_asr_panic_input(&memory_dir, &hidden_for_capture);
                         }
                     }
                 }
