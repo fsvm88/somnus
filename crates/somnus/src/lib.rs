@@ -1181,11 +1181,16 @@ pub async fn run() -> Result<()> {
             .expect("--export-proj-weights requires --action");
         std::fs::create_dir_all(export_dir).expect("failed to create export dir");
         let weights = dec.proj_weights_flat();
-        // MLP: W1=[640,1024] then W2=[1024,4480]; linear: W1=[640,4480] only.
+        // MLP: W1=[640,LM_HIDDEN] then W2=[LM_HIDDEN,N_REGIONS*LM_HIDDEN];
+        // linear: W1=[640,N_REGIONS*LM_HIDDEN] only.
+        // gaps.md §39: this used to hardcode the Qwen2.5-era 4480 (5*896) for the linear-proj
+        // case — silently wrong under Qwen3's 1024-dim LM (5*1024=5120). The default MLP path
+        // was never affected (w2 was always "everything remaining").
+        let out_dim = action::N_REGIONS * action::LM_HIDDEN;
         let w1_len = if args.linear_proj {
-            640 * 4480
+            640 * out_dim
         } else {
-            640 * 1024
+            640 * action::LM_HIDDEN
         };
         let w1_bytes: Vec<u8> = weights[..w1_len]
             .iter()
@@ -1201,12 +1206,20 @@ pub async fn run() -> Result<()> {
         println!(
             "  w1.bin  {} f32  shape=[640,{}]",
             w1_len,
-            if args.linear_proj { 4480 } else { 1024 }
+            if args.linear_proj {
+                out_dim
+            } else {
+                action::LM_HIDDEN
+            }
         );
         println!(
-            "  w2.bin  {} f32  shape=[{},4480]",
+            "  w2.bin  {} f32  shape=[{},{out_dim}]",
             weights.len() - w1_len,
-            if args.linear_proj { 0 } else { 1024 }
+            if args.linear_proj {
+                0
+            } else {
+                action::LM_HIDDEN
+            }
         );
         std::process::exit(0);
     }
