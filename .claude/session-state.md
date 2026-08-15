@@ -477,8 +477,8 @@ table covers everything not listed here.
 | I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
 | J | ADR 0003 | Whisper-tiny → Whisper-base / WavLM-base (audio quality) | — (Tier 3, revisit opportunistically) |
 | K | ADR 0003 | DINOv2-S → SigLIP-B (language-aligned visual embeddings, Phase 7+) | — (superseded in spirit by DINOv3-ViT-S, gaps.md §6; SigLIP2-ViT-B/16 tracked separately as §7) |
-| L | ADR 0012 | LoRA fine-tuning of Qwen for episode-vector prefix | — (Tier 3) — marked done 2026-06-25 for Qwen2.5, which was later fully removed (ADR 0036); not re-verified for Qwen3 |
-| M | ADR 0012 | MLP projection (640→5×896) instead of linear | — (Tier 3) — same caveat as L, marked done against Qwen2.5's 896-dim output, not re-verified against Qwen3 |
+| L | ADR 0012 | LoRA fine-tuning of Qwen for episode-vector prefix | — (Tier 3) — **confirmed still open 2026-08-15 (gaps.md §37):** done 2026-06-25 for Qwen2.5 (ADR 0033), orphaned when Qwen2.5 was dropped (ADR 0036); `train_lora_qwen3.py` exists (committed 2026-06-27, same session as the abandoned KV-cache-decode half) but was never run — `qwen3_lm.onnx` is the corrected-export base model, not a LoRA merge |
+| M | ADR 0012 | MLP projection (640→5×896) instead of linear | **RESOLVED 2026-08-15 (gaps.md §37) — not actually open.** Confirmed via code: `--linear-proj` defaults false, the MLP (ADR 0032) is the default production path, dimension-parameterized by `LM_HIDDEN` (now 1024/Qwen3) — works unmodified. Remove from any future copy of this table. |
 | N | ADR 0014 | Visual/audio region grounding (captions, env sound labels) | — (Tier 3) |
 
 Items B, D, G, H (language last-token pooling, full differentiable SAE, learned per-region gate,

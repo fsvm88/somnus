@@ -69,7 +69,7 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0020](0020-systematic-forgetting-cold-truncation.md) | Systematic forgetting: bounded cold archive | accepted |
 | [0021](0021-cross-modal-gist-entropy.md) | Cross-modal gist entropy: ingest_source and concept probe | accepted |
 | [0022](0022-instrumentation-metrics-expansion.md) | Instrumentation and metrics expansion: salience, blend, modality, NREM coverage | accepted |
-| [0023](0023-gpu-unification.md) | GPU unification: ORT/MIGraphX for perception inference | proposed |
+| [0023](0023-gpu-unification.md) | GPU unification: ORT/MIGraphX for perception inference | accepted; Phase 0+1 implemented |
 | [0024](0024-neuromodulatory-self-regulation.md) | Neuromodulatory self-regulation: derived signals replace fixed thresholds | accepted |
 | [0025](0025-sae-l1-coding-loss.md) | SAE L1 coding loss | closed — not adopted |
 | [0026](0026-pruning-ab-distribution-shift.md) | A/B: magnitude pruning safety under distribution shift | closed — FAIL, pruning disabled by default |
@@ -87,4 +87,4 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0038](0038-sparse-encoder-scoring.md) | Sparse (hierarchical) k-WTA encoder scoring for the next scale order | proposed |
 | [0039](0039-unified-metrics-instrumentation.md) | Unified two-tier metrics instrumentation (`somnus-metrics`) | implemented |
 | [0040](0040-sparse-gather-binding-projection.md) | Sparse-gather binding projection (ONNX/MIGraphX) | implemented, deployed live |
-| [0041](0041-live-episode-binding-training.md) | Live-episode binding training in NREM (close the §33 never-trained-binding gap) | proposed |
+| [0041](0041-live-episode-binding-training.md) | Live-episode binding training in NREM (close the §33 never-trained-binding gap) | implemented; not adopted — 2 failed pilots (gaps.md §35/§36) |
