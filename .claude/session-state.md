@@ -36,6 +36,16 @@
 >   stopped cleanly, resumable via `scripts/resume_growth_campaign.sh`. Test push has no
 >   remaining named thin spots. Standing open threads otherwise unchanged: ADR 0038 prerequisite 3
 >   (trigger-gated), deferred items A-N.
+> - **Same-day continuation (after the commits above were pushed):** user asked "anything else we
+>   can improve?" → four candidates surfaced; user's picks: (1) investigate the §25 note that
+>   binding weights never train — **CONFIRMED REAL, written up as gaps.md §33** (all training
+>   paths consume episodes as stored data; ADR 0008's "revisit in Phase 6" never happened;
+>   concrete consequence: grown units' zero-init binding-projection rows never learn, so grown
+>   units are invisible to episode formation; options a/b/c listed, decision pending, implement
+>   only after the 10x campaign finishes); ADR 0008 corrected in place. (2) Pushed local commits
+>   to origin. (3) Cold-archive disk-cap btrfs fallback — user: ok for now. (4) Whisper ASR panic
+>   root cause — **queued** in gaps.md §5 with a suggested approach. These doc edits (gaps.md
+>   §5/§25/§33 + table row, ADR 0008) are the uncommitted state at this point.
 > - **Not pushed:** this session's commits (somnus-memory tests, somnus-perception tests, docs) are on
 >   local `main` only; `origin/main` was in sync at `b684eec` before them — check
 >   `git log origin/main..HEAD` before assuming push state.

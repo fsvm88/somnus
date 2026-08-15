@@ -145,7 +145,11 @@ reference) in `ai-docs/a_b_qwen3_findings.md`.
   (`crates/somnus/src/main.rs`) wraps the call in `catch_unwind` so it no longer kills the whole
   thread. **Unverified:** if the underlying ORT panic poisons the `Session`, every later call on
   it may also panic — degrading to "logs a WARN and drops every cycle" rather than full recovery.
-  Root cause still undiagnosed.
+  Root cause still undiagnosed — **queued for root-causing (2026-08-14, user request)**. Approach
+  when picked up: first instrument the mitigation to settle the poisoning question (does the next
+  `decode_greedy` on the same `Session` succeed after a caught panic?), then reproduce — the panic
+  is intermittent and input-correlated candidates (specific mel frames / chunk boundaries) are
+  untested, so capture the exact input that triggers it before theorizing about ORT internals.
 
 **Metrics collected per cycle:** `output_mse` (reconstruction error), `p_lang` (language region
 activation probability), `proj_loss` (action decoder projection loss), regional activation stats,
@@ -919,8 +923,9 @@ in the current campaign (ORT healthy, zero fallback occurrences). Separately, no
 (`replay_step*`, `wake_reconstruct_step*`, `fused_replay_wake_step_batch`) calls
 `BindingArea::forward` either — `wake_reconstruct_step` rebuilds its episode tensor from plain
 `&[f32]` data rather than a tracked graph node, so `BindingArea`'s weights (`region_projs`,
-`w_q`/`w_k`/`w_v`) currently receive no gradient updates from any path in this codebase, a
-separate, un-investigated fact worth a closer look later but out of scope here.
+`w_q`/`w_k`/`w_v`) currently receive no gradient updates from any path in this codebase —
+investigated 2026-08-14 and confirmed to be a real, long-standing gap (not by design); full
+findings and options in §33.
 
 **Net effect:** the fix is real, numerically verified, and a genuine 11.4× win wherever `burn`'s
 binding path actually runs — pre-crossover campaigns, CPU-only/no-MIGraphX hardware, and the ORT
@@ -1445,6 +1450,60 @@ new metrics — stated explicitly per the standing policy.
 data-handling logic now has direct coverage of its contracts; the two known untestable-in-CI
 surfaces stay skip-don't-fail model-gated (`encode_models.rs`, `ort_grown_region.rs`).
 
+## §33 — BindingArea weights are never trained — confirmed, options pending decision (2026-08-14)
+
+**Context:** §25's correction (2026-07-14) noticed in passing that no training function calls
+`BindingArea::forward` and flagged it "un-investigated, for later." Investigated 2026-08-14 on the
+user's request. **Confirmed: the binding area's ~1.72M parameters (5 region projections, W_q/W_k/
+W_v, the GRU, temporal_proj) have never received a gradient update — not once, since ADR 0008 was
+adopted.** This is a known-gap-that-was-never-closed, not a design choice.
+
+**Evidence (all training paths verified):**
+- `replay_step`/`replay_step_batch`: loss graph is encoder (`forward_tracked`) → k-WTA mask →
+  SAE decoder reconstruction MSE. Binding not in the graph.
+- `wake_reconstruct_step_batch` / `fused_replay_wake_step_batch`: episodes enter as
+  `Tensor::from_data(stored floats)` — the graph stops at the episode boundary. NREM
+  (`sleep.rs:687`) feeds stored `batch[i].0` episodes.
+- ADR 0012 projection training (proj_loss): also trains on stored episode vectors.
+- The only `binding.forward` call sites are inference: `try_bind` (ORT fallback + burn path),
+  `settle_episode` paths B/C, `binding_only`.
+
+**ADR 0008 anticipated exactly this** (Consequences, 2026-05-10): "the binding weights will
+primarily be shaped by the episode vector being reused downstream — this is sparse in Phase 5 and
+**will be revisited in Phase 6**." The downstream reuse never carried gradients (episodes are
+always stored/detached before any training touches them), and the Phase 6 revisit never happened.
+ADR 0008's text is corrected in place to record this.
+
+**Concrete consequence found while verifying:** `grow_region`/`grow_region_seeded` append
+**zero-initialized rows** to the binding projection with the code comment "gradients will shape
+them over time" (`lib.rs` grow path). Since no gradients ever flow, **grown units' binding
+projections stay exactly zero forever — grown units are invisible to episode formation.** At the
+campaign's current 9.3× growth, ~89% of each region's units contribute to SAE reconstruction (the
+growth-gate metric) but nothing to episodes, memory, or recall. The GRU temporal-context path
+(ADR 0008's whole reason to exist) is likewise running on random init.
+
+**Why the campaign still looks healthy:** encoders/decoders/heads learn around the fixed random
+binder — episodes are a stable (if untrained) function of sparse activations, and everything
+downstream adapts to it. `per_region_mse` measures SAE quality, which binding doesn't gate.
+
+**Options (no decision yet):**
+- **(a) Accept + document:** declare binding a fixed random binder. Free. Gives up exactly what
+  ADR 0008 was designed to provide (learned cross-regional interaction + temporal context) and
+  leaves grown units episode-invisible.
+- **(b) Live-episode head training (the natural fix, matches ADR 0008's intent):** during NREM,
+  recompute episodes live from the stored regional inputs via burn binding and train
+  `heads(live_episode)` against the regional targets — gradients flow into binding (and optionally
+  encoders, if activations are re-tracked). Cost: one extra binding forward+backward per NREM batch
+  (small vs. cycle wall-clock). Trade-off: changes training dynamics of a healthy campaign → needs
+  an ADR + an A/B pilot before touching production, and the ORT inference graph only picks up
+  trained weights at the next re-export (growth event / rebuild — already part of the lifecycle).
+- **(c) Temporal prediction loss:** a GRU-specific signal (episode_t → predict episode_{t+1}).
+  More research-y; could complement (b) later.
+
+**Sequencing note:** if (b) is chosen, do it *after* the current 10x campaign finishes — changing
+training dynamics mid-campaign would invalidate the run's continuity. The Whisper-panic root cause
+(§5, queued same day) is independent of this.
+
 ---
 
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
@@ -1486,3 +1545,4 @@ surfaces stay skip-don't-fail model-gated (`encode_models.rs`, `ort_grown_region
 | ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
 | ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |
 | ✅ §32 | **Test-coverage push round 2: burn-path contracts + memory persistence I/O** | Low | Correctness hardening — 27 new tests (somnus-memory 35→47, somnus-perception +15 in new `burn_path_contracts.rs`); campaign-restart persistence files, growth-gate `measure_mse`, save/load round-trips all pinned | Done 2026-08-14 — see §32 above; no remaining named thin spots |
+| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Investigated + confirmed 2026-08-14 — see §33 above; options (a) accept, (b) live-episode head training, (c) temporal loss; decision pending, implement only after the 10x campaign finishes |
