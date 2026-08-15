@@ -442,3 +442,29 @@ Environment: `uv venv .venv && uv pip install torch onnx onnxruntime peft transf
 **Not done:** INT8 quantization of the new decode model (`qwen3_lm_decode_kv_int8.onnx`, the higher-priority `Q-B` path in `ActionDecoder::new`) — FP32 is active and correct, INT8 would be a further speedup, not attempted this pass.
 
 ---
+
+## §43 — Change-gated video encoder A/B (gaps.md §41): measured, 93.8% skip rate, quality tradeoff concentrated in the visual region — no default adopted
+
+**Pilot:** `scripts/ab_video_change_threshold.sh` (new, follows the `ab_binding_replay.sh` template — copied trained `campaign_growth10x` state, sequential control/treatment, `--features fine-metrics`, 10 cycles). Control: no flag (`--video-change-threshold 0.0`, disabled, matches production default). Treatment: `--video-change-threshold 0.05`.
+
+**Skip rate — the headline §41 question:** control encoded 772/772 frames (0% skip, as expected with the gate disabled); treatment encoded 753/12,107 frames, **93.8% skipped**. The h3h3/podcasts/shorts corpus used for the growth campaign is mostly slow-changing (talking-head/interview footage) at `--video-stride 2` sampling, so `mean_abs_diff` rarely crosses 0.05 frame-to-frame — a much higher skip rate than might be assumed from the threshold's magnitude alone.
+
+**Downstream quality — mixed, not a clean win or loss:**
+
+| metric | control | treatment | delta |
+|---|---|---|---|
+| mean_output_mse | 0.010370 | 0.012633 | **+21.8%** |
+| mean_output_mse_wake | 0.052496 | 0.050438 | −3.9% |
+| gist_recall_rate | 0.735365 | 0.798353 | +8.6% |
+| warm_recall_l2 | 0.539064 | 0.460980 | −14.5% (lower is better) |
+| per_region_mse.Visual (index 2) | 0.001577 | 0.001747 | **+10.8%** |
+| nrem_wall_ms | 6539 | 6386 | −2.3% |
+| rem_wall_ms | 9359 | 8524 | −8.9% |
+
+Other four regions' `per_region_mse` moved ≤4% either direction. The pattern is coherent: the one region whose *input* is directly gated (Visual) degrades, while several session-level recall/gist metrics improve slightly — plausibly because fewer, more decorrelated video ingests reduce redundant near-duplicate episodes competing in the same warm-store neighborhood, the same mechanism `gaps-resolved.md`'s BatchTopK/replay-ratio wins traded on, though not confirmed here. `mean_output_mse`'s +21.8% is the one metric that reads as a real regression rather than noise, and it's an aggregate across all five regions, not just Visual.
+
+**Deviations recorded (standing A/B instruction) beyond the headline:** `snapshot_episodic_bytes_written` +53% and `synthetics_produced` +53% in the treatment arm — both moved together, consistent with each other, but not obviously explained by the change-gate mechanism itself (video-frame skipping shouldn't directly change episodic snapshot volume or REM synthesis count). Flagging as unexplained, not investigated further this pass — worth checking before adopting a default threshold, in case the change-gate is perturbing episode timing/salience in a way that has a second-order effect on synthesis.
+
+**Not adopted — no decision on a default threshold.** Real wake-path compute savings are large (93.8% fewer `enc.encode()` calls at threshold=0.05) and the NREM/REM wall-clock deltas point the same direction, but the quality cost isn't zero (visual-region MSE +10.8%, aggregate MSE +21.8%) and the two unexplained deviations above haven't been chased down. A single 10-cycle pilot at one threshold value is enough to answer "does this do anything" (yes) but not "what's the right threshold" or "is the visual-region cost acceptable" — those need either a threshold sweep or an explicit product/research-priority call this pilot doesn't make on its own. `--video-change-threshold` stays default-off (0.0) in production.
+
+---
