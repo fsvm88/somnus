@@ -11,9 +11,11 @@
 >
 > **Since 2026-07-12:** the main `memory/` was wiped and a full 10x growth campaign launched
 > (target ~9,660 units/region, honeybee-order scale vs. the fruit-fly-order ~1,024-unit baseline
-> above) — as of 2026-07-13 at session 69/131, region sizes are 8,494 (≈88% of target), so the
-> "n=1024, k=20" figure in the 2026-07-11 paragraph above describes the architectural *baseline*,
-> not current production region sizes. Alongside the campaign: K_ACTIVE now scales with region
+> above) — **completed 2026-08-15: all five regions at 9,821 units (101.7% of target)** after 791
+> logged cycles / 188 growth events, 0 panics/segfaults, output MSE −74% first-vs-last-10 cycles
+> (gaps.md §34). The "n=1024, k=20" figure in the 2026-07-11 paragraph above describes the
+> architectural *baseline*, not current production region sizes (production k is `scaled_k(9821)`).
+> Alongside the campaign: K_ACTIVE now scales with region
 > growth (`region::scaled_k`, gaps.md §17), optimizer resets are scoped to the grown region only
 > (§18), growth batch size is novelty-proportional (§19). Perception inference now auto-switches
 > to the ORT/MIGraphX GPU path past the CPU/GPU crossover without a manual flag (ADR 0037,

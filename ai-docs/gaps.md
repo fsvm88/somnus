@@ -375,7 +375,7 @@ Migration cost: rewrite the HNSW interaction layer in `crates/somnus-memory`. Re
 
 ---
 
-## 16. Growth-scaling pilot campaigns (10x growable-core scaling) 🔬 CHARACTERIZED, full campaign not yet run
+## 16. Growth-scaling pilot campaigns (10x growable-core scaling) ✅ COMPLETE (campaign finished 2026-08-15, see §34)
 
 **Goal:** scale somnus's own growable core (5× k-WTA regions + GRU + binding, `~5,400` units baseline
 per `brain-scale-comparison.md`) 10x, toward honeybee-order scale (~54,000 units, ~9,660
@@ -441,12 +441,13 @@ observed rates) — roughly **2.4–3x longer than the pre-§19 estimate**, not 
 slower or less healthy, but because it's now correctly proportional to actual novelty, and this
 corpus/setup mostly produces moderate (not severe) novelty per trigger.
 
-**Not yet done:** the actual full-scale campaign to reach 10x, now estimated at ~9.3–11.5h
-unattended (was ~3.9h pre-§19). All three pilots ran in isolated scratch memory dirs
-(`memory/growth_pilot/`, `memory/growth_pilot_expanded/`, `memory/growth_pilot_v2/` — untracked,
-not the main `memory/`); the full campaign has not been launched. Next step is user-driven: accept
-the longer campaign time, or revisit §19's `GROWTH_BATCH_MAX`/curve shape if ~3-4h is a hard
-budget constraint.
+**Done (2026-08-15):** the actual full-scale campaign reached the 10x target — launched 2026-07-12
+(§20), finished 2026-08-15 at `[9821]×5` units/region (101.7% of the 9,660 target) after 791
+logged cycles and 188 growth events, in roughly half the pilot-3-projected cycle budget
+(§19's novelty-proportional batches ran larger in practice: mean 46.8 vs the projected 35.6
+units/event). All three pilots ran in isolated scratch memory dirs (`memory/growth_pilot/`,
+`memory/growth_pilot_expanded/`, `memory/growth_pilot_v2/` — untracked, not the main `memory/`).
+Full completion writeup: §34.
 
 ---
 
@@ -579,6 +580,8 @@ previously estimated. See §16 pilot 3 for full numbers and the revised campaign
 ---
 
 ## 20. Full 10x growth campaign launched; `campaign_status.py`; `eval_metrics.py` region-name bug fix (2026-07-12)
+
+> **Completed 2026-08-15** — target reached at `[9821]×5` (101.7% of 9,660). See §34.
 
 **§16's full campaign is now running** (not just pilots). Per the user's explicit call, `memory/`
 was wiped completely first (all production state + every old A/B/pilot scratch dir — ~17GB, all
@@ -1502,7 +1505,50 @@ downstream adapts to it. `per_region_mse` measures SAE quality, which binding do
 
 **Sequencing note:** if (b) is chosen, do it *after* the current 10x campaign finishes — changing
 training dynamics mid-campaign would invalidate the run's continuity. The Whisper-panic root cause
-(§5, queued same day) is independent of this.
+(§5, queued same day) is independent of this. **Update 2026-08-15:** the campaign finished (§34),
+so (b) is no longer sequenced behind anything — decision still pending.
+
+---
+
+## §34 — The 10x growth campaign is complete (2026-08-15)
+
+**The §16/§20 campaign reached its target.** Final session 82 (15 cycles) completed 2026-08-15
+with all five regions at **9,821 units = 101.7% of the 9,660 10x target** (`campaign_status.py`:
+"target reached."). The growable core grew from the wiped-from-scratch `[1024]×5` baseline
+(2026-07-12) to honeybee-order scale in 791 logged cycles / 188 growth events (mean batch 46.8
+units/event, cadence 1/4.21 cycles) over 82 sessions — roughly half the cycle budget pilot 3's
+recalibration projected (§16's "~1,298 cycles"), because real mean batches ran larger than the
+pilot's 35.6.
+
+**Final leg (this session's work):** the 2026-08-14 session had launched what it expected to be
+the last campaign session (session 80, `SESSIONS=1 CYCLES=15`) and was interrupted by a machine
+shutdown mid-cycle-8, at `[9645]×5` — 15 units short. Resumed 2026-08-15: one aborted attempt
+(session 81, completed exactly 1 cycle — growth suppressed by cooldown, ORT healthy — before a
+launcher-side process-group kill; harmless, snapshot-consistent) then session 82 ran the full 15
+cycles to a clean `max-sleep-cycles reached` exit. Growth during session 82: 9645 → 9675 (c5) →
+9769 (c8) → 9821 (c12), i.e. the target was crossed at the first event (c5). The on-disk ONNX
+artifacts were re-exported at the final `[9821]×5` size by the session's own end-of-cycle rebuild,
+so inference state matches weights. `scripts/resume_growth_campaign.sh` now correctly reports
+"campaign already reached its target session" — it is session-budget-based and the unit target is
+met, so nothing about it needs changing.
+
+**Health, whole campaign:** 0 panics, 0 segfault restarts (the exit-139 MIGraphX destructor race
+that hit pilots and early sessions never fired in the final leg), 0 ORT fallbacks in the final
+session, 7 `misc_warning` counts lifetime. Final-cycle timing at 9,821 units/region: perception
+1.6s, NREM 7.4s, REM 9.4s, snapshot 2.9s, spill 5.4s.
+
+**Quality trend:** `mean_output_mse` first-10 vs last-10 cycles: 0.0430 → 0.0112 (**−74.0%**);
+latest per-region MSE: speech 0.0019, env 0.0009, visual 0.0019, symbolic 0.0007, language 0.0001.
+`gist_recall_rate` 0.562 (cross-session), `within_session_gist_rate` 0.820, `warm_recall_l2` 0.381.
+Memory tiers at completion: warm 151,725 records (816M), cold 158,534 (101M).
+
+**Eval harness ran automatically** on session exit (`train_campaign.sh` post-campaign step): all
+charts regenerated into `memory/campaign_growth10x/` (growth_timeline, per_region_mse,
+language_trajectory, timing_breakdown, wake_timing, sleep_triggers, modality_balance,
+gist_quality, recall_quality, settle_stats, memory_growth).
+
+**What this unblocks:** §33's binding-weights decision (options a/b/c) was explicitly sequenced
+behind this campaign finishing — it can now be taken. Nothing else was gated on the campaign.
 
 ---
 
@@ -1528,7 +1574,7 @@ training dynamics mid-campaign would invalidate the run's continuity. The Whispe
 | ✅ §13 | **Change-gated video encoder** | Low | Wake-path compute (unmeasured savings) | Deployed 2026-07-06, opt-in via `--video-change-threshold` |
 | ❌ §14 | **SVD low-rank check (region/binding weights)** | Low | Capacity efficiency | Null result 2026-07-06 — near-full-rank, not pursued |
 | §15 | **Crate hygiene** (usearch migration, burn-ndarray watch, ffmpeg-the-third) | Low–Med | HNSW footprint / maintenance | Dead deps removal already done; usearch/ffmpeg-the-third deferred until raised by a concrete need |
-| 🔄 §16 | **Growth-scaling pilot campaigns** (10x growable-core scaling) | Med (pilots done; full campaign launched 2026-07-12, running unattended) | Growable-core capacity | Characterized 2026-07-09/11/12 (3 pilots, no plateau risk found); full 10x campaign launched 2026-07-12 from wiped `memory/`, tracked live via `scripts/campaign_status.py` — see §20 |
+| ✅ §16 | **Growth-scaling pilot campaigns** (10x growable-core scaling) | Med (pilots done; full campaign 2026-07-12 → 2026-08-15) | Growable-core capacity | Characterized 2026-07-09/11/12 (3 pilots, no plateau risk found); full campaign launched 2026-07-12, **completed 2026-08-15 at `[9821]×5` (101.7% of target)** — see §20/§34 |
 | ✅ §17 | **K_ACTIVE scaling with region growth** | Low–Med | Sparse coding quality at scale | Deployed 2026-07-12 — see §17 below |
 | ✅ §18 | **Scope optimizer reset to grown region only** | Low | Convergence stability during growth | Deployed 2026-07-12 — see §18 below |
 | ✅ §19 | **Novelty-proportional growth batch size** | Med | Growth-mechanism correctness | Deployed 2026-07-12 — see §19 below |
@@ -1545,4 +1591,5 @@ training dynamics mid-campaign would invalidate the run's continuity. The Whispe
 | ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
 | ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |
 | ✅ §32 | **Test-coverage push round 2: burn-path contracts + memory persistence I/O** | Low | Correctness hardening — 27 new tests (somnus-memory 35→47, somnus-perception +15 in new `burn_path_contracts.rs`); campaign-restart persistence files, growth-gate `measure_mse`, save/load round-trips all pinned | Done 2026-08-14 — see §32 above; no remaining named thin spots |
-| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Investigated + confirmed 2026-08-14 — see §33 above; options (a) accept, (b) live-episode head training, (c) temporal loss; decision pending, implement only after the 10x campaign finishes |
+| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Investigated + confirmed 2026-08-14 — see §33 above; options (a) accept, (b) live-episode head training, (c) temporal loss; decision pending, campaign gating it finished 2026-08-15 (§34) |
+| ✅ §34 | **10x growth campaign complete** — `[9821]×5` = 101.7% of the 9,660 target | — | Growable-core capacity milestone | Done 2026-08-15 — see §34 above; 791 cycles, 188 growth events, 0 panics/segfaults/ORT-fallbacks, output_mse −74% first-vs-last-10; unblocks §33's decision |

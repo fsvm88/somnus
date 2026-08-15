@@ -1,5 +1,46 @@
 # Session state — somnus
 
+> **✅ SHUTDOWN (clean), 2026-08-15. The 10x growth campaign is COMPLETE.** Resumed the
+> interrupted 2026-08-14 session: first committed+pushed its leftover docs (`836083a` — gaps.md
+> §33/§5 + ADR 0008 correction), then reconstructed the campaign state it had left behind and
+> finished the run.
+> - **Interrupted state found:** the 08-14 session *had* launched the final campaign session
+>   (session 80, `SESSIONS=1 CYCLES=15`) before the shutdown killed it mid-cycle-8 (hard kill,
+>   log ends mid-NREM, no clean exit). On-disk state was snapshot-consistent at `[9645]×5` —
+>   15 units short of the 9,660 target. `resume_growth_campaign.sh` correctly refused to resume
+>   (session-budget exhausted) — it is session-budget-based, not unit-target-based; nothing wrong
+>   with it, just not the right tool once the budget runs out short of the unit goal.
+> - **Completion run:** first relaunch attempt (session 81) completed exactly 1 cycle (growth
+>   suppressed by cooldown, ORT healthy) before being killed by a launcher-side process-group
+>   kill — **operational note for future sessions: the opencode bash tool kills the entire
+>   process group on its 120s timeout; long-lived background launches must use `setsid` (plus
+>   `< /dev/null`, output to a log file) or they die with the launching command.** Relaunched
+>   detached as session 82 with identical parameters: all 15 cycles ran to a clean
+>   `max-sleep-cycles reached` exit. Growth: 9645 → 9675 (c5, **crossed the target here**) →
+>   9769 (c8) → 9821 (c12).
+> - **Final state: `[9821]×5` units/region = 101.7% of the 9,660 10x target**
+>   (`campaign_status.py`: "target reached."). Campaign lifetime: 791 logged cycles, 188 growth
+>   events (mean batch 46.8, cadence 1/4.21), 82 sessions, 2026-07-12 → 2026-08-15. Health:
+>   0 panics, 0 segfault restarts, 0 ORT fallbacks (final session), 7 `misc_warning` lifetime.
+>   Quality: `mean_output_mse` 0.0430 → 0.0112 (−74.0%) first-vs-last-10; latest per-region MSE
+>   0.0001–0.0019; warm 151,725 / cold 158,534 records. ONNX artifacts re-exported at the final
+>   size by the session's own end-of-cycle rebuild; eval harness charts regenerated automatically
+>   on exit. Full writeup: gaps.md §34.
+> - **Docs:** gaps.md §16 marked complete, §20 completion pointer, new §34 + priority-table rows;
+>   `architecture.md` "Since 2026-07-12" paragraph updated to the final state. SVG untouched —
+>   it depicts the architectural baseline (n=1024, k=20), per architecture.md's own convention;
+>   production region size is campaign state, not an architecture parameter.
+> - **Metrics discipline:** no code changed this session (launch + docs only) — no data-handling
+>   operation touched, stated explicitly per the standing policy.
+> - **Next-session entry point:** the campaign's completion unblocks exactly one queued decision —
+>   **gaps.md §33 (BindingArea weights never trained, options a/b/c)** — which was explicitly
+>   sequenced behind the campaign finishing. That decision is now open; ask the user. The other
+>   queued item is the Whisper-ASR-panic root cause (§5, approach sketched there). Standing open
+>   threads otherwise unchanged: ADR 0038 prerequisite 3 (trigger-gated), deferred items A-N.
+> - **Pushed:** everything, including this entry's commit — `origin/main` is in sync.
+>
+> ---
+>
 > **⏸️ SHUTDOWN (clean), 2026-08-14.** Test-coverage push round 2 — closed the two remaining thin
 > spots §31 named (neither advisor-flagged): `somnus-perception` burn-path training functions and
 > `somnus-memory` I/O paths. **27 new tests, workspace 281 passing / 0 failed.**
