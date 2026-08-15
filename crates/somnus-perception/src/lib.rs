@@ -22,7 +22,7 @@ use burn::{
     optim::adaptor::OptimizerAdaptor,
     optim::{AdamW, AdamWConfig, GradientsParams, Optimizer},
     record::{BinFileRecorder, FullPrecisionSettings},
-    tensor::{Distribution, Tensor, TensorData},
+    tensor::{Distribution, Int, Tensor, TensorData},
 };
 use std::collections::VecDeque;
 
@@ -1165,6 +1165,212 @@ impl PerceptionProcessor {
         }
     }
 
+    /// Live-episode binding training step for NREM replay (ADR 0041, gaps.md §33).
+    ///
+    /// Recomputes episodes live through the binding area from the stored regional
+    /// inputs and trains the five output heads against those same regional targets on
+    /// the live episodes — the identical targets `wake_reconstruct_step_batch` uses;
+    /// only the episode's provenance changes (live-through-binding instead of stored).
+    /// Gradients reach the binding weights (the active rows of each region projection
+    /// — including grown units' zero-initialized rows, which no other path ever trains
+    /// — plus W_q/W_k/W_v) and the heads. Activation values enter the graph as
+    /// materialized data (same as every other episode-consuming path), so encoder
+    /// columns are trained by the SAE term in the same NREM batch, not by this step.
+    ///
+    /// Deliberately a separate method with its own optimizer step rather than a fusion
+    /// into `fused_replay_wake_step_batch`: keeps the existing fused path byte-identical
+    /// for the A/B control arm (ADR 0041). Gated behind `--binding-replay` at the call
+    /// site; the `NremBindingReplay` Core metric stays at zero when off.
+    pub fn binding_replay_step_batch(&mut self, batch: &[&[Vec<f32>; 5]]) -> PerceptionResult<f32> {
+        let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::NremBindingReplay, {
+            self.binding_replay_step_batch_inner(batch)
+        });
+        result
+    }
+
+    fn binding_replay_step_batch_inner(
+        &mut self,
+        batch: &[&[Vec<f32>; 5]],
+    ) -> PerceptionResult<f32> {
+        if batch.is_empty() {
+            return Ok(0.0);
+        }
+        let device = self.device;
+        let batch_topk = self.batch_topk;
+        let region_ids = [
+            RegionId::AudioSpeech,
+            RegionId::AudioEnv,
+            RegionId::Visual,
+            RegionId::Symbolic,
+            RegionId::Language,
+        ];
+        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+        let mut n_terms = 0usize;
+
+        {
+            let model = self.model.as_mut().unwrap();
+
+            // Phase 1: per-region batched encoder forwards (same pattern as
+            // replay_step_batch) → per-sample SparseActivations.
+            let mut acts: Vec<[Option<SparseActivation>; 5]> = batch
+                .iter()
+                .map(|_| std::array::from_fn(|_| None))
+                .collect();
+            for region_idx in 0..5usize {
+                let valid: Vec<(usize, &Vec<f32>)> = batch
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        let v = &r[region_idx];
+                        if v.is_empty() {
+                            None
+                        } else {
+                            Some((i, v))
+                        }
+                    })
+                    .collect();
+                if valid.is_empty() {
+                    continue;
+                }
+                let b = valid.len();
+                let n_in = valid[0].1.len();
+                let flat: Vec<f32> = valid.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+                let input_batch: Tensor<TrainB, 2> =
+                    Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
+                let (z_batch, flat_masks) = match region_idx {
+                    0 => model
+                        .speech_layer
+                        .forward_tracked_batch(input_batch, b, batch_topk),
+                    1 => model
+                        .env_layer
+                        .forward_tracked_batch(input_batch, b, batch_topk),
+                    2 => model
+                        .visual_layer
+                        .forward_tracked_batch(input_batch, b, batch_topk),
+                    3 => model
+                        .symbolic_layer
+                        .forward_tracked_batch(input_batch, b, batch_topk),
+                    4 => model
+                        .language_layer
+                        .forward_tracked_batch(input_batch, b, batch_topk),
+                    _ => unreachable!(),
+                };
+                let n_units = flat_masks.len() / b;
+                let z_flat: Vec<f32> = z_batch.into_data().convert::<f32>().to_vec().unwrap();
+                for (j, &(sample_i, _)) in valid.iter().enumerate() {
+                    let mask_row = &flat_masks[j * n_units..(j + 1) * n_units];
+                    let z_row = &z_flat[j * n_units..(j + 1) * n_units];
+                    let mut indices = Vec::new();
+                    let mut values = Vec::new();
+                    for (u, &m) in mask_row.iter().enumerate() {
+                        if m != 0.0 {
+                            indices.push(u as u16);
+                            values.push(z_row[u]);
+                        }
+                    }
+                    acts[sample_i][region_idx] = Some(SparseActivation {
+                        region: region_ids[region_idx],
+                        indices,
+                        values,
+                        n_units,
+                    });
+                }
+            }
+
+            // Phase 2: live episodes through the binding area (graph-preserving), one
+            // per sample with at least one non-empty region. Empty regions become
+            // zero-token placeholders, same as the wake path's lang_zero sites.
+            let mut episodes: Vec<Tensor<TrainB, 2>> = Vec::new();
+            let mut episode_sample: Vec<usize> = Vec::new();
+            for (sample_i, sample_acts) in acts.iter().enumerate() {
+                if sample_acts.iter().all(|a| a.is_none()) {
+                    continue;
+                }
+                let placeholders: [SparseActivation; 5] =
+                    std::array::from_fn(|i| SparseActivation {
+                        region: region_ids[i],
+                        indices: vec![],
+                        values: vec![],
+                        n_units: model.binding.region_n[i],
+                    });
+                let refs: [&SparseActivation; 5] =
+                    std::array::from_fn(|i| sample_acts[i].as_ref().unwrap_or(&placeholders[i]));
+                let ep: Tensor<TrainB, 2> = model.binding.forward_tracked(&refs, &device);
+                episodes.push(ep);
+                episode_sample.push(sample_i);
+            }
+            if episodes.is_empty() {
+                return Ok(0.0);
+            }
+            let ep_batch: Tensor<TrainB, 2> = Tensor::cat(episodes, 0); // [B', EPISODE_DIM]
+
+            // Phase 3: output-head loss against the regional targets — same semantics
+            // as wake_reconstruct_step_batch, with live episodes instead of stored.
+            for head_idx in 0..5usize {
+                let valid: Vec<(usize, &Vec<f32>)> = episode_sample
+                    .iter()
+                    .map(|&sample_i| &batch[sample_i])
+                    .enumerate()
+                    .filter_map(|(row, r)| {
+                        let inp = &r[head_idx];
+                        if inp.is_empty() {
+                            None
+                        } else {
+                            Some((row, inp))
+                        }
+                    })
+                    .collect();
+                if valid.is_empty() {
+                    continue;
+                }
+                let b = valid.len();
+                let n_out = valid[0].1.len();
+                let rows: Vec<i64> = valid.iter().map(|&(row, _)| row as i64).collect();
+                let flat_targets: Vec<f32> = valid
+                    .iter()
+                    .flat_map(|(_, inp)| inp.iter().copied())
+                    .collect();
+                let idx_t: Tensor<TrainB, 1, Int> =
+                    Tensor::from_data(TensorData::new(rows, [b]), &device);
+                let ep_sub: Tensor<TrainB, 2> = ep_batch.clone().select(0, idx_t);
+                let target_batch: Tensor<TrainB, 2> =
+                    Tensor::from_data(TensorData::new(flat_targets, [b, n_out]), &device);
+                let pred = match head_idx {
+                    0 => model.speech_head.forward(ep_sub),
+                    1 => model.env_head.forward(ep_sub),
+                    2 => model.visual_head.forward(ep_sub),
+                    3 => model.symbolic_head.forward(ep_sub),
+                    4 => model.language_head.forward(ep_sub),
+                    _ => unreachable!(),
+                };
+                let loss: Tensor<TrainB, 1> = (pred - target_batch).powi_scalar(2).mean();
+                total_loss = Some(match total_loss {
+                    None => loss,
+                    Some(acc) => acc + loss,
+                });
+                n_terms += 1;
+            }
+        }
+
+        if let Some(loss) = total_loss {
+            let loss_val: f32 = loss.clone().into_scalar();
+            let model = self.model.take().unwrap();
+            let grads = loss.backward();
+            let grads_p = GradientsParams::from_grads(grads, &model);
+            let model = self.optimizer.step(self.current_lr, model, grads_p);
+            self.model = Some(model);
+            // Fine tier: the A/B-comparison-specific signal for ADR 0041 (mean loss =
+            // (summed scaled value / count) / 1e6).
+            somnus_metrics::counted!(
+                somnus_metrics::Metric::BindingReplayLoss,
+                (loss_val * 1e6).max(0.0) as u64
+            );
+            Ok(loss_val / n_terms.max(1) as f32)
+        } else {
+            Ok(0.0)
+        }
+    }
+
     /// Batched output-head training for NREM replay (ADR 0010).
     pub fn wake_reconstruct_step_batch(
         &mut self,
@@ -1577,6 +1783,38 @@ impl PerceptionProcessor {
                     .require_grad();
             h.weight = Param::initialized(id, t);
         }
+    }
+
+    /// Per-row L2 norms of one region's binding-projection weight, row order
+    /// matching unit indices (ADR 0041 inspection surface). Grown rows are
+    /// zero-initialized by `grow_region`/`grow_region_seeded` and only
+    /// `binding_replay_step_batch` ever trains them — this is how the A/B pilot
+    /// verifies they actually learn.
+    pub fn binding_proj_row_norms(&self, region: RegionId) -> Vec<f32> {
+        let m = self.model.as_ref().unwrap();
+        let proj = match region {
+            RegionId::AudioSpeech => &m.binding.region_0,
+            RegionId::AudioEnv => &m.binding.region_1,
+            RegionId::Visual => &m.binding.region_2,
+            RegionId::Symbolic => &m.binding.region_3,
+            RegionId::Language => &m.binding.region_4,
+        };
+        let flat: Vec<f32> = proj
+            .weight
+            .val()
+            .inner()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        let dims = proj.weight.val().inner().dims();
+        let (n, d) = (dims[0], dims[1]);
+        (0..n)
+            .map(|r| {
+                let row = &flat[r * d..(r + 1) * d];
+                row.iter().map(|v| v * v).sum::<f32>().sqrt()
+            })
+            .collect()
     }
 
     /// Apply worker-streamed flat EMA weights to the inference path.
@@ -3158,4 +3396,122 @@ fn apply_gain(values: &[f32], gain: f32) -> Vec<f32> {
         return values.to_vec();
     }
     values.iter().map(|&x| x * gain).collect()
+}
+
+#[cfg(test)]
+mod binding_replay_tests {
+    //! ADR 0041 (gaps.md §33) positive-case pin: grown binding-projection rows
+    //! learn once grown units are active. Lives in-crate (not in `tests/`)
+    //! because it must make grown units win k-WTA deterministically, which
+    //! requires encoder-weight surgery the public API doesn't expose.
+
+    use super::*;
+
+    /// `grow_region` inits new encoder columns at Normal(0, 0.01) — far below
+    /// the Kaiming-scale base columns — so on a single repeated input grown
+    /// units never beat the base winner set on a test-sized step budget (the
+    /// duty-cycle boost, ≤ k/n ≈ 0.02 growing ~0.001/step, cannot bridge the
+    /// z-score gap; grown units break in only on production timescales, via
+    /// homeostatic rotation over many cycles of a diverse corpus — pinned as
+    /// the control arm by `binding_replay_trains_only_active_binding_rows` in
+    /// tests/burn_path_contracts.rs). To pin the §33 fix itself — gradients
+    /// reaching grown binding rows through the live binding forward — set the
+    /// grown columns to the input direction at unit scale so they win k-WTA
+    /// from the first step.
+    #[test]
+    fn binding_replay_trains_grown_binding_rows_when_active() {
+        let device = NdArrayDevice::Cpu;
+        let mut proc = PerceptionProcessor::new(device);
+        const N_GROWN: usize = 8;
+        proc.grow_region(RegionId::AudioSpeech, N_GROWN);
+
+        let regional: [Vec<f32>; 5] = std::array::from_fn(|i| {
+            (0..REGION_DIMS[i])
+                .map(|j| ((j as f32 + 1.0) * 0.01 * (i as f32 + 1.0)).sin())
+                .collect()
+        });
+
+        {
+            let model = proc.model.as_mut().unwrap();
+            let layer = &mut model.speech_layer;
+            let n = layer.n_units;
+            assert_eq!(n, N_UNITS + N_GROWN);
+            let n_in = REGION_DIMS[RegionId::AudioSpeech.as_index()];
+            let mut flat: Vec<f32> = layer
+                .linear
+                .weight
+                .val()
+                .inner()
+                .into_data()
+                .convert::<f32>()
+                .to_vec()
+                .unwrap();
+            let norm: f32 = regional[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+            for c in N_UNITS..n {
+                for (r, &x) in regional[0].iter().enumerate() {
+                    flat[r * n + c] = x / norm;
+                }
+            }
+            let new_w: Tensor<TrainB, 2> =
+                Tensor::from_data(TensorData::new(flat, [n_in, n]), &device);
+            layer.linear.weight = Param::initialized(ParamId::new(), new_w);
+        }
+        // Mirror the production sequence: growth in REM, then the next NREM
+        // opens with refresh_autodiff_state, remapping every param to a fresh
+        // require_grad leaf.
+        proc.refresh_autodiff_state();
+
+        // The None-context binding pass must keep the GRU temporal components
+        // out of the graph entirely (ADR 0041): no gradient entry, so the
+        // optimizer never touches them.
+        let temporal_norm = |p: &PerceptionProcessor| {
+            let m = p.model.as_ref().unwrap();
+            let flat: Vec<f32> = m
+                .binding
+                .temporal_proj
+                .weight
+                .val()
+                .inner()
+                .into_data()
+                .convert::<f32>()
+                .to_vec()
+                .unwrap();
+            flat.iter().map(|v| v * v).sum::<f32>()
+        };
+        let temporal_before = temporal_norm(&proc);
+
+        let norms_before = proc.binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_eq!(norms_before.len(), N_UNITS + N_GROWN);
+        assert!(
+            norms_before[N_UNITS..].iter().all(|&n| n == 0.0),
+            "grown binding rows must start exactly zero"
+        );
+
+        let first_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+        assert!(first_loss.is_finite() && first_loss >= 0.0);
+        let mut last_loss = first_loss;
+        for _ in 0..29 {
+            last_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+            assert!(last_loss.is_finite(), "binding replay loss went non-finite");
+        }
+        assert!(
+            last_loss < first_loss,
+            "binding replay loss did not decrease on repeated input: {first_loss} -> {last_loss}"
+        );
+
+        let norms_after = proc.binding_proj_row_norms(RegionId::AudioSpeech);
+        assert!(
+            norms_after[N_UNITS..].iter().any(|&n| n > 0.0),
+            "grown binding rows must move off zero once active grown units' gradients reach them"
+        );
+        assert!(
+            norms_after[..N_UNITS].iter().any(|&n| n > 0.0),
+            "base binding rows must remain live"
+        );
+        assert_eq!(
+            temporal_norm(&proc),
+            temporal_before,
+            "temporal components must not train in the None-context binding pass"
+        );
+    }
 }

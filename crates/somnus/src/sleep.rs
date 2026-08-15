@@ -361,6 +361,7 @@ pub fn run_sleep_cycle(
     nrem_salience_threshold: usize,
     lang_oversample: usize,
     replay_epochs: usize,
+    binding_replay: bool,
     max_warm_records: usize,
     max_cold_records: usize,
     growth_cooldown: usize,
@@ -709,6 +710,18 @@ pub fn run_sleep_cycle(
             let fused_us = d_replay.as_micros() as u64;
             replay_us_total += fused_us / 2;
             wake_us_total += fused_us / 2;
+
+            // ── Live-episode binding training (ADR 0041, opt-in) ─────────────────
+            // Separate step on the same traces: episodes recomputed live through the
+            // binding area, output heads trained against the regional targets on them.
+            // Off by default; the A/B control arm is byte-identical to the fused path
+            // above. Errors degrade like other NREM step failures (batch skipped).
+            if binding_replay {
+                if let Err(e) = perception.binding_replay_step_batch(&regionals) {
+                    tracing::warn!(?e, "binding_replay_step_batch error — skipping batch");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);
+                }
+            }
 
             // ── Adaptive exit checks (10b) ────────────────────────────────────────
             if sleep_loss_target > 0.0 && batch_start > 0 && loss_ewma < sleep_loss_target {

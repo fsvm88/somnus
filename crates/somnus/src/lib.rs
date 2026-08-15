@@ -461,6 +461,15 @@ struct Args {
     #[arg(long, default_value = "4")]
     nrem_replay_epochs: usize,
 
+    /// Live-episode binding training in NREM (ADR 0041, gaps.md §33): each NREM batch
+    /// additionally recomputes episodes live through the binding area and trains the
+    /// output heads against the regional targets on them, so gradients reach the
+    /// binding weights (which otherwise never train — grown units' binding-projection
+    /// rows stay zero forever). Default off; the A/B this change is gated on compares
+    /// otherwise-identical runs with and without this flag.
+    #[arg(long, default_value = "false")]
+    binding_replay: bool,
+
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.
@@ -1990,6 +1999,7 @@ pub async fn run() -> Result<()> {
                 args.nrem_salience_threshold,
                 args.lang_oversample,
                 args.nrem_replay_epochs,
+                args.binding_replay,
                 args.max_warm_records,
                 effective_max_cold,
                 args.growth_cooldown,

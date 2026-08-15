@@ -123,42 +123,8 @@ impl<B: Backend> BindingArea<B> {
         new_episode: Option<&Vec<f32>>,
         device: &B::Device,
     ) -> EpisodeVector {
-        let region_projs = [
-            &self.region_0,
-            &self.region_1,
-            &self.region_2,
-            &self.region_3,
-            &self.region_4,
-        ];
-
-        // Project each region: region_n[i] → D_PROJ. A k-WTA activation is >95% zero
-        // (k_active/n_units ≈ 2%, preserved by scaled_k as regions grow), so instead of
-        // materializing a dense [1, n] vector and running the full [n, D_PROJ] matmul
-        // (mostly multiplying by zero), gather only the active rows of the projection
-        // weight — [k, D_PROJ] — and contract against the k nonzero values. Same result
-        // (region_projs have no bias, see `new()`), ~n/k_active fewer FLOPs, and `select`
-        // is autodiff-tracked so gradients still flow to just the active weight rows
-        // (gaps.md §25).
-        let projected: Vec<Tensor<B, 2>> = acts
-            .iter()
-            .zip(region_projs.iter())
-            .map(|(act, proj)| {
-                if act.indices.is_empty() {
-                    return Tensor::<B, 2>::zeros([1, D_PROJ], device);
-                }
-                let idx_data: Vec<i64> = act.indices.iter().map(|&i| i as i64).collect();
-                let k = idx_data.len();
-                let idx_t: Tensor<B, 1, Int> =
-                    Tensor::from_data(TensorData::new(idx_data, [k]), device);
-                let gathered = proj.weight.val().select(0, idx_t); // [k, D_PROJ]
-                let vals_t: Tensor<B, 2> =
-                    Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), device);
-                vals_t.matmul(gathered) // [1, D_PROJ]
-            })
-            .collect();
-
         // Stack current region tokens: [5, D_PROJ]
-        let x: Tensor<B, 2> = Tensor::cat(projected, 0);
+        let x: Tensor<B, 2> = self.project_regions(acts, device);
 
         // Q from current regions only: [5, D_PROJ]
         let q: Tensor<B, 2> = self.w_q.forward(x.clone());
@@ -192,7 +158,88 @@ impl<B: Backend> BindingArea<B> {
             (self.w_k.forward(x.clone()), self.w_v.forward(x))
         };
 
-        // Multi-head scaled dot-product.
+        let out: Tensor<B, 2> = self.attend(q, k, v);
+
+        // Flatten [5, D_PROJ] → [EPISODE_DIM]
+        let flat: Vec<f32> = out
+            .flatten::<1>(0, 1)
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        EpisodeVector(flat)
+    }
+
+    /// Graph-preserving, stateless binding forward for training (ADR 0041).
+    ///
+    /// Same computation as `forward` with `new_episode: None` (5-token self-attention,
+    /// no GRU temporal context — the GRU branch is skipped entirely, so `temporal_gru`/
+    /// `temporal_proj` are not in the graph and receive no gradients from this path),
+    /// but returns the episode as a `[1, EPISODE_DIM]` tensor instead of materializing
+    /// to `Vec<f32>`, which would sever the autodiff graph. Does not read or write
+    /// `gru_hidden`, so calls over unordered replay traces cannot corrupt the wake
+    /// path's cached GRU state.
+    ///
+    /// Deliberately NOT wrapped in `BindingForward`: that metric tracks wake-path binding
+    /// cost, and mixing training calls into it would pollute the A/B comparison ADR 0041
+    /// is gated on. The enclosing training step has its own metric (`NremBindingReplay`).
+    pub fn forward_tracked(
+        &mut self,
+        acts: &[&SparseActivation; 5],
+        device: &B::Device,
+    ) -> Tensor<B, 2> {
+        let x: Tensor<B, 2> = self.project_regions(acts, device);
+        let q: Tensor<B, 2> = self.w_q.forward(x.clone());
+        let k: Tensor<B, 2> = self.w_k.forward(x.clone());
+        let v: Tensor<B, 2> = self.w_v.forward(x);
+        let out: Tensor<B, 2> = self.attend(q, k, v);
+        out.flatten::<1>(0, 1).reshape([1, EPISODE_DIM])
+    }
+
+    /// Project each region's sparse activation to a D_PROJ token and stack them to
+    /// `[5, D_PROJ]`. Shared by the inference (`forward_inner`) and training
+    /// (`forward_tracked`) paths.
+    fn project_regions(&self, acts: &[&SparseActivation; 5], device: &B::Device) -> Tensor<B, 2> {
+        let region_projs = [
+            &self.region_0,
+            &self.region_1,
+            &self.region_2,
+            &self.region_3,
+            &self.region_4,
+        ];
+
+        // A k-WTA activation is >95% zero (k_active/n_units ≈ 2%, preserved by scaled_k
+        // as regions grow), so instead of materializing a dense [1, n] vector and running
+        // the full [n, D_PROJ] matmul (mostly multiplying by zero), gather only the active
+        // rows of the projection weight — [k, D_PROJ] — and contract against the k nonzero
+        // values. Same result (region_projs have no bias, see `new()`), ~n/k_active fewer
+        // FLOPs, and `select` is autodiff-tracked so gradients still flow to just the
+        // active weight rows (gaps.md §25).
+        let projected: Vec<Tensor<B, 2>> = acts
+            .iter()
+            .zip(region_projs.iter())
+            .map(|(act, proj)| {
+                if act.indices.is_empty() {
+                    return Tensor::<B, 2>::zeros([1, D_PROJ], device);
+                }
+                let idx_data: Vec<i64> = act.indices.iter().map(|&i| i as i64).collect();
+                let k = idx_data.len();
+                let idx_t: Tensor<B, 1, Int> =
+                    Tensor::from_data(TensorData::new(idx_data, [k]), device);
+                let gathered = proj.weight.val().select(0, idx_t); // [k, D_PROJ]
+                let vals_t: Tensor<B, 2> =
+                    Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), device);
+                vals_t.matmul(gathered) // [1, D_PROJ]
+            })
+            .collect();
+
+        Tensor::cat(projected, 0)
+    }
+
+    /// Multi-head scaled dot-product attention over the region tokens. Q is always the
+    /// 5 current-region tokens; K/V may be extended with the GRU temporal context token
+    /// on the inference path. Returns `[5, D_PROJ]`.
+    fn attend(&self, q: Tensor<B, 2>, k: Tensor<B, 2>, v: Tensor<B, 2>) -> Tensor<B, 2> {
         // Reshape: [seq, D_PROJ] → [seq, N_HEADS, D_HEAD] → [N_HEADS, seq, D_HEAD].
         // The feature axis is split contiguously: head h sees features [h*D_HEAD..(h+1)*D_HEAD]
         // of every token. Reshape order must be [seq, N_HEADS, D_HEAD] first (not
@@ -207,16 +254,7 @@ impl<B: Backend> BindingArea<B> {
         let attn3: Tensor<B, 3> = activation::softmax(scores3, 2);
         let out3: Tensor<B, 3> = attn3.matmul(v3); // [N_HEADS, 5, D_HEAD]
                                                    // Merge: [N_HEADS, 5, D_HEAD] → [5, N_HEADS, D_HEAD] → [5, D_PROJ]
-        let out: Tensor<B, 2> = out3.swap_dims(0, 1).reshape([5, D_PROJ]);
-
-        // Flatten [5, D_PROJ] → [EPISODE_DIM]
-        let flat: Vec<f32> = out
-            .flatten::<1>(0, 1)
-            .into_data()
-            .convert::<f32>()
-            .to_vec()
-            .unwrap();
-        EpisodeVector(flat)
+        out3.swap_dims(0, 1).reshape([5, D_PROJ])
     }
 }
 
@@ -421,6 +459,48 @@ mod tests {
         assert_ne!(
             ep_zero.0, ep_active.0,
             "attention should produce different outputs"
+        );
+    }
+
+    /// ADR 0041: `forward_tracked` must compute exactly the same episode as
+    /// `forward(None)` (same 5-token self-attention math, no GRU context) and must
+    /// be stateless — it may not read or write the cached `gru_hidden` the wake
+    /// path relies on, since NREM replay traces are temporally unordered.
+    #[test]
+    fn forward_tracked_matches_forward_none_and_is_stateless() {
+        let device = NdArrayDevice::Cpu;
+        let mut area = make_area();
+        let acts = [
+            dummy_act(RegionId::AudioSpeech),
+            dummy_act(RegionId::AudioEnv),
+            dummy_act(RegionId::Visual),
+            dummy_act(RegionId::Symbolic),
+            zero_act(RegionId::Language),
+        ];
+        let refs: [&SparseActivation; 5] = [&acts[0], &acts[1], &acts[2], &acts[3], &acts[4]];
+
+        let ep_ref = area.forward(&refs, None, &device);
+        assert!(
+            area.gru_hidden.is_none(),
+            "forward(None) must not set gru_hidden"
+        );
+
+        let ep_t = area.forward_tracked(&refs, &device);
+        assert!(
+            area.gru_hidden.is_none(),
+            "forward_tracked must not touch gru_hidden"
+        );
+        assert_eq!(ep_t.dims(), [1, EPISODE_DIM]);
+        let ep_t_vec: Vec<f32> = ep_t
+            .flatten::<1>(0, 1)
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        assert_eq!(ep_t_vec.len(), EPISODE_DIM);
+        assert_eq!(
+            ep_t_vec, ep_ref.0,
+            "forward_tracked must be bit-identical to forward(None)"
         );
     }
 }

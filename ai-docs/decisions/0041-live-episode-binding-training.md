@@ -1,7 +1,7 @@
 # 0041. Live-episode binding training in NREM (close the §33 never-trained-binding gap)
 
-- **Status:** proposed (decision taken 2026-08-15, implementation not yet started; gated on the
-  isolated A/B pilot described under "Validation plan" before touching production `memory/`).
+- **Status:** implemented & verified (validation item 1 done 2026-08-15); still gated on the
+  isolated A/B pilot (validation items 2–3) before touching production `memory/`.
 - **Date:** 2026-08-15
 
 ## Context
@@ -151,10 +151,26 @@ that A/B runs always use full debugging metrics and record deviations:
 
 ## Validation plan (before production adoption)
 
-1. **Unit/integration tests:** `forward_tracked` ≡ `forward(None)` numerically on identical
-   inputs; backward through `forward_tracked` produces non-zero grads on region-projection rows
-   (including a grown-unit row) and zero graph connection to `gru_hidden`; existing `forward`
-   behavior unchanged (all existing binding tests pass untouched).
+1. **Unit/integration tests — DONE 2026-08-15:** `forward_tracked` ≡ `forward(None)` numerically
+   and stateless (`binding.rs::forward_tracked_matches_forward_none_and_is_stateless`); backward
+   through `forward_tracked` moves grown units' zero-init binding-projection rows off zero and
+   leaves the GRU temporal components untouched
+   (`lib.rs::binding_replay_tests::binding_replay_trains_grown_binding_rows_when_active`);
+   existing `forward` behavior unchanged (all pre-existing binding tests pass untouched).
+   **Test-placement note (matters for reading item 2):** the grown-row gradient test lives
+   in-crate, not in `tests/`, because grown units do not win k-WTA in any synthetic single-input
+   setup on a test-sized step budget — `grow_region` inits their encoder columns at
+   Normal(0, 0.01), far below the Kaiming-scale base columns, and the duty-cycle boost
+   (≤ k/n ≈ 0.02, growing ~0.001/step) cannot bridge that z-score gap; grown units break into the
+   winner set only on production timescales, via homeostatic rotation over many cycles of a
+   diverse corpus. The in-crate test therefore forces grown units active via encoder-column
+   surgery to pin the gradient path itself; the public-API integration test
+   (`burn_path_contracts.rs::binding_replay_trains_only_active_binding_rows`) pins the control
+   arm — never-active grown rows stay exactly zero (no dense-scatter leak), loss still falls.
+   **Pilot implication:** in the item-2 A/B, grown-row movement (`binding_proj_row_norms` on the
+   grown slice) is only expected in regions/cycles where grown units actually win k-WTA; a
+   treatment that learns on base rows but shows no grown-row movement is not automatically inert —
+   check winner composition before concluding.
 2. **Isolated A/B pilot from the trained production state** (not fresh memory — fresh memory has
    no grown units, so it couldn't test the actual fix): copy `memory/` (weights + tiers) to two
    scratch dirs, run control (`--binding-replay` off) vs treatment (on) for the same clip corpus

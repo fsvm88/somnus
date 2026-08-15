@@ -390,10 +390,19 @@ pub enum Metric {
     /// just render as a weird number (or `null`, since `serde_json` serializes non-finite
     /// floats that way) with no alarm — this is the alarm.
     TrainingNanDetected,
+    /// `binding_replay_step_batch` — one live-episode binding training step per NREM batch
+    /// (ADR 0041): episodes recomputed live through the binding area, output heads trained
+    /// against the regional targets on them. Fires only with `--binding-replay`; stays at zero
+    /// when off (the control-arm signal for the A/B this change exists for).
+    NremBindingReplay,
+    /// Live-episode binding loss per step (ADR 0041), scaled ×1e6 and recorded via `counted!`
+    /// (Fine tier — the A/B-comparison-specific signal). `count` = number of steps, summed
+    /// value = total scaled loss; mean loss = (total/count)/1e6.
+    BindingReplayLoss,
 }
 
 impl Metric {
-    pub const COUNT: usize = 100;
+    pub const COUNT: usize = 102;
 
     const fn as_index(self) -> usize {
         match self {
@@ -497,6 +506,8 @@ impl Metric {
             Metric::SnapshotEpisodicBytesRead => 97,
             Metric::ColdArchiveSpillBytesWritten => 98,
             Metric::TrainingNanDetected => 99,
+            Metric::NremBindingReplay => 100,
+            Metric::BindingReplayLoss => 101,
         }
     }
 
@@ -602,6 +613,8 @@ impl Metric {
             Metric::SnapshotEpisodicBytesRead => "snapshot_episodic_bytes_read",
             Metric::ColdArchiveSpillBytesWritten => "cold_archive_spill_bytes_written",
             Metric::TrainingNanDetected => "training_nan_detected",
+            Metric::NremBindingReplay => "nrem_binding_replay",
+            Metric::BindingReplayLoss => "binding_replay_loss",
         }
     }
 
@@ -706,6 +719,8 @@ impl Metric {
         Metric::SnapshotEpisodicBytesRead,
         Metric::ColdArchiveSpillBytesWritten,
         Metric::TrainingNanDetected,
+        Metric::NremBindingReplay,
+        Metric::BindingReplayLoss,
     ];
 }
 

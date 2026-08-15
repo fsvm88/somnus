@@ -465,4 +465,72 @@ mod tests {
             "grown-region binding must stay finite"
         );
     }
+
+    // ── binding replay (ADR 0041, gaps.md §33) ───────────────────────────────
+
+    /// Empty batch is a no-op returning 0.0 (same contract as the other batch
+    /// training steps).
+    #[test]
+    fn binding_replay_empty_batch_is_noop() {
+        let mut proc = make_proc();
+        assert_eq!(proc.binding_replay_step_batch(&[]).unwrap(), 0.0);
+    }
+
+    /// Control arm of the §33 fix: grown units' binding-projection rows start
+    /// at exactly zero (`grow_region` appends zero rows) and can only receive
+    /// gradients when a grown unit wins k-WTA and its row is gathered by the
+    /// sparse `select`. On a fresh model with a single repeated input that
+    /// never happens here: grown encoder columns init at 0.01 scale, far below
+    /// the Kaiming-scale base columns, and the duty-cycle boost (≤ k/n ≈ 0.02,
+    /// growing ~0.001/step) cannot bridge that gap on a test-sized step budget
+    /// — grown units break into the winner set only on production timescales
+    /// (homeostatic rotation over many cycles of a diverse corpus). The grown
+    /// rows must therefore stay exactly zero: this pins that gradients reach
+    /// only gathered rows (no dense-scatter leak into never-active rows). The
+    /// positive case — grown rows moving once grown units are active — is
+    /// pinned by `binding_replay_trains_grown_binding_rows_when_active` in
+    /// lib.rs, which can force grown units into the winner set deterministically.
+    /// Loss still decreases: base rows, W_q/W_k/W_v and the heads train on the
+    /// live episodes.
+    #[test]
+    fn binding_replay_trains_only_active_binding_rows() {
+        let mut proc = make_proc();
+        proc.grow_region(RegionId::AudioSpeech, 64);
+        let norms_before = proc.binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_eq!(norms_before.len(), N_UNITS + 64);
+        assert!(
+            norms_before[N_UNITS..].iter().all(|&n| n == 0.0),
+            "grown binding rows must start exactly zero"
+        );
+        // Mirror the production sequence: growth happens in REM, and the next
+        // NREM opens with refresh_autodiff_state (sleep.rs), which remaps every
+        // param to a fresh require_grad leaf — grow_region's Tensor::from_inner
+        // rebuilds don't carry the flag on their own.
+        proc.refresh_autodiff_state();
+
+        let regional = regional_inputs();
+        let first_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+        assert!(first_loss.is_finite() && first_loss >= 0.0);
+        let mut last_loss = first_loss;
+        for _ in 0..29 {
+            last_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+            assert!(last_loss.is_finite(), "binding replay loss went non-finite");
+        }
+        assert!(
+            last_loss < first_loss,
+            "binding replay loss did not decrease on repeated input: {first_loss} -> {last_loss}"
+        );
+
+        let norms_after = proc.binding_proj_row_norms(RegionId::AudioSpeech);
+        assert!(
+            norms_after[N_UNITS..].iter().all(|&n| n == 0.0),
+            "never-active grown binding rows must stay exactly zero (no dense-scatter leak)"
+        );
+        // Base rows are live too (they were random-init, not zero) — training must
+        // not zero them out wholesale.
+        assert!(
+            norms_after[..N_UNITS].iter().any(|&n| n > 0.0),
+            "base binding rows must remain live"
+        );
+    }
 }
