@@ -1,5 +1,54 @@
 # Session state — somnus
 
+> **✅ CHECKPOINT (clean), 2026-08-15 — resumed after a hard machine lockup; ADR 0041 implemented,
+> verified, committed, pushed.** The locked session (started after the campaign-completion shutdown
+> below) had: taken the §33 decision (user chose option b), committed ADR 0041 + the standing
+> A/B-metrics instruction (`7a63d09`), implemented the whole feature, and was mid-debug of its
+> grown-rows test when the machine died (last message recovered from the opencode session DB:
+> "I'll test the gradient flow directly through `forward_tracked` in the crate's test module
+> instead"). This session finished that step and everything after it.
+> - **Root cause of the failing test — not a gradient bug:** grown units' encoder columns init at
+>   Normal(0, 0.01) vs Kaiming-scale base columns, so grown units never win k-WTA in a synthetic
+>   single-input setup (duty-cycle boost ≤ k/n ≈ 0.02, growing ~0.001/step, can't bridge the z-gap;
+>   the locked session's 200-step diag confirmed 0/64 rows moved). Gradient flow itself is sound:
+>   burn's `select` backward scatters correctly (verified in burn-autodiff source), `Param::val()`
+>   preserves the graph, and the new in-crate test proves grown rows learn once grown units are
+>   active. **In production grown units break into the winner set via homeostatic rotation over
+>   many cycles of a diverse corpus** — recorded in ADR 0041's validation plan with the pilot
+>   implication: grown-row movement in the A/B only appears where grown units actually win k-WTA;
+>   check winner composition before declaring the term inert.
+> - **Tests landed:** `lib.rs::binding_replay_tests::binding_replay_trains_grown_binding_rows_when_active`
+>   (in-crate; forces grown units active via encoder-column surgery → grown rows move off zero, loss
+>   falls, GRU temporal components provably untouched) and
+>   `burn_path_contracts.rs::binding_replay_trains_only_active_binding_rows` (public-API control
+>   arm: never-active grown rows stay exactly zero — no dense-scatter leak — loss still falls).
+>   The locked session's scratch `examples/diag_binding.rs` deleted (findings baked into test docs).
+> - **Feature summary (`4f7aa1f`):** `BindingArea::forward_tracked` (graph-preserving stateless
+>   None-context forward; `forward` refactored onto shared `project_regions`/`attend`, behavior
+>   unchanged), `PerceptionProcessor::binding_replay_step_batch` (+`binding_proj_row_norms`
+>   inspection surface), `--binding-replay` CLI flag (default off) wired through `run_sleep_cycle`,
+>   new Core `NremBindingReplay` + Fine `BindingReplayLoss` metrics (`Metric::COUNT` 100 → 102,
+>   enum-invariant tests pass both feature states).
+> - **Also fixed (`1bc8af1`, pre-existing, confirmed on pristine tree via stash):** the
+>   `ort_grown_region` encoder test failed under `mn10_env` — the completed campaign re-exported
+>   `perception_encoder.onnx` at baseline ENV_DIM=512, which a 960-dim build can never match; the
+>   skip logic now covers that feature/artifact mismatch (loud eprintln).
+> - **Verified:** fmt clean, `cargo clippy --workspace --all-targets -- -D warnings` clean,
+>   `cargo test --workspace` 285 passed / 0 failed, `fine-metrics` + `mn10_env` feature states
+>   green, `somnus --help` shows the flag. ADR 0041 status → "implemented & verified (validation
+>   item 1)".
+> - **Next-session entry point:** ADR 0041 validation items 2–3 — the **isolated A/B pilot from the
+>   trained production state**: copy `memory/` (weights + tiers) to two scratch dirs, control
+>   (`--binding-replay` off) vs treatment (on), same clip corpus + cycle count, both arms built and
+>   run with `fine-metrics`, deviations recorded per the standing instruction. **GATED on explicit
+>   user go-ahead** (copies ~production state; the ADR is the plan of record). Other standing
+>   threads unchanged: ADR 0038 prerequisite 3 (trigger-gated), deferred items A-N, Whisper-ASR
+>   root cause (§5, approach sketched).
+> - **Pushed:** everything — `origin/main` in sync at `1bc8af1` (includes the locked session's
+>   previously-unpushed `7a63d09`).
+>
+> ---
+>
 > **✅ SHUTDOWN (clean), 2026-08-15. The 10x growth campaign is COMPLETE.** Resumed the
 > interrupted 2026-08-14 session: first committed+pushed its leftover docs (`836083a` — gaps.md
 > §33/§5 + ADR 0008 correction), then reconstructed the campaign state it had left behind and

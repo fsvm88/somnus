@@ -1453,7 +1453,7 @@ new metrics — stated explicitly per the standing policy.
 data-handling logic now has direct coverage of its contracts; the two known untestable-in-CI
 surfaces stay skip-don't-fail model-gated (`encode_models.rs`, `ort_grown_region.rs`).
 
-## §33 — BindingArea weights are never trained — confirmed, options pending decision (2026-08-14)
+## §33 — BindingArea weights are never trained — confirmed; decided (b) & implemented, A/B pilot pending (2026-08-14)
 
 **Context:** §25's correction (2026-07-14) noticed in passing that no training function calls
 `BindingArea::forward` and flagged it "un-investigated, for later." Investigated 2026-08-14 on the
@@ -1513,8 +1513,15 @@ so (b) is no longer sequenced behind anything — decision still pending.
 (`decisions/0041-live-episode-binding-training.md`) — opt-in `--binding-replay` NREM pass that
 recomputes episodes live through the binding and trains the existing output heads against the
 regional targets on them; explicitly does NOT train the GRU (that's (c)'s job — the `None`-context
-pass leaves the GRU out of the graph). Status: ADR `proposed`, implementation gated on the
-isolated A/B pilot from the trained production state (ADR 0041 "Validation plan"), run with full
+pass leaves the GRU out of the graph). **Status update 2026-08-15 (post-lockup resume): implemented
+& verified** (`4f7aa1f`) — ADR 0041 validation item 1 done: `forward_tracked` ≡ `forward(None)` and
+stateless; grown units' zero-init binding rows move off zero once the units win k-WTA (in-crate test
+forces selection); GRU stays out of the graph; public-API test pins never-active grown rows staying
+exactly zero. Key finding recorded in the ADR: grown units don't win k-WTA in any synthetic
+single-input setup (fresh-init 0.01-scale encoder columns vs Kaiming base; duty-cycle boost too
+small/soft) — they break in only on production timescales via homeostatic rotation, so the A/B pilot
+must check winner composition before reading grown-row movement. Remaining gate: the isolated A/B
+pilot from the trained production state (ADR 0041 "Validation plan" items 2–3), run with full
 `fine-metrics` per the standing instruction.
 
 ---
@@ -1600,5 +1607,5 @@ behind this campaign finishing — it can now be taken. Nothing else was gated o
 | ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
 | ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |
 | ✅ §32 | **Test-coverage push round 2: burn-path contracts + memory persistence I/O** | Low | Correctness hardening — 27 new tests (somnus-memory 35→47, somnus-perception +15 in new `burn_path_contracts.rs`); campaign-restart persistence files, growth-gate `measure_mse`, save/load round-trips all pinned | Done 2026-08-14 — see §32 above; no remaining named thin spots |
-| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision taken 2026-08-15: **(b) live-episode binding training**, ADR 0041 (`proposed`); (c) temporal loss sequenced as follow-up; implementation gated on isolated A/B pilot from trained state |
+| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision (b) 2026-08-15, ADR 0041 **implemented & verified** (`4f7aa1f`, `--binding-replay` opt-in; validation item 1 done); remaining gate = isolated A/B pilot from trained state (items 2–3); (c) temporal loss sequenced as follow-up |
 | ✅ §34 | **10x growth campaign complete** — `[9821]×5` = 101.7% of the 9,660 target | — | Growable-core capacity milestone | Done 2026-08-15 — see §34 above; 791 cycles, 188 growth events, 0 panics/segfaults/ORT-fallbacks, output_mse −74% first-vs-last-10; unblocks §33's decision |
