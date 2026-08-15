@@ -2,10 +2,13 @@
 
 - **Status:** implemented; isolated A/B pilot run 2026-08-15 (gaps.md §35) — mechanism validated
   and the §33 fix engages in production state, but the predicted episode-drift recall regression
-  materialized and the NREM cost displaced ~30% of replay. **Not adopted.** Adoption gated on:
-  (1) warm-store rebuild-from-cold at switchover (the named mitigation), (2) cost reduction
-  (fused step variant and/or fewer binding steps per cycle), (3) a repeat pilot showing drift
-  contained. Flag stays opt-in (`--binding-replay`, default off) until then.
+  materialized and the NREM cost displaced ~30% of replay. **Not adopted.** Adoption path queued
+  (gaps.md §35 "Adoption path"): step budget (`--binding-replay-steps`) → longer repeat pilot
+  (≥20 cycles, n≥2) → adopt if drift contained. **Correction recorded:** the named mitigation
+  "rebuild warm from cold at switchover" does not work as written — cold records store only
+  episode vectors, not regional inputs, so they can't be re-formed through a new binder; the
+  real absorption mechanism is warm-store turnover (~30 cycles) plus a slower binder change rate.
+  Flag stays opt-in (`--binding-replay`, default off) until adoption.
 - **Date:** 2026-08-15
 
 ## Context
@@ -117,10 +120,14 @@ the sequenced follow-up that covers it.
   tiers were produced by the untrained binder; once binding trains, newly-formed episodes drift
   away from stored ones, and the warm HNSW store mixes both generations. Judged tolerable for the
   pilot: the warm store turns over (`--max-warm-records` eviction, currently 151,725/200,000),
-  recall is L2-distance-based so gradual drift degrades gracefully, and the pilot measures the
-  degradation directly (`warm_recall_l2`, `gist_recall_rate`). If drift shows up as recall
-  regression in the pilot, mitigation (e.g. warm-store rebuild from cold at switchover) becomes
-  part of the adoption plan.
+   recall is L2-distance-based so gradual drift degrades gracefully, and the pilot measures the
+   degradation directly (`warm_recall_l2`, `gist_recall_rate`). If drift shows up as recall
+   regression in the pilot, mitigation becomes part of the adoption plan. **(2026-08-15 update:
+   drift did show up — gaps.md §35 — and the mitigation named here does not work as written:
+   cold records store only episode vectors, not regional inputs, so a rebuild from cold can't
+   re-form episodes through a new binder. The real absorption mechanisms are warm-store turnover
+   (~30 cycles at the 200k cap) and a step budget slowing the binder's change rate; see the
+   §35 queued adoption path.)**
 - **ORT inference picks up trained binding weights at the next re-export** (`rebuild_ort_session`
   on growth/restart — already part of the lifecycle; `export_weights_for_onnx` already exports all
   22 tensors including the binding's). Between training and re-export, wake inference runs the

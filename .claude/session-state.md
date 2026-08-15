@@ -35,11 +35,25 @@
 > - **Committed + pushed:** `35a2346` (pilot infra), plus this writeup commit (gaps.md §35 +
 >   table rows, ADR 0041 status/validation/metrics-doc fixes, somnus-metrics doc fix, session state).
 >   Production `memory/` untouched — campaign state intact.
-> - **Next-session entry point:** user decision on the adoption path — implement the warm-rebuild
->   mitigation + fused/cheaper binding step and re-run the pilot, or hold. Option (c)
->   temporal-prediction loss stays sequenced behind adoption. Standing threads otherwise
->   unchanged: ADR 0038 prerequisite 3 (trigger-gated), deferred items A-N, Whisper-ASR root
->   cause (§5).
+> - **Next-session entry point — QUEUED (user chose the ADR path, 2026-08-15): the ADR 0041
+>   adoption path** (full detail in gaps.md §35 "Adoption path"):
+>   1. **`--binding-replay-steps N`** — cap binding replay at N batches/cycle (start N=1): cuts
+>      the +34.5% NREM cost and ~30% replay displacement roughly proportionally, and slows
+>      episode drift at the same time. Fused variant stays deferred unless N=1 still displaces.
+>   2. **Repeat pilot** (`scripts/ab_binding_replay.sh`, `CYCLES≥20` so turnover visibly starts,
+>      n≥2/arm if machine time allows): pass = binding still learning + grown rows still moving +
+>      cross-session gist stable-or-recovering as the store re-generates + replay contained.
+>   3. Adopt (default-on / new control) only on a clean repeat pilot; drift monitoring on for the
+>      first production leg.
+>   **Key correction found while queueing:** the ADR's named mitigation "rebuild warm from cold"
+>   does NOT work as written — `EpisodeRecord` (SMNCOLD3) stores only episode vectors, not
+>   regional inputs, so episodes can't be re-formed through a new binder from cold. Real
+>   absorption = warm-store turnover (~30 cycles at the 200k cap) + the step budget slowing the
+>   binder's change rate; SMNCOLD4-with-regionals only if those prove insufficient (heavy: ~5×
+>   cold bloat). Recorded in gaps.md §35 + ADR 0041 status/consequences.
+>   Option (c) temporal-prediction loss stays sequenced behind adoption. Standing threads
+>   otherwise unchanged: ADR 0038 prerequisite 3 (trigger-gated), deferred items A-N,
+>   Whisper-ASR root cause (§5).
 >
 > ---
 >

@@ -1619,10 +1619,32 @@ space), `mean_proj_loss` +24.8%. n=1 per arm — run-to-run variance is unmeasur
 
 **Verdict per ADR 0041 pass criterion:** binding learns ✓ (and the §33 fix engages beyond what the
 criterion asked), no-regression ✗ (recall regresses via the predicted drift channel). **Not adopted.**
-Adoption path, in order: (1) warm-store rebuild-from-cold at switchover (the named mitigation) and
-(2) cost reduction (fused step variant and/or fewer binding steps per cycle) — then a repeat pilot
-that must show drift contained (cross-session gist stable or recovering as the store re-generates)
-before default-on. Option (c) temporal-prediction loss remains sequenced behind adoption as designed.
+
+**Correction to the ADR's named mitigation (found while queueing the adoption path):** the cold
+archive (`EpisodeRecord`, SMNCOLD3) stores only the 640-dim episode vector + id/timestamp/salience/
+source — **not the regional inputs** (those live only in hot-tier replay traces, capacity 8,192).
+"Rebuild the warm store from cold at switchover" therefore can only re-index old-generation
+vectors, not re-form episodes through the new binder — it does not produce a single-generation
+store, so it does not actually mitigate the mixing. The real options are: (a) accept the one-time
+turnover tax (`--max-warm-records 200000` at ~6.5k new records/cycle ≈ full store re-generation in
+~30 cycles; drift is transient and the binder converges — `binding_replay_loss` already fell 67.5%
+in 10 cycles, so per-generation drift shrinks over time), (b) a SMNCOLD4 format storing regional
+inputs so true re-formation becomes possible (~5× cold bloat: 2,560 floats/record — heavy, only if
+(a) proves insufficient), (c) slow the binder's change rate via the step budget (below), which
+simultaneously cuts cost and per-generation drift.
+
+**Adoption path (QUEUED 2026-08-15, user chose the ADR path):**
+1. **Step budget:** `--binding-replay-steps N` (cap binding replay at N batches per cycle; start
+   with N=1 — one step/cycle cuts the measured +34.5% NREM cost and the ~30% replay displacement
+   roughly proportionally, and slows drift). Fused variant stays deferred unless N=1 still
+   displaces replay.
+2. **Repeat pilot** via `ab_binding_replay.sh`: treatment = flag + step budget, control unchanged;
+   **longer** (≥20 cycles so turnover visibly starts absorbing drift) and n≥2 per arm if machine
+   time allows (this run was n=1). Pass = binding still learning + grown rows still moving +
+   cross-session gist stable-or-recovering as the store re-generates + replay displacement
+   contained.
+3. Only then adopt (default-on or new control), with drift monitoring kept on for the first
+   production leg. Option (c) temporal-prediction loss remains sequenced behind adoption.
 
 ---
 
@@ -1665,6 +1687,6 @@ before default-on. Option (c) temporal-prediction loss remains sequenced behind 
 | ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
 | ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |
 | ✅ §32 | **Test-coverage push round 2: burn-path contracts + memory persistence I/O** | Low | Correctness hardening — 27 new tests (somnus-memory 35→47, somnus-perception +15 in new `burn_path_contracts.rs`); campaign-restart persistence files, growth-gate `measure_mse`, save/load round-trips all pinned | Done 2026-08-14 — see §32 above; no remaining named thin spots |
-| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision (b) 2026-08-15, ADR 0041 implemented; **pilot ran (§35): fix engages (47–96% of grown rows learn in 10 cycles), but predicted episode-drift recall regression materialized and NREM cost displaced 30% of replay — not adopted**; adoption gated on warm-store rebuild-from-cold mitigation + cost reduction + repeat pilot |
+| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision (b) 2026-08-15, ADR 0041 implemented; **pilot ran (§35): fix engages (47–96% of grown rows learn in 10 cycles), but predicted episode-drift recall regression materialized and NREM cost displaced 30% of replay — not adopted**; adoption path queued (§35): step budget → longer repeat pilot (turnover absorbs drift; the cold-rebuild mitigation doesn't work as written — cold lacks regional inputs) |
 | ✅ §34 | **10x growth campaign complete** — `[9821]×5` = 101.7% of the 9,660 target | — | Growable-core capacity milestone | Done 2026-08-15 — see §34 above; 791 cycles, 188 growth events, 0 panics/segfaults/ORT-fallbacks, output_mse −74% first-vs-last-10; unblocks §33's decision |
 | 🔍 §35 | **ADR 0041 isolated A/B pilot** (trained state, 10 cycles/arm, fine-metrics both arms) | — | Validates/invalidates live-episode binding training before adoption | Done 2026-08-15 — mechanism validated (§33 fix engages in production state), predicted episode-drift materialized (cross-session gist −53%, warm_l2 rising), cost +34.5% NREM displacing 30% of replay; adoption path: warm-rebuild mitigation + fused/cheaper step + repeat pilot |
