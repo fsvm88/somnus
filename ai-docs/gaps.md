@@ -1,6 +1,6 @@
 # Gaps, candidates, and open work
 
-> **Contents:** Open, undecided items only — algorithm/encoder/LLM upgrade candidates awaiting a decision, and known incompleteness with no chosen fix yet. Items that reached a decision (accepted/deployed/adopted, or rejected/not-pursued/null-result) live in [`gaps-resolved.md`](gaps-resolved.md), verbatim, under the same section numbers. Pruned to open-only 2026-08-15 (was §0-§37; see `gaps-resolved.md`'s header for what moved and why).
+> **Contents:** Open, undecided items only — algorithm/encoder/LLM upgrade candidates awaiting a decision, and known incompleteness with no chosen fix yet. Items that reached a decision (accepted/deployed/adopted, or rejected/not-pursued/null-result) live in [`gaps-resolved.md`](gaps-resolved.md), verbatim, under the same section numbers. Pruned to open-only 2026-08-15 (was §0-§37; see `gaps-resolved.md`'s header for what moved and why). §38 (Qwen3 KV-cache generation speedup) resolved and removed from this file 2026-08-15; full record at `gaps-resolved.md` §38.
 > **When to read:** Picking the next item to try, or checking whether something is still undecided.
 > **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `gaps-resolved.md`, not that it never existed. New items get the next unused number across both files (next: §44).
 
@@ -74,12 +74,6 @@ Raised 2026-07-12 while fixing an export-script bug (`gaps-resolved.md` §22). W
 
 ---
 
-## §38 — Qwen3 KV-cache generation speedup — ✅ RESOLVED 2026-08-15, see `gaps-resolved.md` §38
-
-`ActionDecoder` now loads the FP32 KV-cache fast path in production (`"loading KV-cache FP32 models — fast generate() path active (ADR 0034)"`, confirmed live). Root cause was two Qwen3-specific attention details missing from the decode wrapper (`head_dim=128` decoupled from `hidden_size/num_heads`, plus per-head QK-RMSNorm), not the originally-reported `torch.export` issue — full trail, the fixes, and the verification-harness bug found along the way are in `gaps-resolved.md` §38.
-
----
-
 ## §39 — Qwen3 LoRA fine-tuning (ADR 0033's natural follow-on) never run
 
 Same orphaned-infrastructure story as §38, same source commit (2026-06-27): `scripts/train_lora_qwen3.py` exists, ported from ADR 0033's Qwen2.5 script, but its own commit message says it's blocked ("current blocker: projection weights from Qwen2.5 don't match Qwen3 dims... regenerate projection weights from Qwen3 model, future campaign run"). That campaign run never happened — `memory/lora_output/` has never existed in git history, and a checksum/size/date comparison of `qwen3_lm.onnx` (4,517,046 bytes, 2026-07-05) vs. `qwen3_lm_base.onnx` (5,248,472 bytes, 2026-06-27) shows two genuinely different files with the later one's date matching the ADR 0035/0036 Qwen3-architecture-class-fix session, not a LoRA merge timestamp. **Production Qwen3 generation is running on frozen pretrained weights, never fine-tuned on somnus's own episode-prefix distribution.**
@@ -137,7 +131,6 @@ ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate 
 | §15 | **Crate hygiene** (usearch, burn-ndarray watch, ffmpeg-the-third) | Low–Med | HNSW footprint / maintenance | Deferred until raised |
 | 🔮 §23 | **Native Rust ONNX graph construction** | High | Removes Python runtime dependency | Scoped, not started |
 | 🔍 §33 | **BindingArea weights never trained** | Med–High | Episode quality / temporal context / grown-unit participation | Decision (b), ADR 0041 implemented; three pilots FAIL (drift+cost, then worse instability, then worse still at lower loss scale); (c) favored among 2 remaining candidates |
-| §38 | **Qwen3 KV-cache generation** (ADR 0034 gap) | — | ~7.8× generation speedup | ✅ Resolved 2026-08-15 — `gaps-resolved.md` §38 |
 | §39 | **Qwen3 LoRA fine-tuning** (ADR 0033 follow-on) | Med (a campaign run) | Generation grounded in somnus's own distribution | Blocked infra never run; needs a priority decision |
 | §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); instrumented 2026-08-15 (AsrPanic/AsrPostPanic* counters + input capture); poisoning question + root cause still open, pending natural recurrence |
 | §41 | **Change-gated video encoder A/B** | Low | Wake-path compute savings vs. visual-region quality cost | Measured 2026-08-15 (`gaps-resolved.md` §43) — 93.8% skip rate, real quality tradeoff; no default threshold adopted |
