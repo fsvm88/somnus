@@ -72,11 +72,9 @@ Raised 2026-07-12 while fixing an export-script bug (`gaps-resolved.md` §22). W
 
 ---
 
-## §38 — Qwen3 KV-cache generation speedup (ADR 0034) not active in production
+## §38 — Qwen3 KV-cache generation speedup — ✅ RESOLVED 2026-08-15, see `gaps-resolved.md` §38
 
-ADR 0034 shipped a 7.8× generation speedup for Qwen2.5 (530ms/step → 68ms/step) via a split prefill/decode ONNX pair with static-shape KV buffers. That pair was never fully re-exported for Qwen3: `models/qwen3_lm_prefill_kv.onnx` exists (committed 2026-06-27, part of a commit explicitly titled "Item 5 partial — Qwen3-0.6B infrastructure setup"), but **`qwen3_lm_decode_kv.onnx` does not exist** — checked directly on disk (`/data/somnus/models/`, no such file, no such symlink). `ActionDecoder::new` (`crates/somnus/src/action.rs:362-376`) requires *both* the prefill and decode files (or both INT8 variants) to be present before it activates the fast path; with only one present, it falls through to `tracing::info!("KV-cache models absent — generate() using slow lm_session path")`. **Every `generate()` call since Qwen3 became the sole LM (ADR 0036, 2026-07-05) has been running on the slow O(n²) CPU path** — not a silent failure, just a silent non-upgrade nobody re-checked after the Qwen3 swap.
-
-**Not blocking** — generation still works, just ~7.8× slower per call than the architecture is capable of. Fix is mechanical (re-run `scripts/export_kv_cache_qwen3.py`'s decode-side export, blocked per its own 2026-06-27 commit message by a `torch.export` shape-inference issue that was never revisited) — not attempted, flagging for a decision on priority. Found: `gaps-resolved.md` §37.3 (2026-08-15 documentation audit).
+`ActionDecoder` now loads the FP32 KV-cache fast path in production (`"loading KV-cache FP32 models — fast generate() path active (ADR 0034)"`, confirmed live). Root cause was two Qwen3-specific attention details missing from the decode wrapper (`head_dim=128` decoupled from `hidden_size/num_heads`, plus per-head QK-RMSNorm), not the originally-reported `torch.export` issue — full trail, the fixes, and the verification-harness bug found along the way are in `gaps-resolved.md` §38.
 
 ---
 
@@ -131,7 +129,7 @@ ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate 
 | §15 | **Crate hygiene** (usearch, burn-ndarray watch, ffmpeg-the-third) | Low–Med | HNSW footprint / maintenance | Deferred until raised |
 | 🔮 §23 | **Native Rust ONNX graph construction** | High | Removes Python runtime dependency | Scoped, not started |
 | 🔍 §33 | **BindingArea weights never trained** | Med–High | Episode quality / temporal context / grown-unit participation | Decision (b), ADR 0041 implemented; two pilots FAIL (drift+cost, then worse instability); no path chosen among 3 queued candidates |
-| §38 | **Qwen3 KV-cache generation** (ADR 0034 gap) | Low (mechanical, blocked on a `torch.export` issue) | ~7.8× generation speedup, currently inactive | Not attempted; needs a priority decision |
+| §38 | **Qwen3 KV-cache generation** (ADR 0034 gap) | — | ~7.8× generation speedup | ✅ Resolved 2026-08-15 — `gaps-resolved.md` §38 |
 | §39 | **Qwen3 LoRA fine-tuning** (ADR 0033 follow-on) | Med (a campaign run) | Generation grounded in somnus's own distribution | Blocked infra never run; needs a priority decision |
 | §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); instrumented 2026-08-15 (AsrPanic/AsrPostPanic* counters + input capture); poisoning question + root cause still open, pending natural recurrence |
 | §41 | **Change-gated video encoder A/B** | Low | Wake-path compute savings, currently unmeasured | Deployed, unmeasured; no decision on when to run |

@@ -419,3 +419,26 @@ The two orphaned-optimization gaps above (§37.3/§37.4, now `gaps.md` §38/§39
 **Metrics discipline:** this audit is documentation/build-configuration analysis, no code changed, no new data-handling operation introduced — no new metrics needed, stated explicitly per the standing policy.
 
 ---
+
+## §38 — Qwen3 KV-cache generation speedup (ADR 0034) ✅ ACTIVE (2026-08-15)
+
+**Was:** `models/qwen3_lm_decode_kv.onnx` never existed; `ActionDecoder::new` fell through to the slow O(n²) `lm_session` path for every `generate()` call since Qwen3 became the sole LM (ADR 0036). Reported blocker: a `torch.export` shape-inference issue in `scripts/export_kv_cache_qwen3.py`'s decode-side export, never revisited after a 2026-06-27 commit noted it and moved on.
+
+**Root cause was not what the blocker note said.** The script already had `dynamo=False` set (the documented fix for the reported issue) — attempting the export fresh hit a *different*, previously-undiagnosed error: `RuntimeError: shape '[1, 1, 16, 64]' is invalid for input of size 2048`. Qwen3's `head_dim` (128, confirmed via `AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")`) is decoupled from `hidden_size/num_attention_heads` (which would compute to 64) — a GQA/architecture detail Qwen2.5 doesn't have, so the script's `HEAD_DIM=64` constant (correct for Qwen2.5, copied over for Qwen3) was silently wrong. Qwen3 also has per-head QK-RMSNorm (`q_norm`/`k_norm` on the `head_dim` axis, `Qwen3Attention.forward`) which Qwen2.5 has no equivalent of and the decode wrapper's manual reimplementation was missing entirely — not a crash, but a numerically-wrong export had the shape bug been papered over without also adding this.
+
+**Three fixes landed in `scripts/export_kv_cache_qwen3.py`:**
+1. `HEAD_DIM = 128` (was 64), plus `attn.q_norm(...)`/`attn.k_norm(...)` applied on the `head_dim` axis before rotary, matching `Qwen3Attention.forward` exactly.
+2. `attn_out` reshape before `o_proj` fixed to `N_HEADS*HEAD_DIM` (2048), not `LM_HIDDEN` (1024) — they only coincide for Qwen2.5.
+3. A second bug found via the equivalence check (below): the decode wrapper's hand-rolled MLP had `gate_proj(x) * silu(up_proj(x))` — SwiGLU's gate/up order backwards vs. the real `Qwen3MLP.forward`'s `silu(gate_proj(x)) * up_proj(x)`. Fixed by delegating to the real `layer.mlp(hidden)` module instead of reimplementing it by hand (matching how `export_kv_cache.py`, the working Qwen2.5 script, already avoided this class of bug).
+
+Also replaced `F.scaled_dot_product_attention` in the decode wrapper with the same manual matmul+softmax attention `export_kv_cache.py` uses (SDPA's export path is the one structurally new element vs. the script that already exports cleanly — pre-emptive, not itself diagnosed as a failure).
+
+**Verification bug found and fixed too:** the script's `verify_equivalence` (ported from `export_kv_cache.py`) compared `zip(ref_tokens, kv_toks)` index-for-index, but by construction `kv_toks[i]` is the prediction for position `prefix_len+1+i` while `ref_tokens[i]` is the prediction for position `prefix_len+i` — an inherent off-by-one. Before the two model bugs above were fixed, this made the check silently unable to distinguish "wrong by one position" (a real bug) from "wrong outputs" (also a real bug) — both scored near-zero. Fixed by comparing `ref_tokens[1:]` against `kv_toks[:-1]`. This same off-by-one likely exists in `export_kv_cache.py` (identical code, never touched here — Qwen2.5 is deprecated post-ADR-0036, out of scope) — flagging in case that script is ever revived.
+
+**Final verification: 19/19 token agreement** (prefix=320, 20 greedy decode steps), prefill logits exact match (`max_abs_diff=0.00e+00`). Exported, consolidated external data into a single `<name>.onnx.data` companion file (the legacy TorchScript exporter defaults to ~200 loose per-initializer files past a size threshold — cleaned up to match the existing `prefill_kv.onnx` convention), moved into `/data/somnus/models/` with the standard symlink-into-`models/` pattern. **Confirmed live**: `somnus --action` now logs `"loading KV-cache FP32 models — fast generate() path active (ADR 0034)"` instead of the slow-path fallback.
+
+Environment: `uv venv .venv && uv pip install torch onnx onnxruntime peft transformers accelerate` (CPU-only, matching ADR 0034's own finding that GPU/MIGraphX is slower for these static-shape KV models). `torch_dtype` deprecation warnings are cosmetic (transformers 5.15 wants `dtype=`), left as-is.
+
+**Not done:** INT8 quantization of the new decode model (`qwen3_lm_decode_kv_int8.onnx`, the higher-priority `Q-B` path in `ActionDecoder::new`) — FP32 is active and correct, INT8 would be a further speedup, not attempted this pass.
+
+---
