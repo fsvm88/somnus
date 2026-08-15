@@ -468,3 +468,25 @@ Other four regions' `per_region_mse` moved ≤4% either direction. The pattern i
 **Not adopted — no decision on a default threshold.** Real wake-path compute savings are large (93.8% fewer `enc.encode()` calls at threshold=0.05) and the NREM/REM wall-clock deltas point the same direction, but the quality cost isn't zero (visual-region MSE +10.8%, aggregate MSE +21.8%) and the two unexplained deviations above haven't been chased down. A single 10-cycle pilot at one threshold value is enough to answer "does this do anything" (yes) but not "what's the right threshold" or "is the visual-region cost acceptable" — those need either a threshold sweep or an explicit product/research-priority call this pilot doesn't make on its own. `--video-change-threshold` stays default-off (0.0) in production.
 
 ---
+
+## §44 — ADR 0041 third pilot: candidate (a), loss-scale reduction — FAIL, worse than either prior pilot (2026-08-15)
+
+**Setup:** `scripts/ab_binding_replay_loss_scale.sh` (new script, `ab_binding_replay.sh` template). New CLI flag `--binding-replay-loss-scale <f32>` (default 1.0, no behavior change) threaded through `lib.rs` → `sleep.rs` → `PerceptionProcessor::binding_replay_step_batch(batch, loss_scale)` → `somnus-perception/src/lib.rs`'s `binding_replay_step_batch_inner`, applied as `loss.mul_scalar(loss_scale)` on the tensor immediately before `.backward()` (the `BindingReplayLoss` metric still records the *unscaled* value, for comparability across different scale settings). Treatment: `--binding-replay --binding-replay-loss-scale 0.1` (step-count cap stays at its default of 1, same as §36 — this pilot isolates the scale variable, not a combination). Control: no flag. 10 cycles, copied trained state, `--features fine-metrics`, same corpus.
+
+**Result: worse than both §35 (unbounded) and §36 (step-count cap alone).**
+
+| metric | control | treatment (scale=0.1) | delta |
+|---|---|---|---|
+| mean_output_mse | 0.013483 | 0.072891 | **+440.6%** |
+| per_region_mse (all 5 regions) | — | — | +25.4% to **+80.8%**, every region worse |
+| traces_replayed | 431.2 | 219.0 | −49.2% |
+| settle_iters_sum / settle_trigger_count | — | — | +39% both |
+| nrem_wall_ms | 6091 | 4917.7 | −19.3% (the only clearly "good" number) |
+
+`nrem_binding_replay` fired 6/10 cycles (matches the step-count cap's expected firing pattern); control-arm leak check clean (zero firings). The same salience/settle cascade signature from §36 reappears (`settle_iters_sum`/`settle_trigger_count` both +39%, `traces_replayed` down ~half) — **but the quality damage is roughly 4x worse than §36's own same-cycle-MSE-blowup finding**, at 10x *lower* gradient magnitude. This is the opposite of the theory candidate (a) was testing (a full-strength update was assumed to be the driver of instability; a 10x-weaker update was expected to at least not make things worse).
+
+**Interpretation — tentative, not confirmed:** a partially-scaled gradient update may leave the binding weights in a worse state than either "no update" or "full update" — nudging grown units' zero-init rows away from zero without enough signal to converge them usefully, effectively adding noise to the binding projection rather than a small, controlled correction. This would mean loss *magnitude* was never the right lever (matching §36's own conclusion about step *count*), and the salience/settle cascade is a structural consequence of live-episode training itself, not a dosage problem — directly pointing at candidate (c) (decouple the cascade at the control-signal level, not the training-step level) as the more principled remaining option, over candidate (b) (fusing into the existing optimizer step, which doesn't address dosage or the cascade either).
+
+**Status: candidate (a) closed, FAIL.** Three of three ADR 0041 adoption attempts (§35 unbounded, §36 step-count cap, §44 loss-scale) have now failed, each for a related but distinct reason. `gaps.md` §33 updated: candidates (a) tried; (b)/(c) still queued, with (c) now the recommended next attempt given the cascade appears to be the common failure thread across all three pilots so far.
+
+---

@@ -18,9 +18,21 @@
   reacting to the degraded output. The §33 fix still engages under the cap (grown rows 30–78%
   nonzero, confirmed via `binding_row_norms`), so the mechanism isn't broken — but step-count
   capping decoupled cost from drift instead of taming both as hypothesized. **Step-count capping
-  abandoned as the lever.** Candidates queued, none chosen yet: reduce step *magnitude* (lower LR/
-  loss-scale on the term) instead of count; fuse into the existing `fused_replay_wake_step_batch`
-  step rather than a separate optimizer pass; decouple the salience/settle cascade directly.
+  abandoned as the lever.**
+  **2026-08-15 (later still): candidate (a), loss-scale reduction, tried and FAILED WORSE (gaps-resolved.md §44).**
+  New `--binding-replay-loss-scale <f32>` flag (default 1.0) scales the live-episode loss tensor
+  immediately before `.backward()`. Pilot at scale=0.1 (step cap left at its default of 1) produced
+  `mean_output_mse` +440.6% vs. control -- every region worse (+25% to +81%), the same
+  salience/settle cascade signature as the N=1 pilot (`traces_replayed` -49%, `settle_iters_sum`
+  +39%) but roughly 4x the quality damage at 10x lower gradient magnitude. The opposite of the
+  theory being tested (weaker update expected to reduce instability, not worsen it) -- suggests a
+  partially-scaled update adds noise to the binding weights without enough signal to converge them
+  usefully, and that the cascade is a structural consequence of live-episode training itself, not
+  a dosage effect tunable via step count or loss magnitude. **Loss-scale reduction abandoned as the
+  lever.** Two candidates remain, neither tried: fuse into the existing `fused_replay_wake_step_batch`
+  step rather than a separate optimizer pass; decouple the salience/settle cascade directly (favored,
+  since the cascade -- not step count, not loss magnitude -- is the one symptom common to all three
+  failed pilots so far).
 - **Date:** 2026-08-15
 
 ## Context

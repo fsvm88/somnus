@@ -2,7 +2,7 @@
 
 > **Contents:** Open, undecided items only — algorithm/encoder/LLM upgrade candidates awaiting a decision, and known incompleteness with no chosen fix yet. Items that reached a decision (accepted/deployed/adopted, or rejected/not-pursued/null-result) live in [`gaps-resolved.md`](gaps-resolved.md), verbatim, under the same section numbers. Pruned to open-only 2026-08-15 (was §0-§37; see `gaps-resolved.md`'s header for what moved and why).
 > **When to read:** Picking the next item to try, or checking whether something is still undecided.
-> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `gaps-resolved.md`, not that it never existed. New items get the next unused number across both files (next: §43).
+> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `gaps-resolved.md`, not that it never existed. New items get the next unused number across both files (next: §44).
 
 ---
 
@@ -54,7 +54,7 @@ Raised 2026-07-12 while fixing an export-script bug (`gaps-resolved.md` §22). W
 
 ---
 
-## §33 — BindingArea weights never trained — decision (b) implemented, two pilots FAIL, no path chosen
+## §33 — BindingArea weights never trained — decision (b) implemented, three pilots FAIL, no path chosen
 
 **Confirmed 2026-08-14:** the binding area's ~1.72M params (5 region projections, W_q/W_k/W_v, GRU, temporal_proj) have never received a gradient — since ADR 0008. All training paths (`replay_step*`, `wake_reconstruct_step*`, `fused_replay_wake_step_batch`, ADR 0012 proj_loss) consume episodes as stored `Tensor::from_data` — the graph stops at the episode boundary; only inference call sites (`try_bind`, `settle_episode`, `binding_only`) ever call `binding.forward`. ADR 0008 anticipated this ("will be revisited in Phase 6") — the revisit never happened; corrected in place.
 
@@ -68,7 +68,9 @@ Raised 2026-07-12 while fixing an export-script bug (`gaps-resolved.md` §22). W
 
 **Repeat pilot at step-budget cap N=1 (`gaps-resolved.md` §36, 2026-08-15):** wall-clock did improve (−24.8%) but quality got *worse* — 10× same-cycle MSE on fired cycles, plus a new salience/settle cascade starving 6/20 cycles of replay traces. **Also not adopted.** Step-count capping abandoned as the lever.
 
-**Open — no path chosen. Three untried candidates queued:** (a) reduce step *magnitude* (LR/loss-scale) instead of count, (b) fuse into `fused_replay_wake_step_batch`'s existing optimizer step instead of a separate pass, (c) decouple the salience/settle cascade directly (a control-side clamp on wake-triggering reacting to NREM-quality swings). Full pilot numbers: `gaps-resolved.md` §35/§36. ADR: `decisions/0041-live-episode-binding-training.md`.
+**Third pilot, candidate (a) — loss-scale reduction (`gaps-resolved.md` §44, 2026-08-15):** `--binding-replay-loss-scale 0.1` (new flag, step-count cap left at its default of 1). **Worse than both prior pilots** — `mean_output_mse` +440.6%, every region's `per_region_mse` up 25-81%, the same salience/settle cascade signature as §36 (`traces_replayed` −49%, `settle_iters_sum`/`settle_trigger_count` +39%) but with roughly 4x the quality damage at 10x *lower* gradient magnitude. **Also not adopted.** Loss-magnitude scaling abandoned as the lever — the opposite of what the theory predicted (a weaker update made things worse, not better), suggesting a partially-scaled update adds noise without enough signal to converge, and that the salience/settle cascade is a structural consequence of live-episode training itself, not a dosage problem.
+
+**Open — no path chosen. Two untried candidates remain, (c) now favored:** (b) fuse into `fused_replay_wake_step_batch`'s existing optimizer step instead of a separate pass — doesn't address the cascade, lower priority given (a)'s result; **(c) decouple the salience/settle cascade directly** (a control-side clamp on wake-triggering reacting to NREM-quality swings) — favored, since the cascade (not step count, not loss magnitude) is the one symptom common to all three failed pilots so far. Full pilot numbers: `gaps-resolved.md` §35/§36/§44. ADR: `decisions/0041-live-episode-binding-training.md`.
 
 ---
 
@@ -134,7 +136,7 @@ ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate 
 | §11 | **Gemma 3 1B IT** | Med–High | Generation (lower priority than closing §38/§39) | Deferred |
 | §15 | **Crate hygiene** (usearch, burn-ndarray watch, ffmpeg-the-third) | Low–Med | HNSW footprint / maintenance | Deferred until raised |
 | 🔮 §23 | **Native Rust ONNX graph construction** | High | Removes Python runtime dependency | Scoped, not started |
-| 🔍 §33 | **BindingArea weights never trained** | Med–High | Episode quality / temporal context / grown-unit participation | Decision (b), ADR 0041 implemented; two pilots FAIL (drift+cost, then worse instability); no path chosen among 3 queued candidates |
+| 🔍 §33 | **BindingArea weights never trained** | Med–High | Episode quality / temporal context / grown-unit participation | Decision (b), ADR 0041 implemented; three pilots FAIL (drift+cost, then worse instability, then worse still at lower loss scale); (c) favored among 2 remaining candidates |
 | §38 | **Qwen3 KV-cache generation** (ADR 0034 gap) | — | ~7.8× generation speedup | ✅ Resolved 2026-08-15 — `gaps-resolved.md` §38 |
 | §39 | **Qwen3 LoRA fine-tuning** (ADR 0033 follow-on) | Med (a campaign run) | Generation grounded in somnus's own distribution | Blocked infra never run; needs a priority decision |
 | §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); instrumented 2026-08-15 (AsrPanic/AsrPostPanic* counters + input capture); poisoning question + root cause still open, pending natural recurrence |
