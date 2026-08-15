@@ -345,9 +345,27 @@ pub enum Metric {
     /// The synchronous `wake_reconstruct_step` fallback path failed for one episode (used when
     /// no async `WakeReconWorker` is active, or per-episode within it).
     WakeReconstructError,
-    /// Whisper ASR decode failed or panicked for one audio chunk (the `catch_unwind`-guarded
-    /// path, gaps.md's mitigated-not-root-caused ORT panic) — the chunk is dropped either way.
+    /// Whisper ASR decode returned `Err(_)` (not a panic) for one audio chunk. Split from
+    /// `AsrPanic` 2026-08-15 (gaps.md §40) — the two failure modes were previously conflated,
+    /// which made it impossible to tell a normal decode error from the intermittent ORT panic
+    /// from the metrics file alone.
     AsrError,
+    /// Whisper ASR decode panicked (the `catch_unwind`-guarded path, gaps.md's
+    /// mitigated-not-root-caused ORT panic, e.g. "GetElementType is not implemented") for one
+    /// audio chunk — the chunk is dropped either way. Distinct from `AsrError` since a panic
+    /// crosses an ORT/FFI boundary mid-call and raises the open question (gaps.md §40) of
+    /// whether the `Session`'s ORT-internal state survives intact; `AsrPostPanicOutcome`
+    /// answers that empirically.
+    AsrPanic,
+    /// One ASR decode succeeded *after* at least one `AsrPanic` has already fired this process
+    /// session. Paired with `AsrPostPanicFailure` to directly answer gaps.md §40's open
+    /// poisoning question: a `Session` that recovers fully should show this dominating; one
+    /// that's poisoned should show `AsrPostPanicFailure` dominating, or a permanent-failure tail
+    /// after the first panic.
+    AsrPostPanicSuccess,
+    /// One ASR decode failed or panicked again *after* at least one `AsrPanic` has already
+    /// fired this process session — see `AsrPostPanicSuccess`.
+    AsrPostPanicFailure,
     /// `ingest_language_line`'s embedding step failed (table mean-pool or `--lang-use-lm`
     /// hidden-state path) — that language line never reached any region.
     LangEmbedError,
@@ -404,7 +422,7 @@ pub enum Metric {
 }
 
 impl Metric {
-    pub const COUNT: usize = 102;
+    pub const COUNT: usize = 105;
 
     const fn as_index(self) -> usize {
         match self {
@@ -510,6 +528,9 @@ impl Metric {
             Metric::TrainingNanDetected => 99,
             Metric::NremBindingReplay => 100,
             Metric::BindingReplayLoss => 101,
+            Metric::AsrPanic => 102,
+            Metric::AsrPostPanicSuccess => 103,
+            Metric::AsrPostPanicFailure => 104,
         }
     }
 
@@ -617,6 +638,9 @@ impl Metric {
             Metric::TrainingNanDetected => "training_nan_detected",
             Metric::NremBindingReplay => "nrem_binding_replay",
             Metric::BindingReplayLoss => "binding_replay_loss",
+            Metric::AsrPanic => "asr_panic",
+            Metric::AsrPostPanicSuccess => "asr_post_panic_success",
+            Metric::AsrPostPanicFailure => "asr_post_panic_failure",
         }
     }
 
@@ -723,6 +747,9 @@ impl Metric {
         Metric::TrainingNanDetected,
         Metric::NremBindingReplay,
         Metric::BindingReplayLoss,
+        Metric::AsrPanic,
+        Metric::AsrPostPanicSuccess,
+        Metric::AsrPostPanicFailure,
     ];
 }
 
