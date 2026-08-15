@@ -3,244 +3,40 @@
 - **Status:** implemented, full-coverage pass complete.
 - **Date:** 2026-07-14
 
-> **Update (2026-07-14, later):** user asked to extend coverage from "every existing hand-rolled
-> timer" (the original scope below) to "every meaningful data-handling step, reachable for A/B
-> comparison" — i.e. instrument previously-untimed functions, not just convert existing timers.
-> Grew `Metric` from 24 to 67 variants across `somnus-perception` (binding forward, ORT run_encoder/
-> run_binding, fused-replay sub-phases, growth/prune, EMA predict/update/sync, ORT lifecycle,
-> homeostatic decay, REM self-probe functions), `somnus-memory` (cold archive open/truncate/evict,
-> semantic-store warm-load, recollection promote, snapshot save/load), `somnus-sensory` (one
-> aggregate `MediaFileDecode` metric spanning a whole file's decode-thread lifetime), and `somnus`
-> (action-decoder init/generate, gain-worker compute, ASR greedy decode, audio resampling,
-> language embedding, episode recording). Two new structural patterns emerged and are documented
-> below: the **private-`_inner`-method split** (for functions with early `return`/`?`/`bail!` that
-> would otherwise skip the macro's post-body recording), and the **immediately-invoked-closure
-> wrap** (for the one case — `somnus-sensory`'s decode thread — where isolating early returns inside
-> an already-existing closure required a nested closure rather than a new method). Verified live:
-> a single 2-session pilot recorded 40 distinct metrics simultaneously, including cross-thread
-> ones (`wake_worker_train_step`, `gain_compute` — plain atomics are safe to write from any
-> thread, no locking needed) and metrics that correctly stayed at zero for conditions the pilot
-> didn't trigger (region growth, `--action`, cold-archive eviction).
+> **Update (2026-07-14, later): full-coverage expansion.** Extended scope from "convert every existing hand-rolled timer" to "every meaningful data-handling step, reachable for A/B comparison" — instrumenting previously-untimed functions, not just converting existing timers. `Metric` 24→67 variants across `somnus-perception` (binding forward, ORT run_encoder/run_binding, fused-replay sub-phases, growth/prune, EMA predict/update/sync, ORT lifecycle, homeostatic decay, REM self-probes), `somnus-memory` (cold archive open/truncate/evict, semantic-store warm-load, recollection promote, snapshot save/load), `somnus-sensory` (one aggregate `MediaFileDecode` spanning a file's whole decode-thread lifetime), `somnus` (action-decoder init/generate, gain-worker, ASR greedy decode, audio resampling, language embedding, episode recording). Two new patterns (documented below): **private-`_inner`-method split** (functions with early return/`?`/`bail!`) and **immediately-invoked-closure wrap** (the one case with no separate method to split into — `somnus-sensory`'s decode thread). Verified: a 2-session pilot recorded 40 metrics simultaneously, incl. cross-thread ones (`wake_worker_train_step`, `gain_compute` — plain atomics safe from any thread) and untriggered ones correctly staying at zero.
 
-> **Update (2026-07-15): first real use of the "counted" tier.** Auditing coverage after the
-> full-coverage pass found every one of the 67 variants above was duration-based —
-> `counted_core!`/`counted!` existed in the macro API but had zero call sites anywhere in the
-> workspace, so the design's value/event half was dead code. Added 7 new Core-tier value metrics,
-> `Metric::COUNT` 67→74, all via `counted_core!` (a raw `.add()`, no timing):
-> - `region_n_units`/`region_k_active` — a region's live `n_units`/`k_active` recorded at each
->   `grow_region`/`grow_region_seeded`/`prune_region` event (bounded ≤5/cycle each). Gives the
->   actual sparsity ratio (`k_active / n_units`) that ADR 0037/0038's scoring-cost analysis needs,
->   without a one-off validation script — previously that ratio was only ever printed manually.
-> - `cold_archive_evicted_records` — how many records `ColdArchive::evict_lowest_salience`
->   actually removed. Distinct from `ColdArchiveEvict`'s existing timing, which only counts how
->   many times the function *ran*, not how much it evicted.
-> - `video_frames_encoded`/`video_frames_skipped` — flushed once per second at the same point the
->   video-encoder thread already throttle-logs (`tracing::info!("video embeddings/s")`), so no new
->   per-frame overhead. Exposes the change-gate's actual skip rate in the metrics file instead of
->   only a log line.
-> - `refresh_language_cache_run`/`refresh_language_cache_skipped` — which branch fired inside
->   `refresh_language_cache`. The existing `RefreshLanguageCache` timing wraps both the ORT-active
->   skip and the real `forward_no_dc` call uniformly and can't tell them apart; these two counters
->   close that gap.
->
-> Deliberately not added: per-message channel/queue-depth sampling (`audio_tx`/`video_tx`/etc. in
-> `main.rs`) — no existing per-second throttle point exists on the audio-thread side to piggyback
-> on the way the video thread's did, and sampling at message-send frequency would violate this
-> crate's own per-element guardrail. Left as a candidate for later, not implemented.
->
-> Verified: `cargo build/clippy/test --release --workspace` clean in both feature states. Live
-> pilot (2-session, isolated scratch memory dir, cleaned up after) confirmed
-> `video_frames_encoded`, `refresh_language_cache_run`, and — unexpectedly, in only 2 tiny-capacity
-> sessions — `region_n_units`/`region_k_active` all fired with real values; the conditional ones
-> (`video_frames_skipped`, `cold_archive_evicted_records`, `refresh_language_cache_skipped`)
-> correctly stayed absent since their triggering conditions (change-gate skip, cold eviction, ORT
-> active) didn't occur in that run.
+> **Update (2026-07-15): first real use of the "counted" tier.** All 67 variants were duration-based — `counted_core!`/`counted!` had zero call sites. Added 7 Core value metrics (`Metric::COUNT` 67→74, raw `.add()`, no timing): `region_n_units`/`region_k_active` (per growth/prune event — gives the live sparsity ratio ADR 0037/0038 needs without a one-off script), `cold_archive_evicted_records` (vs. `ColdArchiveEvict`'s existing call-count timing), `video_frames_encoded`/`_skipped` (piggybacked on the video thread's existing per-second throttle log, no new overhead), `refresh_language_cache_run`/`_skipped` (the existing timing wraps both branches uniformly, couldn't distinguish). Deliberately not added: per-message channel/queue-depth sampling — no existing per-second throttle point to piggyback on for audio, and per-message sampling would violate the crate's per-element guardrail. Verified both feature states clean; 2-session pilot confirmed 4/7 fired (incl. `region_n_units`/`region_k_active` unexpectedly, even in a tiny run), 3 conditional ones correctly absent.
 
-> **Update (2026-07-15, later): operational health for unattended long-running campaigns.** A
-> second, deeper audit — ahead of a long CPU/GPU-intensive growth campaign — targeted signals that
-> matter for catching problems *during* an unattended run rather than after the fact. `Metric`
-> grew 74→99. Five categories:
-> - **GPU/ORT degradation**, previously visible only via manual log-grepping (gaps.md §24's whole
->   investigation was grepping ~100K lines for two exact strings): `ort_encoder_fallback`/
->   `ort_binding_fallback` (encoder/binding call failed, fell back to burn — both the `try_bind`
->   and `settle` call sites), `ort_session_init_failed` (first-attempt build failed, sticky for the
->   rest of the process), `ort_session_rebuild_failed` (a later rebuild failed while an existing
->   session stayed active — a different failure mode/recovery path than init failure, so kept
->   separate). The MIGraphX-destructor-race segfault restart (exit 139) can't be captured this way
->   at all — it happens during process teardown, after somnus's own metrics write — so it's handled
->   at the shell level instead: `scripts/train_campaign.sh` now appends a JSON line to
->   `segfault_restarts.jsonl` in the campaign dir on every exit-139 restart, and
->   `scripts/campaign_status.py` reads it, replacing the old "this script can't see restarts" note
->   under `-- health --` with an actual count and session list.
-> - **Resource sampling**: `process_rss_bytes`/`memory_dir_disk_free_bytes`, sampled once per
->   sleep cycle. `sysinfo` was previously called only once at startup (to size the auto warm/cold
->   caps) — a slow leak or filling disk during a long unattended campaign would have been invisible
->   until OOM or ENOSPC. The disk-free lookup was factored into `memory_dir_disk_free_bytes()` and
->   reused by both the startup auto-cap and the new per-cycle sample.
-> - **Growth input**: `growth_batch_size` — the actual novelty-scaled batch chosen per growth event
->   (gaps.md §19), pairing with the previous round's `region_n_units`/`region_k_active` (the growth
->   *result*) to give the full input→output picture.
-> - **Grouped failure counters** for every recurring `warn!`/`error!` site in `somnus`/`somnus-perception`
->   (not startup-only messages get their own bucket where the failure mode differs; see each
->   variant's doc comment in `crates/somnus-metrics/src/lib.rs` for the exact call sites folded into
->   it): `sleep_persistence_write_failed` (any of the 5 end-of-cycle snapshot/HNSW/weights/
->   region-sizes/cooldown writes), `nrem_step_error` (staleness inference, fused-replay,
->   projection-distill, proj-weight-norm), `cold_archive_op_error` (append/evict during spill),
->   `rem_probe_error` (measure_mse/measure_output_mse_inference/synthesize_episode),
->   `perception_ingest_error` (a whole audio/video/language ingest call failed outright — flagged
->   as the single highest-value counter in this batch), `wake_reconstruct_error`, `asr_error`,
->   `lang_embed_error`, `action_generation_error`, `wake_recon_worker_died` (rare, high-severity:
->   the async worker died silently), `startup_restore_degraded`, `media_source_error` (input-source
->   failures: file/mic/webcam/encoder-thread), and `misc_warning` (the remaining low-frequency
->   sites — a nonzero count is a prompt to grep the log, not a diagnosis by itself). Grouping was a
->   deliberate choice over one variant per call site (~55 sites would have made the enum
->   unmaintainable without adding proportionate diagnostic value — the log line still pinpoints
->   which site fired).
-> - **Disk I/O byte volume**: `semantic_store_dump`/`semantic_store_dump_bytes` (the warm HNSW
->   dump was previously untimed entirely, found while adding the byte counter — same function
->   gaps.md §21's leak lived in), `snapshot_episodic_bytes_written`/`_read` (via `fs::metadata` on
->   the written/read file — no per-write-call instrumentation needed), `cold_archive_spill_bytes_written`
->   (derived from the spill loop's existing record count × `somnus_memory::cold::RECORD_BYTES`, now
->   `pub` — no second measurement). `SemanticStore::dump`'s signature changed from `Result<(),
->   io::Error>` to `Result<u64, io::Error>` (bytes written) to support this; both call sites
->   updated.
->
-> Verified: `cargo build/clippy/test --release --workspace` clean in both feature states (99
-> variants). Live pilot (2-session, isolated scratch memory dir, cleaned up after) confirmed
-> `process_rss_bytes`, `memory_dir_disk_free_bytes`, `growth_batch_size`, `semantic_store_dump`/
-> `_bytes`, `snapshot_episodic_bytes_written`/`_read`, `cold_archive_spill_bytes_written`, and
-> `misc_warning` all fired with plausible real values (RSS ~11GB, disk-free ~916GB) in a run that
-> happened to hit the disk-not-found auto-cap fallback path. `segfault_restarts.jsonl` and its
-> `campaign_status.py` display verified separately with a hand-crafted fixture (no real segfault
-> was available to trigger one in a short pilot).
+> **Update (2026-07-15, later): operational health for unattended campaigns.** `Metric` 74→99, five categories: **GPU/ORT degradation** — `ort_encoder_fallback`/`ort_binding_fallback`, `ort_session_init_failed` (sticky), `ort_session_rebuild_failed` (separate failure mode from init). The MIGraphX-destructor-race segfault (exit 139) can't be captured this way (happens during teardown, after metrics write) — handled shell-side instead: `train_campaign.sh` appends `segfault_restarts.jsonl`, `campaign_status.py` displays it. **Resource sampling** — `process_rss_bytes`/`memory_dir_disk_free_bytes` per sleep cycle (`sysinfo` was previously startup-only; a slow leak/filling disk during a long run would've been invisible until OOM/ENOSPC). **Growth input** — `growth_batch_size` (pairs with `region_n_units`/`region_k_active` for the full input→output picture). **Grouped failure counters** for every recurring warn!/error! site (deliberately grouped, not one-per-site — ~55 sites would make the enum unmaintainable without adding diagnostic value; the log line still pinpoints the exact site): `sleep_persistence_write_failed`, `nrem_step_error`, `cold_archive_op_error`, `rem_probe_error`, `perception_ingest_error` (flagged highest-value — means real data loss), `wake_reconstruct_error`, `asr_error`, `lang_embed_error`, `action_generation_error`, `wake_recon_worker_died` (rare, high-severity), `startup_restore_degraded`, `media_source_error`, `misc_warning`. **Disk I/O bytes** — `semantic_store_dump`/`_bytes` (found `dump()` itself was untimed — the same function gaps.md §21's leak lived in), `snapshot_episodic_bytes_written`/`_read`, `cold_archive_spill_bytes_written` (derived from the spill loop's existing record count). `SemanticStore::dump`'s return type changed `Result<(),io::Error>`→`Result<u64,io::Error>` for this. Verified both feature states clean (99 variants); live pilot confirmed all fired with plausible values (RSS ~11GB, disk-free ~916GB, including hitting the disk-not-found auto-cap fallback); `segfault_restarts.jsonl` verified with a hand-crafted fixture.
 
-> **Update (2026-07-15, final): third-pass correctness audit before campaign launch.** Rather
-> than hunt for more things to instrument, this pass verified everything already built. Checked:
-> every one of the 99 variants above has a live call site (no orphan/no-op variants — spot-checked
-> all 24 round-2 additions individually); `main.rs`'s `#![recursion_limit = "512"]` has enormous
-> headroom against the 85-field metrics `json!{}` literal (no fragility); `campaign_status.py`/
-> `eval_metrics.py` tolerate unknown JSON fields fine via `.get()` with no schema validation. Two
-> real gaps found and fixed:
-> - **Numerical health**: no code path anywhere checked `mean_train_loss`/`mean_output_mse`/
->   `mean_proj_loss` for NaN/Inf before writing them to the metrics JSON — a training blowup on an
->   unattended run would have rendered as a weird number with no alarm. Added `Metric::COUNT`
->   99→100: `training_nan_detected`, checked and recorded once per NREM replay
->   (`crates/somnus/src/sleep.rs`, right after these three values are computed) alongside a
->   `tracing::error!` with the offending values.
-> - **Surfacing gap**: every round-2 failure counter was faithfully recorded but never displayed
->   anywhere a human running the campaign would see it — `campaign_status.py`'s `-- health --`
->   section only showed `scan_panics()`/`read_segfault_restarts()`, not any `fine_metrics` content.
->   Added `summarize_failure_counters()` (sums each failure counter's `count` across every cycle's
->   drained-per-cycle `fine_metrics` snapshot, since each snapshot only covers the cycle it was
->   taken in) and a new health-section block listing any nonzero ones, `wake_recon_worker_died`/
->   `training_nan_detected` flagged red as the two most severe.
->
-> Verified: `cargo build/clippy/test --release --workspace` clean in both feature states (100
-> variants). Live pilot confirmed the health-section display renders correctly against a real
-> `metrics.jsonl` (showed the same `misc_warning: 1` disk-cap-fallback edge case from the round-2
-> pilot); a hand-crafted fixture confirmed multi-cycle summing and severity coloring both work.
+> **Update (2026-07-15, final): third-pass correctness audit.** Verified rather than extended: every one of 99 variants has a live call site (spot-checked all 24 round-2 additions), `main.rs`'s `recursion_limit=512` has headroom against the 85-field `json!{}` literal, `campaign_status.py`/`eval_metrics.py` tolerate unknown fields fine. Two real gaps fixed: **numerical health** — no path checked `mean_train_loss`/`mean_output_mse`/`mean_proj_loss` for NaN/Inf before writing them; added `training_nan_detected` (COUNT 99→100), checked in `sleep.rs` right after computation, with a `tracing::error!` alongside. **Surfacing gap** — every round-2 failure counter was recorded but never displayed; added `summarize_failure_counters()` (sums each counter across cycles' `fine_metrics` snapshots) to `campaign_status.py`'s health section, `wake_recon_worker_died`/`training_nan_detected` flagged red. Verified both feature states clean (100 variants); live pilot + hand-crafted fixture confirmed multi-cycle summing and severity coloring.
 
-> **Policy (2026-07-15): this ADR's two-tier split is now the standing demarcation line for all
-> future ADRs/architectural changes/algorithm switches** (see `CLAUDE.md`'s "Metrics discipline"
-> section). No operation touching data ships unmeasured. **Core** (`timed_core!`/`counted_core!`)
-> = normal performance/health monitoring, always on — the tier a new ADR's implementation should
-> default to. **Fine** (`timed!`/`counted!`, `fine-metrics` feature) = investigation-grade
-> evaluation for actively debugging a regression or validating a specific improvement claim, not
-> worth its (small but nonzero) always-on cost otherwise. Every future ADR should name which
-> existing metrics already cover the affected path and which new ones the change needs, and treat
-> "wired + verified live in a short pilot" as part of done, not a follow-up.
+> **Policy (2026-07-15): this ADR's two-tier split is the standing demarcation line for all future ADRs/architectural changes/algorithm switches** (CLAUDE.md "Metrics discipline"). No operation touching data ships unmeasured. **Core** (`timed_core!`/`counted_core!`) = always-on performance/health monitoring, the default tier for new work. **Fine** (`timed!`/`counted!`, `fine-metrics` feature) = investigation-grade evaluation, not worth its small always-on cost otherwise. Every future ADR should name existing coverage + new metrics needed, and treat "wired + verified live in a short pilot" as part of done, not a follow-up.
 
 ## Context
 
-While scoping ADR 0038's benchmarking prerequisite (measure the k-WTA scoring matmul's real
-cost), it became clear the codebase had no shared instrumentation mechanism at all: every timed
-call site hand-rolled its own `let t = Instant::now(); ...; t.elapsed()` pair, duplicated dozens
-of times across `crates/somnus-perception/src/lib.rs` (6 ingest phases), `crates/somnus/src/sleep.rs`
-(11 wall-clock phases), `crates/somnus-encoding/src/{audio,video}.rs` (3 encoder timers), and
-`crates/somnus/src/main.rs` (4 more sites, two of them *duplicate* measurements of a call already
-timed inside `somnus-encoding`). No Criterion setup, no timing macro, no shared registry — each site
-independently computed a duration and fed it into its own local accumulator or `tracing::info!`
-field, then a single ~90-field `serde_json::json!{}` literal in `main.rs` assembled everything
-into the campaign's NDJSON metrics file by hand.
+While scoping ADR 0038's benchmarking prerequisite (measure the k-WTA scoring matmul's real cost), it became clear there was no shared instrumentation mechanism at all — every timed site hand-rolled its own `Instant::now()`/`.elapsed()`, duplicated across `somnus-perception` (6 ingest phases), `somnus/sleep.rs` (11 phases), `somnus-encoding` (3 encoder timers), `somnus/main.rs` (4 sites, two of them *duplicate* measurements of a call already timed inside `somnus-encoding`). No Criterion, no macro, no registry — each site fed its own local accumulator or `tracing::info!` field into a single ~90-field `json!{}` literal in `main.rs`.
 
-The user wanted two things layered on top of this: (1) much finer-grained counters — "every
-operation which handles data gets a counter" — gated behind a Cargo feature so a normal build
-stays exactly as lean as today, and (2) once that existed, a single pass converting every
-*existing* hand-rolled timer to the same mechanism, so there is one way of doing metrics instead
-of two (the old ad hoc pattern plus a new opt-in one bolted alongside it).
+Two things layered on top: (1) much finer-grained counters ("every operation that handles data gets a counter"), gated behind a Cargo feature so a normal build stays lean; (2) a single pass converting every *existing* hand-rolled timer to the same mechanism, so there's one way of doing metrics instead of the old pattern plus a new one bolted alongside it.
 
 ## Decision
 
-New crate `crates/somnus-metrics`, with metrics recorded in two tiers sharing one registry:
+New crate `crates/somnus-metrics`, two tiers sharing one registry: **Core** (`timed_core!`/`counted_core!`) — unconditional, always recording, funneling every metric this codebase has always reported through one macro instead of copy-pasted boilerplate. **Fine** (`timed!`/`counted!`) — gated behind `fine-metrics` (off by default); with the feature disabled the macros expand to a bare passthrough, textually absent, not a runtime-skipped branch. Reserved for granular sub-breakdowns (currently `KwtaScoreMatmul`/`KwtaSelectTopK`, ADR 0038's need).
 
-- **Core** (`timed_core!`/`counted_core!`): unconditionally compiled and always recording — this
-  *is* the "big item" tier, i.e. every metric this codebase has always reported (ingest phases,
-  sleep wall-clock, encoder timers, main-loop ingest/query timers), just funneled through one
-  macro instead of copy-pasted boilerplate at each site.
-- **Fine** (`timed!`/`counted!`): gated behind the `fine-metrics` Cargo feature (off by default).
-  With the feature disabled, these macros expand to a bare passthrough of their body — the
-  `Instant`/atomic-counter code is textually absent, not a runtime-skipped branch. Reserved for
-  granular sub-breakdowns not worth paying for on every build (currently: `KwtaScoreMatmul`/
-  `KwtaSelectTopK`, the sub-phases inside the k-WTA ingest step that ADR 0038 needs).
+Both tiers write to one fixed-size atomic `Registry` (one `AtomicU64` count/total-ns pair per `Metric` variant — mirrors `RegionId::as_index()`'s dense-array-over-enum pattern rather than a `HashMap`), drained per sleep cycle into a new `"fine_metrics"` NDJSON key. All pre-existing top-level fields unchanged (same `Duration` values, now returned by the macro) — `campaign_status.py`/`eval_metrics.py` need no changes.
 
-Both tiers write into a single fixed-size atomic `Registry` (one `AtomicU64` count/total-nanosecond
-pair per `Metric` enum variant — mirrors `RegionId::as_index()`'s existing dense-array-over-enum
-pattern rather than a `HashMap`), drained once per sleep cycle via `Registry::snapshot_and_reset()`
-into a new `"fine_metrics"` key in the existing metrics NDJSON line. All pre-existing top-level
-JSON fields (`perc_kwta_us`, `nrem_wall_ms`, `speech_encode_total_ms`, etc.) are populated exactly
-as before — from the same `Duration` values, now returned by the macro instead of a separately
-maintained `Instant` — so `campaign_status.py`/`eval_metrics.py` need no changes.
-
-**Full conversion, not just new call sites.** Every existing hand-rolled timer across
-`somnus-perception`, `somnus-encoding`, and `somnus`'s event loop / sleep cycle now goes through
-`timed_core!` (or a direct `somnus_metrics::METRICS.record()` call where a span is too structurally
-entangled — multiple mutable locals escaping scope, nested loops with early `break`s — to cleanly
-wrap as a single macro-body expression; see "Alternatives" below). Two genuinely duplicate
-timers were found and removed in the process: `main.rs` was independently re-timing
-`encode_speech`/`encode_env`/video-frame `encode()` calls that `somnus-encoding` already timed and
-returned via `encode_ms` — main.rs now logs that field directly instead of measuring the same call
-twice.
+**Full conversion, not just new sites.** Every hand-rolled timer across `somnus-perception`/`somnus-encoding`/`somnus` now goes through `timed_core!` (or a direct `somnus_metrics::METRICS.record()` call where a span is too structurally entangled to wrap as one macro-body expression — see Alternatives). Found and removed two genuine duplicate timers: `main.rs` was re-timing `encode_speech`/`encode_env`/video `encode()` calls `somnus-encoding` already timed and returned via `encode_ms`.
 
 ## Alternatives considered
 
-1. **Wrap every span in `timed_core!`'s block-expression idiom uniformly.** Works cleanly for
-   self-contained bodies (a single `match`/`if`/function call with no bindings needed outside the
-   macro). Rejected for a handful of structurally awkward spans — sleep.rs's full NREM loop
-   (`SleepNrem`), its two non-contiguous REM sub-sections (`SleepRem`), and the whole-cycle
-   wall-clock (`SleepTotal`) — because each has locals computed inside the "old span" that are
-   consumed far later in the function (e.g. `mean_train_loss` feeds the final `SleepStats`
-   construction hundreds of lines later). Forcing these into a macro body would either leak scope
-   incorrectly or require a large, risky restructuring for no behavioral benefit. For these,
-   `somnus_metrics::METRICS.record(Metric::X, duration)` is called directly at the same point the
-   duration was already being computed — same registry, same `Metric` enum, same output, just
-   without the macro's return-value sugar. This is a deliberate, documented exception, not an
-   inconsistency: the goal is one *registry*, not that every call site must look identical.
-2. **`tracing` spans instead of a bespoke registry.** `tracing` is already a workspace dependency
-   but used purely for line-logging (`info!`/`warn!`), never `#[instrument]`/spans, and no
-   subscriber layer for structured span export is configured. Spans add per-call
-   allocation/dispatch overhead the user explicitly wanted to avoid, and the desired output
-   (aggregated count + total time per operation, drained once per cycle) is a poor fit for a
-   line-per-event log stream. Rejected.
-3. **`HashMap<String, ...>` registry instead of a fixed enum-indexed array.** Would avoid having
-   to enumerate `Metric` variants up front, but costs a hash + allocation per record call — this
-   codebase already has one precedent for exactly this trade-off (`RegionId::as_index()` over a
-   dense array) and follows it here for the same reason: cheap enough to call unconditionally in
-   the Core tier.
-4. **Keep the pilot's dual-write pattern** (separate `Instant::now()` for the old field, plus a
-   `timed!` wrap for the new registry) **permanently, instead of converting fully.** This was the
-   state after the first half of this session's work (see gaps.md's write-up) and is explicitly
-   what the user asked to eliminate — "one way of doing metrics."
+1. **Uniform block-expression wrapping.** Works for self-contained bodies. Rejected for `sleep.rs`'s full NREM loop (`SleepNrem`), its two non-contiguous REM sub-sections (`SleepRem`), and the whole-cycle total (`SleepTotal`) — each has locals computed inside the span but consumed hundreds of lines later (e.g. `mean_train_loss` feeds the final `SleepStats`). Forcing these into a macro body would leak scope or need risky restructuring for no behavioral benefit — `METRICS.record()` is called directly at the same point instead. A deliberate documented exception: the goal is one *registry*, not identical-looking call sites.
+2. **`tracing` spans instead of a bespoke registry.** Already a dep but used purely for line-logging, no `#[instrument]`/spans/subscriber configured. Spans add per-call overhead the user wanted to avoid; a line-per-event stream is a poor fit for "aggregated count+time, drained once per cycle." Rejected.
+3. **`HashMap<String,...>` registry.** Avoids enumerating variants up front but costs a hash+alloc per call — the codebase already has a precedent for the fixed-array trade-off (`RegionId::as_index()`); followed here for the same reason.
+4. **Keep the pilot's dual-write pattern permanently** (separate `Instant::now()` for the old field + a `timed!` wrap for the registry). Explicitly what the user asked to eliminate — "one way of doing metrics."
 
 ## Implementation patterns (full-coverage pass)
 
-Two structural patterns cover every function encountered, beyond the straightforward "wrap a
-self-contained expression" case already shown above:
-
-1. **Private-`_inner`-method split** — the default choice for any function with an early
-   `return`, `?`, or `bail!` reachable from multiple points (most fallible functions). Rather than
-   restructure the body to avoid early exits (risky, easy to introduce a subtle behavior change),
-   split into a thin public wrapper that calls `timed_core!` around a call to a same-signature
-   private `_inner` method, e.g.:
+1. **Private-`_inner`-method split** — default for any function with an early return/`?`/`bail!` reachable from multiple points. Split into a thin public wrapper calling `timed_core!` around a same-signature private `_inner`:
    ```rust
    pub fn prune_region(&mut self, region: RegionId, prune_fraction: f32) -> usize {
        let (n_pruned, _) = somnus_metrics::timed_core!(
@@ -249,55 +45,21 @@ self-contained expression" case already shown above:
        );
        n_pruned
    }
-   fn prune_region_inner(&mut self, region: RegionId, prune_fraction: f32) -> usize { /* unchanged body, early returns and all */ }
+   fn prune_region_inner(&mut self, region: RegionId, prune_fraction: f32) -> usize { /* unchanged body */ }
    ```
-   The macro always records — regardless of which internal return path the `_inner` call takes —
-   because the early returns exit `_inner`, not the timed block itself. Used for the large
-   majority of newly-instrumented functions (`grow_region_seeded`, `synthesize_episode`,
-   `rebuild_ort_session`, `ColdArchive::open`, `snapshot::load_snapshot`, `ActionDecoder::generate`,
-   `WhisperDecoder::decode_greedy`, and about a dozen more).
-2. **Immediately-invoked closure** — used exactly once, for `somnus-sensory`'s `MediaFile` decode
-   thread, where the code to time is *already* the body of a `move ||` closure passed to
-   `std::thread::spawn` (no separate method to split out to). Wrapping the whole closure body in
-   `timed_core!` directly would have the same early-`return`-skips-recording problem as an
-   unsplit function, since `return` targets the nearest enclosing closure just as it targets the
-   nearest enclosing function. Fix: nest a nested `(|| { ...original body with returns... })()`
-   *inside* the `timed_core!` block, so the early returns exit the inner IIFE only, leaving the
-   outer macro's post-body recording intact. One `#[allow(clippy::redundant_closure_call)]` needed
-   since clippy doesn't know the wrap is load-bearing, not decorative.
+   The macro always records regardless of internal return path, since early returns exit `_inner`, not the timed block. Used for the majority of new sites (`grow_region_seeded`, `synthesize_episode`, `rebuild_ort_session`, `ColdArchive::open`, `snapshot::load_snapshot`, `ActionDecoder::generate`, `WhisperDecoder::decode_greedy`, ~a dozen more).
+2. **Immediately-invoked closure** — used once, for `somnus-sensory`'s `MediaFile` decode thread, where the timed code is already a `move ||` closure body with no method to split into. Wrapping directly would have the same early-return-skips-recording problem. Fix: nest `(|| { ...original body with returns... })()` inside `timed_core!`, so early returns exit only the inner IIFE. One `#[allow(clippy::redundant_closure_call)]` since clippy doesn't know the wrap is load-bearing.
 
-Both patterns are minimal-diff: the original function/closure body is preserved byte-for-byte
-(aside from the rename to `_inner` or the IIFE wrapper), so behavior is unchanged by construction
-— confirmed by the full test suite passing unmodified after every conversion in this pass.
+Both patterns preserve the original body byte-for-byte aside from the rename/wrapper — behavior unchanged by construction, confirmed by the full test suite passing unmodified after every conversion.
 
 ## Consequences
 
-- New always-on runtime cost: one `Instant::now()`/`.elapsed()` pair (already present everywhere
-  before this change) plus two atomic `fetch_add`s per Core-tier call site, on every build. This
-  is strictly less code executed than before at sites that previously computed a duration by hand
-  and then also fed it into a `tracing` field — the macro replaces both.
-- `crates/somnus-metrics` is now a dependency of `somnus-perception`, `somnus-memory`, `somnus-sensory`,
-  `somnus-encoding`, and `somnus` — a genuine cross-cutting concern shared by 5 crates, matching
-  `CLAUDE.md`'s bar for a new crate ("split crates along architectural boundaries... only once
-  those boundaries are real").
-- `main.rs`'s `#![recursion_limit]` had to rise 256→512 to add the one new `"fine_metrics"` key to
-  the already-large `json!{}` macro invocation — noted here since it's an easy thing to trip over
-  again if more fields are added to that literal in the future.
-- `somnus-memory` now has Core-tier coverage on every operation-granularity I/O path (cold archive
-  open/truncate/evict, semantic-store warm-load, recollection promote, snapshot save/load) added
-  in the full-coverage pass — the "no pre-existing timers to convert" gap noted in the original
-  version of this ADR is closed. Still deliberately *not* instrumented: per-record operations
-  inside an already-aggregated loop (`ColdArchive::append`/`SemanticStore::insert` during the
-  spill loop, `PqCodebook::encode`/`decode` per record) — these stay covered only in aggregate via
-  the enclosing `SleepSpill`/`MediaFileDecode`-style phase metric, per the crate's own guardrail
-  against per-element instrumentation.
+- New always-on cost: one `Instant::now()`/`.elapsed()` (already present everywhere) plus two atomic `fetch_add`s per Core site — strictly less code than sites that previously computed a duration by hand and *also* fed a `tracing` field.
+- `somnus-metrics` is now a dependency of 5 crates (`somnus-perception`, `somnus-memory`, `somnus-sensory`, `somnus-encoding`, `somnus`) — a genuine cross-cutting concern, matching CLAUDE.md's bar for a new crate.
+- `main.rs`'s `#![recursion_limit]` rose 256→512 for the new `"fine_metrics"` key in the `json!{}` literal — worth remembering if more fields are added there.
+- `somnus-memory` now has Core coverage on every operation-granularity I/O path (closing this ADR's original "no pre-existing timers to convert" gap). Still deliberately uninstrumented: per-record operations inside an already-aggregated loop (`ColdArchive::append`/`SemanticStore::insert` during spill, `PqCodebook::encode`/`decode` per record) — covered only in aggregate via the enclosing phase metric, per the crate's per-element guardrail.
 
 ## What would invalidate this
 
-- If Core-tier overhead is ever measured to matter (unlikely given `Instant::now()`'s ~20-40ns
-  cost on Linux and the operation-granularity guardrail this crate documents), the two-tier split
-  would need a third, even-cheaper "sampled" tier, or Core itself would need to move behind a
-  runtime flag instead of being unconditional.
-- If a genuine cross-crate structured-tracing need emerges (span-based distributed tracing,
-  OpenTelemetry export), this registry-based approach would likely be superseded rather than
-  extended — it was deliberately scoped to "cheap always-on counters," not general observability.
+- If Core-tier overhead ever measurably matters (unlikely, ~20-40ns `Instant::now()` cost + the operation-granularity guardrail), a third even-cheaper "sampled" tier would be needed, or Core would need to move behind a runtime flag.
+- If a genuine cross-crate structured-tracing need emerges (span-based distributed tracing, OpenTelemetry), this registry approach would likely be superseded rather than extended — it was scoped to "cheap always-on counters," not general observability.

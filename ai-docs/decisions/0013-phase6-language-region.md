@@ -3,85 +3,30 @@
 **Status:** Implemented (Stage A and Stage B complete)
 **Date:** 2026-05-17
 
-> **Decision:** Language as 5th cognitive region (index 4, 896-dim Qwen2.5 embed table mean-pooled); EPISODE_DIM 512→640; fed from stdin text and Whisper ASR transcripts.  
+> **Decision:** Language as 5th cognitive region (index 4, 896-dim Qwen2.5 embed table mean-pooled); EPISODE_DIM 512→640; fed from stdin text and Whisper ASR transcripts.
 > **Keywords:** language region, Qwen2.5, 896-dim, EPISODE_DIM=640, ASR, ingest_language, 5th region, mean-pool, text bypass
-
----
 
 ## Context
 
-Phases 1–5 gave somnus four sensory regions: AudioSpeech (384-dim), AudioEnv (512-dim), Visual (384-dim), and Symbolic (384-dim). Episodes were formed by binding all four. There was no region capable of representing language semantics directly; text queries were processed only by the ActionDecoder (ADR 0012) at generation time, never stored in episodic memory.
-
-Adding a dedicated language region lets text become a first-class episodic modality: sentences are stored as compressed activation patterns, participate in cross-modal binding, and are recalled by content like any other sensory input.
-
----
+Phases 1-5 gave somnus four sensory regions (AudioSpeech 384, AudioEnv 512, Visual 384, Symbolic 384) — episodes bound all four. No region represented language semantics directly; text queries were only processed by the ActionDecoder (ADR 0012) at generation time, never stored in episodic memory. A dedicated language region makes text a first-class episodic modality: sentences stored as compressed activation patterns, participating in cross-modal binding, recalled by content like any sensory input.
 
 ## Decision
 
-### Region design
+**Region design:** fifth region, Language, backed by Qwen2.5-0.5B's frozen embedding table. Dim 896 (`LM_HIDDEN`); input = mean-pooled token embeddings from the frozen Qwen2.5 BPE table; architecture = k-WTA+SAE decoder identical to other regions; EPISODE_DIM 512(4×128)→640(5×128); optional — episodes still form from regions 0-3 alone, language is opportunistic. **Why Qwen2.5 embeddings:** the ActionDecoder already loads this table for surrogate training — reuse adds no new model weight, stays coherent with generation, gives strong BPE semantic content for free.
 
-Add a fifth cognitive region — Language — backed by Qwen2.5-0.5B's frozen embedding table.
+**Stage A — manual text ingestion (stdin):** new `--language` flag; `LangEmbedder` (`main.rs`) loads `qwen25_embed_table.safetensors`+`qwen25_tokenizer.json`, mean-pools token embeddings per input line. Stdin reader fans out to `query_rx` (ADR 0012 generation) and `lang_rx` (language ingest) — one line feeds both when `--action --language` are both set; a `lang_closed` guard prevents polling a dead channel when `--language` is off. Flows through `ingest_language_line()`→`perception.ingest_language()`→`record_episode()`→optional gain update.
 
-- **Dimension:** 896 (Qwen2.5 hidden size, `LM_HIDDEN` in `action.rs`)
-- **Input:** mean-pooled token embeddings from the frozen Qwen2.5 BPE embed table
-- **Architecture:** k-WTA + SAE decoder identical to the other regions (added in `somnus-perception`)
-- **EPISODE_DIM:** grows from 512 (4 × D_PROJ=128) to 640 (5 × 128)
-- **Optional:** episodes still form from regions 0–3 alone; language is opportunistic
+**Stage B — automatic ASR via Whisper greedy decoder:** new `whisper_tiny_decoder.onnx` export (`WhisperDecoderWrapper` returns logits for the **last position only**, `out[0][:,-1:,:]`, ~10× faster than full-sequence LM head projection). `encode_speech()` in `somnus-encoding` now returns `(AudioEmbedding, Vec<f32>)` — the second element is the raw `[1500,384]` encoder hidden state (non-ASR callers discard at zero cost). `WhisperDecoder` (`whisper_asr.rs`) greedy-decodes with a fixed prefix `[SOT=50258,EN=50259,TRANSCRIBE=50359,NO_TIMESTAMPS=50363]`, stops at `EOT=50257`, only `id<50257` tokens go to the tokenizer. `AudioProcessor` holds optional `whisper_dec`/`lang_tx` — ASR runs synchronously in the (already-blocking) audio encoder task after each speech embedding, transcript sent to `lang_rx`. `lang_tx` cloned into both the stdin-reader task and the audio-encoder task, original dropped in `main()` — `lang_rx` closes naturally when both sources disconnect. **Soft failure:** missing decoder/tokenizer files → warn log, ASR disabled, Stage A unaffected.
 
-### Why Qwen2.5 embeddings
-
-The ActionDecoder (ADR 0012) already loads the Qwen2.5-0.5B embed table for surrogate training. Reusing the same frozen embeddings for the language region adds no new model weight, stays coherent with the generation pathway, and gives strong BPE-derived semantic content for free.
-
-### Stage A — Manual text ingestion (stdin)
-
-**Goal:** get text into the language region without blocking mic/camera.
-
-- New `--language` CLI flag enables the region.
-- A `LangEmbedder` struct in `main.rs` loads `qwen25_embed_table.safetensors` and `qwen25_tokenizer.json`, then mean-pools token embeddings for each input line.
-- Stdin reader task now fans out to two mpsc channels: `query_rx` (ActionDecoder generation, ADR 0012) and `lang_rx` (language ingest). One line can feed both paths simultaneously when `--action --language` are both set.
-- A `lang_closed` guard prevents the select arm from polling a dead channel when `--language` is off.
-- Language embeddings pass through the same `ingest_language_line()` helper → `perception.ingest_language()` → `record_episode()` → optional gain update.
-
-### Stage B — Automatic ASR via Whisper greedy decoder
-
-**Goal:** route speech audio through Whisper ASR so that spoken words also update the language region without any manual typing.
-
-- A new `whisper_tiny_decoder.onnx` is exported via `scripts/export_models.py`. The Python wrapper (`WhisperDecoderWrapper`) feeds encoder hidden states + decoder token IDs and returns logits for the **last position only** (`last = out[0][:, -1:, :]`), giving ~10× speedup over full-sequence LM head projection.
-- `encode_speech()` in `somnus-encoding` now returns `(AudioEmbedding, Vec<f32>)` — the second element is the raw (1500 × 384) encoder hidden state. Callers that don't need ASR discard it at zero cost.
-- `WhisperDecoder` (`crates/somnus/src/whisper_asr.rs`) runs greedy decode with a fixed English-transcription prefix: `[SOT=50258, EN=50259, TRANSCRIBE=50359, NO_TIMESTAMPS=50363]`. Decoding stops at `EOT=50257`; only tokens with `id < 50257` are passed to the tokenizer to produce text.
-- `AudioProcessor` acquires optional `whisper_dec: Option<WhisperDecoder>` and `lang_tx: Option<Sender<String>>`. After each successful speech embedding, if both are present, ASR runs synchronously in the audio encoder task (already blocking) and the transcript is sent to `lang_rx`.
-- `lang_tx` ownership: the original sender is held in `main()` after the stdin reader block, cloned into the stdin reader task and into the audio encoder task, then dropped — so `lang_rx` closes naturally when both sources disconnect.
-- **Soft failure:** if `whisper_tiny_decoder.onnx` or `whisper_tokenizer.json` are absent, a warn log is emitted and ASR is disabled; Stage A stdin ingestion continues unaffected.
-
-### Model artifacts
-
-| File | Produced by | Purpose |
-|------|-------------|---------|
-| `qwen25_embed_table.safetensors` | `export_qwen25()` | Language region embeddings + LangEmbedder |
-| `qwen25_tokenizer.json` | `export_qwen25()` | BPE tokenizer for LangEmbedder |
-| `whisper_tiny_decoder.onnx` | `export_whisper_decoder()` | ASR decoder (last-token-only) |
-| `whisper_tokenizer.json` | `export_whisper_decoder()` | Whisper BPE tokenizer |
-
-All files are gitignored and regenerated by `scripts/export_models.py`.
-
----
+**Model artifacts:** `qwen25_embed_table.safetensors`/`qwen25_tokenizer.json` (LangEmbedder), `whisper_tiny_decoder.onnx`/`whisper_tokenizer.json` (ASR) — all gitignored, regenerated by `scripts/export_models.py`.
 
 ## Alternatives considered
 
-**Dedicated language encoder (e.g., MiniLM):** adds another ONNX model with no benefit over the already-loaded Qwen embeddings. Rejected.
-
-**Full-sequence Whisper LM head in ONNX:** would produce logits for every token at every step, forcing a vocab-size multiplication at full seq_len. Last-token-only is ~10× cheaper for autoregressive decode. Rejected.
-
-**WhisperDecoder in `somnus-encoding`:** `somnus-encoding` has no `tokenizers` dep and adding it would pull it transitively into every encoding consumer. `crates/somnus` already has `tokenizers = "0.21"`. Rejected.
-
-**Async ASR via a separate tokio task:** ASR decode takes ~200 ms per 30-second chunk (much less than the chunk duration), so running it synchronously inside the already-blocking audio encoder task adds no latency to the main event loop. Rejected as over-engineering.
-
----
+- **Dedicated language encoder (e.g. MiniLM).** Adds another ONNX model with no benefit over the already-loaded Qwen embeddings. Rejected.
+- **Full-sequence Whisper LM head in ONNX.** Would produce logits for every token every step — vocab-size multiplication at full seq_len; last-token-only is ~10× cheaper for autoregressive decode. Rejected.
+- **`WhisperDecoder` in `somnus-encoding`.** That crate has no `tokenizers` dep — adding it would pull it transitively into every encoding consumer; `somnus` already has `tokenizers="0.21"`. Rejected.
+- **Async ASR via a separate tokio task.** ASR decode (~200ms/30s chunk) is much less than the chunk duration, so running synchronously inside the already-blocking audio encoder task adds no main-loop latency. Rejected as over-engineering.
 
 ## Consequences
 
-- EPISODE_DIM = 640; any snapshot from Phase 5 (EPISODE_DIM=512) is incompatible without re-calibration.
-- Spoken speech can now contribute to episodic memory as language, not just as an AudioSpeech embedding — cross-modal binding between heard words and visual events becomes possible.
-- The ActionDecoder and LangEmbedder share the same embed table file; loading order is independent.
-- Stage A can be used without running `export_whisper_decoder()` (only Qwen artifacts required).
-- The `encode_speech()` API change is internal to `somnus-encoding`; no public crate consumers exist outside this workspace.
+EPISODE_DIM=640 — Phase 5 snapshots (512) are incompatible without re-calibration. Spoken speech can now contribute to episodic memory as language, not just AudioSpeech — cross-modal binding between heard words and visual events becomes possible. ActionDecoder and LangEmbedder share the same embed table file, load order independent. Stage A works without `export_whisper_decoder()` (only Qwen artifacts required). The `encode_speech()` API change is internal to `somnus-encoding`, no external consumers.

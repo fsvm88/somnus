@@ -12,55 +12,34 @@ deferred:
 
 # ADR 0010 — Bidirectional Top-Down Priors
 
-**Date:** 2026-05-11  
+**Date:** 2026-05-11
 **Status:** Accepted
 
-> **Decision:** After each episode, output heads predict next encoder embeddings; on next ingest, blend raw input with stored prediction (RECALL_BLEND=0.5); prior_cosine logged per region.  
+> **Decision:** After each episode, output heads predict next encoder embeddings; on next ingest, blend raw input with stored prediction (RECALL_BLEND=0.5); prior_cosine logged per region.
 > **Keywords:** top-down priors, prior blend, blend_with_prior, prior_cosine, RECALL_BLEND, predictive coding, bidirectional, region prior
 
 ## Context
 
-The architecture doc commits to a bidirectional binding area: the integrative layer both composes regional inputs into an episode (bottom-up) and sends top-down signals back to the regions to bias their interpretation of the next input. The canonical example is McGurk-style disambiguation: visual evidence of mouth motion should raise the prior on "speech" in the audio-speech region, surfacing a faint voice that bottom-up audio alone would suppress under noise.
-
-ADR 0009 added output heads that map the episode vector (640-dim) back to each region's encoder dimension — exactly the feedback signal needed. The top-down prior mechanism reuses those heads at no extra parameter cost.
+`architecture.md` commits to a bidirectional binding area: composes regional inputs bottom-up, and sends top-down signals back to bias interpretation of the next input — canonically, McGurk-style disambiguation (visual mouth-motion raises the audio-speech "speech" prior, surfacing a faint voice noise would otherwise suppress). ADR 0009's output heads (episode vector→each region's encoder dim) are exactly the needed feedback signal — the top-down prior mechanism reuses them at no extra parameter cost.
 
 ## Decision
 
-After each episode is produced, run the five output heads in inference mode to generate **predicted encoder embeddings** for each region. On the *next* encoder input, blend the raw embedding with the stored prediction:
+After each episode, run the five output heads in inference mode for **predicted encoder embeddings** per region. On the *next* encoder input, blend raw with the stored prediction: `biased_input_i = (1-β)*raw_encoder_i + β*prior_prediction_i`, fed to k-WTA; `raw_encoder_i` stays stored in `EpisodeTrace.regional` for SAE/output-head training targets.
 
-```
-biased_input_i = (1 - β) * raw_encoder_i + β * prior_prediction_i
-```
+`β` is a CLI arg, **default 0.0** (mechanism present, off) — enable only after `output_mse` converges in a baseline run, since random output-head weights produce noise predictions that would pollute encoder inputs during the period the heads need to learn from them.
 
-Feed `biased_input_i` to the k-WTA layer. Store `raw_encoder_i` in `EpisodeTrace.regional` for SAE and output-head training targets.
+**Observable — prior fidelity:** when β>0 and a prior exists, log cosine similarity between prior prediction and raw encoder input at INFO per ingest — a rising `prior_cosine` over a session is the primary metric for whether the top-down path does anything meaningful.
 
-`β` (prior blend weight) is a **CLI arg defaulting to 0.0** (mechanism present, off by default). Enable only after `output_mse` has converged in a baseline run — the output heads start with random weights and their predictions are noise until trained. Injecting 20% random noise from the start would pollute encoder inputs during the period the heads need to learn from them.
+**No new weights:** the five output heads are the feedback path. `prior_predictions: [Option<Vec<f32>>;5]` on `PerceptionProcessor`, updated after every episode — plain `Vec<f32>`, detached, no gradient tracking. Language head (index 4) participates but stays None until an episode with language input occurs.
 
-### Observable: prior fidelity
-
-When β > 0 and a prior exists, log the cosine similarity between the prior prediction and the raw encoder input at INFO per ingest call. A rising `prior_cosine` over a session indicates the heads are learning useful predictions. This is the primary metric for evaluating whether the top-down path is doing anything meaningful.
-
-### No new weights
-
-The five output heads are the feedback path. `prior_predictions: [Option<Vec<f32>>; 5]` is a field on `PerceptionProcessor`, updated after every episode. The language head (index 4) participates but its prior is only non-None after an episode with language input. Plain `Vec<f32>` — detached from the computation graph, no gradient tracking needed.
-
-### Timing
-
-Prior is always one episode behind (from episode t−1 to bias encoding at t). This is correct for predictive coding: the current belief (last episode) generates a prediction; the prediction biases processing of the next observation; the prediction error updates the model. No settling loop — single-pass.
+**Timing:** prior is always one episode behind (t-1 biases encoding at t) — correct for predictive coding (current belief generates a prediction, prediction biases next observation processing, prediction error updates the model). No settling loop, single-pass.
 
 ## Consequences
 
-**Wake/sleep k-WTA inconsistency (known, acceptable).**  
-During wake, k-WTA sees `biased_input` (when β > 0). During sleep, `replay_step` trains k-WTA + SAE on `raw_encoder` (stored in `EpisodeTrace.regional`). Same layer, two input regimes. At β = 0.2 the bias is mild; the gap is dominated by the direct input signal. The alternative — store biased inputs and train against biased targets — was rejected because it makes the output head loss circular (predict the biased input that was itself derived from the prior prediction). Training on raw is the ground-truth anchor.
-
-**Cold-start gate.** β = 0.0 is the safe default. The prior mechanism ships in the binary; tuning it on is a deliberate one-line flag change after a baseline observation.
-
-**No settling loop.** The iterative refinement scheme from `multimodal-binding.md` (run binding + feedback 2–3 times per input) is not implemented. Single-pass is consistent with real-time wake operation and avoids per-input iteration overhead. If iterative refinement proves necessary for disambiguation quality, it is an incremental upgrade to this mechanism.
-
-**Snapshot compatibility.** `prior_predictions` is in-memory state (not saved). On restore, it starts as `[None; 4]` and warms up within one episode — no snapshot format change.
+**Wake/sleep k-WTA inconsistency (known, acceptable):** wake sees `biased_input` (β>0); sleep's `replay_step` trains on `raw_encoder` (stored). Same layer, two input regimes — at β=0.2 the bias is mild, dominated by the direct signal. Storing/training against biased inputs was rejected — it would make the output-head loss circular (predicting the biased input that was itself derived from the prior prediction); training on raw is the ground-truth anchor. **Cold-start gate:** β=0.0 default is safe, tuning on is a deliberate one-line flag change after a baseline observation. **No settling loop:** the iterative refinement scheme (`multimodal-binding.md`) isn't implemented — single-pass matches real-time wake operation, avoids per-input iteration overhead; an incremental upgrade if disambiguation quality needs it (done — ADR 0011). **Snapshot compatibility:** `prior_predictions` is in-memory only, not saved — restores as `[None;4]`, warms up within one episode, no snapshot format change.
 
 ## Alternatives considered
 
-- **Separate feedback weight matrices** (not reusing output heads): more expressive (can learn different features for feedback vs. reconstruction), adds ~852K params, loses the output-head-as-feedback elegance. Deferred.
-- **Post–k-WTA injection** (bias the dense activation inside `to_dense_n` before binding): avoids the wake/sleep training inconsistency but requires structural changes to `BindingArea::forward` (which currently takes `&[&SparseActivation]`). More invasive; deferred.
-- **Gating** (learned scalar gate per region, not additive blend): requires training a gating network; overkill given that β accomplishes the same effect as a fixed gate. Can revisit once the additive blend is calibrated.
+- **Separate feedback weight matrices** (not reusing output heads). More expressive (different features for feedback vs. reconstruction), adds ~852K params, loses the output-head-as-feedback elegance. Deferred.
+- **Post-k-WTA injection** (bias the dense activation inside `to_dense_n` before binding). Avoids the wake/sleep inconsistency but needs structural changes to `BindingArea::forward` (takes `&[&SparseActivation]`) — more invasive. Deferred.
+- **Gating** (learned scalar gate per region, not additive blend). Needs a gating network — overkill when β accomplishes the same effect as a fixed gate; revisit once the additive blend is calibrated.

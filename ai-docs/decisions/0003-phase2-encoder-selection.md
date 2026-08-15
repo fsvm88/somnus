@@ -23,30 +23,11 @@ deferred:
 
 ## Context
 
-Phase 2 wires frozen pretrained encoders between the sensory pipeline (`somnus-sensory`)
-and the regional concept areas. Three encoder streams are required by the architecture:
+Phase 2 wires frozen pretrained encoders between `somnus-sensory` and the regional concept areas. Three streams required: audio-speech (phoneme/word-level), audio-env (environmental-sound), visual (patch-level).
 
-- **Audio-speech:** phoneme/word-level representations for the audio-speech region.
-- **Audio-env:** environmental-sound representations for the audio-env region.
-- **Visual:** patch-level visual representations for the visual region.
+Resolves four open questions from `architecture.md`/`research/encoders.md`: (1) one multi-task audio encoder vs. two specialized? (2) which models, at which sizes? (3) where do ONNX artifacts live? (4) how does Whisper's 30s chunk window interact with a continuous stream?
 
-The ADR resolves four open questions from `architecture.md` and `research/encoders.md`:
-
-1. One multi-task audio encoder (CLAP alone) or two specialized encoders?
-2. Which specific models, at which sizes?
-3. Where do ONNX artifacts live in the repo?
-4. How does Whisper's 30-second chunk window interact with a continuous audio stream?
-
-Constraints:
-
-- **VRAM budget:** 14 GB usable (16 GB minus ~2 GB desktop overhead). Encoder VRAM
-  must leave ≥ 12 GB for episodic memory and cognitive layers in later phases.
-- **Latency target:** each encoder completes its forward pass within one frame period
-  of its respective modality at real-time rates.
-- **ONNX + `ort`:** all encoders are run via ONNX Runtime (`ort` crate) so inference
-  is decoupled from Python and can run in a Rust process.
-- **Frozen only:** no fine-tuning in Phase 2. Weights are loaded once at startup,
-  pinned to a fixed revision for reproducibility.
+**Constraints:** VRAM budget 14GB usable (16GB minus ~2GB desktop overhead), encoder VRAM must leave ≥12GB for later-phase memory/cognitive layers. Latency: each encoder completes within one frame period of its modality at real-time rates. ONNX+`ort` for all encoders (decouples inference from Python). Frozen only — no Phase 2 fine-tuning, weights pinned to a fixed revision.
 
 ## Decision
 
@@ -64,66 +45,23 @@ within budget.
 
 ### Why two audio encoders, not one
 
-`architecture.md` notes that two specialized encoders compose better than one
-multi-task encoder:
-
-- Whisper-tiny produces **sequential frame-level features** tied to spoken content —
-  the representation the audio-speech region needs.
-- CLAP produces a **multi-label continuous embedding** over the whole audio clip —
-  the representation the audio-env region needs.
-- Running both in parallel lets both signals coexist without one collapsing the other
-  (the "engine overtakes voice" failure mode).
-
-CLAP alone, even though it covers some speech, does not produce the kind of phoneme-
-and word-aligned representations Whisper's encoder provides. The cost of running both
-is ~230 MB VRAM and ~30–70 ms combined forward-pass time, which is affordable.
+Whisper-tiny gives sequential frame-level features tied to spoken content (what audio-speech needs); CLAP gives a multi-label continuous embedding over the whole clip (what audio-env needs) — running both lets the signals coexist without one collapsing the other ("engine overtakes voice"). CLAP alone doesn't produce phoneme/word-aligned representations Whisper's encoder does. Cost of both: ~230MB VRAM, ~30-70ms combined forward pass — affordable.
 
 ### Why Whisper-tiny, not base or small
 
-Whisper-tiny's 384-dim output matches DINOv2-S/14's 384-dim. At the binding area,
-audio-speech and visual embeddings can be concatenated or otherwise composed without
-a projection head. Whisper-base (512-dim) and Whisper-small (768-dim) would require
-a projection.
-
-Whisper-tiny's phoneme-level quality is sufficient for Phase 2, whose goal is "embeddings
-flowing in real time", not optimized speech understanding. Upgrade to Whisper-base if
-downstream concept learning shows clear quality degradation.
+384-dim output matches DINOv2-S/14 — audio-speech and visual can compose at the binding area without a projection head (base=512-dim, small=768-dim would need one). Phase 2's goal is "embeddings flowing in real time," not optimized speech understanding — tiny's phoneme quality is sufficient; upgrade to base if downstream concept learning shows clear degradation.
 
 ### Why DINOv2-S/14, not SigLIP-B
 
-DINOv2 produces strong general-purpose spatial features; SigLIP-B's advantage (language-
-aligned embeddings) becomes relevant when symbolic-region grounding requires text-visual
-similarity. The symbolic region is not the focus of Phase 2. DINOv2-S/14 at 42 MB FP16
-is also the smallest choice, keeping VRAM clear for later phases.
+DINOv2 gives strong general-purpose spatial features; SigLIP-B's language-alignment advantage matters for symbolic-region grounding, which isn't Phase 2's focus. DINOv2-S/14 is also the smallest option (42MB FP16), keeping VRAM clear for later phases.
 
 ### Whisper 30-second chunk strategy
 
-Whisper's encoder operates over a fixed 30-second mel spectrogram. For a continuous audio
-stream this requires buffering:
-
-**Phase 2 strategy: non-overlapping 30-second chunks, zero-padded at end of stream.**
-
-- The audio stream from `somnus-sensory` accumulates `AudioFrame`s until 30 seconds of
-  samples are buffered (at 16 kHz, the rate Whisper expects: 480 000 samples).
-- The accumulated buffer is resampled to 16 kHz if the source rate differs, converted
-  to a mel spectrogram (80 bins × 3000 frames), then forwarded through the encoder.
-- The encoder outputs 1500 × 384 frame-level tokens per chunk.
-- For the binding area in Phase 2, the 1500 tokens are mean-pooled to a single 384-dim
-  vector per chunk. Finer temporal resolution (per-token routing) is deferred to Phase 3.
-- This introduces up to 30 seconds of latency for the audio-speech stream. This is
-  acceptable for Phase 2, where the goal is end-to-end embedding flow, not real-time
-  dialogue. If Phase 3 concept learning needs lower latency, migrate to WavLM-base or
-  add a sliding-window with overlap.
-
-CLAP and DINOv2 have no fixed-chunk constraint and operate at their natural rates
-(per-clip and per-frame respectively).
+Whisper's encoder needs a fixed 30s mel spectrogram — **Phase 2: non-overlapping 30s chunks, zero-padded at stream end.** `somnus-sensory`'s AudioFrames accumulate to 480,000 samples @ 16kHz, resampled if needed, converted to an 80×3000 mel spectrogram, forwarded through the encoder → 1500×384 frame-level tokens, mean-pooled to one 384-dim vector/chunk for the Phase 2 binding area (per-token routing deferred to Phase 3). Introduces up to 30s latency — acceptable since the goal is end-to-end flow, not real-time dialogue; migrate to WavLM-base or a sliding window if Phase 3 needs lower latency. CLAP and DINOv2 have no fixed-chunk constraint, operate at their natural (per-clip, per-frame) rates.
 
 ### ONNX artifact storage
 
-Model weights are **not committed to the repository**. Reasons:
-- Whisper-tiny + CLAP + DINOv2-S/14 total ~272 MB FP16; git history of model updates
-  would compound that cost quickly.
-- SHA-256 repo on Codeberg has no git-lfs equivalent configured.
+Model weights **not committed** — the trio totals ~272MB FP16 (git history of updates would compound fast) and the Codeberg repo has no git-lfs equivalent configured.
 
 Convention:
 
@@ -146,68 +84,26 @@ SHA-256 checksums of the canonical exports so anyone can verify their artifacts.
 
 ### New crate: `somnus-encoding`
 
-A `crates/somnus-encoding` library crate handles:
-
-- Loading ONNX models at startup via `ort`.
-- Defining `AudioEmbedding` and `VideoEmbedding` frame types.
-- Exposing a sync encoding API matching the pull/push style of `somnus-sensory`.
-
-The binary `somnus` wires `somnus-sensory` → `somnus-encoding` via `spawn_blocking` bridges,
-matching the pattern established in Phase 1.
-
-`somnus-encoding` is a pure library crate; no async, no tokio dependency.
+Handles: loading ONNX models at startup via `ort`; `AudioEmbedding`/`VideoEmbedding` types; a sync encoding API matching `somnus-sensory`'s pull/push style. Binary wires `somnus-sensory`→`somnus-encoding` via `spawn_blocking`, same pattern as Phase 1. Pure library crate, no async/tokio.
 
 ## Alternatives considered
 
-**Single audio encoder (CLAP only).** Simpler — one model, 512-dim for all audio.
-Rejected: CLAP is not strong at phoneme/word-level speech representations. Concepts
-grounded in spoken words would be underserved. The 512-dim mismatch with DINOv2-S's
-384-dim also requires a projection at the binding area.
-
-**WavLM-base + CLAP** (the "best speech quality" pairing from `encoders.md`).
-WavLM-base is 95M params vs. Whisper-tiny's 39M; it produces richer phoneme features
-but at ~190 MB FP16 vs. ~75 MB. WavLM also outputs ~50 frames/s (768-dim), not 384-dim,
-requiring a projection to align with DINOv2-S. Deferred as the natural upgrade path if
-Phase 3 concept quality for audio-speech proves insufficient.
-
-**SigLIP-B/16 instead of DINOv2-S/14.** SigLIP provides language alignment (768-dim
-shared text-visual space) which is valuable for the symbolic region but not for the
-visual region alone. SigLIP-B at ~174 MB FP16 and 768-dim would require projection
-heads at the binding area (DINOv2 audio: 384-dim, SigLIP visual: 768-dim). Deferred
-until the symbolic region is in scope.
-
-**MobileViT-S as visual encoder.** Lightest option (5.6M params, ~11 MB FP16), good for
-prototyping. Feature quality is noticeably lower than DINOv2-S on dense vision tasks.
-Acceptable as a temporary stand-in if ONNX export of DINOv2-S proves difficult, but not
-the intended target.
+- **Single audio encoder (CLAP only).** Rejected — not strong at phoneme/word-level speech; the 512-dim/384-dim mismatch with DINOv2-S would also need a projection.
+- **WavLM-base + CLAP.** WavLM (95M params, ~190MB FP16) gives richer phoneme features than Whisper-tiny (39M, ~75MB) but outputs 768-dim/~50fps, needing a projection to align with DINOv2-S. Deferred as the natural upgrade if Phase 3 audio-speech quality proves insufficient.
+- **SigLIP-B/16 instead of DINOv2-S/14.** Language alignment (768-dim shared text-visual space) matters for the symbolic region, not visual alone; would need projection heads (audio 384-dim vs. visual 768-dim). Deferred until the symbolic region is in scope.
+- **MobileViT-S as visual encoder.** Lightest (5.6M, ~11MB FP16), noticeably lower quality than DINOv2-S — acceptable fallback if DINOv2-S's ONNX export fails, not the target.
 
 ## Consequences
 
-- **Embedding dimensions in the system:** audio-speech 384, audio-env 512, visual 384.
-  The binding area must handle a 384+512+384 = 1280-dim concatenated input in Phase 2,
-  or project all streams to a common dim. This is a Phase 3 decision; Phase 2 stops at
-  emitting the individual embeddings.
-- **Phase 2 setup prerequisite:** Python environment with `torch`, `transformers`,
-  `optimum[onnxruntime]` to run `scripts/export_models.py`. OnnxRuntime C++ shared
-  library installed system-wide (Arch: `onnxruntime` from community repo or AUR).
-- **Audio-speech latency is 30s per chunk.** Acceptable in Phase 2. Review when Phase 3
-  starts consuming embeddings in real time.
-- **CLAP input rate:** CLAP expects variable-length audio clips; Phase 2 will feed it
-  the same 30s windows used for Whisper (simplest shared chunking). Finer-grained CLAP
-  inference (e.g., per-second) is a Phase 3 refinement.
+- Embedding dims: audio-speech 384, audio-env 512, visual 384 — binding area handles a 1280-dim concatenated input in Phase 2, or projects to a common dim (Phase 3 decision).
+- Phase 2 setup needs a Python env (`torch`/`transformers`/`optimum[onnxruntime]`) for `scripts/export_models.py`, plus system OnnxRuntime.
+- Audio-speech latency is 30s/chunk — acceptable in Phase 2, review once Phase 3 consumes embeddings in real time.
+- CLAP fed the same 30s windows as Whisper for Phase 2 (simplest shared chunking); finer-grained CLAP inference is a Phase 3 refinement.
 
 ## What would invalidate this decision
 
-- **Whisper-tiny phoneme quality proves insufficient for concept learning in Phase 3.**
-  Upgrade to Whisper-base (512-dim, requires binding-area projection) or WavLM-base
-  (768-dim, larger projection).
-- **30-second audio latency becomes a hard blocker** for a Phase 3 use case. Migrate the
-  speech encoder to WavLM-base, which operates at ~50 frames/s with no chunk constraint.
-- **VRAM budget shrinks significantly** (e.g., large episodic memory + cognitive layer
-  in Phase 4 exhausts 12 GB). Downgrade DINOv2-S to MobileViT-S (42 MB → 11 MB)
-  or drop CLAP in favour of single audio-env features from WavLM.
-- **Symbolic region grounding requires language-aligned visual embeddings** (Phase 4+).
-  Swap DINOv2-S for SigLIP-B or add a frozen CLIP text encoder alongside.
-- **`ort` ONNX export for any of the three models proves broken or unmaintained.**
-  Fall back to `candle` inference from HF weights directly, or to a Python sidecar via
-  gRPC.
+- Whisper-tiny phoneme quality proving insufficient for Phase 3 concept learning → upgrade to Whisper-base or WavLM-base (larger projection either way).
+- 30s audio latency becoming a hard blocker → migrate to WavLM-base (~50fps, no chunk constraint).
+- VRAM budget shrinking significantly (Phase 4 memory/cognitive layers exhausting 12GB) → downgrade DINOv2-S to MobileViT-S, or drop CLAP for WavLM-only audio-env.
+- Symbolic-region grounding needing language-aligned visual embeddings (Phase 4+) → swap DINOv2-S for SigLIP-B or add a frozen CLIP text encoder.
+- `ort` ONNX export breaking/going unmaintained for any of the three → fall back to `candle` direct-from-HF-weights, or a Python sidecar via gRPC.

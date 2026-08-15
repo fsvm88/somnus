@@ -8,33 +8,11 @@
 
 ## Context
 
-ADR 0001 established the workspace layout. This ADR fixes the concrete Rust types
-for Phase 1: frames, errors, metrics, capture handles, and the channel topology
-that connects them. The goal is that implementation is about writing code, not
-resolving architecture.
+ADR 0001 established the workspace layout. This ADR fixes the concrete Rust types for Phase 1 (frames, errors, metrics, capture handles) and the channel topology, so implementation is just writing code.
 
-Constraints carried in from prior research:
+**Constraints:** cpal callbacks run on a dedicated platform thread — must not block/panic/allocate excessively. Video capture (v4l2) is pull-based. Bounded channels with drop-oldest backpressure, not blocking producers or unbounded growth. Binary uses `tokio`; library crates stay sync/async-agnostic. `thiserror` in libraries, `anyhow` in the binary. `tracing` only, no `println!`.
 
-- cpal audio callbacks run on a dedicated platform thread; they must not block,
-  panic, or allocate excessively.
-- Video capture (v4l2 on Linux) is a pull API: the caller requests a frame.
-- A bounded channel with drop-oldest backpressure is preferred over blocking the
-  producer or unbounded growth.
-- The binary uses `tokio`; library crates are `async`-agnostic (sync types only).
-- `thiserror` in libraries; `anyhow` in the binary.
-- `tracing` for all telemetry; no `println!` or `eprintln!` in production paths.
-
-Additional constraints settled post-design:
-
-- The system must accept a video file as input (user has no camera). A media file
-  provides both audio and video streams from one path.
-- Mic audio can run alongside file audio simultaneously (e.g., processing a movie
-  while a person speaks in the room). No sample-level mixing in Phase 1 — sources
-  independently produce `AudioFrame`s that fan into the same downstream channel.
-- Graceful shutdown on Ctrl+C is required; frames in flight are discarded, not
-  flushed.
-- Phase 1 "done" = capture pipeline running, metrics logging, clean shutdown.
-  Encoding (frozen models via `ort`) is Phase 2. No visualizer in Phase 1.
+**Additional constraints:** must accept a video file as input (no camera available) — a media file provides both audio+video from one path. Mic audio can run alongside file audio (no sample-level mixing in Phase 1 — sources fan independently into the same channel). Graceful Ctrl+C shutdown, frames in flight discarded not flushed. Phase 1 "done" = capture pipeline + metrics + clean shutdown; encoding is Phase 2, no visualizer yet.
 
 ## Decision
 
@@ -322,24 +300,7 @@ impl AudioCapture {
 }
 ```
 
-**Design notes:**
-
-- **Sample format dispatch:** `default_input_config()` returns the device's preferred
-  format, which on Linux ALSA is often I16 (not F32). The `make_cb!` macro generates a
-  typed callback for each `SizedSample` type; `f32::from_sample(s)` normalises every
-  sample to `[-1.0, 1.0]` f32. I8/I16/I32/I64/U8/U16/U32/U64/F32/F64 are all handled;
-  I24/U24/DSD variants return `SensorError::UnsupportedSampleFormat` (rare on consumer
-  hardware).
-- The callback captures both `tx` (Sender) and `rx_drain` (a clone of the same
-  Receiver). `crossbeam_channel` Receivers are cloneable; the main consumer's
-  Receiver sees the same channel minus whichever frames were drained.
-- The callback never blocks. `try_send` and `try_recv` are both O(1).
-- `_stream` is never read; it is held only to prevent `Drop` from stopping playback.
-- **Multi-source fan-in:** because `crossbeam_channel::Sender<T>` is `Clone`, a
-  `MediaFile`'s audio output and a live `AudioCapture` can both send into the
-  *same* downstream channel by cloning the `Sender`. The binary handles this; no
-  special mixer type is needed. Frames from both sources are interleaved by
-  arrival order. Sample-level mixing (summing waveforms) is deferred to Phase 2+.
+**Design notes:** `default_input_config()` often returns I16 on Linux ALSA, not F32 — the `make_cb!` macro generates a typed callback per `SizedSample` type, normalizing everything to `[-1.0,1.0]` f32 via `f32::from_sample`; I8/I16/I32/I64/U8/U16/U32/U64/F32/F64 handled, I24/U24/DSD → `UnsupportedSampleFormat` (rare). The callback holds both `tx` and a cloned `rx_drain` for drop-oldest; never blocks (`try_send`/`try_recv` are O(1)). `_stream` is held only to prevent `Drop` from stopping playback. **Multi-source fan-in:** `Sender<T>: Clone` lets a `MediaFile`'s audio and a live `AudioCapture` send into the same downstream channel — no mixer type needed, frames interleave by arrival order; sample-level mixing deferred to Phase 2+.
 
 ---
 
@@ -401,37 +362,13 @@ impl VideoCapture {
 }
 ```
 
-**Crate selection — `nokhwa`:**
-
-Alternatives:
-- `v4l` (Linux-only v4l2 wrapper, minimal deps, lower-level API)
-- `rscam` (older v4l2 wrapper, less maintained)
-- `nokhwa` (cross-platform, actively maintained, clean frame API)
-
-`nokhwa` chosen because it wraps platform APIs behind a consistent interface and
-is actively maintained. The project runs on Linux; `v4l` would also work, but
-`nokhwa` keeps the option open if the hardware ever moves. Add
-`features = ["input-native"]` for native platform capture without requiring OpenCV.
-
-API verified against nokhwa 0.10.10 source: `Camera::frame()` returns
-`Result<Buffer, NokhwaError>`; `Buffer::buffer()` returns `&[u8]`;
-`RequestedFormatType::AbsoluteHighestFrameRate` exists.
+**Crate selection — `nokhwa`:** alternatives were `v4l` (Linux-only, minimal, lower-level) and `rscam` (older, less maintained). `nokhwa` chosen for its consistent cross-platform interface and active maintenance — keeps the door open if hardware ever moves off Linux; `features = ["input-native"]` avoids an OpenCV dependency. API verified against nokhwa 0.10.10: `Camera::frame() -> Result<Buffer, NokhwaError>`, `Buffer::buffer() -> &[u8]`, `RequestedFormatType::AbsoluteHighestFrameRate` exists.
 
 ---
 
 ### `media_file.rs`
 
-Decodes both audio and video streams from a single media file (MP4, MKV, etc.).
-The primary use case is testing without a camera: supply a video file and get
-the same `AudioFrame` / `VideoFrame` stream types as live capture.
-
-**Phase 1 limitation:** the file must contain both an audio and a video stream. Audio-only
-(`.wav`, `.mp3`) or video-only files will fail at `start()` with `MediaFileNoStream`.
-
-**Thread architecture:** a single background thread demuxes packets and decodes both streams
-inline. This avoids inter-thread packet queues and the complexity of sharing a
-format context. For typical video files (H.264 + AAC), decoding is fast enough that
-serialising audio and video decode does not introduce perceptible latency.
+Decodes both audio and video streams from a single media file (MP4, MKV, etc.) — the primary use case is testing without a camera. **Phase 1 limitation:** both streams must be present; audio-only or video-only files fail `start()` with `MediaFileNoStream`. **Thread architecture:** a single background thread demuxes and decodes both streams inline (avoids inter-thread packet queues / sharing a format context); fast enough for typical H.264+AAC files with no perceptible latency from serializing the two.
 
 ```rust
 use std::path::PathBuf;
@@ -726,36 +663,9 @@ fn send_drop_oldest<T>(
 }
 ```
 
-**Design notes:**
+**Design notes:** `ffmpeg::init()` is idempotent (static `AtomicBool`), safe to call from `start()` regardless of what else calls it. Decode thread reuses `audio_raw`/`video_raw` across iterations; converter output (`conv`) allocated fresh per call since frame sizes vary across codec flush boundaries. Channel-layout fallback (`bits()==0`) avoids a resampler init panic on containers that omit it (raw PCM, some MP4 muxings). Resampler flush loop ends on `delay.is_none()` — same-rate conversion holds ≤1 frame, so it runs at most twice. Video scaler is stateless, no flush needed. Audio-only/video-only files unsupported in Phase 1.
 
-- `ffmpeg::init()` is idempotent (uses a static `AtomicBool`); calling it in `start()`
-  is safe even if the binary calls it separately.
-- The decode thread reuses `audio_raw` / `video_raw` across iterations (decoder fills
-  them each call). Converter output frames (`conv`) are allocated fresh per call because
-  the resampler allocates on `is_empty()` check and frame sizes can vary across codec
-  flush boundaries.
-- Channel layout fallback (`bits() == 0`) prevents a resampler init panic on containers
-  that omit channel layout (common in raw PCM or some MP4 muxings).
-- The resampler flush loop terminates on `delay.is_none()` (no samples remaining in
-  the SwrContext buffer). For same-rate format conversion the buffer holds ≤ 1 frame,
-  so the loop runs at most twice.
-- Video scaler is stateless; no flush is required.
-- Audio-only and video-only files are not supported in Phase 1. Both streams must be
-  present or `start()` returns `MediaFileNoStream`.
-
-**Crate selection — `ffmpeg-next`:**
-
-Alternatives:
-- `video-rs` (higher-level ffmpeg wrapper; audio support is limited)
-- `gstreamer` (pipeline model; heavyweight, hard to bundle)
-- `symphonia` + `video-rs` (pure Rust; symphonia handles audio; video-rs handles video;
-  but they cannot share a single format context for the same file)
-
-`ffmpeg-next` chosen because it exposes both the audio and video streams of a
-single file through one format context, handles resampling and pixel-format
-conversion via libswresample/libswscale, and supports every common container and
-codec. Requires `libavcodec`, `libavformat`, `libavutil`, `libswresample`,
-`libswscale` installed on the system (Arch: `pacman -S ffmpeg`).
+**Crate selection — `ffmpeg-next`:** alternatives were `video-rs` (limited audio support) and `gstreamer` (heavyweight pipeline model) and `symphonia`+`video-rs` (pure Rust, but can't share one format context for a single file). `ffmpeg-next` chosen for exposing both streams through one format context plus resampling/pixel-conversion via libswresample/libswscale. Requires `libavcodec`/`libavformat`/`libavutil`/`libswresample`/`libswscale` on the build host (`pacman -S ffmpeg`).
 
 ---
 
@@ -819,14 +729,7 @@ On Ctrl+C the shutdown propagates automatically through the channel graph:
 5. VideoCapture pull loop: TrySendError::Disconnected → break → cam drops → device released
 ```
 
-Requirements for this cascade:
-- Forwarding threads MUST use the `TrySendError::Disconnected` arm and break.
-  Silently ignoring send errors (`let _ = tx.try_send(...)`) breaks the cascade:
-  the thread loops forever and the source (cpal, decoder) is never released.
-- `MediaFileStreams._handles` being destructured-away (dropped) is intentional.
-  The decoder threads are responsible for detecting Disconnected on their senders
-  and exiting themselves; the JoinHandles are not the lifetime mechanism.
-- Frames in flight at shutdown are discarded. No flush is attempted.
+Requirements: forwarding threads MUST match `TrySendError::Disconnected` and break — silently ignoring send errors breaks the cascade (thread loops forever, source never released). `MediaFileStreams._handles` being dropped on destructure is intentional — decoder threads detect Disconnected on their own senders and exit themselves; JoinHandles aren't the lifetime mechanism. Frames in flight at shutdown are discarded, no flush attempted.
 
 ---
 
@@ -1057,18 +960,7 @@ fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
 }
 ```
 
-**Notes:**
-
-- `MediaFileStreams` is destructured with `..` in the match arm, which drops
-  `_handles` (the decoder thread JoinHandles) immediately. Dropping JoinHandles
-  detaches the threads; they exit when their channel senders detect `Disconnected`
-  (see Shutdown cascade below).
-- The webcam pull loop cannot use `forward_frames` because `VideoCapture` has no
-  source `Receiver` — it is a blocking pull model. The drop-oldest pattern is
-  inlined identically.
-- `audio_drain` / `video_drain` receiver clones are not consumed by the bridge;
-  they are held only as drain templates for spawned threads and drop when main
-  returns.
+**Notes:** `MediaFileStreams` destructured with `..` drops `_handles` immediately — detaches the decoder threads, which exit via Disconnected detection (see Shutdown cascade). The webcam pull loop can't use `forward_frames` (`VideoCapture` has no source `Receiver`, it's a blocking pull model) — drop-oldest is inlined identically. `audio_drain`/`video_drain` clones are held only as drain templates, not consumed by the bridge.
 
 ---
 
@@ -1106,53 +998,21 @@ fn forward_frames<T>(src: Receiver<T>, tx: Sender<T>, drain: Receiver<T>) {
 
 ## Alternatives considered
 
-**`VideoSource` enum inside `VideoCapture`.** An alternative to `MediaFile` would
-be a `VideoSource { Webcam(u32), File(PathBuf) }` enum that `VideoCapture` dispatches
-on. Rejected because: (1) it would hide the `nokhwa` vs `ffmpeg-next` backend split
-inside one type, making the dependency graph harder to reason about; (2) a video file
-also has an audio track, which `VideoCapture` has no business decoding — `MediaFile`
-owns both streams cleanly.
-
-**`AudioSource` enum for mic vs file.** Symmetric to the VideoSource alternative.
-Rejected for the same reason: mic uses cpal, file uses ffmpeg-next; mixing them in
-one enum couples unrelated backends. The fan-in via `Sender::clone` achieves the
-same result at the binary level with no coupling in the library.
-
-**Sample-level audio mixing in Phase 1.** True mixing (summing waveforms from mic
-and file to produce a single coherent audio stream) requires resampling both sources
-to a common rate and synchronizing their timelines. Deferred to Phase 2+: Phase 1
-interleaves frames by arrival order, which is sufficient for verifying capture works.
-
-**`tokio::sync::broadcast` for Phase 1 audio.** Broadcast channels discard
-messages when a slow reader falls behind rather than dropping the oldest. For Phase 1
-with one consumer this doesn't matter. For Phase 2 with multiple consumers at
-different speeds, the semantics are wrong. The Phase 2 ADR will revisit.
-
-**`tokio::sync::mpsc` directly in the cpal callback.** Not possible: `mpsc::Sender`
-cannot be cloned for the drain path. crossbeam gives both send and drain on the same
-channel.
-
-**`ndarray` as the tensor type in `somnus-sensory`.** Rejected: `somnus-sensory` has no
-ML computation. Conversion to tensors happens in `somnus-encoding`.
+- **`VideoSource`/`AudioSource` enums dispatching webcam-vs-file inside `VideoCapture`/audio capture.** Rejected: would hide the nokhwa/ffmpeg-next backend split inside one type, and a video file's audio track has no business being decoded by `VideoCapture` anyway — `MediaFile` owning both streams is cleaner. `Sender::clone` fan-in achieves the same result at the binary level with no library-level coupling.
+- **Sample-level audio mixing in Phase 1.** Requires resampling + timeline sync across sources — deferred to Phase 2+; arrival-order interleaving is enough to verify capture works.
+- **`tokio::sync::broadcast` for Phase 1 audio.** Discards on a slow reader instead of dropping oldest — wrong semantics once Phase 2 has multiple consumers at different speeds; revisit then.
+- **`tokio::sync::mpsc` directly in the cpal callback.** Not possible — `mpsc::Sender` can't be cloned for the drain path; crossbeam gives both send and drain on one channel.
+- **`ndarray` as the tensor type in `somnus-sensory`.** Rejected — no ML computation here; that's `somnus-encoding`'s job.
 
 ## Consequences
 
-- Phase 1 implementation order: frame → error → metrics → audio → video →
-  media_file → binary.
-- `ffmpeg-next` requires libavcodec/libavformat/libavutil/libswresample/libswscale
-  installed on the build host (`pacman -S ffmpeg` on Arch). This is a hard build
-  dependency.
-- The crossbeam channel in `AudioCapture` is internal. Phase 2 channel topology
-  changes are isolated to `audio.rs` and the bridge code in the binary.
-- `nokhwa` is unused in the primary test path (file input). It will first be
-  exercised when a webcam is available.
+- Phase 1 implementation order: frame → error → metrics → audio → video → media_file → binary.
+- `ffmpeg-next` requires libavcodec/libavformat/libavutil/libswresample/libswscale on the build host (`pacman -S ffmpeg`) — a hard build dependency.
+- `AudioCapture`'s crossbeam channel is internal; Phase 2 topology changes stay isolated to `audio.rs` + the binary's bridge code.
+- `nokhwa` is unused on the primary (file-input) test path — first exercised once a webcam is available.
 
 ## What would invalidate this
 
-- If the cpal callback's `iter().map().collect()` allocation measurably increases
-  callback latency (unlikely at typical 10 ms chunk sizes), replace with a
-  pre-allocated ring buffer and zero-copy frames passed as `Arc<[f32]>`.
-- If `nokhwa` fails to open the camera or produces incorrect pixel formats on the
-  target hardware, replace with `v4l` (Linux-only but smaller and more direct).
-- If Phase 2 encoding proves that multiple simultaneous consumers need different
-  drop semantics, redesign the channel topology before Phase 2 ships.
+- The cpal callback's `iter().map().collect()` allocation measurably increasing latency (unlikely at ~10ms chunks) → pre-allocated ring buffer + `Arc<[f32]>` zero-copy frames.
+- `nokhwa` failing to open the camera or producing wrong pixel formats on the target hardware → fall back to `v4l`.
+- Phase 2 encoding needing different drop semantics per consumer → redesign the channel topology before Phase 2 ships.

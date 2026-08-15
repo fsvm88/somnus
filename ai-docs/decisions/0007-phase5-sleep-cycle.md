@@ -12,191 +12,59 @@ deferred:
 
 # ADR 0007 — Phase 5: sleep cycle + consolidation (`somnus-sleep`)
 
-**Status:** accepted  
+**Status:** accepted
 **Date:** 2026-05-10
 
-> **Decision:** NREM replay (AdamW + cosine LR, homeostatic decay) + REM gist probe (k-means, growth when gist_recall_rate < 0.5) + snapshot (weights + episodic + region_sizes); sleep triggered by high-water mark, schedule, or perf-degradation.  
+> **Decision:** NREM replay (AdamW + cosine LR, homeostatic decay) + REM gist probe (k-means, growth when gist_recall_rate < 0.5) + snapshot (weights + episodic + region_sizes); sleep triggered by high-water mark, schedule, or perf-degradation.
 > **Keywords:** NREM, REM, sleep, replay, consolidation, growth, snapshot, AdamW, cosine LR, homeostatic, gist_recall_rate, sleep_trigger, high_water, schedule, perf_degradation
 
 ## Context
 
-Phase 4 left the system in eager-insert mode: every episode vector lands in both the hot (EpisodicBuffer) and warm (SemanticStore) tiers immediately, without any consolidation, weight updates, or compression. The k-WTA and SAE weights from Phase 3 are still random. Phase 5 adds the sleep machinery that makes the hot→warm→cold pipeline meaningful and starts training the perception weights via experience replay.
+Phase 4 left the system in eager-insert mode: every episode lands in both hot and warm tiers immediately, no consolidation/weight updates/compression, k-WTA and SAE weights still random. Phase 5 adds the sleep machinery that makes hot→warm→cold meaningful and starts training perception weights via experience replay.
 
-Three smoke tests verified the design assumptions before this ADR was finalised:
-- Candle autograd flows through a k-WTA straight-through mask (gradient reaches encoder Linear weights).
-- VarMap must be kept alive after construction for optimizer, save, and load access.
-- Growth via `Tensor::cat` + `Var::from_tensor` + Linear rebuild is feasible; optimizer state resets on growth.
+Three smoke tests verified design assumptions first: candle autograd flows through a k-WTA straight-through mask (gradient reaches encoder Linear weights); `VarMap` must be kept alive after construction for optimizer/save/load access; growth via `Tensor::cat`+`Var::from_tensor`+Linear rebuild is feasible, optimizer state resets on growth.
 
 ## Decisions
 
-### 1. EpisodeTrace — hot buffer stores encoder inputs alongside episode vector
+**1. `EpisodeTrace` — hot buffer stores encoder inputs alongside the episode vector.** Upgraded from `EpisodeRecord` (id+timestamp+vector) to `EpisodeTrace{record, regional:[Vec<f32>;5]}` (speech 384/env 512/visual 384/symbolic 384/language 896 — was `[4]` at Phase 5, language added Phase 6/ADR 0013). `regional[i]` is the raw encoder output fed into region i's k-WTA, needed for the SAE reconstruction training loss during sleep replay. Cold archive keeps storing `EpisodeRecord` only — per-region inputs are transient hot-tier data, not worth cold storage. `EpisodicBuffer::push` gains a `regional` param; `PerceptionOutput` gains `regional_inputs: Option<[Vec<f32>;4]>`.
 
-The hot EpisodicBuffer is upgraded from `EpisodeRecord` (id + timestamp + episode vector) to `EpisodeTrace`:
+**2. `PerceptionProcessor` stores VarMap + optimizer.** Holds `varmap: VarMap` (no longer let out of scope); AdamW created from `varmap.all_vars()`, also stored. Enables weight save/load (`varmap.save`/`load`), optimizer step during sleep, post-growth optimizer reset. Also stores `latest_inputs: [Option<Vec<f32>>;4]` so `try_bind` can assemble `regional_inputs`.
 
-```
-EpisodeTrace {
-    record:   EpisodeRecord,         // id, timestamp_secs, episode vector (640-dim; was 512 at Phase 5)
-    regional: [Vec<f32>; 5],         // encoder embeddings: [speech(384), env(512), visual(384), symbolic(384), language(896)]
-                                     // (was [4] at Phase 5; language added in Phase 6, ADR 0013)
-}
-```
+**3. k-WTA/SAE training during NREM replay.** Per trace, per region: forward `z=encoder_linear.forward(regional[i])` (tracked) → straight-through top-K mask (untracked constant) → `sparse_z=z*mask` (gradient flows through z) → SAE decode → `mse=mean((regional[i]-recon)²)` → accumulate across regions → optimizer step. Duty-cycle boosting runs during wake inference only, not on the replay training forward. AdamW default lr=1e-3, tunable.
 
-`regional[i]` is the raw encoder output that was fed into region `i`'s k-WTA layer. It is needed to compute a training loss (SAE reconstruction MSE given the k-WTA output) during sleep replay.
+**4. Homeostatic downscaling.** After replay, all k-WTA/SAE decoder weights × `(1-DECAY_RATE)` (default 1e-4/cycle); rows for units that appeared in at least one replay step are protected from decay. Implements the "replay protection" variant of Tononi's synaptic homeostasis hypothesis.
 
-The cold archive (ColdArchive) continues to store EpisodeRecord only. Per-region encoder inputs are transient hot-tier data; they are not worth the cold storage cost.
+**5. Compression: episodic→cold spill.** End of NREM: `cold.append(&trace.record)` for the whole hot buffer — fills `ColdArchive::append` (implemented but unconnected at Phase 4). Warm HNSW isn't evicted in Phase 5 (100k cap is the limit; region-sharded eviction/pruning is Phase 6+).
 
-**Consequence:** `EpisodicBuffer::push` gains a `regional: [Vec<f32>; 4]` parameter. The `PerceptionOutput` struct gains `regional_inputs: Option<[Vec<f32>; 4]>` — populated whenever an episode vector is produced. The `somnus` binary passes this through to the buffer push.
+**6. Cold→warm promotion implemented.** `promote(id)` scans the cold archive (memmap) for the record, dequantises, inserts into warm. Linear scan acceptable at Phase 5 scale (<10k cold records); an index is Phase 6 work.
 
-### 2. PerceptionProcessor stores VarMap + optimizer
+**7. REM stage: generative replay + growth trigger.** No weight updates — per trace, mean SAE MSE per region; if `mean_mse[region] > GROWTH_THRESHOLD (0.1)` for ≥`GROWTH_MIN_SAMPLES(16)` traces, flag for growth. **Growth (simplified CC):** `GROWTH_BATCH=64` new units per flagged region — `new_rows=Tensor::randn(0,GROWTH_INIT_STD,(64,n_in))`, `cat` onto the encoder weight, new `Var`, rebuild `KWtaLayer.linear`, extend `duty_cycle` with zeros, expand the SAE decoder similarly (zero-init new columns), recreate the optimizer (resets Adam moments, acceptable). Full candidate-pool pre-training deferred to Phase 6.
 
-`PerceptionProcessor` is restructured to hold `varmap: VarMap`. The constructor no longer lets it go out of scope. The optimizer (AdamW) is created from `varmap.all_vars()` and also stored on the struct.
+**Phase 5 limitation — growth is session-local.** `VarMap::save`/`load` requires exact shape match; a grown region's shape differs from the initial `N_UNITS`, so restoring from a pre-growth snapshot fails silently (grown vars missing). Growth isn't persisted across restarts in Phase 5 — always restores to the `N_UNITS` baseline. Durable growth is Phase 6 work.
 
-This enables:
-- Weight save/load via `varmap.save(path)` / `varmap.load(path)`.
-- Optimizer step during sleep via `opt.backward_step(&loss)`.
-- Post-growth optimizer reset (recreate from updated vars).
+**8. Sleep controller.** Synchronous function in `sleep.rs` (not a separate crate), blocks the main loop. **Entry triggers** (checked in the main `select!` loop): `episodic.len() >= HIGH_WATER` (80% capacity default) or `wake_elapsed >= MAX_WAKE_DURATION` (10min default). **Interruptibility:** an `AtomicBool` flag set on ctrl-c or a high-salience event (stub returning false in Phase 5) — each replay step checks it, exits early on set, resumes from a checkpoint index on `EpisodicBuffer` next cycle. **Duration:** no adaptive cap in Phase 5 — full buffer always replayed (or interrupted).
 
-The `PerceptionProcessor` also stores `latest_inputs: [Option<Vec<f32>>; 4]` — the most recent encoder input per region — so that `try_bind` can assemble `regional_inputs` alongside the episode vector.
+**9. Snapshot/restore.** `memory/snapshot.tmp/` written atomically (rename to `memory/snapshot/`, same-filesystem atomic on Linux): `episodic.bin` (u64 count + per-trace `EpisodeRecord` bytes + 4×`[u16 len; f32 values]` regional embeddings), `weights.safetensors` (`varmap.save`). Restore on startup: load episodic.bin, rebuild warm `SemanticStore` from cold archive + any unspilled hot records, load weights, `next_id = max(restored_ids)+1`.
 
-### 3. k-WTA and SAE weight training during NREM-like replay
+**Why rebuild instead of persisting the HNSW file?** `hnsw_rs::Hnsw::load_hnsw`'s lifetime is tied to its `HnswIo` loader (for mmap support) — storing `Hnsw<'static>` while persisting across calls would need unsafe lifetime erasure. Rebuilding from the (already-durable) cold archive sidesteps this: O(N log N), fast enough at Phase 5 scale (<10K records). Worth the unsafe complexity only past ~100K+ records — deferred to that milestone.
 
-During the NREM-like stage, each EpisodeTrace in the hot buffer is replayed. For each region `i`:
+**Quantization note:** cold vectors are INT8-quantised with per-vector scale — dequantised L2 differs slightly from f32. Episode vectors are 640-dim (Phase 5 was 512, grew with Phase 6's language region); `RECALL_BLEND_THRESHOLD=5.5` stays valid for L2-normalised 640-dim vectors.
 
-1. Forward: `z = encoder_linear.forward(regional[i])` — tracked tensor.
-2. Straight-through mask: top-K selection on `z`, create 0/1 mask tensor (untracked constant).
-3. Sparse activation: `sparse_z = z * mask` — gradient flows through `z`.
-4. SAE decode: `recon = sae_decoder.forward(sparse_z)`.
-5. Loss: `mse = mean((regional[i] - recon)²)`.
-6. Accumulate loss over all regions in the trace.
-7. Optimizer step.
-
-Duty-cycle boosting continues to run during wake-time inference. During replay, the boosting scalar is not applied to the training forward pass (we train on the raw linear output, not the boosted one).
-
-**Learning rate:** AdamW with default params (lr=1e-3); tunable in config.
-
-### 4. Homeostatic downscaling
-
-After replay, all k-WTA Linear and SAE decoder weights are multiplied by `1 - DECAY_RATE` (default: `1e-4` per sleep cycle). Units whose indices appeared in at least one replay step during the NREM stage are protected from decay (their weight rows are not scaled down).
-
-Mechanistically: after the replay loop collects the set of active unit indices per region, the weight decay skips those rows. This implements the "replay protection" variant of Tononi's synaptic homeostasis hypothesis: consolidation reinforces replayed content while reducing overall weight magnitude.
-
-### 5. Compression: episodic → cold spill
-
-At the end of NREM, cold-archive the entire hot buffer:
-
-```
-for trace in episodic.iter() {
-    cold.append(&trace.record)?;
-}
-```
-
-This fills `ColdArchive::append`, which was implemented but unconnected in Phase 4.
-
-The SemanticStore (warm HNSW) is not evicted in Phase 5. Its 100k cap is the limit. Region-sharded eviction and warm→cold pruning are Phase 6+ work.
-
-### 6. Cold→warm promotion: RecollectionLayer::promote() implemented
-
-`promote(id)` now:
-1. Iterates the cold archive (via memmap) to find the record with the given id.
-2. Dequantises and inserts into `recall.warm` (SemanticStore).
-
-A linear scan over the cold archive is acceptable in Phase 5 (cold len < 10k). An index is Phase 6 work.
-
-### 7. REM-like stage: generative replay + growth trigger
-
-After NREM, the REM stage measures reconstruction quality without updating weights:
-
-1. For each trace in the hot buffer, compute mean SAE MSE per region (no optimizer step).
-2. If `mean_mse[region] > GROWTH_THRESHOLD` (default: 0.1) for at least `GROWTH_MIN_SAMPLES=16` traces: flag that region for growth.
-
-**Growth (simplified CC):**
-
-For each flagged region, add `GROWTH_BATCH=64` new units:
-
-1. Get current k-WTA encoder weight: shape `[N_UNITS, n_in]`.
-2. Create `new_rows = Tensor::randn(0.0, GROWTH_INIT_STD, (GROWTH_BATCH, n_in))`.
-3. `expanded_w = Tensor::cat(&[old_w, new_rows], 0)` → `[N_UNITS + GROWTH_BATCH, n_in]`.
-4. Create `new_var = Var::from_tensor(&expanded_w)`.
-5. Replace var in varmap; rebuild `KWtaLayer.linear` from `Linear::new(new_var.as_tensor(), None)`.
-6. Extend `duty_cycle` vec with `GROWTH_BATCH` zeros.
-7. Similarly expand SAE decoder weight from `[n_in, N_UNITS]` to `[n_in, N_UNITS + GROWTH_BATCH]` (add zero-initialised columns).
-8. Recreate optimizer from `varmap.all_vars()` (resets Adam moments — acceptable).
-
-Full cascade-correlation candidate-pool training (training new units on residual error before insertion) is deferred to Phase 6.
-
-**Phase 5 limitation — growth is session-local:** `save_weights` / `load_weights` uses `VarMap::save` / `VarMap::load`, which requires that the saved and loaded var shapes match exactly. A grown region has a different encoder/decoder shape than the initial `N_UNITS`. This means weight restores from a pre-growth snapshot will fail silently (the grown vars are missing). In Phase 5, growth is not persisted across restarts — the system always restores to the `N_UNITS` baseline. Durable growth (saving the new shape + reloading into a resized layer) is Phase 6 work.
-
-### 8. Sleep controller
-
-The sleep controller is a synchronous function in `crates/somnus/src/sleep.rs` (not a separate crate). It blocks the main loop.
-
-**Entry triggers (checked in the main select! loop after every perception event):**
-- `episodic.len() >= HIGH_WATER` (default: 80% of episodic_capacity).
-- `wake_elapsed >= MAX_WAKE_DURATION` (default: 10 minutes).
-
-**Interruptibility:** An `AtomicBool` interrupt flag is set on `ctrl-c` or on a high-salience event (not implemented in Phase 5 — the flag is wired but the salience detector is a stub returning false). Each replay step checks the flag; if set, the sleep cycle exits early and the next wake cycle will resume replay from where it left off (tracked by a checkpoint index stored on `EpisodicBuffer`).
-
-**Duration:** The cycle runs until all traces in the hot buffer have been replayed (or interrupted). No adaptive duration cap in Phase 5 — the full buffer is always replayed.
-
-### 9. Snapshot / restore
-
-Snapshot directory: `memory/snapshot/`. Write atomically:
-
-1. Write to `memory/snapshot.tmp/`:
-   - `episodic.bin` — custom binary: u64 count, then per-trace: EpisodeRecord bytes (same layout as cold archive per-record) + 4 × `[u16 len; f32 values...]` for regional embeddings.
-   - `weights.safetensors` — `varmap.save(path)`.
-2. `std::fs::rename("memory/snapshot.tmp", "memory/snapshot")` — atomic on Linux (same filesystem).
-
-On startup, if `memory/snapshot/` exists, restore:
-1. Load `episodic.bin` into `EpisodicBuffer`.
-2. Rebuild warm `SemanticStore` by inserting records from:
-   - Cold archive (`memory/episodes.cold`) — all historically spilled episodes from all past sessions.
-   - Hot episodic buffer — any records not yet spilled (typically empty after a completed sleep).
-3. Load `weights.safetensors` via `varmap.load(path)`.
-
-`EpisodeTrace` ids from the previous session are restored verbatim; the `next_id` counter is set to `max(restored_ids) + 1`.
-
-**Why rebuild instead of persisting the HNSW file?** `hnsw_rs::Hnsw::load_hnsw` has a lifetime tied to the `HnswIo` loader (to support mmap). Storing `Hnsw<'static>` in `SemanticStore` while also persisting across calls would require unsafe lifetime erasure. Rebuilding from the cold archive (which is already durable) sidesteps the problem cleanly. The rebuild is O(N log N) in cold-archive size; at Phase 5 scale (< 10K records) this is fast enough on startup. If cold archives grow to 100K+ records, HNSW file persistence becomes worth the unsafe complexity — defer to that milestone.
-
-**Quantization note:** cold archive vectors are INT8-quantised with per-vector scale. Dequantised L2 distances will differ slightly from original f32 values. Episode vectors are 640-dim (Phase 5 was 512-dim; grew with Phase 6 language region). `RECALL_BLEND_THRESHOLD=5.5` remains valid for L2-normalised 640-dim vectors.
-
-### 10. Eager insert removed from wake path
-
-The Phase 4 eager insert into SemanticStore is removed. During wake, episodes go only into the hot EpisodicBuffer. The warm tier is populated by the sleep replay step. This aligns with the architecture.md spec: "does not update semantic memory during wake — all consolidation is deferred to sleep."
+**10. Eager insert removed from wake path.** Phase 4's eager SemanticStore insert is gone — wake only writes hot `EpisodicBuffer`; warm is populated by sleep replay, matching `architecture.md`'s "no semantic memory updates during wake."
 
 ## Consequences
 
-- `crates/somnus-perception`: `PerceptionProcessor` gains `varmap`, `optimizer`, `latest_inputs`; new `train_region`, `homeostatic_decay`, `grow_region` methods; `PerceptionOutput` gains `regional_inputs`.
-- `crates/somnus-memory`: `EpisodeTrace` added; `EpisodicBuffer` stores traces; `EpisodeRecord` unchanged (cold tier); `RecollectionLayer::promote` implemented; snapshot/restore logic added.
-- `crates/somnus/src/sleep.rs`: new module with `run_sleep_cycle`.
-- `crates/somnus/src/main.rs`: sleep trigger in main loop; snapshot on exit.
-- Workspace deps added: `safetensors` (for VarMap.save/load); no new crates needed.
-- The `all_vars` call on the VarMap is sufficient for optimizer construction; no additional introspection APIs are needed.
+- `somnus-perception`: `PerceptionProcessor` gains `varmap`/`optimizer`/`latest_inputs`; new `train_region`/`homeostatic_decay`/`grow_region`; `PerceptionOutput` gains `regional_inputs`.
+- `somnus-memory`: `EpisodeTrace` added; `EpisodicBuffer` stores traces; `EpisodeRecord` unchanged (cold); `RecollectionLayer::promote` implemented; snapshot/restore added.
+- `somnus/src/sleep.rs`: new module, `run_sleep_cycle`. `somnus/src/main.rs`: sleep trigger in main loop, snapshot on exit.
+- New workspace dep: `safetensors` (VarMap save/load). `all_vars()` is sufficient for optimizer construction, no extra introspection needed.
 
 ## What this does not address
 
-- Region-sharded warm-tier eviction (Phase 6).
-- Salience-gated sleep interruptibility (Phase 6).
-- Adaptive sleep duration (Phase 6, see ADR 0024 S3 + P1b).
-- Neuromodulation signals (ADR 0024).
-- GPU execution (currently CPU; CUDA is a future concern when model scales warrant it).
+Region-sharded warm eviction (Phase 6); salience-gated sleep interruptibility (Phase 6); adaptive sleep duration (Phase 6, ADR 0024 S3+P1b); neuromodulation (ADR 0024); GPU execution (CPU-only until model scale warrants CUDA).
 
 ---
 
-## Amendment — Cascade-correlation growth init implemented (2026-06-14, commit cbd8f63)
+## Amendment — Cascade-correlation growth init implemented (2026-06-14, cbd8f63)
 
-The deferred `cascade-correlation-training` item is now implemented as **seeded growth
-init** (P2b). Rather than training a full candidate pool before insertion, new encoder
-columns are seeded with normalized high-residual training inputs × 0.01:
-
-1. `collect_high_residual_inputs<T>()` (in `somnus-perception/src/lib.rs`): scores all
-   hot-buffer traces by SAE reconstruction MSE per region, returns top `2 × GROWTH_BATCH`
-   inputs sorted by MSE descending.
-2. `grow_region_seeded()`: seeds each new encoder column with a normalized seed × 0.01;
-   decoder rows remain zero-init. Falls back to `grow_region()` when seeds are empty.
-3. `sleep.rs`: collects seeds before REM growth, passes them to `grow_region_seeded()`.
-
-This is a lightweight approximation of cascade-correlation: new units are biased toward
-the inputs the model already fails on, rather than random. Full candidate-pool pre-training
-(train new units for N epochs in isolation before insertion) remains deferred until growth
-quality metrics stabilize.
+The deferred `cascade-correlation-training` item shipped as **seeded growth init** (P2b) instead of full candidate-pool training: `collect_high_residual_inputs<T>()` scores hot-buffer traces by per-region SAE reconstruction MSE, returns the top `2×GROWTH_BATCH` sorted descending; `grow_region_seeded()` seeds each new encoder column with a normalized seed×0.01 (decoder rows stay zero-init), falling back to `grow_region()` on empty seeds; `sleep.rs` collects seeds before REM growth and passes them through. A lightweight CC approximation — new units bias toward inputs the model already fails on, rather than random init. Full candidate-pool pre-training remains deferred until growth-quality metrics stabilize.

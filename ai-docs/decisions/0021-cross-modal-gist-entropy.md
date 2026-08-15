@@ -15,130 +15,42 @@ deferred:
 **Status:** accepted
 **Date:** 2026-05-30
 
-> **Decision:** Add IngestSource enum on EpisodeRecord to track modality; add cross_modal_gist_entropy metric (Shannon entropy over ingest_source distribution per cycle).  
+> **Decision:** Add IngestSource enum on EpisodeRecord to track modality; add cross_modal_gist_entropy metric (Shannon entropy over ingest_source distribution per cycle).
 > **Keywords:** IngestSource, gist entropy, cross_modal_gist_entropy, concept probe, modality balance, SMNHOT02, asr_count, blend_count
 
 ## Context
 
-The existing gist probe (ADR 0007) measures episodic clustering quality: does the system
-recall episodes from the same k-means cluster as their nearest warm-memory neighbor? This
-tells us whether the episode space is well-organised, but not whether the same concept
-is represented consistently across different senses.
-
-If a dog seen in video and a dog heard barking end up in different gist clusters,
-the system has no cross-modal binding for "dog". If they land in the same cluster,
-that's evidence of grounding. Without a modality tag per episode, there is no way to
-measure this.
+The existing gist probe (ADR 0007) measures episodic clustering quality — does the system recall episodes from the same k-means cluster as their nearest warm-memory neighbor? That says whether the episode space is well-organised, not whether the same concept is represented consistently across senses. If a dog seen and a dog heard land in different gist clusters, there's no cross-modal binding for "dog"; same cluster is evidence of grounding. Without a modality tag per episode there's no way to measure this.
 
 ## Decision
 
-### 1. `IngestSource` enum on `EpisodeRecord`
+**1. `IngestSource` enum on `EpisodeRecord`** (Speech=0, Env=1, Visual=2, Language=3, Mixed=4, Unknown=255), derived at push time from which regional encoder inputs were non-empty: region 0 only→Speech, 1→Env, 2→Visual, 3→Unknown (Symbolic is a derived convergence layer, not a raw input), 4→Language, 2+→Mixed, none→Unknown.
 
-Add an `IngestSource: u8` enum (Speech=0, Env=1, Visual=2, Language=3, Mixed=4,
-Unknown=255) to `EpisodeRecord`. Derived at push time from which regional encoder inputs
-were non-empty:
+**2. Cold archive schema bump (SMNCOLD2).** `ingest_source` appended as 1 byte/record, `RECORD_BYTES` 660→661, magic bumped `SMNCOLD1`→`SMNCOLD2` so old archives fail loudly (`BadMagic`) rather than silently misreading. Old archives incompatible — use a fresh `--memory-dir` when upgrading.
 
-- region 0 only → Speech
-- region 1 only → Env
-- region 2 only → Visual
-- region 3 only → Unknown (Symbolic is a derived convergence layer, not a raw encoder input)
-- region 4 only → Language
-- 2+ non-empty → Mixed
-- none non-empty → Unknown
-
-### 2. Cold archive schema bump (SMNCOLD2)
-
-`ingest_source` is appended as 1 byte per record, extending `RECORD_BYTES` from 660 to
-661. The magic bytes are bumped from `SMNCOLD1` to `SMNCOLD2` so old archives fail
-gracefully with `BadMagic` rather than silently misreading data.
-
-Old archives are incompatible. Always use a fresh `--memory-dir` when upgrading.
-
-### 3. Cross-modal gist entropy metric
-
-During the REM pre-spill probe, after k-means clustering:
-
-- Assign each hot-tier episode to its nearest gist centroid.
-- Build a per-cluster histogram of `ingest_source` values (5 known-source bins; Unknown
-  excluded from entropy calculation).
-- For each cluster with ≥2 known-source episodes, compute Shannon entropy (bits) over
-  the source distribution.
-- Report `cross_modal_gist_entropy`: mean entropy across occupied clusters.
-
-**Interpretation:**
-- 0 bits: all episodes in each cluster came from the same modality (no cross-modal binding).
-- log2(5) ≈ 2.32 bits: maximum — perfectly uniform source mix per cluster.
-- A value rising over sessions indicates the system is grouping multi-modal experiences
-  into shared representational clusters.
-
-This is a **diagnostic metric only**. No growth or pruning decisions are gated on it.
-Once we have multi-session data and understand the typical range, it can inform
-architectural changes or learning-rate schedules.
+**3. Cross-modal gist entropy metric.** During the REM pre-spill probe, after k-means: assign each hot-tier episode to its nearest gist centroid, build a per-cluster `ingest_source` histogram (5 known-source bins, Unknown excluded), compute Shannon entropy (bits) per cluster with ≥2 known-source episodes, report `cross_modal_gist_entropy` = mean entropy across occupied clusters. 0 bits = single modality per cluster (no cross-modal binding); log2(5)≈2.32 bits = maximum uniform mix; rising over sessions = growing multi-modal grouping. **Diagnostic only** — no growth/pruning decisions gate on it, informs architecture/LR schedule decisions once the typical range is understood.
 
 ## Limitations
 
-- Hot-tier only: the gist probe runs on the current session's episodes before spill.
-  Episodes from prior sessions (in warm/cold) do not contribute source tags because
-  cold→warm promotion does not currently carry `ingest_source` back through the warm
-  HNSW. The metric therefore reflects within-session cross-modal mixing, not
-  cross-session consolidation.
-- With short training clips, a single session may produce few modalities, making entropy
-  trivially low. The metric becomes informative once multi-modal clips are used.
-- `Unknown` is excluded from entropy. If the system runs in audio-only mode, entropy will
-  be 0 bits by construction — not a failure, just a configuration artefact.
+Hot-tier only at introduction — cold→warm promotion didn't carry `ingest_source`, so the metric reflected within-session mixing only (fixed by the 2026-06-14 amendment below). Short clips → few modalities per session → trivially low entropy until multi-modal clips are used. `Unknown` excluded from entropy — audio-only runs read as 0 bits by construction, a configuration artefact not a failure.
 
 ## What would invalidate this
 
-If we add cross-session source tracking (cold→warm promotion preserves `ingest_source`),
-the probe should be extended to sample from warm as well. If salience-weighted cluster
-assignment is added, the histogram weights should be adjusted accordingly.
+Cross-session source tracking added → extend the probe to sample warm too (done, see amendment). Salience-weighted cluster assignment added → adjust histogram weights accordingly (done, see amendment).
 
 ## Amendment: cross-session gist histogram (2026-06-14)
 
-The warm store's `records: HashMap<usize, EpisodeRecord>` already carries `ingest_source`
-(and `salience`) for all cold→warm–promoted records via `rebuild_from_recent`. A new
-`SemanticStore::sample_records(max_n)` method returns an evenly-sampled slice of those
-records. After the hot-tier loop in the gist probe, a bounded warm sample (`GIST_SAMPLE`
-records) is also binned into `cluster_sources` via `nearest_centroid`, giving
-`cross_modal_gist_entropy` a cross-session signal once cold history is non-trivial.
-
-Note: hot-tier records that are also in warm are counted twice; at production scales (warm
-≫ hot) this is a negligible bias and not worth the filtering cost.
+The warm store's `records: HashMap<usize, EpisodeRecord>` already carries `ingest_source`/`salience` for cold→warm-promoted records via `rebuild_from_recent`. New `SemanticStore::sample_records(max_n)` returns an evenly-sampled slice; after the hot-tier loop, a bounded warm sample (`GIST_SAMPLE` records) is also binned into `cluster_sources` via `nearest_centroid`, giving `cross_modal_gist_entropy` a real cross-session signal once cold history is non-trivial. Hot-tier records also present in warm are double-counted — negligible bias at production scale (warm≫hot), not worth filtering.
 
 ## Amendment: proportional regional attribution + -0.0 fix (2026-06-15)
 
-The original `IngestSource`-slot approach collapsed all multi-modal episodes (video + audio
-campaigns) into `IngestSource::Mixed`, making `cross_modal_gist_entropy` always ~0 and
-susceptible to an IEEE 754 -0.0 artefact (`-1.0 * log2(1.0) = -0.0`).
+The original `IngestSource`-slot approach collapsed all multi-modal (video+audio) episodes into `Mixed`, keeping `cross_modal_gist_entropy` always ~0 and hitting an IEEE 754 `-0.0` artefact (`-1.0*log2(1.0)=-0.0`). Two fixes (`sleep.rs`):
 
-Two fixes applied (sleep.rs):
+1. **Proportional regional attribution:** `cluster_sources` is now filled by decomposing each episode vector into 5×(EPISODE_DIM/5) regional slices, L2-norming each, normalising to sum=1, and distributing the episode's salience weight proportionally across all 5 slots — meaningful entropy even for Mixed-tagged episodes, since the regional breakdown is embedded in the vector itself. New helper `regional_weights(ep_vec)`. `IngestSource` no longer feeds the histogram (still stored on `EpisodeRecord` for episode counting/other uses).
+2. **-0.0 fix:** per-term entropy returns `0.0` explicitly when `p>=1.0` instead of evaluating `-p*p.log2()`.
 
-1. **Proportional regional attribution**: `cluster_sources` is now filled by decomposing
-   each episode vector into 5 × (EPISODE_DIM/5) regional slices, computing the L2 norm of
-   each slice, normalising to sum=1, and distributing the episode's salience weight across
-   all 5 slots proportionally. This gives meaningful entropy even for Mixed-tagged episodes
-   because the regional breakdown is embedded in the episode vector itself.  A helper
-   `regional_weights(ep_vec)` is added in sleep.rs.  `IngestSource` is no longer used for
-   the histogram (the slot mapping is removed); `IngestSource::Mixed` is still stored on
-   `EpisodeRecord` for episode counting and other uses.
-
-2. **-0.0 float fix**: the per-term entropy formula now returns `0.0` explicitly when
-   `p >= 1.0` instead of evaluating `-p * p.log2()` (which yields `-0.0` via IEEE 754).
-
-`cluster_sources` remains `Vec<[f32; 6]>`; slot 5 stays zero (unused) so no type change is
-needed.
-
-**Long-term note:** proportional attribution from episode-vector norms is a proxy for
-true regional presence (the norms reflect binding projections, not raw k-WTA activations).
-If finer attribution is needed, store a `regional_presence: u8` bitmask on `EpisodeRecord`
-(SMNCOLD4 bump) and use explicit per-region presence flags for attribution instead.
+`cluster_sources` stays `Vec<[f32;6]>` (slot 5 unused/zero, no type change needed). **Long-term note:** norm-based attribution is a proxy for true regional presence (norms reflect binding projections, not raw k-WTA activations) — if finer attribution is needed, store a `regional_presence: u8` bitmask on `EpisodeRecord` (SMNCOLD4 bump) and use explicit per-region flags instead.
 
 ## Amendment: salience-weighted cluster assignment (2026-06-14)
 
-`cluster_sources` changed from `Vec<[u32; 6]>` to `Vec<[f32; 6]>`. Each episode now
-contributes `weight = salience.clamp(0.01, 2.0)` to its cluster/source slot instead of 1.
-Episodes with `salience == f32::MAX` (first-session, warm was empty) use weight 1.0.
-The entropy computation operates on `f32` weighted totals throughout; the cluster-occupied
-threshold is now `>= 2.0` (weighted sum). `traces_for_rem` tuple extended to 4 elements
-`(ep_vec, regional, ingest_source, salience)` and `collect_high_residual_inputs` in
-`somnus-perception` updated to `<T, U>` to remain generic over the trailing two elements.
+`cluster_sources` changed `Vec<[u32;6]>`→`Vec<[f32;6]>` — each episode contributes `weight=salience.clamp(0.01,2.0)` (or 1.0 if `salience==f32::MAX`, first-session/empty-warm) instead of a flat 1. Entropy computed on f32 weighted totals throughout; cluster-occupied threshold now `>=2.0` (weighted sum). `traces_for_rem` extended to 4 elements `(ep_vec, regional, ingest_source, salience)`; `collect_high_residual_inputs` in `somnus-perception` updated to `<T,U>` to stay generic over the trailing two elements.

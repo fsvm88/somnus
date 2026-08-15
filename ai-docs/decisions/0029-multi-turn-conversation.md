@@ -5,60 +5,24 @@
 
 ## Context
 
-Each query was fully independent. The LLM had no access to what was said one turn ago. R2
-adds a sliding conversation history so the system can refer back to earlier turns within
-a wake session.
+Each query was fully independent — the LLM had no access to what was said one turn ago. R2 adds a sliding conversation history so the system can refer back to earlier turns within a wake session.
 
 ## Decision
 
-Maintain a ring buffer of `(query_token_ids, response_token_ids)` pairs on `ActionDecoder`.
-On each `generate()` call, embed the buffered turns and prepend them to the input sequence
-between the episode context and the current query.
+Maintain a ring buffer of `(query_token_ids, response_token_ids)` pairs on `ActionDecoder`. Each `generate()` call embeds buffered turns and prepends them between episode context and the current query:
 
-**Sequence layout (R1 + R2):**
 ```
 [recalled_0_tokens | ... | recalled_k_tokens | current_tokens | hist_turn_0 | ... | hist_turn_N | query_tokens]
 ```
 
-**Token budget:** `CONV_HISTORY_BUDGET = 256` tokens of history per generation call.
-Oldest turns are evicted at push-time (not at embed-time) so the buffer is always within
-budget and memory is bounded across a long wake session.
-
-**Truncation policy:** oldest-first. Turns are included in the order they were added; if a
-turn's tokens fit within the remaining budget it is included, otherwise skipped (first-fit
-oldest-first). No summarisation — the simplicity is appropriate at this stage.
-
-**EOS stripping:** trailing `EOS_TOKEN_ID` tokens are stripped from `response_ids` before
-storage so they are never embedded mid-context (the tokenizer's `decode(.., true)` already
-strips them from the text, but the raw IDs need explicit handling).
-
-**Buffer lifecycle:** cleared on sleep entry (`clear_conversation()` called before
-`run_sleep_cycle`). Conversation history is wake-local by design — matching the
-biological working-memory scope.
-
-**All three call sites** (pre-sleep drain ~line 1476, main event loop ~line 2305, and the
-`--query` one-shot ~line 2648) push turns. The one-shot fires before the main loop so its
-turn is available immediately; it clears at the first sleep cycle.
-
-**Observability:** `generate()` emits a `tracing::info!` with `history_turns`,
-`history_tokens`, `recalled`, and `seq_len` before each call, making it easy to verify
-that history grows across turns and resets after sleep.
+**Token budget:** `CONV_HISTORY_BUDGET=256` tokens of history per call — oldest turns evicted at push-time (not embed-time) so the buffer stays within budget, bounding memory across a long wake session. **Truncation:** oldest-first order, first-fit — a turn is included if its tokens fit the remaining budget, else skipped. No summarisation, appropriate at this stage. **EOS stripping:** trailing `EOS_TOKEN_ID` stripped from `response_ids` before storage so they're never embedded mid-context (the tokenizer's `decode(..,true)` already strips them from text, but raw IDs need explicit handling). **Lifecycle:** cleared on sleep entry (`clear_conversation()` before `run_sleep_cycle`) — wake-local by design, matching biological working-memory scope. **All three call sites** (pre-sleep drain, main event loop, the `--query` one-shot) push turns — the one-shot fires before the main loop so its turn is immediately available, clearing at the first sleep cycle. **Observability:** `generate()` logs `history_turns`/`history_tokens`/`recalled`/`seq_len` before each call, verifying history grows across turns and resets after sleep.
 
 ## Alternatives considered
 
-- **Summarise oldest turns instead of dropping them.** Would preserve more information but
-  requires another LM call or an offline summary path. Deferred — not worth the complexity
-  at this stage when generation quality itself is not saturated.
-- **Separate history budget per context block.** Fixed 256 tokens for history, 128 for
-  recall. Chose a simple combined check; recall tokens are already bounded by `--recall-k`
-  (default 3 × 5 region tokens = 15 tokens, well within limits).
-- **Store embeddings instead of IDs.** Saves re-embedding cost at generation time. Rejected
-  — IDs are ~200× smaller to store, and re-embedding is cheap (CPU table lookup via
-  `embed_flat`).
+- **Summarise oldest turns instead of dropping.** Preserves more info but needs another LM call or offline summary path — deferred, not worth the complexity while generation quality itself isn't saturated.
+- **Separate history budget per context block.** Chose one simple combined check (256 history + recall bounded separately by `--recall-k`, default 3×5=15 tokens, well within limits) over per-block budgets.
+- **Store embeddings instead of IDs.** Would save re-embedding cost — rejected, IDs are ~200× smaller to store and re-embedding is cheap (CPU table lookup via `embed_flat`).
 
 ## What would invalidate this decision
 
-- History budget too small: generation quality clearly limited by truncated context. Raise
-  `CONV_HISTORY_BUDGET` or switch to a summarisation strategy.
-- Multi-session continuity required: remove the sleep-clear or persist the buffer. Not a
-  current goal.
+History budget too small (generation clearly context-limited) → raise `CONV_HISTORY_BUDGET` or switch to summarisation. Multi-session continuity required → remove the sleep-clear or persist the buffer (not a current goal).

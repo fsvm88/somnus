@@ -37,16 +37,11 @@ Concrete signals that would force us to revisit. If none can be named, the decis
 
 ## When to write an ADR
 
-- A non-obvious choice that future-us will ask "why?" about.
-- A choice with consequences that touch more than one subsystem.
-- A choice that overrides a default from `principles.md` or `tech-stack.md`.
-- The promotion of an experiment into the main system.
+A non-obvious choice future-us will ask "why?" about; consequences touching more than one subsystem; overriding a `principles.md`/`tech-stack.md` default; promoting an experiment into the main system.
 
 ## When *not* to write an ADR
 
-- Routine implementation details.
-- Choices fully determined by `principles.md` or `tech-stack.md`.
-- Throwaway code in `experiments/`.
+Routine implementation details; choices fully determined by `principles.md`/`tech-stack.md`; throwaway code in `experiments/`.
 
 ## Index
 

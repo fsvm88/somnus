@@ -5,10 +5,7 @@
 
 ## Setup
 
-Two campaigns, each 10 sessions × 3 cycles, CAPACITY=4096, ONNX on.  
-Clips: 4k Japan walk (1 hr) + London walk (1 hr).  
-A = `--recall-ef 64` (default), B = `--recall-ef 16`.  
-Warm index grew from 0 → ~98k records over 30 cycles.
+Two campaigns, each 10 sessions × 3 cycles, CAPACITY=4096, ONNX on. Clips: 4k Japan walk (1hr) + London walk (1hr). A = `--recall-ef 64` (default), B = `--recall-ef 16`. Warm index grew 0→~98k records over 30 cycles.
 
 ## Results
 

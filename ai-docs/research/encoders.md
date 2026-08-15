@@ -1,199 +1,130 @@
 # Encoders
 
-> **Contents:** Frozen pretrained encoder options and their VRAM/latency/dimension tradeoffs — speech (Whisper-tiny 384-dim ✓ committed), environment (CLAP-HTSAT 512-dim ✓ committed), visual (DINOv2-S/14 384-dim ✓ committed). Alternatives compared: HuBERT, SigLIP, MobileViT.  
+> **Contents:** Frozen pretrained encoder options and their VRAM/latency/dimension tradeoffs — speech (Whisper-tiny 384-dim ✓ committed), environment (CLAP-HTSAT 512-dim ✓ committed), visual (DINOv2-S/14 384-dim ✓ committed). Alternatives compared: HuBERT, SigLIP, MobileViT.
 > **When to read:** Considering a replacement encoder; understanding why the committed trio was chosen; checking embedding dimensions for a new region.
 
-Research note for somnus. Covers the frozen pretrained encoder stack: audio (speech-focused + environment-focused) and visual. All numbers are **engineering estimates** from model architecture specs and published benchmarks; exact figures depend on driver/kernel versions. Refine to Option A (cited measurements) before making final encoder commitments.
+Research note covering the frozen pretrained encoder stack: audio (speech + environment) and visual. All numbers are **engineering estimates** from architecture specs and published benchmarks — exact figures depend on driver/kernel versions; refine to cited measurements before final commitments.
 
-Hardware target: 14 GB VRAM (16 GB minus ~2 GB desktop overhead), 56 GB usable RAM.
-
-See `architecture.md` "Frontend: encoders and bypass" for the design commitment. Encoder choice becomes the first ADR.
+Hardware target: 14GB VRAM (16GB minus ~2GB desktop overhead), 56GB usable RAM. See `architecture.md` "Frontend: encoders and bypass" for the design commitment.
 
 ---
 
 ## Why encoders anchor the architecture
 
-Encoder output dimensions set embedding sizes for every downstream component:
-
-- Regional concept areas store vectors of encoder output dimension.
-- The binding area composes encoder outputs — if they differ in size, a projection step is needed.
-- The HNSW index in the recollection layer is built over these vectors.
-- Memory tier capacity scales linearly with embedding dimension.
-
-Choosing a smaller encoder is not just a latency decision — it multiplies through memory cost across the entire hierarchy.
+Encoder output dimensions set embedding sizes for every downstream component: regional concept areas store encoder-dim vectors, the binding area needs a projection step if sizes differ, the recollection-layer HNSW index is built over these vectors, and memory-tier capacity scales linearly with dimension. A smaller encoder isn't just a latency decision — it multiplies through memory cost across the whole hierarchy.
 
 ---
 
 ## Audio encoders
 
-somnus needs two types of audio feature stream (see `architecture.md` "Output discipline: multi-source"):
-
-- **Speech-recognition features** — frame-level or token-level representations tied to spoken content.
-- **Environmental-sound features** — multi-label embeddings for ambient events (vehicle noise, footsteps, etc.).
-
-These can come from one multi-task encoder or two specialized encoders.
+somnus needs two feature streams (`architecture.md` "Output discipline"): speech-recognition features and environmental-sound features — from one multi-task encoder or two specialized ones.
 
 ### Whisper (speech)
 
-OpenAI Whisper is an encoder-decoder trained on 680k hours of supervised audio-text data. The encoder alone provides high-quality speech features without running the decoder.
+Encoder-decoder trained on 680k hours of supervised audio-text; encoder alone gives high-quality speech features without the decoder.
 
-| Variant        | Params | FP16 size | Enc hidden dim | Enc layers | Enc output shape          |
-|----------------|--------|-----------|----------------|------------|---------------------------|
-| tiny / tiny.en | 39M    | ~75 MB    | 384            | 4          | 1500 × 384 per 30s chunk  |
-| base / base.en | 74M    | ~148 MB   | 512            | 6          | 1500 × 512 per 30s chunk  |
-| small / small.en | 244M | ~488 MB   | 768            | 12         | 1500 × 768 per 30s chunk  |
+| Variant | Params | FP16 size | Enc hidden dim | Enc layers | Enc output shape |
+|---|---|---|---|---|---|
+| tiny/tiny.en | 39M | ~75MB | 384 | 4 | 1500×384 per 30s chunk |
+| base/base.en | 74M | ~148MB | 512 | 6 | 1500×512 per 30s chunk |
+| small/small.en | 244M | ~488MB | 768 | 12 | 1500×768 per 30s chunk |
 
-**Inference latency (encoder-only forward pass):**
-- tiny: ~10–25 ms per 30 s chunk on consumer GPU (est.)
-- base: ~20–45 ms
-- small: ~60–120 ms
-
-Full transcription (encoder + autoregressive decoder) is 10–20× slower. somnus uses encoder-only for features.
-
-**Tradeoffs:**
-- Best in class for phoneme-level and word-level speech representations.
-- Operates on 30-second fixed chunks — introduces ~30 s of latency if used naively. Mitigated by streaming with overlapping windows (at added compute cost).
-- *Not* designed for environmental sound; performance on non-speech audio is poor.
-- ONNX export is straightforward via `transformers`; runs under `ort` without issues.
+Encoder-only latency (est.): tiny ~10-25ms/30s chunk, base ~20-45ms, small ~60-120ms. Full transcription (decoder included) is 10-20× slower — somnus uses encoder-only. Best-in-class phoneme/word-level speech features; 30s fixed chunks (mitigate via overlapping-window streaming); poor on non-speech audio; ONNX export straightforward via `transformers`.
 
 ### HuBERT / wav2vec 2.0 (speech features)
 
-Self-supervised speech representation models. HuBERT generally produces better phoneme-aligned representations than wav2vec2 at the same model size.
+Self-supervised; HuBERT generally beats wav2vec2 at matched size.
 
-| Model             | Params | FP16 size | Hidden dim | Output shape               |
-|-------------------|--------|-----------|------------|----------------------------|
-| wav2vec2-base     | 95M    | ~190 MB   | 768        | ~50 frames/s × 768         |
-| wav2vec2-large    | 317M   | ~634 MB   | 1024       | ~50 frames/s × 1024        |
-| HuBERT-base       | 95M    | ~190 MB   | 768        | ~50 frames/s × 768         |
-| HuBERT-large      | 317M   | ~634 MB   | 1024       | ~50 frames/s × 1024        |
-| WavLM-base        | 95M    | ~190 MB   | 768        | ~50 frames/s × 768         |
+| Model | Params | FP16 size | Hidden dim | Output shape |
+|---|---|---|---|---|
+| wav2vec2-base | 95M | ~190MB | 768 | ~50 frames/s × 768 |
+| wav2vec2-large | 317M | ~634MB | 1024 | ~50 frames/s × 1024 |
+| HuBERT-base | 95M | ~190MB | 768 | ~50 frames/s × 768 |
+| HuBERT-large | 317M | ~634MB | 1024 | ~50 frames/s × 1024 |
+| WavLM-base | 95M | ~190MB | 768 | ~50 frames/s × 768 |
 
-**Inference latency (base variants, GPU):**
-- ~30–80 ms per 10 s audio on GPU (est.)
-- Frame-level outputs: more granular than Whisper's 30s-chunk pooling.
-
-**Tradeoffs vs. Whisper:**
-- Continuous streaming-friendly (no fixed chunk window).
-- Richer prosody and phoneme features — better for learning word-level concepts in context.
-- Not trained for environmental sound.
-- No built-in text supervision — requires a downstream head if word identity is needed.
-- WavLM adds masked speech prediction with utterance mixing; slightly stronger on downstream tasks.
+Est. ~30-80ms/10s clip on GPU (base variants); frame-level output, more granular than Whisper's chunk pooling. Streaming-friendly (no fixed window), richer prosody/phoneme features, but no environmental-sound training and no built-in text supervision. WavLM adds masked speech prediction with utterance mixing, slightly stronger downstream.
 
 ### CLAP (environmental + some speech)
 
-LAION-CLAP: dual audio-text encoder trained contrastively on a large audio-caption dataset. Bridges environmental sound and natural language descriptions.
+Dual audio-text encoder, contrastive, bridges environmental sound and language.
 
-| Model               | Params (audio enc) | FP16 size | Output dim |
-|---------------------|--------------------|-----------|------------|
-| LAION-CLAP (HTSAT)  | ~75–86M            | ~155 MB   | 512        |
-| Microsoft CLAP      | ~86M               | ~172 MB   | 512        |
+| Model | Params (audio enc) | FP16 size | Output dim |
+|---|---|---|---|
+| LAION-CLAP (HTSAT) | ~75-86M | ~155MB | 512 |
+| Microsoft CLAP | ~86M | ~172MB | 512 |
 
-Audio encoder uses HTSAT (Hierarchical Token-Semantic Audio Transformer, a Swin Transformer variant over mel spectrograms).
+HTSAT = Hierarchical Token-Semantic Audio Transformer (Swin variant over mel spectrograms). Est. ~20-50ms/10s clip; variable-length input, no fixed chunk. Strong on env classification/retrieval; shared 512-dim audio-text space (useful for symbolic-region grounding); weaker speech recognition than Whisper/HuBERT; HTSAT less common in Rust/ONNX toolchains, needs care to export.
 
-**Inference latency:**
-- ~20–50 ms per 10 s clip on GPU (est.)
-- Operates over variable-length audio; no fixed chunk constraint.
+**Pairing summary:**
 
-**Tradeoffs:**
-- Strong on environmental sound classification and retrieval.
-- Shared 512-dim embedding space with text — enables text-to-audio similarity directly, useful for symbolic-region grounding.
-- Speech recognition quality is lower than Whisper or HuBERT — CLAP was not trained primarily for speech features.
-- HTSAT architecture is less common in Rust/ONNX toolchains; exporting to ONNX requires care.
+| Pairing | Total params | VRAM (FP16) | Speech quality | Env quality | Streaming |
+|---|---|---|---|---|---|
+| Whisper-tiny + CLAP | ~114M | ~230MB | Good | Good | Chunked |
+| HuBERT-base + CLAP | ~170M | ~345MB | Better | Good | Yes |
+| WavLM-base + CLAP | ~170M | ~345MB | Best | Good | Yes |
 
-### Audio encoder summary and recommended pairing
-
-Running two specialized encoders is preferred (see `architecture.md` "Output discipline"):
-
-| Pairing                  | Total params | VRAM (FP16) | Speech quality | Env quality | Streaming |
-|--------------------------|--------------|-------------|----------------|-------------|-----------|
-| Whisper-tiny + CLAP      | ~114M        | ~230 MB     | Good           | Good        | Chunked   |
-| HuBERT-base + CLAP       | ~170M        | ~345 MB     | Better         | Good        | Yes       |
-| WavLM-base + CLAP        | ~170M        | ~345 MB     | Best           | Good        | Yes       |
-
-**Phase 1 recommendation (estimate):** Whisper-tiny (encoder-only) + CLAP-audio. Smallest VRAM footprint, proven ONNX paths, covers both streams. Upgrade speech encoder to WavLM-base if phoneme quality matters for downstream concept learning.
+**Phase 1 recommendation (estimate):** Whisper-tiny (encoder-only) + CLAP — smallest VRAM, proven ONNX paths, covers both streams. Upgrade to WavLM-base if phoneme quality matters downstream.
 
 ---
 
 ## Visual encoders
 
-somnus needs a frozen visual encoder emitting continuous frame embeddings for the visual regional concept area.
-
 ### DINOv2
 
-Meta's self-supervised ViT family. Currently best-in-class for dense visual features and semantic patch representations without supervision.
+Meta's self-supervised ViT family — best-in-class dense visual/semantic patch features without supervision.
 
-| Variant     | Params | FP16 size | Output dim | Patch | Notes                  |
-|-------------|--------|-----------|------------|-------|------------------------|
-| ViT-S/14    | 21M    | ~42 MB    | 384        | 14px  | Fastest, good features |
-| ViT-B/14    | 86M    | ~172 MB   | 768        | 14px  | Better spatial detail  |
-| ViT-L/14    | 307M   | ~614 MB   | 1024       | 14px  | High quality, heavy    |
-| ViT-g/14    | 1.1B   | ~2.2 GB   | 1536       | 14px  | Research use only      |
+| Variant | Params | FP16 size | Output dim | Patch | Notes |
+|---|---|---|---|---|---|
+| ViT-S/14 | 21M | ~42MB | 384 | 14px | Fastest, good features |
+| ViT-B/14 | 86M | ~172MB | 768 | 14px | Better spatial detail |
+| ViT-L/14 | 307M | ~614MB | 1024 | 14px | High quality, heavy |
+| ViT-g/14 | 1.1B | ~2.2GB | 1536 | 14px | Research use only |
 
-**Inference latency (224×224 input, GPU):**
-- ViT-S/14: ~4–8 ms/frame (est.)
-- ViT-B/14: ~12–18 ms/frame (est.)
-- ViT-L/14: ~35–55 ms/frame (est.)
-
-**Tradeoffs:**
-- Dense patch tokens available — can retrieve spatial feature maps, not just the [CLS] pooled embedding. Useful for object-level binding.
-- No language alignment — embeddings are not text-comparable without an additional head.
-- ONNX export available; runs under `ort`.
+Est. latency (224×224, GPU): S ~4-8ms/frame, B ~12-18ms, L ~35-55ms. Dense patch tokens available (spatial feature maps, not just CLS pooled — useful for object-level binding); no language alignment; ONNX export runs fine under `ort`.
 
 ### SigLIP / SigLIP 2
 
-Google's CLIP variant using sigmoid loss. Strong language-vision alignment; becoming the encoder of choice for multimodal LLMs (Gemma 3, Qwen3-VL).
+Google's sigmoid-loss CLIP variant, strong language-vision alignment, becoming the encoder of choice for multimodal LLMs (Gemma 3, Qwen3-VL).
 
-| Variant       | Params (vision enc) | FP16 size | Output dim | Notes                         |
-|---------------|---------------------|-----------|------------|-------------------------------|
-| SigLIP-B/16   | ~87M                | ~174 MB   | 768        | Good text-aligned features    |
-| SigLIP-So400M | ~400M               | ~800 MB   | 1152       | Very strong, large            |
-| SigLIP 2-B    | ~93M                | ~186 MB   | 768        | Multilingual, dense features  |
+| Variant | Params (vision enc) | FP16 size | Output dim | Notes |
+|---|---|---|---|---|
+| SigLIP-B/16 | ~87M | ~174MB | 768 | Good text-aligned features |
+| SigLIP-So400M | ~400M | ~800MB | 1152 | Very strong, large |
+| SigLIP 2-B | ~93M | ~186MB | 768 | Multilingual, dense features |
 
-**Tradeoffs:**
-- Better language alignment than DINOv2 — text-grounded visual concepts land near text embeddings. Useful for the symbolic region.
-- SigLIP 2 adds dense (patch-level) features; better spatial resolution than original SigLIP.
-- Slightly behind DINOv2 on pure vision tasks (e.g., semantic segmentation).
-- If symbolic region uses CLAP's 512-dim text embeddings and visual region uses SigLIP-B's 768-dim, a projection is needed for cross-modal binding — or both encoders must be chosen to share a projection space.
+Better language alignment than DINOv2 (text-grounded concepts land near text embeddings — useful for the symbolic region); SigLIP 2 adds dense patch-level features; slightly behind DINOv2 on pure vision tasks (e.g. segmentation). If symbolic region uses CLAP's 512-dim text and visual uses SigLIP-B's 768-dim, cross-modal binding needs a projection unless both share a space.
 
 ### MobileViT / EfficientViT
 
-Lightweight models for minimal VRAM footprint.
+Lightweight, minimal VRAM.
 
-| Model          | Params | FP16 size | Output dim | Notes                           |
-|----------------|--------|-----------|------------|---------------------------------|
-| MobileViT-S    | 5.6M   | ~11 MB    | 640        | Very fast, mobile-optimized     |
-| MobileViT-XS   | 2.3M   | ~5 MB     | 384        | Tiny                            |
-| EfficientViT-M5| 12.5M  | ~25 MB    | 512        | Efficient, modern               |
+| Model | Params | FP16 size | Output dim | Notes |
+|---|---|---|---|---|
+| MobileViT-S | 5.6M | ~11MB | 640 | Very fast, mobile-optimized |
+| MobileViT-XS | 2.3M | ~5MB | 384 | Tiny |
+| EfficientViT-M5 | 12.5M | ~25MB | 512 | Efficient, modern |
 
-**Tradeoffs:**
-- Dramatically smaller VRAM footprint — relevant if VRAM is tight.
-- Noticeably lower feature quality than DINOv2 or SigLIP on downstream tasks.
-- Good for Phase 1 where we are testing the pipeline, not yet optimizing feature quality.
+Dramatically smaller footprint, noticeably lower quality than DINOv2/SigLIP — fine for pipeline testing, not feature-quality optimization.
 
-### Visual encoder summary
+**Visual summary:**
 
-| Encoder       | Params | FP16 size | Dim  | Best for                              |
-|---------------|--------|-----------|------|---------------------------------------|
-| DINOv2-S/14   | 21M    | ~42 MB    | 384  | Dense spatial features, low VRAM      |
-| DINOv2-B/14   | 86M    | ~172 MB   | 768  | Better features, still affordable     |
-| SigLIP-B/16   | 87M    | ~174 MB   | 768  | Language-aligned, text-visual binding |
-| MobileViT-S   | 5.6M   | ~11 MB    | 640  | Prototyping, minimal VRAM             |
+| Encoder | Params | FP16 size | Dim | Best for |
+|---|---|---|---|---|
+| DINOv2-S/14 | 21M | ~42MB | 384 | Dense spatial features, low VRAM |
+| DINOv2-B/14 | 86M | ~172MB | 768 | Better features, still affordable |
+| SigLIP-B/16 | 87M | ~174MB | 768 | Language-aligned, text-visual binding |
+| MobileViT-S | 5.6M | ~11MB | 640 | Prototyping, minimal VRAM |
 
-**Phase 1 recommendation:** DINOv2-S/14 (42 MB FP16, 384-dim). Matches Whisper-tiny's embedding size (384-dim) — avoids a projection head at the binding area. Upgrade to DINOv2-B or SigLIP-B if alignment with the symbolic region requires language grounding.
+**Phase 1 recommendation:** DINOv2-S/14 (42MB FP16, 384-dim) — matches Whisper-tiny's dim, avoids a binding-area projection head. Upgrade to DINOv2-B or SigLIP-B if symbolic-region language grounding is needed.
 
 ---
 
 ## Text bypass encoder
 
-The text bypass encoder must produce embeddings in the same representational space as the speech-recognition output (see `architecture.md` "Text bypass"). Options:
+Must land in the same representational space as the speech-recognition output (`architecture.md` "Text bypass"). Options: **CLIP/SigLIP text encoder** (~63-93M, ~126-186MB FP16, 512-768-dim — natural match if visual is SigLIP); **sentence-transformers all-MiniLM-L6** (22M, ~44MB, 384-dim, fast general-purpose, not audio-aligned without fine-tuning); **fine-tuned joint encoder** aligned to HuBERT/WavLM (doesn't exist off-the-shelf, would need a research step).
 
-- **CLIP text encoder / SigLIP text encoder:** project text into a shared text-vision space. If visual encoder is SigLIP, the text encoder is a natural match. Params: ~63–93M, ~126–186 MB FP16, 512–768-dim.
-- **Sentence-transformers (all-MiniLM-L6):** 22M params, ~44 MB FP16, 384-dim. Very fast, general-purpose text embeddings. Not aligned to audio space without fine-tuning.
-- **Fine-tuned joint encoder:** trained to align text embeddings with HuBERT/WavLM speech representations. Does not exist off-the-shelf; requires a research step.
-
-The fundamental tension: audio speech encoders (HuBERT, Whisper) and text encoders do not natively share embedding spaces. CLAP partially bridges this (512-dim joint audio-text space). If text bypass must map to the same space as the speech encoder, either:
-1. Use CLAP as the speech encoder (gives a shared 512-dim space), or
-2. Train a small projection head.
+Fundamental tension: audio speech encoders and text encoders don't natively share embedding spaces. CLAP partially bridges this (512-dim joint space) — either use CLAP as the speech encoder, or train a small projection head.
 
 ---
 
@@ -201,26 +132,22 @@ The fundamental tension: audio speech encoders (HuBERT, Whisper) and text encode
 
 All encoders in VRAM simultaneously (wake mode):
 
-| Scenario         | Encoders                              | Total VRAM (FP16)  | VRAM remaining (of 14 GB) |
-|------------------|---------------------------------------|--------------------|-----------------------------|
-| Minimal          | Whisper-tiny + CLAP + DINOv2-S        | ~267 MB            | ~13.7 GB                    |
-| Moderate         | WavLM-base + CLAP + DINOv2-B          | ~517 MB            | ~13.5 GB                    |
-| Rich             | WavLM-base + CLAP + SigLIP-B + CLIP-text | ~700 MB        | ~13.3 GB                    |
+| Scenario | Encoders | Total VRAM (FP16) | VRAM remaining (of 14GB) |
+|---|---|---|---|
+| Minimal | Whisper-tiny + CLAP + DINOv2-S | ~267MB | ~13.7GB |
+| Moderate | WavLM-base + CLAP + DINOv2-B | ~517MB | ~13.5GB |
+| Rich | WavLM-base + CLAP + SigLIP-B + CLIP-text | ~700MB | ~13.3GB |
 
-Encoder VRAM is not the bottleneck. Forward-pass activation buffers (roughly 2–4× model size for a single frame) add another ~200–700 MB in the worst case, still leaving >12 GB for episodic memory and cognitive layers.
-
-**Key constraint is latency, not memory.** Running multiple encoders in parallel at video frame rates (25 fps) and audio chunk rates requires:
-- Visual: ~8 ms/frame for DINOv2-S = ~125 fps theoretical max → not the bottleneck at 25 fps.
-- Audio: Whisper operates on 30s chunks, not per-frame. CLAP at ~30 ms/10s clip → real-time at continuous audio.
+Not VRAM-bound — activation buffers add another ~200-700MB worst case, still >12GB free. **Latency is the real constraint:** DINOv2-S at ~8ms/frame → ~125fps theoretical max, not the bottleneck at 25fps; Whisper operates on 30s chunks not per-frame; CLAP ~30ms/10s clip → real-time at continuous audio.
 
 ---
 
 ## Open questions → future ADR
 
-1. One multi-task audio encoder (CLAP alone) or two specialized? Depends on how important rich phoneme features are for the symbolic region in Phase 1.
-2. DINOv2-S (384-dim, matches Whisper-tiny) vs. SigLIP-B (768-dim, better language alignment)? If text bypass matters in early phases, SigLIP-B is better.
-3. How to handle text bypass's representational alignment with the speech encoder — shared CLAP space, projection head, or deferred?
-4. Streaming vs. chunked audio processing — Whisper's 30s window may introduce unacceptable latency; evaluate WavLM for streaming.
+1. One multi-task audio encoder (CLAP alone) or two specialized? Depends on how much phoneme richness the symbolic region needs in Phase 1.
+2. DINOv2-S (384-dim, matches Whisper-tiny) vs. SigLIP-B (768-dim, better language alignment)?
+3. Text bypass's representational alignment with the speech encoder — shared CLAP space, projection head, or deferred?
+4. Streaming vs. chunked audio — Whisper's 30s window may be unacceptable latency; evaluate WavLM for streaming.
 
 ---
 
