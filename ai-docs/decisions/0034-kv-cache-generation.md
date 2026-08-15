@@ -1,7 +1,9 @@
 # ADR 0034 — KV-cache split prefill/decode generation (generation speedup)
 
 **Date:** 2026-06-25
-**Status:** Implemented
+**Status:** Implemented for Qwen2.5; re-implemented and confirmed active for Qwen3 (2026-08-15, engineering-log.md §38).
+
+> **Update (2026-08-15):** ADR 0036 (2026-07-05) made Qwen3 the sole action-decoder LM, but `models/qwen3_lm_decode_kv.onnx` was never exported — `ActionDecoder::new` silently fell through to the slow O(n²) `lm_session` path for every `generate()` call from adoption until this fix, over a month later. The blocker noted in a 2026-06-27 commit (a `torch.export` shape-inference issue) turned out not to be the real cause: the actual bugs were Qwen3-specific architecture details the Qwen2.5 export script's constants didn't account for — `head_dim=128` decoupled from `hidden_size/num_attention_heads` (would compute to 64), and per-head QK-RMSNorm (`q_norm`/`k_norm`) that Qwen2.5 has no equivalent of. Both fixed in `scripts/export_kv_cache_qwen3.py`, plus a SwiGLU gate/up order bug in the decode wrapper's hand-rolled MLP (fixed by delegating to the real `layer.mlp` module instead of reimplementing it) and an off-by-one in the equivalence checker that had been masking the other bugs' verification. Final verification: 19/19 token agreement, prefill exact match. Confirmed live: `somnus --action` now logs the fast-path message instead of the slow-path fallback. INT8 quantization of the decode model (a further speedup) not attempted this pass. Full trail: engineering-log.md §38.
 
 ## Context
 

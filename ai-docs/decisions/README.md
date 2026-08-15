@@ -80,11 +80,11 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0031](0031-gpu-generation-fixed-shape-lm.md) | GPU generation via fixed-shape LM (qwen25_lm_fixed.onnx) | accepted |
 | [0032](0032-mlp-projection.md) | MLP projection (640→1024→5×896, ADR 0012 item M) | accepted |
 | [0033](0033-lora-qwen-finetuning.md) | LoRA fine-tuning of Qwen2.5-0.5B on episode prefixes (ADR 0012 item L) | validated and deployed |
-| [0034](0034-kv-cache-generation.md) | KV-cache split prefill/decode generation (generation speedup) | implemented |
+| [0034](0034-kv-cache-generation.md) | KV-cache split prefill/decode generation (generation speedup) | implemented (Qwen2.5); re-implemented and active for Qwen3 (2026-08-15) |
 | [0035](0035-qwen3-hidden-size-compile-time.md) | LM hidden size (Qwen2.5 vs Qwen3) is a compile-time choice, not runtime | implemented |
 | [0036](0036-adopt-qwen3-drop-qwen25.md) | Adopt Qwen3-0.6B as the action-decoder LM; drop Qwen2.5 | implemented |
 | [0037](0037-auto-onnx-perception-inference.md) | Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover | accepted |
 | [0038](0038-sparse-encoder-scoring.md) | Sparse (hierarchical) k-WTA encoder scoring for the next scale order | proposed |
 | [0039](0039-unified-metrics-instrumentation.md) | Unified two-tier metrics instrumentation (`somnus-metrics`) | implemented |
 | [0040](0040-sparse-gather-binding-projection.md) | Sparse-gather binding projection (ONNX/MIGraphX) | implemented, deployed live |
-| [0041](0041-live-episode-binding-training.md) | Live-episode binding training in NREM (close the §33 never-trained-binding gap) | implemented; not adopted — 2 failed pilots (engineering-log.md §35/§36) |
+| [0041](0041-live-episode-binding-training.md) | Live-episode binding training in NREM (close the §33 never-trained-binding gap) | implemented; not adopted — 3 failed pilots (engineering-log.md §35/§36/§44) |

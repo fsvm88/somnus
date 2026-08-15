@@ -239,6 +239,18 @@ that A/B runs always use full debugging metrics and record deviations:
    Candidates queued for the next attempt: reduce step magnitude (LR/loss-scale) instead of count;
    fuse into the existing fused-replay step instead of a separate optimizer pass; decouple the
    salience/settle cascade directly. No path chosen yet.
+5. **Candidate (a), loss-scale reduction — implemented and FAILED WORSE (engineering-log.md §44):**
+   new `--binding-replay-loss-scale <f32>` flag (default 1.0, no behavior change) scales the
+   live-episode loss immediately before `.backward()`. Pilot at scale=0.1 (step cap left at its
+   default of N=1) produced `mean_output_mse` +440.6% vs. control, every region worse (+25% to
+   +81%) — roughly 4× the quality damage of the §36 step-count pilot at 10× lower gradient
+   magnitude, the opposite of the theory being tested. Same salience/settle cascade signature as
+   §36. **Verdict: loss-scale reduction abandoned as the lever** — a partially-scaled update
+   appears to add noise to the binding weights without enough signal to converge them usefully;
+   the cascade reads as a structural consequence of live-episode training itself, not a dosage
+   effect tunable via step count or loss magnitude. Two candidates remain, neither tried: fuse
+   into the existing `fused_replay_wake_step_batch` step; decouple the salience/settle cascade
+   directly (favored — the one symptom common to all three failed pilots). No path chosen yet.
 
 ## What would invalidate this
 
