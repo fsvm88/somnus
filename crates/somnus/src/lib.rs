@@ -478,6 +478,17 @@ struct Args {
     #[arg(long, default_value = "1")]
     binding_replay_steps: usize,
 
+    /// Loss-scale multiplier on `binding_replay`'s live-episode loss before backward (gaps.md
+    /// §33, candidate (a) of the three queued after step-count capping — §36's
+    /// `--binding-replay-steps 1` pilot — improved wall-clock but made quality *worse*, not
+    /// better). Untried: reducing step *magnitude* instead of step *count*, on the theory
+    /// that a full-strength gradient update through the live binding path is what's driving
+    /// the same-cycle MSE blowup and salience/settle cascade, not the number of times it
+    /// fires. Only meaningful when `--binding-replay` is set. Default 1.0 (no scaling,
+    /// byte-identical to pre-this-flag behavior).
+    #[arg(long, default_value = "1.0")]
+    binding_replay_loss_scale: f32,
+
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.
@@ -2060,6 +2071,7 @@ pub async fn run() -> Result<()> {
                 args.nrem_replay_epochs,
                 args.binding_replay,
                 args.binding_replay_steps,
+                args.binding_replay_loss_scale,
                 args.max_warm_records,
                 effective_max_cold,
                 args.growth_cooldown,

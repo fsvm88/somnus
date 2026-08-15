@@ -1181,9 +1181,13 @@ impl PerceptionProcessor {
     /// into `fused_replay_wake_step_batch`: keeps the existing fused path byte-identical
     /// for the A/B control arm (ADR 0041). Gated behind `--binding-replay` at the call
     /// site; the `NremBindingReplay` Core metric stays at zero when off.
-    pub fn binding_replay_step_batch(&mut self, batch: &[&[Vec<f32>; 5]]) -> PerceptionResult<f32> {
+    pub fn binding_replay_step_batch(
+        &mut self,
+        batch: &[&[Vec<f32>; 5]],
+        loss_scale: f32,
+    ) -> PerceptionResult<f32> {
         let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::NremBindingReplay, {
-            self.binding_replay_step_batch_inner(batch)
+            self.binding_replay_step_batch_inner(batch, loss_scale)
         });
         result
     }
@@ -1191,6 +1195,7 @@ impl PerceptionProcessor {
     fn binding_replay_step_batch_inner(
         &mut self,
         batch: &[&[Vec<f32>; 5]],
+        loss_scale: f32,
     ) -> PerceptionResult<f32> {
         if batch.is_empty() {
             return Ok(0.0);
@@ -1353,9 +1358,12 @@ impl PerceptionProcessor {
         }
 
         if let Some(loss) = total_loss {
+            // Unscaled value recorded in BindingReplayLoss below, for comparability across
+            // different loss_scale pilots — only the tensor entering backward() is scaled.
             let loss_val: f32 = loss.clone().into_scalar();
+            let scaled_loss = loss.mul_scalar(loss_scale);
             let model = self.model.take().unwrap();
-            let grads = loss.backward();
+            let grads = scaled_loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
             let model = self.optimizer.step(self.current_lr, model, grads_p);
             self.model = Some(model);
@@ -3487,11 +3495,11 @@ mod binding_replay_tests {
             "grown binding rows must start exactly zero"
         );
 
-        let first_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+        let first_loss = proc.binding_replay_step_batch(&[&regional], 1.0).unwrap();
         assert!(first_loss.is_finite() && first_loss >= 0.0);
         let mut last_loss = first_loss;
         for _ in 0..29 {
-            last_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+            last_loss = proc.binding_replay_step_batch(&[&regional], 1.0).unwrap();
             assert!(last_loss.is_finite(), "binding replay loss went non-finite");
         }
         assert!(

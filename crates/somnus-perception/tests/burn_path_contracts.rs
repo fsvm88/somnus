@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn binding_replay_empty_batch_is_noop() {
         let mut proc = make_proc();
-        assert_eq!(proc.binding_replay_step_batch(&[]).unwrap(), 0.0);
+        assert_eq!(proc.binding_replay_step_batch(&[], 1.0).unwrap(), 0.0);
     }
 
     /// Control arm of the §33 fix: grown units' binding-projection rows start
@@ -509,11 +509,11 @@ mod tests {
         proc.refresh_autodiff_state();
 
         let regional = regional_inputs();
-        let first_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+        let first_loss = proc.binding_replay_step_batch(&[&regional], 1.0).unwrap();
         assert!(first_loss.is_finite() && first_loss >= 0.0);
         let mut last_loss = first_loss;
         for _ in 0..29 {
-            last_loss = proc.binding_replay_step_batch(&[&regional]).unwrap();
+            last_loss = proc.binding_replay_step_batch(&[&regional], 1.0).unwrap();
             assert!(last_loss.is_finite(), "binding replay loss went non-finite");
         }
         assert!(
