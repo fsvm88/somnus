@@ -43,6 +43,8 @@ Every ADR, architectural improvement/fix, or algorithm-switch proposal must acco
 
 When proposing or implementing a change: name which existing metrics already cover the affected code path, name what new Core/Fine metrics the change needs (new operations, new failure modes, new tunable-value counters), and don't declare the change done until those are wired and verified live (a short pilot run showing the metric fire with a plausible value, not just a clean build). If a change doesn't touch any measurable data-handling operation, say so explicitly rather than silently skipping this step.
 
+**A/B runs always run with full debugging metrics, and deviations always get recorded** (standing instruction, 2026-08-15): every A/B pilot builds and runs both arms with `fine-metrics` enabled (the Fine tier exists precisely for A/B comparison), and the write-up records observed deviations — arm-vs-arm divergence on more than the headline metric, plus any deviation from expected/baseline behavior (unexpected counter firings, metric regressions, health anomalies), not just whether the hypothesis won.
+
 ## Working with the user
 
 - Exploratory prompts ("how should we…", "what about X") get a recommendation + the main trade-off in a few sentences, not a finished plan. Wait for the go-ahead before implementing.

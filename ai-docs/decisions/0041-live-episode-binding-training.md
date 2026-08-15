@@ -1,0 +1,183 @@
+# 0041. Live-episode binding training in NREM (close the §33 never-trained-binding gap)
+
+- **Status:** proposed (decision taken 2026-08-15, implementation not yet started; gated on the
+  isolated A/B pilot described under "Validation plan" before touching production `memory/`).
+- **Date:** 2026-08-15
+
+## Context
+
+`gaps.md` §33 (2026-08-14) confirmed a long-standing gap first anticipated by ADR 0008 itself:
+**no training path in this codebase has ever sent a gradient into the binding area.** All training
+(`replay_step*`, `wake_reconstruct_step*`, `fused_replay_wake_step_batch`, ADR 0012 proj_loss)
+consumes episodes as stored data (`Tensor::from_data`), so the graph stops at the episode boundary.
+ADR 0008's "the binding weights will primarily be shaped by the episode vector being reused
+downstream — will be revisited in Phase 6" never materialized: the downstream reuse never carried
+gradients, and the Phase 6 revisit never happened.
+
+Concrete consequences, both verified in §33:
+
+1. The binding's ~1.72M parameters (5 region projections, W_q/W_k/W_v, GRU, temporal_proj) run on
+   their random init, permanently.
+2. `grow_region`/`grow_region_seeded` append **zero-initialized rows** to the binding projection
+   (`crates/somnus-perception/src/lib.rs:1851-1868`, comment "gradients will shape them over time").
+   Since no gradients ever flow, **grown units' binding rows stay exactly zero forever — grown
+   units are invisible to episode formation.** The 10x growth campaign completed 2026-08-15
+   (gaps.md §34) at `[9821]×5`, so 8,797 of 9,821 units per region (89.6%) — the campaign's entire
+   product — contribute to SAE reconstruction but nothing to episodes, memory, or recall.
+
+The campaign's completion removes the sequencing blocker §33 named (no mid-campaign dynamics
+change to protect). The user chose option (b) — live-episode head training — with option (c)
+(temporal prediction loss) as an explicitly sequenced follow-up, not a combined change (one new
+loss term per pilot for A/B attribution; see "Alternatives considered").
+
+## Decision
+
+Add an opt-in NREM training pass in which episodes are **recomputed live through the binding
+area** from the stored regional inputs and the existing output heads are trained against the
+regional targets on those live episodes — so gradients flow into the binding weights.
+
+Mechanism, per NREM batch (traces already carry `regional: [Vec<f32>; 5]`):
+
+1. Per-region encoder `forward_tracked` → k-WTA mask → `sparse_z` — exactly the tracked forwards
+   `replay_step_batch` already runs for the SAE reconstruction loss (reused, not duplicated).
+2. **New:** feed the five `SparseActivation`s through a new graph-preserving binding forward
+   (`BindingArea::forward_tracked`, see contract changes below) → live episode tensor
+   `[1, EPISODE_DIM]` per trace, batched to `[B, EPISODE_DIM]`.
+3. **New:** run the existing five output heads (`speech_head`…`language_head`, the same heads
+   ADR 0012's proj_loss trains) on the live episodes; MSE against the traces' stored regional
+   inputs — the identical target `wake_reconstruct_step_batch` already uses, so the loss semantics
+   are unchanged; only the episode's provenance changes (live-through-binding instead of stored).
+4. Accumulate with the SAE reconstruction term, one `backward()` + `optimizer.step()`.
+
+Gradients reach: the active rows of each region's binding projection (including grown units' rows
+the first time they win k-WTA selection — this is the fix for consequence 2 above), W_q/W_k/W_v,
+the encoders (through `z`), and the heads. **The GRU (`temporal_gru`/`temporal_proj`) is NOT
+trained by this pass** — see "Contract changes" for why, and option (c) under "Alternatives" for
+the sequenced follow-up that covers it.
+
+**Gating:** new CLI flag `--binding-replay` (default off). Off = byte-identical to today's NREM
+(control arm); on = the new pass runs (treatment arm). No other behavior changes.
+
+### Contract changes
+
+- **`BindingArea::forward_tracked(&mut self, acts: &[&SparseActivation; 5], device) -> Tensor<B, 2>`**
+  (new): stateless binding forward returning the `[1, EPISODE_DIM]` episode *tensor* without
+  materializing to `Vec<f32>`. Two reasons this can't just call the existing `forward`:
+  1. `forward_inner` ends in `.into_data().to_vec()` (`binding.rs:213-219`) — materializing
+     severs the autodiff graph, so no gradient could flow through an `EpisodeVector` no matter
+     how it was produced.
+  2. `forward` with `new_episode: Some(_)` mutates the cached `gru_hidden` (`binding.rs:178-185`),
+     which the wake ingest path relies on; a training pass over unordered replay traces must not
+     touch it. With `new_episode: None` the existing path is already stateless (the GRU branch is
+     skipped entirely), so `forward_tracked` is implemented as the `None`-context computation
+     returning the tensor pre-flatten. The existing `forward` is refactored to share this inner
+     computation (its observable behavior unchanged).
+- **`PerceptionProcessor::binding_replay_step_batch(&mut self, batch: &[&[Vec<f32>; 5]])`** (new):
+  the step described above. Deliberately a separate method + separate optimizer step rather than
+  fusing into `fused_replay_wake_step_batch`: keeps the existing fused path byte-identical for the
+  control arm, and fusion is a cheap optimization to do only if the pilot wins (one fewer AdamW
+  pass per batch, ~150ms at batch=128, per that function's own doc comment).
+- **`sleep.rs` NREM loop:** when `--binding-replay` is set, call `binding_replay_step_batch` on
+  the same trace batches the existing replay consumes.
+
+## Alternatives considered
+
+- **(a) Accept the fixed random binder, document the limitation** (§33 option a): free, but gives
+  up exactly what ADR 0008 was designed to provide and leaves 89.6% of the grown core invisible to
+  episodes/memory/recall. Rejected — the growth campaign's product is mostly unused downstream
+  while this stands.
+- **(c) Temporal prediction loss** (episode_t → predict episode_{t+1}, §33 option c): the
+  GRU-specific signal. Chosen as the *follow-up*, not a combined change, for three reasons:
+  (1) one new loss term per pilot is this project's A/B discipline — combined terms can't be
+  attributed or individually rolled back; (2) (c) needs temporally-adjacent episode pairs, which
+  replay traces don't currently carry (real plumbing: pair construction or next-episode links);
+  (3) two new loss terms at once double the destabilization surface on a healthy trained state.
+  Note (b) and (c) are complementary by construction, not redundant: (b)'s `None`-context pass
+  doesn't put the GRU in the graph at all, so (c) is the only path that trains the temporal
+  components.
+- **(b)+(c) combined in one ADR/pilot**: the user's initial question; sequenced instead, per the
+  three reasons above. If (b)'s pilot lands, (c) gets its own small ADR reusing (b)'s
+  live-episode machinery.
+- **Train the binding against stored episodes directly** (e.g. a loss pulling live episodes toward
+  stored ones): rejected — it would teach the binder to imitate its own untrained output, freezing
+  the very behavior being fixed.
+- **Fusing the new term into `fused_replay_wake_step_batch` immediately**: rejected for the pilot
+  phase (control-arm byte-identity + rollback isolation); revisit as an optimization if adopted.
+
+## Consequences
+
+- **Training dynamics change for any run with the flag on** — that's the point, and why adoption
+  is gated on the isolated A/B pilot below; production `memory/` is untouched until the pilot
+  wins.
+- **Episode-space drift across binder generations:** all episodes currently in the warm/cold
+  tiers were produced by the untrained binder; once binding trains, newly-formed episodes drift
+  away from stored ones, and the warm HNSW store mixes both generations. Judged tolerable for the
+  pilot: the warm store turns over (`--max-warm-records` eviction, currently 151,725/200,000),
+  recall is L2-distance-based so gradual drift degrades gracefully, and the pilot measures the
+  degradation directly (`warm_recall_l2`, `gist_recall_rate`). If drift shows up as recall
+  regression in the pilot, mitigation (e.g. warm-store rebuild from cold at switchover) becomes
+  part of the adoption plan.
+- **ORT inference picks up trained binding weights at the next re-export** (`rebuild_ort_session`
+  on growth/restart — already part of the lifecycle; `export_weights_for_onnx` already exports all
+  22 tensors including the binding's). Between training and re-export, wake inference runs the
+  stale binder — same lag that already exists for every other weight class after growth.
+- **Cost:** one extra binding forward per trace per NREM batch (burn path, sparse-gather — the
+  §25/§30 fast path, since training always runs on burn/CPU), plus the head forwards already
+  shared with the proj_loss semantics. Expected ≪ cycle wall-clock; measured live by the new Core
+  metric below, not assumed.
+
+## Metrics
+
+Per the standing metrics-discipline policy (CLAUDE.md) and the 2026-08-15 standing instruction
+that A/B runs always use full debugging metrics and record deviations:
+
+- **Existing coverage named:** the enclosing NREM phase is already Core-timed; `BindingForward`
+  (Core) covers the wake-path binding call; `binding_forward` (Fine) exists; `wake_worker_train_step`
+  and the fused-replay sub-phase metrics (Fine) cover the adjacent training paths the new step
+  sits next to.
+- **New Core:** `NremBindingReplay` — wall-clock of `binding_replay_step_batch` (operation
+  granularity, same shape as the other training-step metrics). Fires every NREM batch when the
+  flag is on; stays at zero when off (which is itself the control-arm signal).
+- **New Fine:** `binding_replay_loss` value counter (per-cycle mean of the new term — the
+  A/B-comparison-specific signal, exactly the Fine tier's stated purpose).
+- **No new failure counter:** the new path is the same tensor operations as existing tracked
+  paths (encoder forwards, sparse gather, attention, head forwards) with no I/O, no ORT, and no
+  new invariant that can break independently; the one genuinely new surface — `forward_tracked`'s
+  graph continuity — is pinned by a unit test (episode tensor backward reaches a binding weight's
+  grad) rather than a runtime counter.
+- **A/B pilot runs both arms with `fine-metrics` enabled and the write-up records deviations** —
+  arm-vs-arm divergence beyond the headline metrics plus any deviation from baseline behavior
+  (unexpected counter firings, metric regressions, health anomalies), per the standing instruction.
+
+## Validation plan (before production adoption)
+
+1. **Unit/integration tests:** `forward_tracked` ≡ `forward(None)` numerically on identical
+   inputs; backward through `forward_tracked` produces non-zero grads on region-projection rows
+   (including a grown-unit row) and zero graph connection to `gru_hidden`; existing `forward`
+   behavior unchanged (all existing binding tests pass untouched).
+2. **Isolated A/B pilot from the trained production state** (not fresh memory — fresh memory has
+   no grown units, so it couldn't test the actual fix): copy `memory/` (weights + tiers) to two
+   scratch dirs, run control (`--binding-replay` off) vs treatment (on) for the same clip corpus
+   and cycle count, both built and run with `fine-metrics`. Headline metrics: `mean_output_mse`,
+   `per_region_mse`, `gist_recall_rate`/`within_session_gist_rate`, `warm_recall_l2`, plus the
+   new `binding_replay_loss` and `NremBindingReplay` cost. Deviations recorded per the standing
+   instruction. Pass criterion is not just "no regression": the treatment should show the binding
+   actually learning (binding_replay_loss trending down) without recall/quality regression — a
+   flat treatment means the term is inert and the gap stays open.
+3. Only after a winning pilot: enable by default (or adopt as the new control), with the
+   episode-drift monitoring above kept on for the first production leg.
+
+## What would invalidate this
+
+- The pilot shows recall/quality regression from episode-space drift that warm-store turnover
+  doesn't absorb (the consequence flagged above turns out real at this scale).
+- The new term is inert: binding_replay_loss doesn't fall, or grown units' binding rows stay
+  ~zero after many cycles (would indicate the heads can route around the binding — e.g. learn to
+  ignore the episode's binding-shaped components — in which case the loss design, not just the
+  gating, is wrong).
+- The NREM wall-clock cost of the extra pass is materially larger than the ≪-cycle estimate at
+  9.8k-unit scale (the Core metric exists to catch exactly this; if it fires large, the batched
+  fused variant becomes a prerequisite, not an optimization).
+- A future change makes replay traces' stored regional inputs unavailable or stale relative to
+  current encoder state in a way the existing DER++ staleness filter doesn't catch (the new term
+  reuses the same targets, so it inherits their validity assumptions).
