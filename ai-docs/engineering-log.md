@@ -1,6 +1,6 @@
-# Resolved gaps (archive)
+# Engineering log (archive)
 
-> **Contents:** Every gaps.md item that has reached a decision — accepted/deployed/adopted, or rejected/not-pursued/null-result. Moved here verbatim (2026-08-15) so `gaps.md` holds only open items. Section numbers (`§N`) are unchanged from their original assignment in gaps.md — external docs cite them as `gaps-resolved.md §N`.
+> **Contents:** Every gaps.md item that has reached a decision — accepted/deployed/adopted, or rejected/not-pursued/null-result. Moved here verbatim (2026-08-15) so `gaps.md` holds only open items. Section numbers (`§N`) are unchanged from their original assignment in gaps.md — external docs cite them as `engineering-log.md §N`.
 > **When to read:** Historical record of what was tried, what won, what lost, and why. Not a to-do list.
 > **Relationship to ADRs:** where an ADR exists for an item, the ADR is the canonical long-form record; this file keeps the gaps-native write-up (pilot numbers, A/B tables, correction trail) that doesn't all live in the ADR.
 > **Promoted remainders:** a few closed-header sections had an open tail that didn't belong in an archive. Those tails were split out and now live in `gaps.md` under new numbers — noted inline at the point of the split (§5 → §38/§39/§40; §13 → §41; §25/§28/§29 → §42; §37 → collapsed into §38/§39).
@@ -461,7 +461,7 @@ Environment: `uv venv .venv && uv pip install torch onnx onnxruntime peft transf
 | nrem_wall_ms | 6539 | 6386 | −2.3% |
 | rem_wall_ms | 9359 | 8524 | −8.9% |
 
-Other four regions' `per_region_mse` moved ≤4% either direction. The pattern is coherent: the one region whose *input* is directly gated (Visual) degrades, while several session-level recall/gist metrics improve slightly — plausibly because fewer, more decorrelated video ingests reduce redundant near-duplicate episodes competing in the same warm-store neighborhood, the same mechanism `gaps-resolved.md`'s BatchTopK/replay-ratio wins traded on, though not confirmed here. `mean_output_mse`'s +21.8% is the one metric that reads as a real regression rather than noise, and it's an aggregate across all five regions, not just Visual.
+Other four regions' `per_region_mse` moved ≤4% either direction. The pattern is coherent: the one region whose *input* is directly gated (Visual) degrades, while several session-level recall/gist metrics improve slightly — plausibly because fewer, more decorrelated video ingests reduce redundant near-duplicate episodes competing in the same warm-store neighborhood, the same mechanism `engineering-log.md`'s BatchTopK/replay-ratio wins traded on, though not confirmed here. `mean_output_mse`'s +21.8% is the one metric that reads as a real regression rather than noise, and it's an aggregate across all five regions, not just Visual.
 
 **Deviations recorded (standing A/B instruction) beyond the headline:** `snapshot_episodic_bytes_written` +53% and `synthetics_produced` +53% in the treatment arm — both moved together, consistent with each other, but not obviously explained by the change-gate mechanism itself (video-frame skipping shouldn't directly change episodic snapshot volume or REM synthesis count). Flagging as unexplained, not investigated further this pass — worth checking before adopting a default threshold, in case the change-gate is perturbing episode timing/salience in a way that has a second-order effect on synthesis.
 
