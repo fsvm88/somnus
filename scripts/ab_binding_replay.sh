@@ -113,14 +113,14 @@ for k in HEADLINE:
     d = (t - c) / max(abs(c), 1e-9) * 100
     print(f"{k:34} {c:13.6f} {t:13.6f} {d:+8.1f}%")
 
-regs = sorted((ctrl[-1].get("per_region_mse") or {}).keys())
-for reg in regs:
-    c = statistics.mean([r["per_region_mse"][reg] for r in ctrl
-                         if r.get("per_region_mse") and reg in r["per_region_mse"]])
-    t = statistics.mean([r["per_region_mse"][reg] for r in trt
-                         if r.get("per_region_mse") and reg in r["per_region_mse"]])
+regs = ctrl[-1].get("per_region_mse") or []
+for i, _ in enumerate(regs):
+    c = statistics.mean([r["per_region_mse"][i] for r in ctrl
+                         if r.get("per_region_mse") and i < len(r["per_region_mse"])])
+    t = statistics.mean([r["per_region_mse"][i] for r in trt
+                         if r.get("per_region_mse") and i < len(r["per_region_mse"])])
     d = (t - c) / max(abs(c), 1e-9) * 100
-    print(f"{('per_region_mse.' + reg):34} {c:13.6f} {t:13.6f} {d:+8.1f}%")
+    print(f"{('per_region_mse.' + str(i)):34} {c:13.6f} {t:13.6f} {d:+8.1f}%")
 
 # ── New ADR 0041 metrics (treatment must fire; control must stay at zero) ──
 print("\n-- ADR 0041 metrics --")
@@ -134,9 +134,12 @@ else:
     print("nrem_binding_replay: NOT FIRED in treatment — flag not taking effect?")
 per_cycle = []
 for r in trt:
-    x = (r.get("fine_metrics") or {}).get("binding_replay_loss")
-    if x and x.get("count"):
-        per_cycle.append((r["cycle"], x["total"] / x["count"] / 1e6))
+    fm = r.get("fine_metrics") or {}
+    x = fm.get("binding_replay_loss")
+    steps = (fm.get("nrem_binding_replay") or {}).get("count", 0)
+    if x and x.get("count") and steps:
+        # count accumulates summed scaled loss (x1e6); steps from nrem_binding_replay
+        per_cycle.append((r["cycle"], x["count"] / steps / 1e6))
 if per_cycle:
     print("binding_replay_loss per-cycle mean (treatment):")
     for cyc, v in per_cycle:

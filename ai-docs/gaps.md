@@ -1568,6 +1568,64 @@ behind this campaign finishing — it can now be taken. Nothing else was gated o
 
 ---
 
+## §35 — ADR 0041 isolated A/B pilot: mechanism validated, §33 fix engages, predicted episode-drift materializes (2026-08-15)
+
+**Setup** (`scripts/ab_binding_replay.sh`, artifacts in `memory/ab_binding_replay/{control,treatment}/campaign/`):
+the trained production state (snapshot + warm 151,725 + cold 158,534 + onnx) copied per arm
+(btrfs reflink), 1 session × 10 cycles each, campaign clip corpus (140 clips), CAPACITY=8192,
+REPLAY_EPOCHS=4, both arms built+run with `fine-metrics` per the standing instruction, arms run
+sequentially for clean wall-clock. Control: no flag. Treatment: `--binding-replay`.
+
+**Headline result — the §33 fix engages in production state.** Grown units DO win k-WTA in the
+trained state (they don't in synthetic single-input setups — the unit tests document why: fresh-init
+0.01-scale encoder columns can't beat Kaiming-scale base columns there). In production, 791 cycles
+of duty-cycle homeostasis left overused base units carrying negative boost and underused grown units
+positive boost, and the diverse corpus rotates winner sets — so grown units activate from the first
+cycles. Final grown binding-row state (`binding_row_norms` example): control **grown_nz = 0/8,901
+in all regions** (the §33 gap persists without the flag, as designed); treatment **47–96% of grown
+rows nonzero** (AudioSpeech 4,244, AudioEnv 8,480, Visual 6,125, Symbolic 8,603, Language 6,267 of
+9,008), grown_max norms 0.04–0.14 vs base mean ~0.19 — i.e. the campaign's entire grown product,
+invisible to episode formation until now, started entering episodes within 10 cycles.
+
+**Mechanism metrics:** `binding_replay_loss` fell 0.141 → 0.046 (−67.5%) over the cycles it ran;
+`nrem_binding_replay` fired 28 steps at mean 1.44 s/step; control arm fired neither (the control-arm
+signal); 0 `training_nan_detected` both arms; both arms exited cleanly.
+
+**The predicted consequence materialized — episode-space drift.** The warm store holds 151k episodes
+formed by the untrained binder; treatment immediately starts forming episodes with a changing binder
+(now including grown-unit content). Signature: `warm_recall_l2` rises *progressively* in treatment
+(0.44 → 0.68 → 0.74 → 0.89 over cycles 3–9) while control improves (1.29 → 0.31–0.44); cross-session
+`gist_recall_rate` collapses to 0.23–0.45 and keeps falling while control reaches 0.90–0.99; but
+`within_session_gist_rate` *improves* (+13.3%) — recent same-generation episodes recall fine, old
+cross-generation ones don't. That split is the mixed-generation-store fingerprint, not a broken
+mechanism. ADR 0041 named exactly this risk and its mitigation: **warm-store rebuild from cold at
+switchover** (the cold archive holds the raw records; rebuilding warm post-switch produces one
+binder generation). A 10-cycle pilot cannot test whether plain warm-store turnover absorbs the drift
+(eviction at `--max-warm-records 200000` only begins ~cycle 8 at this ingest rate).
+
+**Cost — the ADR's ≪-cycle estimate did not hold at full scale.** 1.44 s/step × ~2.8 steps/cycle
+= +34.5% NREM wall-clock, which displaced consolidation work: `traces_replayed` −30%,
+`blend_count` −64% (partly via adaptive-exit interaction: treatment cycles 3–4 exited NREM early,
+`mean_output_mse` logged 0, no binding steps ran). The ADR's invalidation clause applies: the
+batched/fused variant (one fewer AdamW pass per batch, and/or fewer binding steps per cycle) is a
+prerequisite for adoption, not an optimization.
+
+**Other recorded deviations (standing instruction):** growth fired 3 events in both arms but
+diverged — batch size +103%, final sizes 10,032 (treatment) vs 9,925 (control); `mean_salience_wake`
++34%, `settle_delta_mean` +77%, `mean_synthetic_output_mse` −32%, `mean_output_mse_wake` −21.5%
+(treatment better during wake), NREM `mean_output_mse` +46.1% (heads tracking a drifting episode
+space), `mean_proj_loss` +24.8%. n=1 per arm — run-to-run variance is unmeasured; the progressive
+(within-arm monotonic) drift trajectory is the strongest evidence here, not the point estimates.
+
+**Verdict per ADR 0041 pass criterion:** binding learns ✓ (and the §33 fix engages beyond what the
+criterion asked), no-regression ✗ (recall regresses via the predicted drift channel). **Not adopted.**
+Adoption path, in order: (1) warm-store rebuild-from-cold at switchover (the named mitigation) and
+(2) cost reduction (fused step variant and/or fewer binding steps per cycle) — then a repeat pilot
+that must show drift contained (cross-session gist stable or recovering as the store re-generates)
+before default-on. Option (c) temporal-prediction loss remains sequenced behind adoption as designed.
+
+---
+
 > **Note:** the `#` column matches the `##` section number above (`§N`), not chronological/priority
 > order. Table numbering used to drift from the section headers — corrected 2026-07-11; if you're
 > reading an old cached copy of this table, re-fetch rather than trust remembered numbers.
@@ -1607,5 +1665,6 @@ behind this campaign finishing — it can now be taken. Nothing else was gated o
 | ✅ §30 | **Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040** — correction to §28/§29 | Med | Wake-path `OrtRunBinding` wall-clock — dense region projection was 75-76% of the binding graph's cost at campaign scale, not the "fixed-size" GRU+attention §28/§29 described | Implemented + deployed live 2026-08-12: 40-59% `OrtRunBinding` reduction on production traffic (2.15-2.83 → 1.17-1.30ms/call), zero ORT fallback, MIGraphX `Gather`-as-input probed clean; §28/§29/ADR 0038 mischaracterization corrected — see §30 above |
 | ✅ §31 | **Test-coverage push: rubato-5 contract drift + drift-pin pattern** | Low | Correctness hardening + regression coverage — 54 new tests (somnus-encoding 0→41, whisper_asr 0→8, somnus-metrics 3→8); `SincResampler` contract re-enforced after rubato 5 silently stopped enforcing it | Done 2026-08-13 — see §31 above; queued test list now empty |
 | ✅ §32 | **Test-coverage push round 2: burn-path contracts + memory persistence I/O** | Low | Correctness hardening — 27 new tests (somnus-memory 35→47, somnus-perception +15 in new `burn_path_contracts.rs`); campaign-restart persistence files, growth-gate `measure_mse`, save/load round-trips all pinned | Done 2026-08-14 — see §32 above; no remaining named thin spots |
-| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision (b) 2026-08-15, ADR 0041 **implemented & verified** (`4f7aa1f`, `--binding-replay` opt-in; validation item 1 done); remaining gate = isolated A/B pilot from trained state (items 2–3); (c) temporal loss sequenced as follow-up |
+| 🔍 §33 | **BindingArea weights never trained** (~1.72M params on random init; grown units episode-invisible) | Med–High | Episode quality / temporal context / grown-unit participation — ADR 0008's "revisit in Phase 6" never happened | Decision (b) 2026-08-15, ADR 0041 implemented; **pilot ran (§35): fix engages (47–96% of grown rows learn in 10 cycles), but predicted episode-drift recall regression materialized and NREM cost displaced 30% of replay — not adopted**; adoption gated on warm-store rebuild-from-cold mitigation + cost reduction + repeat pilot |
 | ✅ §34 | **10x growth campaign complete** — `[9821]×5` = 101.7% of the 9,660 target | — | Growable-core capacity milestone | Done 2026-08-15 — see §34 above; 791 cycles, 188 growth events, 0 panics/segfaults/ORT-fallbacks, output_mse −74% first-vs-last-10; unblocks §33's decision |
+| 🔍 §35 | **ADR 0041 isolated A/B pilot** (trained state, 10 cycles/arm, fine-metrics both arms) | — | Validates/invalidates live-episode binding training before adoption | Done 2026-08-15 — mechanism validated (§33 fix engages in production state), predicted episode-drift materialized (cross-session gist −53%, warm_l2 rising), cost +34.5% NREM displacing 30% of replay; adoption path: warm-rebuild mitigation + fused/cheaper step + repeat pilot |

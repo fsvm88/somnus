@@ -1,5 +1,48 @@
 # Session state — somnus
 
+> **✅ CHECKPOINT (clean), 2026-08-15 (same day, later) — ADR 0041 isolated A/B pilot RUN,
+> written up as gaps.md §35. Verdict: mechanism validated, §33 fix engages in production state,
+> predicted episode-drift materialized → NOT adopted yet.**
+> - **Setup:** `scripts/ab_binding_replay.sh` (new, committed) — trained production state copied
+>   per arm (snapshot+warm+cold+onnx, btrfs reflink), 1 session × 10 cycles, campaign corpus,
+>   both arms fine-metrics, sequential for clean wall-clock. Artifacts kept in
+>   `memory/ab_binding_replay/{control,treatment}/campaign/` (rm -rf when done with them).
+> - **Headline — the §33 fix engages in production state:** control grown rows stayed 0/8,901 in
+>   all regions; treatment **47–96% of grown rows nonzero after 10 cycles** (`binding_row_norms`
+>   example, new, committed). Grown units DO win k-WTA in the trained state — 791 cycles of
+>   duty-cycle homeostasis (overused base units carry negative boost) + corpus diversity rotate
+>   them in from the first cycles. The synthetic-setup pessimism in ADR 0041's validation-item-1
+>   note does not apply to production state; the ADR is updated to say so.
+> - **Mechanism:** `binding_replay_loss` 0.141 → 0.046 (−67.5%); `nrem_binding_replay` 28 steps @
+>   mean 1.44 s/step; control arm fired neither; 0 NaN; clean exits.
+> - **The predicted consequence materialized:** warm store mixes 151k untrained-binder episodes
+>   with new trained-binder episodes → `warm_recall_l2` rises progressively in treatment
+>   (0.44→0.89) while control improves (1.29→0.31–0.44); cross-session gist −53% and falling;
+>   within-session gist +13.3% (same-generation recall fine) — the mixed-generation fingerprint,
+>   exactly the ADR's flagged risk. **Cost:** +34.5% NREM wall-clock, displaced ~30% of replay
+>   traces and 64% of blends (partly via adaptive-exit interaction) — the ≪-cycle estimate did
+>   not hold; fused/cheaper step variant is now an adoption prerequisite per the ADR's own
+>   invalidation clause. Other deviations recorded in §35 (growth divergence 10,032 vs 9,925,
+>   salience/settle/wake-MSE movements; n=1 per arm, noted).
+> - **Adoption path (in the ADR status + §35 verdict):** (1) warm-store rebuild-from-cold at
+>   switchover (the named mitigation), (2) cost reduction (fused step variant and/or fewer
+>   binding steps per cycle), (3) repeat pilot showing drift contained. Flag stays opt-in.
+> - **Also this session:** fixed a `BindingReplayLoss` doc bug found by the pilot — `counted!`
+>   accumulates into `count` only, so the metric's documented "count = steps, total = loss"
+>   semantics were impossible; doc now says count accumulates summed scaled loss and step count
+>   rides `NremBindingReplay` (data was recoverable, comparison uses it). Comparison script in
+>   ab_binding_replay.sh fixed accordingly (per_region_mse is a list, loss key shape).
+> - **Committed + pushed:** `35a2346` (pilot infra), plus this writeup commit (gaps.md §35 +
+>   table rows, ADR 0041 status/validation/metrics-doc fixes, somnus-metrics doc fix, session state).
+>   Production `memory/` untouched — campaign state intact.
+> - **Next-session entry point:** user decision on the adoption path — implement the warm-rebuild
+>   mitigation + fused/cheaper binding step and re-run the pilot, or hold. Option (c)
+>   temporal-prediction loss stays sequenced behind adoption. Standing threads otherwise
+>   unchanged: ADR 0038 prerequisite 3 (trigger-gated), deferred items A-N, Whisper-ASR root
+>   cause (§5).
+>
+> ---
+>
 > **✅ CHECKPOINT (clean), 2026-08-15 — resumed after a hard machine lockup; ADR 0041 implemented,
 > verified, committed, pushed.** The locked session (started after the campaign-completion shutdown
 > below) had: taken the §33 decision (user chose option b), committed ADR 0041 + the standing

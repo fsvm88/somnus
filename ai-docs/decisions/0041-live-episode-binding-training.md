@@ -1,7 +1,11 @@
 # 0041. Live-episode binding training in NREM (close the §33 never-trained-binding gap)
 
-- **Status:** implemented & verified (validation item 1 done 2026-08-15); still gated on the
-  isolated A/B pilot (validation items 2–3) before touching production `memory/`.
+- **Status:** implemented; isolated A/B pilot run 2026-08-15 (gaps.md §35) — mechanism validated
+  and the §33 fix engages in production state, but the predicted episode-drift recall regression
+  materialized and the NREM cost displaced ~30% of replay. **Not adopted.** Adoption gated on:
+  (1) warm-store rebuild-from-cold at switchover (the named mitigation), (2) cost reduction
+  (fused step variant and/or fewer binding steps per cycle), (3) a repeat pilot showing drift
+  contained. Flag stays opt-in (`--binding-replay`, default off) until then.
 - **Date:** 2026-08-15
 
 ## Context
@@ -138,8 +142,10 @@ that A/B runs always use full debugging metrics and record deviations:
 - **New Core:** `NremBindingReplay` — wall-clock of `binding_replay_step_batch` (operation
   granularity, same shape as the other training-step metrics). Fires every NREM batch when the
   flag is on; stays at zero when off (which is itself the control-arm signal).
-- **New Fine:** `binding_replay_loss` value counter (per-cycle mean of the new term — the
-  A/B-comparison-specific signal, exactly the Fine tier's stated purpose).
+- **New Fine:** `binding_replay_loss` — `counted!` accumulator holding the summed loss
+  scaled ×1e6 (the registry has one accumulator per metric, so the step count rides
+  `NremBindingReplay`; mean loss/step = binding_replay_loss.count ÷ nrem_binding_replay.count
+  ÷ 1e6). The A/B-comparison-specific signal, exactly the Fine tier's stated purpose.
 - **No new failure counter:** the new path is the same tensor operations as existing tracked
   paths (encoder forwards, sparse gather, attention, head forwards) with no I/O, no ORT, and no
   new invariant that can break independently; the one genuinely new surface — `forward_tracked`'s
@@ -171,17 +177,23 @@ that A/B runs always use full debugging metrics and record deviations:
    grown slice) is only expected in regions/cycles where grown units actually win k-WTA; a
    treatment that learns on base rows but shows no grown-row movement is not automatically inert —
    check winner composition before concluding.
-2. **Isolated A/B pilot from the trained production state** (not fresh memory — fresh memory has
-   no grown units, so it couldn't test the actual fix): copy `memory/` (weights + tiers) to two
-   scratch dirs, run control (`--binding-replay` off) vs treatment (on) for the same clip corpus
-   and cycle count, both built and run with `fine-metrics`. Headline metrics: `mean_output_mse`,
-   `per_region_mse`, `gist_recall_rate`/`within_session_gist_rate`, `warm_recall_l2`, plus the
-   new `binding_replay_loss` and `NremBindingReplay` cost. Deviations recorded per the standing
-   instruction. Pass criterion is not just "no regression": the treatment should show the binding
-   actually learning (binding_replay_loss trending down) without recall/quality regression — a
-   flat treatment means the term is inert and the gap stays open.
+2. **Isolated A/B pilot from the trained production state** — **DONE 2026-08-15, writeup gaps.md
+   §35** (not fresh memory — fresh memory has no grown units, so it couldn't test the actual fix):
+   copied `memory/` (weights + tiers) to two scratch dirs, ran control (`--binding-replay` off) vs
+   treatment (on) for the same clip corpus and 10 cycles, both built and run with `fine-metrics`.
+   Headline metrics: `mean_output_mse`, `per_region_mse`, `gist_recall_rate`/
+   `within_session_gist_rate`, `warm_recall_l2`, plus the new `binding_replay_loss` and
+   `NremBindingReplay` cost. Deviations recorded per the standing instruction. **Outcome: binding
+   learned (loss −67.5%) and the §33 fix engages (47–96% of grown rows nonzero in 10 cycles vs 0 in
+   control), but the predicted episode-drift consequence materialized (cross-session gist −53% and
+   progressively rising warm_recall_l2 while within-session gist improved) and the NREM cost
+   (+34.5%) displaced ~30% of replay traces — not a clean pass.** The pilot also falsified the
+   validation-item-1 worry that grown units might not win k-WTA in production state: 791 cycles of
+   duty-cycle homeostasis plus corpus diversity rotate them in from the first cycles.
 3. Only after a winning pilot: enable by default (or adopt as the new control), with the
-   episode-drift monitoring above kept on for the first production leg.
+   episode-drift monitoring above kept on for the first production leg. **Blocked by item 2's
+   outcome — the adoption path now requires the warm-store rebuild-from-cold mitigation and cost
+   reduction first, then a repeat pilot (gaps.md §35 verdict).**
 
 ## What would invalidate this
 

@@ -395,9 +395,11 @@ pub enum Metric {
     /// against the regional targets on them. Fires only with `--binding-replay`; stays at zero
     /// when off (the control-arm signal for the A/B this change exists for).
     NremBindingReplay,
-    /// Live-episode binding loss per step (ADR 0041), scaled ×1e6 and recorded via `counted!`
-    /// (Fine tier — the A/B-comparison-specific signal). `count` = number of steps, summed
-    /// value = total scaled loss; mean loss = (total/count)/1e6.
+    /// Cumulative live-episode binding loss (ADR 0041), scaled ×1e6 and recorded via
+    /// `counted!` (Fine tier — the A/B-comparison-specific signal). `count` accumulates
+    /// the summed scaled loss (the registry has one accumulator per metric); the step
+    /// count comes from `NremBindingReplay` (fires once per step), so mean loss per
+    /// step = binding_replay_loss.count / nrem_binding_replay.count / 1e6.
     BindingReplayLoss,
 }
 
