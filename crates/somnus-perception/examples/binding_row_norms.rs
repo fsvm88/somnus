@@ -15,8 +15,8 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| panic!("usage: binding_row_norms <weights.bin>"));
     let weights_path = std::path::Path::new(&weights);
-    let sizes_str = std::fs::read_to_string(weights_path.with_extension("sizes"))
-        .expect("read .sizes sidecar");
+    let sizes_str =
+        std::fs::read_to_string(weights_path.with_extension("sizes")).expect("read .sizes sidecar");
     let sizes: [usize; 5] = sizes_str
         .split_whitespace()
         .map(|s| s.parse().unwrap())

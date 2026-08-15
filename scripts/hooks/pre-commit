@@ -1,0 +1,10 @@
+#!/bin/sh
+# Mirrors .github/workflows/ci.yml's fmt/clippy gates so failures are caught
+# before push, not after. Installed via scripts/setup-hooks.sh.
+set -e
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --check
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
