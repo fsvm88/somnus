@@ -1,15 +1,15 @@
 # 0041. Live-episode binding training in NREM (close the §33 never-trained-binding gap)
 
-- **Status:** implemented; isolated A/B pilot run 2026-08-15 (gaps-resolved.md §35) — mechanism validated
+- **Status:** implemented; isolated A/B pilot run 2026-08-15 (engineering-log.md §35) — mechanism validated
   and the §33 fix engages in production state, but the predicted episode-drift recall regression
   materialized and the NREM cost displaced ~30% of replay. **Not adopted.** Adoption path queued
-  (gaps-resolved.md §35 "Adoption path"): step budget (`--binding-replay-steps`) → longer repeat pilot
+  (engineering-log.md §35 "Adoption path"): step budget (`--binding-replay-steps`) → longer repeat pilot
   (≥20 cycles, n≥2) → adopt if drift contained. **Correction recorded:** the named mitigation
   "rebuild warm from cold at switchover" does not work as written — cold records store only
   episode vectors, not regional inputs, so they can't be re-formed through a new binder; the
   real absorption mechanism is warm-store turnover (~30 cycles) plus a slower binder change rate.
   Flag stays opt-in (`--binding-replay`, default off) until adoption.
-  **2026-08-15 (later): adoption-path step budget tried and FAILED (gaps-resolved.md §36).**
+  **2026-08-15 (later): adoption-path step budget tried and FAILED (engineering-log.md §36).**
   `--binding-replay-steps N` (default 1) caps `binding_replay_step_batch` calls per sleep cycle;
   the repeat pilot at N=1 (20 cycles, n=1) cut NREM wall-clock (−24.8%, the cap works as a cost
   lever) but made quality *worse* than the unbounded §35 pilot: ~10× same-cycle `mean_output_mse`
@@ -19,7 +19,7 @@
   nonzero, confirmed via `binding_row_norms`), so the mechanism isn't broken — but step-count
   capping decoupled cost from drift instead of taming both as hypothesized. **Step-count capping
   abandoned as the lever.**
-  **2026-08-15 (later still): candidate (a), loss-scale reduction, tried and FAILED WORSE (gaps-resolved.md §44).**
+  **2026-08-15 (later still): candidate (a), loss-scale reduction, tried and FAILED WORSE (engineering-log.md §44).**
   New `--binding-replay-loss-scale <f32>` flag (default 1.0) scales the live-episode loss tensor
   immediately before `.backward()`. Pilot at scale=0.1 (step cap left at its default of 1) produced
   `mean_output_mse` +440.6% vs. control -- every region worse (+25% to +81%), the same
@@ -53,7 +53,7 @@ Concrete consequences, both verified in §33:
    (`crates/somnus-perception/src/lib.rs:1851-1868`, comment "gradients will shape them over time").
    Since no gradients ever flow, **grown units' binding rows stay exactly zero forever — grown
    units are invisible to episode formation.** The 10x growth campaign completed 2026-08-15
-   (gaps-resolved.md §34) at `[9821]×5`, so 8,797 of 9,821 units per region (89.6%) — the campaign's entire
+   (engineering-log.md §34) at `[9821]×5`, so 8,797 of 9,821 units per region (89.6%) — the campaign's entire
    product — contribute to SAE reconstruction but nothing to episodes, memory, or recall.
 
 The campaign's completion removes the sequencing blocker §33 named (no mid-campaign dynamics
@@ -147,7 +147,7 @@ the sequenced follow-up that covers it.
    recall is L2-distance-based so gradual drift degrades gracefully, and the pilot measures the
    degradation directly (`warm_recall_l2`, `gist_recall_rate`). If drift shows up as recall
    regression in the pilot, mitigation becomes part of the adoption plan. **(2026-08-15 update:
-   drift did show up — gaps-resolved.md §35 — and the mitigation named here does not work as written:
+   drift did show up — engineering-log.md §35 — and the mitigation named here does not work as written:
    cold records store only episode vectors, not regional inputs, so a rebuild from cold can't
    re-form episodes through a new binder. The real absorption mechanisms are warm-store turnover
    (~30 cycles at the 200k cap) and a step budget slowing the binder's change rate; see the
@@ -224,8 +224,8 @@ that A/B runs always use full debugging metrics and record deviations:
 3. Only after a winning pilot: enable by default (or adopt as the new control), with the
    episode-drift monitoring above kept on for the first production leg. **Blocked by item 2's
    outcome — the adoption path now requires the warm-store rebuild-from-cold mitigation and cost
-   reduction first, then a repeat pilot (gaps-resolved.md §35 verdict).**
-4. **Cost/drift-reduction step — implemented 2026-08-15, repeat pilot FAILED (gaps-resolved.md §36):** new
+   reduction first, then a repeat pilot (engineering-log.md §35 verdict).**
+4. **Cost/drift-reduction step — implemented 2026-08-15, repeat pilot FAILED (engineering-log.md §36):** new
    `--binding-replay-steps N` CLI flag (default 1) caps `binding_replay_step_batch` calls per
    sleep cycle via a step-budget counter in the NREM loop
    (`sleep.rs::binding_replay_step_budget_remaining`); `N=0` disables the pass even with

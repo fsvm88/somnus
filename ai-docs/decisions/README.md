@@ -87,4 +87,4 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0038](0038-sparse-encoder-scoring.md) | Sparse (hierarchical) k-WTA encoder scoring for the next scale order | proposed |
 | [0039](0039-unified-metrics-instrumentation.md) | Unified two-tier metrics instrumentation (`somnus-metrics`) | implemented |
 | [0040](0040-sparse-gather-binding-projection.md) | Sparse-gather binding projection (ONNX/MIGraphX) | implemented, deployed live |
-| [0041](0041-live-episode-binding-training.md) | Live-episode binding training in NREM (close the §33 never-trained-binding gap) | implemented; not adopted — 2 failed pilots (gaps-resolved.md §35/§36) |
+| [0041](0041-live-episode-binding-training.md) | Live-episode binding training in NREM (close the §33 never-trained-binding gap) | implemented; not adopted — 2 failed pilots (engineering-log.md §35/§36) |

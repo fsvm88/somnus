@@ -73,4 +73,4 @@ All remaining ADR backlog items are **deferred indefinitely** — do not propose
 
 Items deferred: A (cold archive promotion index), C (sparse activation storage), E (separate output-head optimizer), F (post-k-WTA prior injection), I (knowledge distillation compression), J (Whisper-base), K (SigLIP-B), L (LoRA fine-tuning — done for Qwen2.5 pre-ADR-0036, orphaned by the Qwen3 swap; `scripts/train_lora_qwen3.py` exists but was never run, production `qwen3_lm.onnx` is not LoRA-tuned — see gaps.md §39, open), N (visual/audio grounding).
 
-Item M (MLP projection) is NOT deferred — ADR 0032 implemented it and it has been the default production path since 2026-06-21 (`--linear-proj` defaults false; confirmed dimension-generic and Qwen3-compatible via gaps-resolved.md §37's audit). Do not relist it here.
+Item M (MLP projection) is NOT deferred — ADR 0032 implemented it and it has been the default production path since 2026-06-21 (`--linear-proj` defaults false; confirmed dimension-generic and Qwen3-compatible via engineering-log.md §37's audit). Do not relist it here.

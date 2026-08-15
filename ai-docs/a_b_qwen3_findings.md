@@ -4,7 +4,7 @@
 
 ## Original run (2026-06-28) — INVALIDATED, kept only as an incident record
 
-> Reported Qwen3 "underperforming" on `warm_recall_l2` (0.550→0.498, -9.6%). **Not trustworthy**: `LM_HIDDEN` had been bumped 896→1024 (`6335b42`) the day before, but `ActionDecoder` still loaded Qwen2.5's real 896-wide embed table by hardcoded filename — `embed_flat()` sliced it at stride 1024, silently corrupting every token embedding in **both** arms. Qwen3 also had no GPU-path export of its own and ran via a file-swap trick whose restore step failed (`qwen25_lm.onnx` on disk was actually the Qwen3 model). The -9.6% reflects a broken pipeline, not either architecture. DINOv2 was used as the visual encoder for both arms (DINOv3 was believed MIGraphX-incompatible then — later found to be a CWD-relative path bug, gaps-resolved.md §6).
+> Reported Qwen3 "underperforming" on `warm_recall_l2` (0.550→0.498, -9.6%). **Not trustworthy**: `LM_HIDDEN` had been bumped 896→1024 (`6335b42`) the day before, but `ActionDecoder` still loaded Qwen2.5's real 896-wide embed table by hardcoded filename — `embed_flat()` sliced it at stride 1024, silently corrupting every token embedding in **both** arms. Qwen3 also had no GPU-path export of its own and ran via a file-swap trick whose restore step failed (`qwen25_lm.onnx` on disk was actually the Qwen3 model). The -9.6% reflects a broken pipeline, not either architecture. DINOv2 was used as the visual encoder for both arms (DINOv3 was believed MIGraphX-incompatible then — later found to be a CWD-relative path bug, engineering-log.md §6).
 
 ## Redo take 1 (2026-07-05): pipeline fixed, comparison inconclusive
 

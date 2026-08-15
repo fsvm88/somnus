@@ -24,7 +24,7 @@
 
 - **`cpal`** — **[committed]** real-time microphone capture (Phase 1), cross-platform, callback bridged to a crossbeam channel.
 - **`ffmpeg-next = "9"`** — **[committed]** audio+video track decoding from media files (Phase 1, `MediaFile`, one dep for both). Bumped 8→9 on 2026-08-12 to build against the locally installed ffmpeg 9.0.
-- **`rubato = "5"`** — **[committed]** sample-rate resampling at encoding time (`somnus-encoding`'s `SincResampler`). Bumped 3→5 in the 2026-08-12 sweep; rubato 5 silently stopped enforcing the chunk-length/valid-ratio contract, so `SincResampler` enforces it itself — pinned by tests, gaps-resolved.md §31.
+- **`rubato = "5"`** — **[committed]** sample-rate resampling at encoding time (`somnus-encoding`'s `SincResampler`). Bumped 3→5 in the 2026-08-12 sweep; rubato 5 silently stopped enforcing the chunk-length/valid-ratio contract, so `SincResampler` enforces it itself — pinned by tests, engineering-log.md §31.
 - **`hound`** — WAV read/write, offline experiments only.
 
 `symphonia` (pure-Rust decoder) is superseded by `ffmpeg-next` for file input — revisit only if a pure-Rust build without system ffmpeg is needed.
@@ -62,7 +62,7 @@ Embedded KV (`redb`/`fjall`/`sled`) and SQL (`rusqlite`/`sqlx`) are candidates o
 - **`tokio`** — **[committed]** async runtime in the binary (Phase 1), `features=["full"]`.
 - **`crossbeam-channel`** — **[committed]** bounded sync channels bridging cpal callbacks and decoder threads to the async runtime — cloneable Sender+Receiver enables drop-oldest and multi-source fan-in.
 - `std::thread` — decoder/capture threads that must not be async.
-- **`rayon`** — **[committed]** parallel warm-store HNSW rebuild (`parallel_insert_slice`, gaps-resolved.md §27, 16.7× speedup).
+- **`rayon`** — **[committed]** parallel warm-store HNSW rebuild (`parallel_insert_slice`, engineering-log.md §27, 16.7× speedup).
 
 ## Observability
 
