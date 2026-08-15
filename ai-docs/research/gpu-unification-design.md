@@ -5,6 +5,12 @@
 > **Status:** Phase 0 (gate validation) and Phase 1 (wake inference on GPU) implemented as of 2026-06-07. Phases 2-4 (micro-batching, EMA in graph, Rust ONNX builder) prospective.
 > **Date:** 2026-06-02 (design); 2026-06-07 (Phase 1 complete)
 > **Companion ADR:** decisions/0023-gpu-unification.md
+> **Superseding change (2026-08-12):** §4's Graph 2 description below is stale as written — see
+> the note inline. `decisions/0040-sparse-gather-binding-projection.md` rewrote the binding graph's
+> region-projection step from a dense matmul to a Gather over active indices only; not part of the
+> original phased plan below, but a real change to the deployed graph. `decisions/0038-sparse-encoder-scoring.md`
+> (`proposed`, not started) is the analogous encoder-side direction this design's Phase 4 didn't
+> anticipate.
 
 ---
 
@@ -82,7 +88,7 @@ for i in 0..5:
     dc[i] *= (1 - ALPHA); dc[i][topk_idx] += ALPHA
 ```
 
-**Graph 2 — Binding** (`perception_binding.onnx`): inputs `sp_0..sp_4[1,N_UNITS]` (sparse, post-CPU-step), `prev_episode[1,EPISODE_DIM]`, `gru_hidden[1,1,GRU_HIDDEN]`; internal `proj_i=sp_i@W_region_i[1,D_PROJ]` → `x=concat(proj_0..4)[5,D_PROJ]`, GRU step → `ctx` via `W_temporal_proj[1,EPISODE_DIM]` → `ctx_tokens[5,D_PROJ]` → `x_ext=concat([x,ctx_tokens])[10,D_PROJ]` → 4-head scaled-dot-product attention (Q from `x`, K/V from `x_ext`) → `episode[1,EPISODE_DIM]`; outputs `episode`, `gru_hidden_out`. Ops: MatMul, GRU, Concat, Reshape, Transpose, Softmax, Mul — all confirmed on MIGraphX.
+**Graph 2 — Binding** (`perception_binding.onnx`): originally designed with dense `sp_0..sp_4[1,N_UNITS]` inputs (sparse-valued but full-length) feeding `proj_i=sp_i@W_region_i[1,D_PROJ]`. **Superseded 2026-08-12 (ADR 0040):** the region-projection step was found to be 75-76% of this graph's per-call cost at campaign scale — a dense matmul reading the full `W_region_i` regardless of input sparsity, memory-bandwidth-bound. Current inputs are `active_idx_0..4[k_active_i]` (int64) + `active_val_0..4[1,k_active_i]` (float) pairs instead, with `proj_i = Gather(W_region_i, active_idx_i, axis=0)` (`[k,D_PROJ]`) followed by a `[1,k]@[k,D_PROJ]` weighted-sum matmul — numerically identical to the dense form (every non-gathered row contributes exactly zero), 54-59% cheaper. `k_active_i` is baked into the graph's static shape at export, sourced from `weights_manifest.json` (never re-derived from `n_units` in Python — the §17/§22/§24 drift class this design didn't anticipate). From this point on, unchanged: `x=concat(proj_0..4)[5,D_PROJ]`, GRU step → `ctx` via `W_temporal_proj[1,EPISODE_DIM]` → `ctx_tokens[5,D_PROJ]` → `x_ext=concat([x,ctx_tokens])[10,D_PROJ]` → 4-head scaled-dot-product attention (Q from `x`, K/V from `x_ext`) → `episode[1,EPISODE_DIM]`; outputs `episode`, `gru_hidden_out`. Ops: MatMul, Gather, GRU, Concat, Reshape, Transpose, Softmax, Mul — all confirmed on MIGraphX (the Gather rewrite also surfaced and worked around a `simplify_reshapes` compiler bug — see ADR 0040).
 
 **MIGraphX operator coverage (empirically verified):** MatMul ✓; GRU (linear_before_reset=1) ✓ 1.79e-07 diff; Softmax+MatMul (cross-attention) ✓ 1.86e-08 diff; TopK ✓ correct set, different order; ScatterElements→internal node ✓; ScatterElements→graph output ≥4 ✗ (MIGraphX bug); INT64 graph outputs (topk indices) ✗ (MIGraphX bug). **Hard constraint: keep all topk/masking/ScatterElements on CPU, never expose as ONNX graph outputs.**
 
@@ -172,7 +178,7 @@ Abandon or revise if: (1) MIGraphX produces wrong results for GRU/TopK/multi-hea
 
 ## 13. Open questions
 
-- **D_PROJ scaling policy:** fixed at 128 — should scale with N_UNITS (formula TBD, e.g. N_UNITS/8) before Phase 1 grows it further; affects EPISODE_DIM.
+- **D_PROJ scaling policy:** fixed at 128 — should scale with N_UNITS (formula TBD, e.g. N_UNITS/8) before Phase 1 grows it further; affects EPISODE_DIM. **Still unresolved as of 2026-08-15:** the 10x growth campaign (engineering-log.md §34) took N_UNITS 1,024→9,821 with D_PROJ still fixed at 128 (confirmed current) — this question was never revisited despite growth well past the original "before Phase 1 grows it further" framing. Similarly, §5's EMA-head-sync "Option B" trigger (N_UNITS≥4096) has been crossed by ~2.4× with EMA heads still off-graph (Option A) — not confirmed broken, just confirmed not acted on.
 - **EPISODE_DIM when region count grows:** currently 640=5×128; adding regions grows it and breaks the memory snapshot format — needs a migration path.
 - **Settle loop at scale:** iterative ORT calls are expensive if settle is re-enabled (`settle_steps>1`) — consider exporting as a scan/loop ONNX op, or keeping settle on CPU with weight copies.
 - **ORT parallel execution:** inter-op parallelism setting — may be worth separate ORT streams for encoder vs. perception at larger N. Profile before adding the complexity.
