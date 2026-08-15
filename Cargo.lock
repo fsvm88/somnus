@@ -1982,6 +1982,7 @@ dependencies = [
  "matrixmultiply",
  "ndarray 0.17.2",
  "ort",
+ "proptest",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",

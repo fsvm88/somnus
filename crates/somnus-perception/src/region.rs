@@ -351,6 +351,192 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
     }
 }
 
+/// ADR 0038 prerequisite 3 (gaps.md §42) — minimal block-local ("hierarchical") k-WTA
+/// scorer, built solely to numerically validate whether block-local competition preserves
+/// the invariants `KWtaLayer::select_top_k`'s single global competition guarantees:
+/// duty-cycle stays bounded, the k/n sparsity ratio is preserved on growth, and no block
+/// is permanently starved of selection. **Not wired into any production forward() path** —
+/// ADR 0038 stays `proposed`; this exists purely to answer the open prerequisite.
+///
+/// `select_top_k`'s duty-cycle target is a single global ratio (`k_active/n_units`) shared
+/// by every unit. Under block-local selection that silently breaks in two ways a naive port
+/// would miss: (1) a block that's rarely chosen at the coarse stage never gets any of its
+/// units selected regardless of their individual duty-cycle boost, so unit-level boosting
+/// alone can't prevent starvation — the *block* itself needs its own duty-cycle-style boost
+/// at the coarse-selection stage; (2) `k_active`'s fixed count doesn't map onto a variable
+/// number of selected blocks of possibly-uneven size, so it has to be split across selected
+/// blocks (proportional to block size here) rather than applied as one flat global ratio.
+pub mod hierarchical_validation {
+    use std::cmp::Ordering;
+
+    /// gaps.md §42's BOOST_STRENGTH/DUTY_CYCLE_ALPHA reused verbatim — the block-local
+    /// scorer is validated against the exact same constants `select_top_k` uses, not a
+    /// separately-tuned set, since the question is "does block-local competition preserve
+    /// the invariant," not "can a different constant compensate."
+    use super::{BOOST_STRENGTH, DUTY_CYCLE_ALPHA};
+
+    /// Per-block duty cycle plus the fixed block size — the piece of state a real
+    /// hierarchical `KWtaLayer` would carry alongside the existing per-unit `duty_cycle`.
+    #[derive(Debug, Clone)]
+    pub struct BlockState {
+        pub block_size: usize,
+        pub block_duty_cycle: Vec<f32>,
+    }
+
+    impl BlockState {
+        pub fn new(n_units: usize, block_size: usize) -> Self {
+            let n_blocks = n_units.div_ceil(block_size);
+            Self {
+                block_size,
+                block_duty_cycle: vec![0.0f32; n_blocks],
+            }
+        }
+
+        pub fn n_blocks(&self, n_units: usize) -> usize {
+            n_units.div_ceil(self.block_size)
+        }
+
+        /// Extend `block_duty_cycle` for newly created blocks after `n_units` grows.
+        /// New blocks start at duty-cycle 0 — same convention `grow_region` uses for new
+        /// units' entries in the per-unit `duty_cycle` vector (region.rs / lib.rs).
+        pub fn grow(&mut self, new_n_units: usize) {
+            let want = self.n_blocks(new_n_units);
+            if want > self.block_duty_cycle.len() {
+                self.block_duty_cycle.resize(want, 0.0);
+            }
+        }
+    }
+
+    fn block_bounds(block: usize, block_size: usize, n: usize) -> (usize, usize) {
+        let start = block * block_size;
+        let end = ((block + 1) * block_size).min(n);
+        (start, end)
+    }
+
+    /// Two-stage selection: coarse per-block scoring (mean activation + block-level
+    /// duty-cycle boost) picks `n_blocks_select` blocks, then exact top-k runs within each
+    /// selected block only, with `k_active` split across selected blocks proportional to
+    /// block size (largest-remainder method, so the total is always exactly `k_active`
+    /// when the selected blocks have that much capacity).
+    ///
+    /// Returns `(index, raw z value)` pairs sorted by index, mirroring `select_top_k`'s
+    /// output shape so it's a drop-in comparison target.
+    pub fn select_top_k_block_local(
+        z_vec: &[f32],
+        unit_duty_cycle: &mut [f32],
+        block_state: &mut BlockState,
+        k_active: usize,
+        n_blocks_select: usize,
+    ) -> Vec<(u16, f32)> {
+        let n = z_vec.len();
+        let block_size = block_state.block_size;
+        let n_blocks = block_state.n_blocks(n);
+        assert_eq!(
+            block_state.block_duty_cycle.len(),
+            n_blocks,
+            "BlockState not grown to match z_vec's n_units — call grow() first"
+        );
+        let n_blocks_select = n_blocks_select.clamp(1, n_blocks);
+
+        // ── Coarse stage: pick blocks, with a block-level duty-cycle boost so a block
+        // that's rarely chosen doesn't stay permanently invisible to selection. ────────
+        let block_target_dc = n_blocks_select as f32 / n_blocks as f32;
+        let mut block_scores: Vec<(usize, f32)> = (0..n_blocks)
+            .map(|b| {
+                let (start, end) = block_bounds(b, block_size, n);
+                let mean: f32 = z_vec[start..end].iter().sum::<f32>() / (end - start) as f32;
+                let boosted =
+                    mean + BOOST_STRENGTH * (block_target_dc - block_state.block_duty_cycle[b]);
+                (b, boosted)
+            })
+            .collect();
+        let split = n_blocks - n_blocks_select;
+        block_scores.select_nth_unstable_by(split, |a, b| {
+            a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
+        });
+        let mut selected_blocks: Vec<usize> =
+            block_scores[split..].iter().map(|&(b, _)| b).collect();
+        selected_blocks.sort_unstable();
+
+        for dc in block_state.block_duty_cycle.iter_mut() {
+            *dc *= 1.0 - DUTY_CYCLE_ALPHA;
+        }
+        for &b in &selected_blocks {
+            block_state.block_duty_cycle[b] += DUTY_CYCLE_ALPHA;
+        }
+
+        // ── Split k_active across selected blocks, proportional to block size. ─────────
+        let selected_total_len: usize = selected_blocks
+            .iter()
+            .map(|&b| {
+                let (s, e) = block_bounds(b, block_size, n);
+                e - s
+            })
+            .sum();
+        let k_active = k_active.min(selected_total_len);
+
+        let mut quota: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut remainders: Vec<(usize, f32)> = Vec::with_capacity(selected_blocks.len());
+        let mut assigned = 0usize;
+        for &b in &selected_blocks {
+            let (s, e) = block_bounds(b, block_size, n);
+            let len = e - s;
+            let exact = k_active as f32 * len as f32 / selected_total_len as f32;
+            let floor = exact.floor() as usize;
+            quota.insert(b, floor);
+            remainders.push((b, exact - floor as f32));
+            assigned += floor;
+        }
+        remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        let mut leftover = k_active - assigned;
+        for &(b, _) in &remainders {
+            if leftover == 0 {
+                break;
+            }
+            *quota.get_mut(&b).unwrap() += 1;
+            leftover -= 1;
+        }
+
+        // ── Fine stage: exact top-k within each selected block, using a *per-block*
+        // duty-cycle target (k_b/block_len), not the single global ratio. ──────────────
+        let mut result: Vec<(u16, f32)> = Vec::with_capacity(k_active);
+        for &b in &selected_blocks {
+            let (start, end) = block_bounds(b, block_size, n);
+            let len = end - start;
+            let k_b = quota[&b].min(len);
+            if k_b == 0 {
+                continue;
+            }
+            let target_dc = k_b as f32 / len as f32;
+            let mut boosted: Vec<(usize, f32)> = (start..end)
+                .map(|i| {
+                    (
+                        i,
+                        z_vec[i] + BOOST_STRENGTH * (target_dc - unit_duty_cycle[i]),
+                    )
+                })
+                .collect();
+            let split_b = len - k_b;
+            boosted.select_nth_unstable_by(split_b, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal)
+            });
+            for &(i, _) in &boosted[split_b..] {
+                result.push((i as u16, z_vec[i]));
+            }
+        }
+        result.sort_unstable_by_key(|(i, _)| *i);
+
+        for dc in unit_duty_cycle.iter_mut() {
+            *dc *= 1.0 - DUTY_CYCLE_ALPHA;
+        }
+        for &(i, _) in &result {
+            unit_duty_cycle[i as usize] += DUTY_CYCLE_ALPHA;
+        }
+
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +659,167 @@ mod tests {
         let (idx, val) = act.to_exact_k(2);
         assert_eq!(idx, vec![5, 10]);
         assert_eq!(val, vec![1.5, 2.5]);
+    }
+}
+
+/// ADR 0038 prerequisite 3 (gaps.md §42) validation tests for `hierarchical_validation`.
+#[cfg(test)]
+mod hierarchical_validation_tests {
+    use super::hierarchical_validation::{select_top_k_block_local, BlockState};
+    use proptest::prelude::*;
+
+    #[test]
+    fn selects_exactly_k_when_capacity_allows() {
+        let n = 256;
+        let block_size = 32; // 8 blocks
+        let z: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let mut dc = vec![0.0f32; n];
+        let mut bs = BlockState::new(n, block_size);
+        let out = select_top_k_block_local(&z, &mut dc, &mut bs, 20, 4);
+        assert_eq!(out.len(), 20);
+    }
+
+    #[test]
+    fn indices_sorted_unique_and_in_range() {
+        let n = 200; // not a multiple of block_size — exercises the ragged last block
+        let block_size = 32;
+        let z: Vec<f32> = (0..n).map(|i| (i * 37 % 199) as f32).collect();
+        let mut dc = vec![0.0f32; n];
+        let mut bs = BlockState::new(n, block_size);
+        let out = select_top_k_block_local(&z, &mut dc, &mut bs, 15, 3);
+        for w in out.windows(2) {
+            assert!(w[0].0 < w[1].0, "indices not strictly sorted/unique");
+        }
+        for &(i, _) in &out {
+            assert!((i as usize) < n);
+        }
+    }
+
+    #[test]
+    fn unit_duty_cycle_stays_bounded_over_many_rounds() {
+        let n = 512;
+        let block_size = 64;
+        let mut dc = vec![0.0f32; n];
+        let mut bs = BlockState::new(n, block_size);
+        for round in 0..2000u32 {
+            // Deterministic pseudo-random z so different units win across rounds.
+            let z: Vec<f32> = (0..n)
+                .map(|i| (((i as u32).wrapping_mul(2654435761).wrapping_add(round)) % 1000) as f32)
+                .collect();
+            let _ = select_top_k_block_local(&z, &mut dc, &mut bs, 20, 4);
+        }
+        // Boosted-selection duty cycle is a decaying EWMA of "was selected" (0/1 per round,
+        // decay factor DUTY_CYCLE_ALPHA) — same bound select_top_k's global duty_cycle
+        // relies on. It must never runs away past 1 (a unit selected every single round
+        // converges to exactly the target, not beyond).
+        for &d in &dc {
+            assert!(
+                (0.0..=1.0).contains(&d),
+                "unit duty cycle out of bounds: {d}"
+            );
+        }
+        for &d in &bs.block_duty_cycle {
+            assert!(
+                (0.0..=1.0).contains(&d),
+                "block duty cycle out of bounds: {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn chronically_low_scoring_block_is_not_permanently_starved() {
+        // Block 0 scores modestly below every other block on raw z (a realistic
+        // duty-cycle-fairness gap — comparable to the scale of the boost itself, ~0.5
+        // at most here). Without a block-level duty-cycle boost (the fix this module
+        // adds vs. a naive port of select_top_k's per-unit-only boosting), block 0 would
+        // never be chosen no matter how long the loop runs — that's the ADR 0038
+        // "Consequences" starvation risk this test exists to catch a regression of.
+        //
+        // Note this is a *bounded* correction, same as select_top_k's existing per-unit
+        // boost: it can resolve fairness among units/blocks whose raw-score gap is within
+        // BOOST_STRENGTH * target_dc, not rescue a block that's arbitrarily far behind —
+        // that bound is inherent to duty-cycle boosting in general, not specific to going
+        // block-local, and is exactly the kind of thing prerequisite 3 is meant to surface.
+        let n = 256;
+        let block_size = 32; // 8 blocks, block 0 is the cold one
+        let mut dc = vec![0.0f32; n];
+        let mut bs = BlockState::new(n, block_size);
+        // DUTY_CYCLE_ALPHA=1/1000 (same constant as production `select_top_k`) means
+        // duty-cycle fairness operates on a ~1000+ round timescale, matching how it's
+        // actually used in production (thousands of ingest events per region, not a
+        // handful) — this loop has to run long enough to see the correction, not just
+        // a handful of rounds.
+        let mut block0_selected_count = 0u32;
+        for round in 0..4000u32 {
+            let mut z: Vec<f32> = (0..n)
+                .map(|i| ((((i as u32).wrapping_mul(97).wrapping_add(round)) % 50) as f32) / 100.0)
+                .collect();
+            for v in z.iter_mut().take(block_size) {
+                *v -= 0.3; // block 0 consistently scores below the others, but not by an
+                           // unrecoverable margin
+            }
+            let out = select_top_k_block_local(&z, &mut dc, &mut bs, 20, 4);
+            if out.iter().any(|&(i, _)| (i as usize) < block_size) {
+                block0_selected_count += 1;
+            }
+        }
+        assert!(
+            block0_selected_count > 0,
+            "block 0 was never selected across 4000 rounds — starvation regression"
+        );
+    }
+
+    #[test]
+    fn newly_grown_units_are_immediately_eligible() {
+        // Mirrors what grow_region/grow_region_seeded (lib.rs) do to a layer's bookkeeping:
+        // append units, extend duty-cycle with zeros, and here also grow the block state.
+        // A newly grown unit must be able to win a block-local selection in the very next
+        // call, same as select_top_k's global competition guarantees today.
+        let n0 = 64;
+        let block_size = 32;
+        let mut dc = vec![0.0f32; n0];
+        let mut bs = BlockState::new(n0, block_size);
+
+        let n1 = 96; // +1 block of new units
+        dc.resize(n1, 0.0);
+        bs.grow(n1);
+        assert_eq!(bs.block_duty_cycle.len(), 3);
+
+        // New block's units score far above everything else — must be selectable.
+        let mut z = vec![0.0f32; n1];
+        for v in z.iter_mut().skip(n0) {
+            *v = 1000.0;
+        }
+        let out = select_top_k_block_local(&z, &mut dc, &mut bs, 8, 1);
+        assert!(
+            out.iter().any(|&(i, _)| (i as usize) >= n0),
+            "newly grown unit was not selectable immediately after growth"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn selection_never_exceeds_k_and_stays_in_range(
+            n in 32usize..300,
+            block_size in 8usize..64,
+            k in 1usize..40,
+            n_blocks_select in 1usize..20,
+            seed in 0u32..10_000,
+        ) {
+            let z: Vec<f32> = (0..n)
+                .map(|i| (((i as u32).wrapping_mul(2654435761).wrapping_add(seed)) % 997) as f32)
+                .collect();
+            let mut dc = vec![0.0f32; n];
+            let mut bs = BlockState::new(n, block_size);
+            let out = select_top_k_block_local(&z, &mut dc, &mut bs, k, n_blocks_select);
+
+            prop_assert!(out.len() <= k);
+            for w in out.windows(2) {
+                prop_assert!(w[0].0 < w[1].0);
+            }
+            for &(i, _) in &out {
+                prop_assert!((i as usize) < n);
+            }
+        }
     }
 }
