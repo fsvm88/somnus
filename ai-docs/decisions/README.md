@@ -88,3 +88,8 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0039](0039-unified-metrics-instrumentation.md) | Unified two-tier metrics instrumentation (`somnus-metrics`) | implemented |
 | [0040](0040-sparse-gather-binding-projection.md) | Sparse-gather binding projection (ONNX/MIGraphX) | implemented, deployed live |
 | [0041](0041-live-episode-binding-training.md) | Live-episode binding training in NREM (close the §33 never-trained-binding gap) | implemented; not adopted — 3 failed pilots (engineering-log.md §35/§36/§44) |
+| [0042](0042-batchtopk-sae.md) | BatchTopK SAE (batch-quantile k-WTA selection for NREM training) | accepted, deployed, default on |
+| [0043](0043-nrem-replay-ratio.md) | NREM replay ratio raised to N=4 | accepted, shipped as default |
+| [0044](0044-derpp-stale-blocking-and-auto-lambda.md) | DER++: stale-output blocking (adopted) and auto-λ loss weighting (rejected) | mixed — stale-output blocking shipped; auto-λ closed/FAIL |
+| [0045](0045-dinov3-visual-encoder.md) | Adopt DINOv3-ViT-S as the visual encoder; drop DINOv2-S/14 | implemented |
+| [0046](0046-audio-env-encoder-candidates.md) | Audio env encoder candidates surveyed: CLAP-HTSAT retained | closed — status quo confirmed |
