@@ -1,8 +1,8 @@
 # Engineering log (archive)
 
-> **Contents:** Every gaps.md item that has reached a decision — accepted/deployed/adopted, or rejected/not-pursued/null-result. Moved here verbatim (2026-08-15) so `gaps.md` holds only open items. Section numbers (`§N`) are unchanged from their original assignment in gaps.md — external docs cite them as `engineering-log.md §N`.
-> **When to read:** Historical record of what was tried, what won, what lost, and why. Not a to-do list.
-> **Relationship to ADRs:** where an ADR exists for an item, the ADR is the canonical long-form record; this file keeps the gaps-native write-up (pilot numbers, A/B tables, correction trail) that doesn't all live in the ADR.
+> **Contents:** Bug fixes, pilot/A-B numeric results, campaign narratives, and other non-decision history from resolved `gaps.md` items. **Decisions live in `ai-docs/decisions/` (ADRs) — where an ADR exists for an item, the ADR is the canonical record of *why*; this file is not it.** Sections with an ADR are trimmed to a pointer plus whatever numeric/debugging detail doesn't fit an ADR's format (raw A/B tables, root-cause trails, per-cycle deviations). Sections with no ADR (bug fixes, test-coverage pushes, campaign milestones, mechanisms not yet defaulted) keep their full write-up here, since this file is their only record.
+> **When to read:** Looking up what a pilot actually measured, how a bug was root-caused, or campaign history. For *why a decision was made*, read the ADR first.
+> **Numbering:** section numbers (`§N`) are unchanged from their original assignment in `gaps.md` — external docs cite them as `engineering-log.md §N`. Do not renumber.
 > **Promoted remainders:** a few closed-header sections had an open tail that didn't belong in an archive. Those tails were split out and now live in `gaps.md` under new numbers — noted inline at the point of the split (§5 → §38/§39/§40; §13 → §41; §25/§28/§29 → §42; §37 → collapsed into §38/§39).
 
 ---
@@ -13,90 +13,45 @@
 
 ---
 
-## 1. Algorithm: BatchTopK SAE ✅ DEPLOYED
+## 1. Algorithm: BatchTopK SAE ✅ DEPLOYED — see ADR 0042
 
-**Source:** Bussmann et al., arXiv:2412.06410, Dec 2024. A/B PASS (commit 25d7496); default in all NREM training.
-
-**What:** Batch-level quantile threshold instead of per-sample hard top-k — one scalar τ per batch so the *average* active-feature count equals k; individual samples may use k±δ. Pure L2 reconstruction loss, no L1 (our L1 SAE experiment, ADR 0025 λ=0.1, hurt MSE +27% and was closed — BatchTopK is structurally different, not a retry).
-
-**Implementation:** `KWtaLayer::forward_tracked_batch(batch_topk: bool)`. Snapshot duty-cycle → boosted values → single τ via `select_nth_unstable` on the flattened batch → apply to all. Inference unchanged (per-sample top-k). `--batch-topk` flag, default false.
+Decision, alternatives, and current-code verification: `decisions/0042-batchtopk-sae.md`. Landed in two commits — `81b64c7` (opt-in, default false) then `0eca914` (flipped both defaults to true after the A/B passed). A/B: commit `0eca914`'s message records PASS, +3.6% MSE within pre-stated tolerance (the log previously cited commit `25d7496` for this result; that hash no longer resolves in repo history — `0eca914` is the surviving record).
 
 ---
 
-## 2. Algorithm: High replay ratio ✅ ADOPTED (N=4, 2026-07-06)
+## 2. Algorithm: High replay ratio ✅ ADOPTED (N=4, 2026-07-06) — see ADR 0043
 
-**Source:** arXiv:2505.12512, May 2025 — replay ratio 4-8× improves consolidation with no degradation.
-
-**Bug found first:** `train_campaign.sh` hardcoded `--nrem-replay-epochs 4` regardless of `EXTRA_ARGS`, so the prior A/B (2026-06-27) compared N=4 vs N=4 — meaningless. Fixed via a `REPLAY_EPOCHS` env var (default 1, matching the CLI default), set explicitly per arm.
-
-**Result:** 5 sessions × 2 cycles, fresh memory both arms, h3h3/shorts corpus. `mean_output_mse` control 0.2379 vs N=4 0.0693 (**-70.9%**), consistent, no reversals, all 5 regions improve monotonically both arms.
-
-**N=2 arm (cost/benefit knee):**
-
-| N | avg mean_output_mse | Δ vs N=1 | wall-clock Δ |
-|---|---|---|---|
-| 1 | 0.2379 | — | — |
-| 2 | 0.1211 | -49.1% | +7.6% |
-| 4 | 0.0693 | -70.9% | +16.6% |
-
-N=2 is more cost-efficient (~6.5% error reduction/1% wall-clock vs N=4's ~4.3%), but **N=4 adopted** — the absolute wall-clock tax (+16.6%) was judged small enough to pay for the larger absolute gain. CLI default and `train_campaign.sh` both flipped 1→4.
+Decision, full N=1/2/4 table, and the N=2 cost-efficiency trade-off: `decisions/0043-nrem-replay-ratio.md`. **Bug found first:** `train_campaign.sh` hardcoded `--nrem-replay-epochs 4` regardless of `EXTRA_ARGS`, so the prior A/B (2026-06-27) compared N=4 vs N=4 — meaningless. Fixed via a `REPLAY_EPOCHS` env var, set explicitly per arm, before the real A/B in the ADR ran.
 
 ---
 
-## 3. Algorithm: DER++ auto-λ + stale-output blocking
+## 3. Algorithm: DER++ auto-λ + stale-output blocking — see ADR 0044
 
-**Source:** Kobayashi 2025, arXiv:2504.20932.
-
-1. **Stale-output blocking ✅ IMPLEMENTED** (65ceaf7): per-batch inference + cosine check (threshold 0.90) skips buffered samples whose stored outputs drifted under distribution shift, before training. Tracked in `SleepStats.stale_traces_skipped`.
-2. **Auto-λ ❌ REJECTED** (2026-07-08, opt-in only, default off): `fused_replay_wake_step_batch` combined `sae_loss`+`wake_loss` as an unweighted sum (implicit λ=1). `--der-auto-lambda` (f2fd185) instead tracks an EWMA (α=0.05) mean/variance of `wake_loss` and weights it by `1/variance` (clamped [0.1, 10.0]). **A/B FAIL:** control avg 0.0487 vs treatment 0.0847 (**+73.8%**), regressed 10/10 cycles (+16% to +937%), no reversals — likely early-EWMA-variance noise causing destabilizing weight spikes. Not adopted; test `der_auto_lambda_stays_finite_and_loss_decreases` stays as a finiteness guard only. Not planned to revisit without a different variance estimator (windowed, or a min-sample floor).
-
-**Implementation:** `PerceptionProcessor.infer_episode_outputs()` infers current predictions; NREM loop compares vs. stored regionals via cosine, filters, trains/projects the survivors.
+Both sub-decisions (stale-output blocking adopted; auto-λ rejected after A/B, +73.8% worse, 10/10 cycles regressed) and full rationale: `decisions/0044-derpp-stale-blocking-and-auto-lambda.md`.
 
 ---
 
 ## 5. LLM: Qwen3-0.6B ✅ ADOPTED (2026-07-05, ADR 0036) — Qwen2.5 dropped
 
-**Source:** Qwen team, April 2025, `Qwen/Qwen3-0.6B`. 600M params, hidden 1024 (Qwen2.5-0.5B: 896), MMLU 70.0 vs ~47.
+Decision, consequences, and final generation-quality confirmation: `decisions/0036-adopt-qwen3-drop-qwen25.md`. Full A/B detail: `a_b_qwen3_findings.md`.
 
-Sole action-decoder LM; `LM_HIDDEN`/`LANG_HIDDEN`/`LANG_DIM`/`EOS_TOKEN_ID` hardcoded to Qwen3, cross-modal projection fixed at 2304. Detail: `a_b_qwen3_findings.md`, ADR 0036.
-
-**Path to adoption:** an initial A/B (2026-06-28) was invalid (a hardcoded 896-wide embed table sliced at stride 1024, corrupting embeddings both arms). Fixing it surfaced two more bugs (Qwen3 loaded into the wrong model class; ~6 more hardcoded language dims disagreeing). Re-run on stock 4-clip corpus was inconclusive (too little speech). Re-run on speech-dense `clips/long/`: Qwen3 beat Qwen2.5 on `mean_proj_loss` by ~22%, no reversals; a direct `generate()` comparison confirmed coherent English vs. Qwen2.5's token garbage. Adopted on both.
-
-**Metrics per cycle:** `output_mse`, `p_lang`, `proj_loss`, regional activation stats, episode counts.
+**Path to adoption (bug trail, not in the ADR):** an initial A/B (2026-06-28) was invalid — a hardcoded 896-wide embed table sliced at stride 1024, corrupting embeddings both arms. Fixing it surfaced two more bugs: Qwen3 loaded into the wrong model class, and ~6 more hardcoded language dims disagreeing. Re-run on the stock 4-clip corpus was inconclusive (too little speech); re-run on speech-dense `clips/long/` gave the ~22% `mean_proj_loss` win the ADR reports.
 
 > **Open remainders split out 2026-08-15:** the adoption above is fully decided and closed. Three things it surfaced stayed open and now live in `gaps.md`: KV-cache split generation incomplete for Qwen3 (§38), LoRA fine-tuning never run for Qwen3 (§39), Whisper `decode_greedy` panic root-cause undiagnosed (§40).
 
 ---
 
-## 6. Visual encoder: DINOv3-ViT-S ✅ VALIDATED & ADOPTED (2026-07-05)
+## 6. Visual encoder: DINOv3-ViT-S ✅ VALIDATED & ADOPTED (2026-07-05) — see ADR 0045
 
-**Source:** Meta, Aug 2025, arXiv:2508.10104. ~21M params (= DINOv2-S), output dim 384 (true drop-in). ImageNet linear probe 81.40% vs DINOv2-S 81.1%.
-
-**MIGraphX fix:** the earlier "CPU backend can't compile DINOv3's attention graph" conclusion was wrong — misread error. Root cause: `torch.onnx.export` wrote external-data format (weights in a sibling `.data` file); the MIGraphX EP resolves that path relative to **process CWD**, not the model's directory, so running outside `models/` failed with an opaque error. Fixed: `export_models.py`'s `export_dinov3()` re-packs with embedded weights (matches DINOv2's layout), no CWD dependency.
-
-**Shape difference (not a bug):** DINOv3-ViT-S/16 outputs `[1,201,384]` (CLS + 4 register tokens + 196 patches) vs DINOv2-S/14's `[1,257,384]` (CLS + 256 patches). `VideoEncoder` now tracks `prefix_tokens`/`total_tokens` per model instead of hardcoding "skip 1, pool 256."
-
-**A/B (2026-07-05, `a_b_dinov3_findings.md`):** visual-region MSE -95.6% (2.183→0.097), `warm_recall_l2` +61.5%, no change to unrelated regions — clean, large, correctly-localized win. Already the active encoder.
+Decision, the MIGraphX misdiagnosis (a CWD-relative external-data path bug misread as an attention-graph incompatibility), the shape-handling fix, and the full A/B table: `decisions/0045-dinov3-visual-encoder.md`. Full A/B write-up: `a_b_dinov3_findings.md`.
 
 ---
 
-## 8. Audio env encoder: M2D-CLAP ⏸️ NOT PURSUED (2026-07-09)
+## 8. Audio env encoder: M2D-CLAP ⏸️ NOT PURSUED (2026-07-09) — see ADR 0046
 
-**Source:** NTT, March 2025, arXiv:2503.22104, `nttcslab/m2d`. ~86M (ViT-B), AudioSet linear-probe mAP 49.0 vs CLAP-HTSAT ~45-46 (+3 mAP). 768-dim (up from 512).
+## 9. Audio env encoder: EfficientAT-mn10 ❌ REJECTED (2026-07-09) — see ADR 0046
 
-**Feasibility research only, decision not pursued:** weights available, no gate. But no ONNX export precedent exists anywhere (dynamic positional-embedding interpolation, `nnAudio` STFT frontend — same fragility class mn10/item 9 was chosen to avoid); license is NTT's non-commercial custom "Evaluation" agreement, not MIT/Apache. Expected gain small relative to that risk — item 9's A/B is a concrete precedent that paper-benchmark quality and somnus-pipeline quality diverge here (mn10 had no quality claim and still regressed MSE +155.6% while a benchmark-adjacent metric moved the "wrong" way). Not implemented. Revisit only if an ONNX export appears elsewhere or CLAP-HTSAT becomes a bottleneck worth the risk.
-
----
-
-## 9. Audio env encoder: EfficientAT-mn10 ❌ REJECTED (2026-07-09)
-
-**Source:** `fschmid56/EfficientAT`. ~5-20M params (MobileNetV3, width_mult=1.0), pure CNN, no attention/ScatterElements.
-
-**Implementation (kept, opt-in):** `Mn10Mel` (`somnus-encoding/src/preprocess/mel.rs`) — Rust port of `AugmentMelSTFT`'s Kaldi-style filterbank, parity-tested at 1e-4. `export_efficientat.py` exports only the MobileNetV3 backbone (mel frontend excluded to avoid reintroducing an STFT op), verified rel L2 ~9e-7, zero STFT ops. New opt-in `mn10_env` Cargo feature: `REGION_DIMS[1]` 512→960, env encoder session/mel/rate (CLAP 48kHz vs mn10 32kHz).
-
-**A/B (5 sessions × 2 cycles, fresh memory, h3h3/shorts):** region-1 MSE isn't a valid cross-arm comparison (different target distributions — CLAP contrastive/unit-norm vs mn10 raw log-mel). Verdict from the other 4 regions (identical architecture both arms): control (CLAP-HTSAT) avg 0.011966 vs treatment (mn10) 0.030588, **+155.6% worse**, 9/10 cycles regressed, no reversals. `warm_recall_l2`/`gist_recall_rate` moved in mn10's favor (+52.6%/+30.7%) but don't override a 2.5× MSE regression — likely a scale-distortion artifact.
-
-**Decision: REJECT.** Default stays CLAP-HTSAT. `mn10_env` kept as opt-in (clean, parity-tested, may suit deployment-size constraints later, or if M2D-CLAP also fails).
+Both candidates, the feasibility/licensing analysis, the full A/B table, and the paper-benchmark-vs-pipeline-quality divergence point: `decisions/0046-audio-env-encoder-candidates.md`.
 
 ---
 
@@ -196,21 +151,15 @@ Checked whether somnus's 21 growable weight matrices (region encoders, cross-mod
 
 ---
 
-## 22. Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover ✅ DONE (2026-07-12)
+## 22. Auto-enable ORT/MIGraphX perception inference past the CPU/GPU crossover ✅ DONE (2026-07-12) — see ADR 0037
 
-**User question** ("onnx=off — any impact?") led to real numbers from `metrics.jsonl`: `perception_total_ms` climbing with region size (9.1s at 1,986 units → 16.1s at 6,043), already over half of cycle wall-clock, past ADR 0023's ~1,230-units/region crossover — the opt-in `--onnx-models-dir` flag was costing real wall-clock for no reason.
-
-**Decision (ADR 0037):** auto-enable ORT/MIGraphX once any region crosses `--onnx-crossover-units` (default 1,230) instead of requiring the flag. One-directional, sticky failure handling (WARN once, stay CPU for process life), `--force-cpu-inference` opt-out. New tested `should_use_ort_inference()`.
-
-**Surfaced two pre-existing bugs in `export_perception_graph.py`** (neither caused by this change, just never exercised past the crossover since Qwen3): stale hardcoded language dim (896 vs Qwen3's 1024), and hardcoded N_UNITS/K_ACTIVE that couldn't survive growth; `--validate-numpy`'s synthetic generator never created `W_cross_bias`. Fixed by deriving dims from actual exported weight shapes (`infer_dims()`) and adding the missing bias generator. Verified: `--validate-numpy` passes (ep=6.64e-09), a real export against a campaign-weight copy (6,397 units/region) loaded through MIGraphX, `perception_total_ms=7,735` vs. the live CPU-only campaign's 16,051 at comparable size — **~2.1× faster** (later invalidated, see §24 correction below).
-
-**Deferred:** eliminating the Python export step via native Rust ONNX construction — no mature crate exists, real hand-rolled-protobuf effort. Tracked as `gaps.md` §23 (still open).
-
-> **⚠️ CORRECTION (§24): the "~2.1×/2.4×" speedup above is invalid** — `to_dense_n(N_UNITS)` used the hardcoded baseline constant, not each region's grown size, so every ORT call silently failed and fell back to burn/CPU for the campaign's entire ORT-active history. The verification run and the campaign's own post-restart cycles were almost certainly both hitting silent fallback — no genuine accelerated ORT call was ever observed at this point. Fix and real numbers: §24.
+Decision, the two prerequisite bugs fixed in `export_perception_graph.py`, and the full correction trail (the initial "~2.1×" measurement was invalid — see §24): `decisions/0037-auto-onnx-perception-inference.md`, which already carries this correction inline. **Deferred:** eliminating the Python export step via native Rust ONNX construction — no mature crate exists; tracked as `gaps.md` §23 (still open).
 
 ---
 
 ## 24. ORT sparse→dense conversion hardcodes baseline N_UNITS ✅ FIXED (2026-07-13)
+
+This bug (and its fix) is the correction referenced inline in `decisions/0037-auto-onnx-perception-inference.md` — that ADR has the final confirmed ~3-4× speedup number; this section keeps the root-cause/debugging trail.
 
 **Found before a routine shutdown check:** `perception_total_ms` had spiked to 188,000-196,000ms/cycle (vs §22's ~6,500-7,700ms), recall metrics collapsing. Log grep: **102,810 occurrences** of "ORT encoder/binding failed, falling back to burn" across session 57's entire runtime — present since session 56 (ORT's very first activation), not a later regression.
 
@@ -244,22 +193,7 @@ Checked whether somnus's 21 growable weight matrices (region encoders, cross-mod
 
 ## §26 — Unified two-tier metrics instrumentation (`somnus-metrics`, ADR 0039)
 
-Raised while scoping ADR 0038's Phase 0. No shared timing mechanism existed — every call site hand-rolled `Instant::now()`/`.elapsed()`.
-
-1. **Fine-grained gated counters:** new crate `somnus-metrics` — `Metric` enum (dense-array-over-enum, mirrors `RegionId::as_index()`), atomic `Registry`, `timed!`/`counted!` macros behind `fine-metrics` (default off, zero-cost when disabled — bare passthrough). Piloted on `somnus-perception`'s 6 ingest phases + new `KwtaScoreMatmul`/`KwtaSelectTopK` sub-breakdown counters (reopens ADR 0038's benchmarking prerequisite via live traffic).
-2. **Full conversion — "one way of doing metrics."** Added an unconditional Core tier (`timed_core!`/`counted_core!`) and converted every hand-rolled site: `somnus-perception` (6 phases), `sleep.rs` (11 phases — 8 via macro block-wrap, 3 structurally-entangled spans via direct `METRICS.record()`, documented exception), `somnus-encoding` (3 encoder timers), `main.rs` (4 sites). Found/fixed 2 duplicate-measurement bugs (main.rs re-timing calls `somnus-encoding` already timed). All pre-existing JSON fields unchanged; new `"fine_metrics"` key carries the registry snapshot.
-
-**Verified:** both feature states clean (5 new `somnus-metrics` tests). Two pilot runs cross-checked old-field vs. registry values (within truncation noise), confirmed `kwta_score_matmul` dominates `kwta_select_topk` ~124-165× at baseline scale (early evidence for ADR 0038, not yet campaign scale).
-
-**Follow-up (same session): full-coverage expansion.** 3-way parallel inventory of every remaining uninstrumented op → `Metric` 24→67 variants: somnus-perception +25 (binding forward, ORT run_encoder/run_binding, fused-replay sub-phases, ORT lifecycle, growth/prune, REM self-probes, EMA sub-steps, refresh_autodiff_state, wake_worker::train_step), somnus-memory +10 (cold open/truncate/evict, semantic warm-load, recollection promote, snapshot save/load), somnus-sensory +1 (aggregate `MediaFileDecode`), somnus binary +7 (action-decoder init/generate, gain-worker, ASR decode, audio resample, language embedding, record_episode). Two new patterns (ADR 0039): private-`_inner`-method split, immediately-invoked-closure wrap. Verified incrementally; live pilot recorded 40 metrics simultaneously, cross-thread ones safe, untriggered conditions correctly stayed zero.
-
-**Follow-up (2026-07-15): value/count metrics.** All 67 were duration-based — added 7 `counted_core!`/`counted!` sites (COUNT 67→74): `region_n_units`/`region_k_active` (per growth/prune event), `cold_archive_evicted_records`, `video_frames_encoded`/`_skipped`, `refresh_language_cache_run`/`_skipped`. Verified; 4/7 fired in a 2-session pilot, 3 conditional ones correctly absent.
-
-**Follow-up (2026-07-15): operational health.** GPU/ORT degradation, resource exhaustion, failure visibility ahead of a long unattended run. COUNT 74→99: `ort_encoder_fallback`/`ort_binding_fallback`/`ort_session_init_failed`/`ort_session_rebuild_failed`; `process_rss_bytes`/`memory_dir_disk_free_bytes` (per-cycle sampling); `growth_batch_size`; 13 grouped failure counters covering every recurring warn!/error! site (`perception_ingest_error` flagged highest-value — means real data loss); disk I/O byte counters (`semantic_store_dump`/`_bytes` found `dump()` itself untimed — fixed in passing). The one gap `somnus-metrics` can't capture (the MIGraphX destructor-race segfault, exit 139, happens during teardown after metrics write) now recorded shell-side: `train_campaign.sh` appends `segfault_restarts.jsonl`, displayed by `campaign_status.py`. Verified; live pilot confirmed 7 new metrics with plausible values (RSS ~11GB, disk-free ~916GB).
-
-**Follow-up (2026-07-15): correctness audit.** Verified prior rounds sound; fixed 2 gaps: added `training_nan_detected` (no prior NaN/Inf check before writing loss/MSE to JSON, COUNT 99→100); added `summarize_failure_counters()` to `campaign_status.py`'s health section (round-2 counters were recorded but never displayed). Verified both feature states + a hand-crafted fixture.
-
-**Note (2026-08-15):** ADR 0041 (§33/§35/§36) added 2 more metrics, `Metric::COUNT` 100→102, confirmed live in code.
+Raised while scoping ADR 0038's Phase 0 (no shared timing mechanism existed — every call site hand-rolled `Instant::now()`/`.elapsed()`). Decision, full coverage-expansion history (`Metric` 24→102 variants across 5 follow-up rounds), and the two-tier Core/Fine policy that's now standing project policy: `decisions/0039-unified-metrics-instrumentation.md` — its update blocks already carry this section's detail verbatim, this pointer avoids maintaining two copies.
 
 ---
 
@@ -275,41 +209,19 @@ The new `SleepWarmRebuild` Core metric (§26) immediately surfaced a large invis
 
 ## §28 — ADR 0038 prerequisite 1: exported encoder graph + live scoring cost
 
-**The exported ONNX encoder graph has the identical dense cost** — one `MatMul` per region, no top-k/gating before it, same `O(d_input×n_units)` as `burn`'s path. Switching backends didn't change the scaling law.
-
-**But live cost is small and not dominant.** `OrtRunEncoder` (Core metric): ~0.85-1.8ms/call (mean ~1.28ms, 1,585 calls) at ~9,400-9,493 units/region. `OrtRunBinding` costs 2-3× more per call at the same scale. Encoder+binding together are 28-73% of `perception_total_ms` (wide variance likely from ASR/video decode contention). **Correction (§30, 2026-08-12):** the "region-count-independent GRU+attention" framing undercounted — a dense region-projection matmul was actually 75-76% of `OrtRunBinding`'s cost, since fixed (54-59% reduction).
-
-**Bearing on ADR 0038:** evidence *for* "ORT/GPU already absorbs wasted FLOPs" at current scale — 1.28ms doesn't need rescuing in a ~1-3s wake loop. Doesn't resolve whether that holds after another 10x (a mouse-order jump would scale the encoder ~10x to ~10-18ms/call while binding stays flat). Prerequisite answered; see §29 for prerequisite 2, and `gaps.md` §42 for prerequisite 3 (still open). No code changes.
-
----
+Full detail (measured `OrtRunEncoder`/`OrtRunBinding` costs, the §30 correction to the "region-count-independent" framing) now lives in `decisions/0038-sparse-encoder-scoring.md`'s own "Prerequisites" section — that ADR already quotes this section verbatim. See `gaps.md` §42 for prerequisite 3 (still open).
 
 ## §29 — ADR 0038 prerequisite 2: does this matter at the targeted scale?
 
-**Stated target is honeybee-order, not mouse-order** (§16: ~9,660 units/region, explicitly not the ~400x mouse jump). No roadmap item exists past the current campaign. Combined with §28 (encoder cost small, not dominant at honeybee scale): **prerequisite 2 resolves negative — hierarchical WTA isn't worth building for the campaign actually running.**
-
-**"Doesn't matter yet," not "wrong direction" — ADR stays `proposed`, not closed** (advisor-caught correction): "no roadmap names mouse-order" ≠ "honeybee-order is a decided ceiling" — `brain-scale-comparison.md` frames the whole project around eventually closing the scale gap via exactly this kind of technique. No code changes.
-
-> **Open remainder split out 2026-08-15:** prerequisite 2's "revisit if the campaign target moves past honeybee-order, or the encoder/binding cost balance shifts back toward the encoder mattering" trigger, plus prerequisite 3 (never started), now live in `gaps.md` §42.
+Same as §28 — full detail (resolves negative at honeybee-order scale, but the ADR stays `proposed`/deferred rather than closed, with an explicit revisit trigger) lives in `decisions/0038-sparse-encoder-scoring.md`.
 
 ---
 
 ## §30 — Sparse-gather binding projection (ONNX/MIGraphX), ADR 0040 — correction to §28/§29
 
-**Correction:** `build_binding_graph` also ran each region's `sp_i[1,n_units]@W_region_i[n_units,D_PROJ]` — a dense matmul that *does* scale with n_units and (per the benchmark below) was the dominant cost inside `OrtRunBinding`, not the GRU+attention §28/§29 attributed it to.
+**Correction:** `build_binding_graph` also ran each region's `sp_i[1,n_units]@W_region_i[n_units,D_PROJ]` — a dense matmul that *does* scale with n_units and was the dominant cost inside `OrtRunBinding` (75-76% at campaign scale), not the GRU+attention §28/§29 attributed it to.
 
-**Implemented the sparse-gather rewrite** (porting §25's burn/CPU fix to ONNX/MIGraphX): `Gather(W_region_i, active_idx_i, axis=0)` + `[1,k]@[k,D_PROJ]` matmul, mathematically identical, reads ~k/n_units of the weight matrix instead of all of it.
-
-**MIGraphX probe: PASS** — `Gather` fed by a runtime int64 index at campaign scale (n=9,660,k=190), max abs diff 1.49e-07. **Found during implementation:** a `Reshape`+matmul combo crashed MIGraphX's `simplify_reshapes` pass (a MIGraphX compiler bug, unrelated to the Gather question) — fixed by declaring the `[1,k]` input directly, no Reshape node.
-
-**Numerical parity: exact** (~1e-8 vs. the deliberately-unrewritten dense `numpy_binding` reference), both CPU and MIGraphX EP, baseline and campaign scale.
-
-**Measured win** (`bench_binding_projection.py`, real MIGraphX EP, n_units=9,660, k_active=189, two reruns): full (dense) 0.856/0.853ms/call → gather 0.393/0.350ms/call — **54-59% reduction** (2.2-2.4× speedup), stable across reruns. This also answers §29's trigger condition (binding got cheaper) — if anything pushes further away from hierarchical-WTA urgency.
-
-**Rust contract change:** `SparseActivation::to_exact_k(k)` (new, pads/truncates to exactly k — covers the `lang_zero` and dense→sparse-tie edge cases). `run_binding` now takes `&[SparseActivation; 5]` directly; a per-region `k_active: [usize;5]` loads once from `weights_manifest.json` (never re-derived from n_units in Rust or Python — the §17/§22/§24 drift class). All 3 `run_binding` call sites in `lib.rs` updated; `binding_only` (burn-only, never ORT) untouched.
-
-**Verified:** affected-crate build/test/clippy/fmt clean (whole-workspace build blocked by an unrelated pre-existing ffmpeg-next mismatch). `ort_grown_region.rs` rewritten for the new fixed-k contract; both integration tests correctly skip against the pre-rewrite on-disk artifact.
-
-**Deployed live same session.** 2-cycle verification leg (session 79): clean rebuild, zero ORT fallback, real **40-59% reduction** in `OrtRunBinding` per-call cost on production traffic (2.15-2.83ms→1.17-1.30ms), including one cycle catching a live growth event with correct re-export. Two unrelated environment blockers fixed along the way (ffmpeg-next/system-ffmpeg version mismatch; `models/` diverged from its symlink target) — neither caused by this change. Full detail: ADR 0040.
+Full write-up (sparse-gather rewrite, MIGraphX probe/compiler-bug workaround, numerical parity, measured 54-59% synthetic / 40-59% live-production win, Rust contract change, deployment trail including two unrelated environment blockers fixed along the way): `decisions/0040-sparse-gather-binding-projection.md` — comprehensive, this section would only duplicate it.
 
 ---
 
@@ -351,42 +263,15 @@ Closed §31's two remaining thin spots. **27 new tests** (somnus-memory 35→47;
 
 ## §35 — ADR 0041 isolated A/B pilot: mechanism validated, §33 fix engages, drift materializes (2026-08-15)
 
-**Setup** (`ab_binding_replay.sh`): trained production state copied per arm (reflink), 1 session × 10 cycles, campaign corpus, both arms `fine-metrics`, sequential. Control: no flag. Treatment: `--binding-replay`.
+Mechanism, verdict, and the corrected mitigation analysis are in `decisions/0041-live-episode-binding-training.md`'s status line and Validation-plan item 2 — not repeated here. **Setup:** `ab_binding_replay.sh`, trained production state copied per arm (reflink), 1 session × 10 cycles, campaign corpus, both arms `fine-metrics`.
 
-**§33 fix engages in production state.** Grown units DO win k-WTA there (unlike synthetic setups — 791 cycles of duty-cycle homeostasis plus corpus diversity rotate them in). Control: grown_nz = 0/8,901 all regions. Treatment: **47-96% of grown rows nonzero** (grown_max 0.04-0.14 vs base mean ~0.19) — the campaign's entire grown product started entering episodes within 10 cycles.
-
-**Mechanism:** `binding_replay_loss` 0.141→0.046 (−67.5%); `nrem_binding_replay` 28 steps @ mean 1.44s/step; control fired neither; 0 NaN; both clean exits.
-
-**Predicted consequence materialized — episode-space drift.** `warm_recall_l2` rises progressively in treatment (0.44→0.89) while control improves (1.29→0.31-0.44); cross-session `gist_recall_rate` collapses to 0.23-0.45 (falling) while control reaches 0.90-0.99; `within_session_gist_rate` improves +13.3% (same-generation recall fine) — the mixed-generation-store fingerprint ADR 0041 named as its flagged risk, not a broken mechanism. The named mitigation (warm-store rebuild from cold) can't be tested in 10 cycles (eviction only starts ~cycle 8 at this ingest rate).
-
-**Cost: the ≪-cycle estimate didn't hold.** 1.44s×~2.8 steps/cycle = +34.5% NREM wall-clock, displacing `traces_replayed` −30%, `blend_count` −64%. Per the ADR's own invalidation clause, a cheaper/fused step variant becomes an adoption prerequisite, not an optimization.
-
-**Other deviations:** growth diverged (10,032 treatment vs 9,925 control), `mean_salience_wake` +34%, `settle_delta_mean` +77%, `mean_output_mse_wake` −21.5% (treatment better during wake), NREM `mean_output_mse` +46.1%, `mean_proj_loss` +24.8%. n=1/arm.
-
-**Verdict:** binding learns ✓ (§33 fix engages beyond the ask), no-regression ✗ (recall regresses via the predicted drift channel). **Not adopted.**
-
-**Correction to the named mitigation:** cold archive (`EpisodeRecord`, SMNCOLD3) stores only the 640-dim episode vector, not regional inputs — "rebuild warm from cold" can only re-index old-generation vectors, not re-form episodes through the new binder. It doesn't actually mitigate the mixing. Real options: (a) accept the one-time turnover tax (~30 cycles at the 200k cap; drift shrinks as the binder converges — loss already fell 67.5% in 10 cycles), (b) a SMNCOLD4 format storing regional inputs (~5× cold bloat, only if (a) proves insufficient), (c) slow the binder's change rate via a step budget.
-
-**Adoption path (queued):** (1) step budget `--binding-replay-steps N`, start N=1. (2) repeat pilot ≥20 cycles, n≥2 if possible; pass = binding learns + grown rows move + cross-session gist stable/recovering + displacement contained. (3) adopt only on a clean repeat, drift monitoring on for the first production leg.
-
-**Step 1 done 2026-08-15** — see §36 for the repeat pilot, which **failed**. Current status (both pilots concluded, no path chosen): `gaps.md` §33.
+**Numeric record (deviations, per the standing A/B instruction):** growth diverged (10,032 treatment vs 9,925 control), `mean_salience_wake` +34%, `settle_delta_mean` +77%, `mean_output_mse_wake` −21.5% (treatment better during wake), NREM `mean_output_mse` +46.1%, `mean_proj_loss` +24.8%. `warm_recall_l2` 0.44→0.89 treatment vs 1.29→0.31-0.44 control; cross-session `gist_recall_rate` collapses to 0.23-0.45 treatment vs 0.90-0.99 control; `within_session_gist_rate` +13.3%. `binding_replay_loss` 0.141→0.046 (−67.5%); `nrem_binding_replay` 28 steps @ mean 1.44s/step (+34.5% NREM wall-clock, `traces_replayed` −30%, `blend_count` −64%). Control: grown_nz = 0/8,901 all regions; treatment: 47-96% of grown rows nonzero (grown_max 0.04-0.14 vs base mean ~0.19). n=1/arm, 0 NaN, both clean exits.
 
 ## §36 — ADR 0041 repeat pilot at `--binding-replay-steps 1`: wall-clock improved, quality got worse (2026-08-15)
 
-**Setup:** same harness, post-§35 production state, CYCLES=20 (vs §35's 10), n=1/arm, both `fine-metrics`. Treatment steps now capped at N=1 (was unbounded, ~2.8/cycle in §35).
+Verdict and interpretation are in `decisions/0041-live-episode-binding-training.md`'s status line and Validation-plan item 4. **Setup:** same harness, post-§35 production state, CYCLES=20 (vs §35's 10), n=1/arm, both `fine-metrics`, treatment steps capped at N=1.
 
-**Wall-clock goal met:** `nrem_wall_ms` **−24.8%** (control 6,784ms/cycle vs treatment 5,099ms) — a real reversal of §35's +34.5%.
-
-**But quality got worse, not better, decomposed per-cycle:**
-1. On the 13/20 cycles where the (rarer, larger) step fired, `mean_output_mse` ran ~**10× control** same-cycle (e.g. cycle 3: 0.0098 vs 0.314). Fewer, bigger steps were more disruptive than §35's smaller, frequent ones, not gentler.
-2. **New failure mode:** 6/20 treatment cycles replayed **zero** traces (vs control's steady 460-512), traced to a salience/settle homeostatic cascade reacting to degraded output (`sal_threshold` +39%, `settle_gate_dynamic` −44%, `settle_iters_sum` +154%, `prior_beta_effective` −41%) — not visible at this magnitude in §35.
-3. Aggregate: `mean_output_mse` +445%, `mean_real_inference_mse` +655%, `gist_recall_rate` −32.5% (comparable order to §35's −53%), `per_region_mse` +20-159% all regions, `blend_count` −52%, `traces_replayed` −58% (worse than §35's −30%). `within_session_gist_rate` still +6.6% (weaker than §35's +13.3%) — drift-not-breakage read holds.
-
-**§33 fix still engages under the cap** (checked directly via `binding_row_norms`, not inferred): control 0/9,089 grown rows nonzero; treatment 30-78% nonzero, `grown_max` 0.029-0.057 (lower than §35's 0.04-0.14, consistent with less total training).
-
-**Verdict — FAIL, worse than §35.** "Binding learning"✓, "grown rows moving"✓, but "gist stable-or-recovering"✗ and "displacement contained"✗ (both worse than §35). n=1/arm, but a 10× same-cycle MSE gap and 6-cycle trace starvation are far past plausible noise.
-
-**What changes:** the hypothesis that capping step *count* would proportionally tame cost and drift was wrong — it decoupled them, trading cost for concentrated-step instability. **Step-count capping abandoned as the lever.** Three untried candidates, no decision yet: (a) reduce step *magnitude* (LR/loss-scale on the term) instead of count, (b) fuse into `fused_replay_wake_step_batch`'s existing optimizer step instead of a separate pass, (c) decouple the salience/settle cascade directly (a control-side clamp on wake-triggering reacting to NREM-quality swings). Current status (no path chosen): `gaps.md` §33.
+**Numeric record:** `nrem_wall_ms` −24.8% (control 6,784ms/cycle vs treatment 5,099ms). On the 13/20 cycles where the step fired, `mean_output_mse` ran ~10× control same-cycle (e.g. cycle 3: 0.0098 vs 0.314). 6/20 treatment cycles replayed zero traces (vs control's steady 460-512) — traced to a salience/settle cascade (`sal_threshold` +39%, `settle_gate_dynamic` −44%, `settle_iters_sum` +154%, `prior_beta_effective` −41%). Aggregate: `mean_output_mse` +445%, `mean_real_inference_mse` +655%, `gist_recall_rate` −32.5%, `per_region_mse` +20-159% all regions, `blend_count` −52%, `traces_replayed` −58%, `within_session_gist_rate` +6.6%. `binding_row_norms`: control 0/9,089 grown rows nonzero; treatment 30-78% nonzero, `grown_max` 0.029-0.057.
 
 ---
 
@@ -421,6 +306,8 @@ The two orphaned-optimization gaps above (§37.3/§37.4, now `gaps.md` §38/§39
 ---
 
 ## §38 — Qwen3 KV-cache generation speedup (ADR 0034) ✅ ACTIVE (2026-08-15)
+
+ADR 0034 now carries this outcome inline (its original write-up was Qwen2.5-only and never mentioned Qwen3 until this fix). This section keeps the full root-cause/debugging trail.
 
 **Was:** `models/qwen3_lm_decode_kv.onnx` never existed; `ActionDecoder::new` fell through to the slow O(n²) `lm_session` path for every `generate()` call since Qwen3 became the sole LM (ADR 0036). Reported blocker: a `torch.export` shape-inference issue in `scripts/export_kv_cache_qwen3.py`'s decode-side export, never revisited after a 2026-06-27 commit noted it and moved on.
 
@@ -471,9 +358,9 @@ Other four regions' `per_region_mse` moved ≤4% either direction. The pattern i
 
 ## §44 — ADR 0041 third pilot: candidate (a), loss-scale reduction — FAIL, worse than either prior pilot (2026-08-15)
 
-**Setup:** `scripts/ab_binding_replay_loss_scale.sh` (new script, `ab_binding_replay.sh` template). New CLI flag `--binding-replay-loss-scale <f32>` (default 1.0, no behavior change) threaded through `lib.rs` → `sleep.rs` → `PerceptionProcessor::binding_replay_step_batch(batch, loss_scale)` → `somnus-perception/src/lib.rs`'s `binding_replay_step_batch_inner`, applied as `loss.mul_scalar(loss_scale)` on the tensor immediately before `.backward()` (the `BindingReplayLoss` metric still records the *unscaled* value, for comparability across different scale settings). Treatment: `--binding-replay --binding-replay-loss-scale 0.1` (step-count cap stays at its default of 1, same as §36 — this pilot isolates the scale variable, not a combination). Control: no flag. 10 cycles, copied trained state, `--features fine-metrics`, same corpus.
+Verdict and interpretation are in `decisions/0041-live-episode-binding-training.md`'s Validation-plan item 5. **Setup:** `scripts/ab_binding_replay_loss_scale.sh` (`ab_binding_replay.sh` template). New `--binding-replay-loss-scale <f32>` flag (default 1.0) scales the loss tensor via `loss.mul_scalar(loss_scale)` immediately before `.backward()` (the `BindingReplayLoss` metric still records the *unscaled* value). Treatment: `--binding-replay --binding-replay-loss-scale 0.1`, step cap at default N=1. Control: no flag. 10 cycles, copied trained state, `fine-metrics`.
 
-**Result: worse than both §35 (unbounded) and §36 (step-count cap alone).**
+**Numeric record:**
 
 | metric | control | treatment (scale=0.1) | delta |
 |---|---|---|---|
@@ -483,10 +370,6 @@ Other four regions' `per_region_mse` moved ≤4% either direction. The pattern i
 | settle_iters_sum / settle_trigger_count | — | — | +39% both |
 | nrem_wall_ms | 6091 | 4917.7 | −19.3% (the only clearly "good" number) |
 
-`nrem_binding_replay` fired 6/10 cycles (matches the step-count cap's expected firing pattern); control-arm leak check clean (zero firings). The same salience/settle cascade signature from §36 reappears (`settle_iters_sum`/`settle_trigger_count` both +39%, `traces_replayed` down ~half) — **but the quality damage is roughly 4x worse than §36's own same-cycle-MSE-blowup finding**, at 10x *lower* gradient magnitude. This is the opposite of the theory candidate (a) was testing (a full-strength update was assumed to be the driver of instability; a 10x-weaker update was expected to at least not make things worse).
-
-**Interpretation — tentative, not confirmed:** a partially-scaled gradient update may leave the binding weights in a worse state than either "no update" or "full update" — nudging grown units' zero-init rows away from zero without enough signal to converge them usefully, effectively adding noise to the binding projection rather than a small, controlled correction. This would mean loss *magnitude* was never the right lever (matching §36's own conclusion about step *count*), and the salience/settle cascade is a structural consequence of live-episode training itself, not a dosage problem — directly pointing at candidate (c) (decouple the cascade at the control-signal level, not the training-step level) as the more principled remaining option, over candidate (b) (fusing into the existing optimizer step, which doesn't address dosage or the cascade either).
-
-**Status: candidate (a) closed, FAIL.** Three of three ADR 0041 adoption attempts (§35 unbounded, §36 step-count cap, §44 loss-scale) have now failed, each for a related but distinct reason. `gaps.md` §33 updated: candidates (a) tried; (b)/(c) still queued, with (c) now the recommended next attempt given the cascade appears to be the common failure thread across all three pilots so far.
+`nrem_binding_replay` fired 6/10 cycles; control-arm leak check clean (zero firings).
 
 ---
