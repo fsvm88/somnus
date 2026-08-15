@@ -47,7 +47,7 @@ except ImportError:
 # ── constants matching action.rs (Item 5: Qwen3-0.6B) ──────────────────────
 EPISODE_DIM = 640
 N_REGIONS = 5
-LM_HIDDEN = 1024  # Qwen3: increased from 1024 (Qwen2.5)
+LM_HIDDEN = 1024  # Qwen3: increased from 896 (Qwen2.5)
 PROJ_HIDDEN = 1024
 
 
@@ -169,8 +169,8 @@ def train(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
     # Frozen embedding table for prefix construction.
-    # Qwen2.5-0.5B ties lm_head and embed_tokens; grab the embedding matrix.
-    embed_weight = model.base_model.model.model.embed_tokens.weight  # [vocab, 1024]
+    # Qwen3-0.6B ties lm_head and embed_tokens; grab the embedding matrix.
+    embed_weight = model.base_model.model.model.embed_tokens.weight  # [vocab, LM_HIDDEN]
 
     model.train()
     global_step = 0
@@ -238,7 +238,7 @@ def train(args):
         export_onnx(merged, tokenizer, args.export_onnx, device)
 
 
-class _Qwen25LMWrapper(torch.nn.Module):
+class _LMWrapper(torch.nn.Module):
     """Mirror of Qwen25LMWrapper in export_models.py — base transformer + lm_head."""
     def __init__(self, m):
         super().__init__()
@@ -285,12 +285,12 @@ def export_onnx(model, tokenizer, onnx_path: str, device):
 
 
 def main():
-    p = argparse.ArgumentParser(description="LoRA fine-tune Qwen2.5-0.5B on episode prefixes")
+    p = argparse.ArgumentParser(description="LoRA fine-tune Qwen3-0.6B on episode prefixes")
     p.add_argument("--training-data", required=True, help="JSONL file from --export-training-data")
     p.add_argument("--proj-weights-dir", required=True, help="Dir with w1.bin / w2.bin from --export-proj-weights")
-    p.add_argument("--model-id", default="Qwen/Qwen2.5-0.5B", help="HuggingFace model id or local path")
-    p.add_argument("--output-dir", default="memory/lora_output", help="Where to save LoRA adapter weights")
-    p.add_argument("--export-onnx", default=None, help="Path to write merged ONNX (e.g. models/qwen25_lm.onnx)")
+    p.add_argument("--model-id", default="Qwen/Qwen3-0.6B", help="HuggingFace model id or local path")
+    p.add_argument("--output-dir", default="memory/lora_output_qwen3", help="Where to save LoRA adapter weights")
+    p.add_argument("--export-onnx", default=None, help="Path to write merged ONNX (e.g. models/qwen3_lm.onnx)")
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--rank", type=int, default=8)
