@@ -90,7 +90,11 @@ This is CLAUDE.md's deferred item **L** — its one-line description ("LoRA fine
 
 ## §40 — Whisper `decode_greedy` intermittent ORT panic: root cause undiagnosed
 
-`decode_greedy` intermittently panics inside ORT ("GetElementType is not implemented"), input-correlated, not yet reproduced on demand. **Mitigated 2026-07-05** via `catch_unwind` in the ASR thread (process survives, cycle's ASR output dropped). **Unverified whether the underlying `Session` gets poisoned** by the panic — i.e. whether recovery is full or degrades to "WARN + drop every cycle" from then on. **Queued 2026-08-14:** first instrument to settle the poisoning question, then capture the exact triggering input before theorizing about ORT internals. No decision on priority yet.
+`decode_greedy` intermittently panics inside ORT ("GetElementType is not implemented"), input-correlated, not yet reproduced on demand. **Mitigated 2026-07-05** via `catch_unwind` in the ASR thread (process survives, cycle's ASR output dropped).
+
+**Instrumented 2026-08-15** (crates/somnus-metrics, crates/somnus/src/lib.rs): `AsrError` (returned `Err`) and the new `AsrPanic` (actual panic) counters are now split — they were previously conflated under one `AsrError` counter, which made root-cause triage from the metrics file alone impossible. Two new Core counters, `AsrPostPanicSuccess`/`AsrPostPanicFailure`, fire on every ASR decode *after* the first `AsrPanic` in a process session — directly answers the open poisoning question (does the `Session` recover fully, or silently degrade) the next time a panic actually fires, without needing to force a reproduction. Note "poisoning" here is not Rust `Mutex` poisoning (no `Mutex` is involved — the `Session` is exclusively owned by the single ASR thread); it means ORT-internal (FFI-side) state possibly left inconsistent after an unwind through `Session::run`. Also added: the panicking input (`encoder_hidden`, the raw Whisper encoder output) is now dumped to `<memory_dir>/asr_panic_captures/panic_input_<ts>.bin` on every panic, so the next occurrence leaves a reproducible input instead of vanishing with the dropped cycle.
+
+**Still open:** the poisoning question itself and the root cause — both need a natural panic recurrence to observe (can't be forced on demand). No decision on priority beyond the instrumentation landing.
 
 ---
 
@@ -121,6 +125,6 @@ ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate 
 | 🔍 §33 | **BindingArea weights never trained** | Med–High | Episode quality / temporal context / grown-unit participation | Decision (b), ADR 0041 implemented; two pilots FAIL (drift+cost, then worse instability); no path chosen among 3 queued candidates |
 | §38 | **Qwen3 KV-cache generation** (ADR 0034 gap) | Low (mechanical, blocked on a `torch.export` issue) | ~7.8× generation speedup, currently inactive | Not attempted; needs a priority decision |
 | §39 | **Qwen3 LoRA fine-tuning** (ADR 0033 follow-on) | Med (a campaign run) | Generation grounded in somnus's own distribution | Blocked infra never run; needs a priority decision |
-| §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); poisoning question + root cause open |
+| §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); instrumented 2026-08-15 (AsrPanic/AsrPostPanic* counters + input capture); poisoning question + root cause still open, pending natural recurrence |
 | §41 | **Change-gated video encoder A/B** | Low | Wake-path compute savings, currently unmeasured | Deployed, unmeasured; no decision on when to run |
 | §42 | **ADR 0038 prerequisite 3 + revisit trigger** | — | Informs hierarchical WTA priority | Prereqs 1/2 answered; prereq 3 never started; ADR stays `proposed` |
