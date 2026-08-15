@@ -9,6 +9,9 @@
   episode vectors, not regional inputs, so they can't be re-formed through a new binder; the
   real absorption mechanism is warm-store turnover (~30 cycles) plus a slower binder change rate.
   Flag stays opt-in (`--binding-replay`, default off) until adoption.
+  **2026-08-15 (later): adoption-path step 1 done** — `--binding-replay-steps N` (default 1)
+  caps `binding_replay_step_batch` calls per sleep cycle; only meaningful with `--binding-replay`
+  set. Next: repeat the isolated A/B pilot at N=1, ≥20 cycles, n≥2/arm.
 - **Date:** 2026-08-15
 
 ## Context
@@ -201,6 +204,13 @@ that A/B runs always use full debugging metrics and record deviations:
    episode-drift monitoring above kept on for the first production leg. **Blocked by item 2's
    outcome — the adoption path now requires the warm-store rebuild-from-cold mitigation and cost
    reduction first, then a repeat pilot (gaps.md §35 verdict).**
+4. **Cost/drift-reduction step — DONE 2026-08-15:** new `--binding-replay-steps N` CLI flag
+   (default 1) caps `binding_replay_step_batch` calls per sleep cycle via a step-budget counter in
+   the NREM loop (`sleep.rs::binding_replay_step_budget_remaining`); `N=0` disables the pass even
+   with `--binding-replay` set. No new metric needed — `NremBindingReplay`/`binding_replay_loss`
+   already cover the (now capped) call count and cost, per the standing metrics-discipline policy.
+   Next: repeat the isolated A/B pilot at the new default (N=1), ≥20 cycles, n≥2/arm, checking
+   binding still learns, grown rows still move, and cross-session gist is stable-or-recovering.
 
 ## What would invalidate this
 

@@ -470,6 +470,14 @@ struct Args {
     #[arg(long, default_value = "false")]
     binding_replay: bool,
 
+    /// Cap on `binding_replay` batches per sleep cycle (ADR 0041 adoption path, gaps.md §35):
+    /// the pilot's isolated A/B showed the unbounded pass costs +34.5% NREM wall-clock and
+    /// displaces ~30% of replay traces, driving episode-space drift faster than warm-store
+    /// turnover absorbs it. Capping the count per cycle bounds both. Only meaningful when
+    /// `--binding-replay` is set; ignored otherwise. Default 1.
+    #[arg(long, default_value = "1")]
+    binding_replay_steps: usize,
+
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.
@@ -2000,6 +2008,7 @@ pub async fn run() -> Result<()> {
                 args.lang_oversample,
                 args.nrem_replay_epochs,
                 args.binding_replay,
+                args.binding_replay_steps,
                 args.max_warm_records,
                 effective_max_cold,
                 args.growth_cooldown,

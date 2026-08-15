@@ -146,6 +146,13 @@ fn mse_novelty(mse: f32, threshold: f32) -> f32 {
     ((mse - threshold) / threshold).clamp(0.0, 1.0)
 }
 
+/// ADR 0041 adoption path (gaps.md §35): whether another `binding_replay_step_batch` call
+/// is still within this cycle's `--binding-replay-steps` budget. `cap == 0` disables the
+/// pass entirely (never runs, even though `--binding-replay` is on).
+fn binding_replay_step_budget_remaining(steps_done: usize, cap: usize) -> bool {
+    steps_done < cap
+}
+
 #[allow(dead_code)]
 pub struct SleepStats {
     pub traces_replayed: usize,
@@ -362,6 +369,7 @@ pub fn run_sleep_cycle(
     lang_oversample: usize,
     replay_epochs: usize,
     binding_replay: bool,
+    binding_replay_steps: usize,
     max_warm_records: usize,
     max_cold_records: usize,
     growth_cooldown: usize,
@@ -571,6 +579,7 @@ pub fn run_sleep_cycle(
     // Replay epochs: each epoch is a full pass through the trace buffer.
     // Loss EWMA carries forward across epochs for continuous LR scheduling.
     let mut first_batch_ever = true;
+    let mut binding_replay_steps_done = 0usize;
 
     for epoch_idx in 0..replay_epochs {
         let mut batch_start = 0usize; // index into `traces` of the current batch start
@@ -716,11 +725,17 @@ pub fn run_sleep_cycle(
             // binding area, output heads trained against the regional targets on them.
             // Off by default; the A/B control arm is byte-identical to the fused path
             // above. Errors degrade like other NREM step failures (batch skipped).
-            if binding_replay {
+            if binding_replay
+                && binding_replay_step_budget_remaining(
+                    binding_replay_steps_done,
+                    binding_replay_steps,
+                )
+            {
                 if let Err(e) = perception.binding_replay_step_batch(&regionals) {
                     tracing::warn!(?e, "binding_replay_step_batch error — skipping batch");
                     somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);
                 }
+                binding_replay_steps_done += 1;
             }
 
             // ── Adaptive exit checks (10b) ────────────────────────────────────────
@@ -1649,6 +1664,21 @@ mod tests {
             badly_failing > barely_failing,
             "badly failing region should get a bigger batch (barely={barely_failing}, badly={badly_failing})"
         );
+    }
+
+    // ── binding-replay step budget tests (ADR 0041 adoption path, gaps.md §35) ──
+
+    #[test]
+    fn binding_replay_budget_allows_until_cap() {
+        assert!(binding_replay_step_budget_remaining(0, 1));
+        assert!(!binding_replay_step_budget_remaining(1, 1));
+        assert!(binding_replay_step_budget_remaining(2, 3));
+        assert!(!binding_replay_step_budget_remaining(3, 3));
+    }
+
+    #[test]
+    fn binding_replay_budget_zero_cap_never_runs() {
+        assert!(!binding_replay_step_budget_remaining(0, 0));
     }
 
     // ── kmeans tests ───────────────────────────────────────────────────────────
