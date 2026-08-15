@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# A/B: ADR 0041 live-episode binding training (gaps.md §33) — validation item 2.
+#
+# Control:   trained production state, no flag (byte-identical NREM)
+# Treatment: same state + --binding-replay (live episodes through the binding,
+#            output heads trained against regional targets on them)
+#
+# Unlike the earlier ab_*.sh pilots (fresh memory), both arms start from a copy
+# of the trained campaign state (snapshot + warm + cold + onnx): fresh memory has
+# no grown units, so it couldn't test the actual fix (ADR 0041 "Validation plan").
+#
+# Standing A/B instruction: both arms built and run with fine-metrics; the
+# comparison below records deviations, not just the headline verdict.
+#
+# Arms run SEQUENTIALLY (not parallel) so the NremBindingReplay wall-clock cost
+# is measured without CPU/GPU contention from the sibling arm.
+#
+# Usage:
+#   bash scripts/ab_binding_replay.sh
+#   CYCLES=5 bash scripts/ab_binding_replay.sh
+#   SKIP_BUILD=1 SKIP_COPY=1 bash scripts/ab_binding_replay.sh   # re-run/analyze only
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+CYCLES="${CYCLES:-10}"
+PILOT_ROOT="${PILOT_ROOT:-memory/ab_binding_replay}"
+SRC_MEMORY="${SRC_MEMORY:-/data/somnus/memory}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
+SKIP_COPY="${SKIP_COPY:-0}"
+
+# Same clip corpus as the growth campaign's final leg.
+CLIPS="$(grep '^CLIPS=' "$SRC_MEMORY/campaign_growth10x/params.txt" | tail -1 | cut -d= -f2-)"
+
+# ── Build once, fine-metrics on (standing A/B instruction) ───────────────────
+if [ "$SKIP_BUILD" != "1" ]; then
+    echo "[ab-binding-replay] building somnus (release, fine-metrics)…"
+    cargo build --release -p somnus --features fine-metrics 2>&1 | tail -2
+fi
+
+# ── Copy the trained production state for each arm ───────────────────────────
+if [ "$SKIP_COPY" != "1" ]; then
+    rm -rf "$PILOT_ROOT"
+    for arm in control treatment; do
+        echo "[ab-binding-replay] copying trained state → $PILOT_ROOT/$arm …"
+        mkdir -p "$PILOT_ROOT/$arm"
+        cp -a --reflink=auto "$SRC_MEMORY/snapshot" "$PILOT_ROOT/$arm/snapshot"
+        cp -a --reflink=auto "$SRC_MEMORY/warm" "$PILOT_ROOT/$arm/warm"
+        cp -a --reflink=auto "$SRC_MEMORY/episodes.cold" "$PILOT_ROOT/$arm/episodes.cold"
+        cp -a --reflink=auto "$SRC_MEMORY/onnx_models" "$PILOT_ROOT/$arm/onnx_models"
+    done
+fi
+
+# ── Control arm ───────────────────────────────────────────────────────────────
+echo ""
+echo "[ab-binding-replay] ── Control: trained state, no --binding-replay ──────────"
+SESSIONS=1 CYCLES="$CYCLES" CAPACITY=8192 \
+    CLIPS="$CLIPS" \
+    MEMORY_DIR="$PILOT_ROOT/control" \
+    CAMPAIGN_DIR="$PILOT_ROOT/control/campaign" \
+    SKIP_BUILD=1 \
+    bash scripts/train_campaign.sh
+
+# ── Treatment arm ─────────────────────────────────────────────────────────────
+echo ""
+echo "[ab-binding-replay] ── Treatment: trained state + --binding-replay ──────────"
+SESSIONS=1 CYCLES="$CYCLES" CAPACITY=8192 \
+    CLIPS="$CLIPS" \
+    MEMORY_DIR="$PILOT_ROOT/treatment" \
+    CAMPAIGN_DIR="$PILOT_ROOT/treatment/campaign" \
+    EXTRA_ARGS="--binding-replay" \
+    SKIP_BUILD=1 \
+    bash scripts/train_campaign.sh
+
+# ── Comparison: headline metrics + new ADR 0041 metrics + deviation scan ─────
+echo ""
+echo "[ab-binding-replay] both arms complete — comparison:"
+python3 - "$PILOT_ROOT" <<'PYEOF'
+import json, statistics, struct, sys
+
+root = sys.argv[1]
+
+def load(arm):
+    rows = []
+    with open(f"{root}/{arm}/campaign/metrics.jsonl") as f:
+        for line in f:
+            r = json.loads(line)
+            if "cycle" in r and "session" in r:
+                rows.append(r)
+    return rows
+
+ctrl = load("control")
+trt = load("treatment")
+if not ctrl or not trt:
+    print("missing metrics for at least one arm — aborting comparison")
+    sys.exit(1)
+
+def mean(rows, key):
+    vals = [r[key] for r in rows if r.get(key) is not None]
+    return statistics.mean(vals) if vals else None
+
+HEADLINE = [
+    "mean_output_mse", "mean_output_mse_wake", "mean_loss", "mean_proj_loss",
+    "gist_recall_rate", "within_session_gist_rate", "warm_recall_l2",
+    "nrem_wall_ms", "rem_wall_ms",
+]
+print(f"\n{'metric':34} {'control':>13} {'treatment':>13} {'delta':>9}")
+print("-" * 72)
+for k in HEADLINE:
+    c, t = mean(ctrl, k), mean(trt, k)
+    if c is None or t is None:
+        continue
+    d = (t - c) / max(abs(c), 1e-9) * 100
+    print(f"{k:34} {c:13.6f} {t:13.6f} {d:+8.1f}%")
+
+regs = sorted((ctrl[-1].get("per_region_mse") or {}).keys())
+for reg in regs:
+    c = statistics.mean([r["per_region_mse"][reg] for r in ctrl
+                         if r.get("per_region_mse") and reg in r["per_region_mse"]])
+    t = statistics.mean([r["per_region_mse"][reg] for r in trt
+                         if r.get("per_region_mse") and reg in r["per_region_mse"]])
+    d = (t - c) / max(abs(c), 1e-9) * 100
+    print(f"{('per_region_mse.' + reg):34} {c:13.6f} {t:13.6f} {d:+8.1f}%")
+
+# ── New ADR 0041 metrics (treatment must fire; control must stay at zero) ──
+print("\n-- ADR 0041 metrics --")
+br = [r.get("fine_metrics", {}).get("nrem_binding_replay") for r in trt]
+br = [x for x in br if x and x.get("count")]
+if br:
+    cnt = sum(x["count"] for x in br)
+    ms = sum(x["total_ns"] for x in br) / cnt / 1e6
+    print(f"nrem_binding_replay (treatment): {cnt} steps, mean {ms:.2f} ms/step")
+else:
+    print("nrem_binding_replay: NOT FIRED in treatment — flag not taking effect?")
+per_cycle = []
+for r in trt:
+    x = (r.get("fine_metrics") or {}).get("binding_replay_loss")
+    if x and x.get("count"):
+        per_cycle.append((r["cycle"], x["total"] / x["count"] / 1e6))
+if per_cycle:
+    print("binding_replay_loss per-cycle mean (treatment):")
+    for cyc, v in per_cycle:
+        print(f"  cycle {cyc}: {v:.6f}")
+    (c1, v1), (c2, v2) = per_cycle[0], per_cycle[-1]
+    print(f"  trend: {v1:.6f} -> {v2:.6f} ({(v2 - v1) / max(v1, 1e-9) * 100:+.1f}%)")
+leak = [r["cycle"] for r in ctrl
+        if (r.get("fine_metrics") or {}).get("nrem_binding_replay", {}).get("count")]
+print(f"control-arm nrem_binding_replay firings (must be none): {leak or 'none'}")
+
+# ── Deviation scan: every shared numeric channel, plus one-arm-only channels ──
+def flat(r):
+    out = {}
+    for k, v in r.items():
+        if isinstance(v, (int, float)) and k not in ("session", "cycle"):
+            out[k] = v
+    for k, v in (r.get("fine_metrics") or {}).items():
+        if isinstance(v, dict) and "count" in v:
+            out[f"fm.{k}.count"] = v.get("count", 0)
+    return out
+
+agg_c, agg_t = {}, {}
+for r in ctrl:
+    for k, v in flat(r).items():
+        agg_c.setdefault(k, []).append(v)
+for r in trt:
+    for k, v in flat(r).items():
+        agg_t.setdefault(k, []).append(v)
+
+EXPECTED_TREATMENT_ONLY = ("fm.nrem_binding_replay.count", "fm.binding_replay_loss.count")
+print("\n-- deviations (|delta| > 30%, or one-arm-only) --")
+any_dev = False
+for k in sorted(set(agg_c) | set(agg_t)):
+    c = statistics.mean(agg_c[k]) if k in agg_c else None
+    t = statistics.mean(agg_t[k]) if k in agg_t else None
+    if c is None or t is None:
+        if k not in EXPECTED_TREATMENT_ONLY:
+            print(f"  ONE-ARM ONLY: {k}: control={c} treatment={t}")
+            any_dev = True
+        continue
+    if abs(c) < 1e-9:
+        if abs(t) > 1e-6:
+            print(f"  {k}: control~0 -> treatment={t:.6g}")
+            any_dev = True
+        continue
+    d = (t - c) / abs(c) * 100
+    if abs(d) > 30:
+        print(f"  {k}: {c:.6g} -> {t:.6g} ({d:+.0f}%)")
+        any_dev = True
+if not any_dev:
+    print("  none beyond the expected treatment-only binding-replay metrics")
+
+# ── Health / growth ──
+print("\n-- health / growth --")
+for arm, rows in (("control", ctrl), ("treatment", trt)):
+    grew = sum(1 for r in rows if r.get("grew"))
+    nan = sum((r.get("fine_metrics") or {}).get("training_nan_detected", {}).get("count", 0)
+              for r in rows)
+    sizes = struct.unpack("<5Q", open(f"{root}/{arm}/snapshot/region_sizes.bin", "rb").read())
+    print(f"{arm}: cycles={len(rows)} grew_events={grew} training_nan={nan} "
+          f"final_region_sizes={list(sizes)}")
+PYEOF
+
+echo ""
+echo "[ab-binding-replay] done. Artifacts:"
+echo "  Control:   $PILOT_ROOT/control/campaign/metrics.jsonl"
+echo "  Treatment: $PILOT_ROOT/treatment/campaign/metrics.jsonl"
