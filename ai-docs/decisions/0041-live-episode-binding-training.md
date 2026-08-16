@@ -40,6 +40,17 @@
   `crates/somnus/src/lib.rs:2905-2922`, are homeostatic controllers correctly reacting to genuinely
   degraded output — as literally described this candidate is symptom suppression, not a fix, and
   any pilot needs `mean_output_mse`/`per_region_mse` as gating criteria, not just cascade metrics).
+  **2026-08-16: candidate (a) re-run with the real LR-scale dosage lever — FAILED, same magnitude
+  as full-strength (engineering-log.md §45).** `--binding-replay-lr-scale 0.1` (a genuine 10×
+  weaker optimizer step this time) produced `mean_output_mse` +444.7% — statistically
+  indistinguishable from §36's unscaled +445% and the invalidated §44 result. Failure shape
+  differs (per-region movement now genuinely mixed, 2 worse/3 better; `gist_recall_rate`/
+  `warm_recall_l2` barely moved instead of collapsing) but the headline number doesn't improve at
+  10× lower update magnitude. **Candidate (a) is now closed in both variants** (loss-scale
+  invalidated as a no-op; LR-scale tested for real and failed). This is now solid evidence — not
+  the flawed inference §44 rested on — that the damage isn't a dosage effect: **(c) decouple the
+  salience/settle cascade is the favored remaining candidate**, with (b) fuse-into-existing-step
+  still untried and lower priority (doesn't address the cascade).
 - **Date:** 2026-08-15
 
 ## Context
@@ -263,7 +274,20 @@ that A/B runs always use full debugging metrics and record deviations:
    salience/settle cascade directly (note: `sal_gate`/`settle_gate_val` are homeostatic
    controllers correctly reacting to genuinely degraded output, so as literally described this is
    symptom suppression — any pilot needs quality metrics as gating criteria, not just cascade
-   metrics). No path chosen yet; the LR-scale pilot is the natural next step.
+   metrics).
+6. **Candidate (a) re-run with real LR-scale dosage — implemented and FAILED (engineering-log.md
+   §45, 2026-08-16):** `--binding-replay-lr-scale 0.1` (step cap at default N=1), the actual
+   dosage test item 5 was meant to be. Produced `mean_output_mse` +444.7% — statistically the same
+   as §36's unscaled +445% and the invalidated §44 result, despite a genuine 10× weaker update.
+   Failure shape differs from both prior pilots (per-region movement mixed rather than uniformly
+   worse; `gist_recall_rate`/`warm_recall_l2` barely moved instead of collapsing), but the
+   headline number doesn't improve at lower magnitude. **Candidate (a) is now closed in both
+   variants.** This is solid evidence — not the flawed inference item 5 previously rested on —
+   that the damage is not a dosage effect. **(c), decoupling the salience/settle cascade, is the
+   favored remaining candidate**; (b), fusing into the existing `fused_replay_wake_step_batch`
+   step, remains untried and lower priority since it doesn't address the cascade. No path chosen
+   yet — next step needs a decision from the user before more code is written, per this project's
+   working-with-user norm for exploratory/architectural calls.
 
 ## What would invalidate this
 

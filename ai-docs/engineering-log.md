@@ -377,3 +377,57 @@ Verdict and interpretation are in `decisions/0041-live-episode-binding-training.
 `nrem_binding_replay` fired 6/10 cycles; control-arm leak check clean (zero firings).
 
 ---
+
+## §45 — ADR 0041 fourth pilot: candidate (a) re-run with real LR-scale dosage — FAIL, same magnitude as full-strength (2026-08-16)
+
+The valid dosage test §44 should have been (`--binding-replay-lr-scale 0.1`, scaling the learning
+rate passed to `optimizer.step()` directly instead of the loss tensor before backward — see this
+same file's §44 correction and `crates/somnus-perception/src/lib.rs`). **Setup:**
+`scripts/ab_binding_replay_lr_scale.sh`, same template/harness as §35/§36/§44, copied trained
+production state, 10 cycles, `fine-metrics`, step cap left at default N=1, `SCALE=0.1`.
+
+**Numeric record:**
+
+| metric | control | treatment (lr_scale=0.1) | delta |
+|---|---|---|---|
+| mean_output_mse | 0.013266 | 0.072265 | **+444.7%** |
+| mean_output_mse_wake | 0.049893 | 0.036848 | −26.1% |
+| mean_proj_loss | 0.000089 | 0.000077 | −13.3% |
+| gist_recall_rate | 0.740830 | 0.730781 | −1.4% |
+| within_session_gist_rate | 0.678525 | 0.775984 | +14.4% |
+| warm_recall_l2 | 0.466625 | 0.459738 | −1.5% |
+| nrem_wall_ms | 6637.3 | 8370.3 | +26.1% |
+| rem_wall_ms | 8505.4 | 8769.9 | +3.1% |
+| per_region_mse.0 (speech) | 0.001866 | 0.001903 | +2.0% |
+| per_region_mse.1 (env) | 0.000945 | 0.000863 | −8.7% |
+| per_region_mse.2 (visual) | 0.001585 | 0.001203 | −24.1% |
+| per_region_mse.3 (symbolic) | 0.002168 | 0.002865 | +32.1% |
+| per_region_mse.4 (language) | 0.000117 | 0.000062 | −47.4% |
+
+**Verdict: the real dosage lever produces the same magnitude of damage as full-strength LR** —
++444.7% here, statistically indistinguishable from §36's unscaled +445% and the invalidated §44
+loss-scale result's +440.6%. Unlike §44, per-region movement is now genuinely mixed (2 regions
+worse, 3 regions better) rather than uniformly worse, and `gist_recall_rate`/`warm_recall_l2`
+barely moved (−1.4%/−1.5%, not §35's collapse) — a different, milder failure shape than the
+earlier pilots, but the headline `mean_output_mse` still blows up by the same ~4.4× factor
+regardless of whether the update is full-strength or 10× weaker. **This is a real, negative
+result for candidate (a):** at a genuine 0.1× learning-rate scale, the live-episode binding update
+is either strong enough to already saturate the damage, or the damage isn't caused by update
+magnitude at all — supporting the structural-cascade reading (favoring candidate (c)) on solid
+footing this time, not the invalidated inference §44 previously rested on.
+
+**Deviations recorded (standing instruction):** `binding_forward.count` +38%, `synthesize_episode`
++38% (both moved together — plausibly more live episodes recomputed per replayed trace at this
+scale, not investigated further); `snapshot_episodic_bytes_written` −45%, `synthetics_produced`
+−45% (same direction as each other, mirrors the unexplained pairing §43 flagged for a different
+pilot — worth checking if this is a recurring artifact of any NREM-shape change, not chased down
+here); `mean_real_inference_mse` +374%; `perc_settle_us` +32%, `settle_delta_mean` +31% (the §36
+settle-cascade signature, present but milder than §36's own +154%/+39% — consistent with N=1's
+cap already being the dominant driver of that particular symptom, separate from `mean_output_mse`).
+`nrem_binding_replay` fired 9/10 cycles (vs §44's 6/10); control-arm leak check clean.
+
+**Candidate (a) is now closed, both variants (loss-scale invalidated, LR-scale tested and failed).
+`gaps.md` §33 and ADR 0041 updated — (c) (decouple the salience/settle cascade) is the
+remaining favored candidate, alongside the untried (b) (fuse into `fused_replay_wake_step_batch`).**
+
+---
