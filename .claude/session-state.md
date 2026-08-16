@@ -4,7 +4,51 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **✅ CHECKPOINT (clean), 2026-08-16 (latest) — gaps.md triage: §41 (change-gated video encoder)
+> **🔄 CHECKPOINT (background pilot running), 2026-08-16 (latest) — §33 candidate (a) closed for
+> real via LR-scale dosage; candidate (d) (freeze heads) scoped, implemented, unit-tested, and
+> mid-pilot at session end.**
+> - **LR-scale dosage pilot (candidate (a) re-run, `engineering-log.md` §45):** corrected the §44
+>   loss-scale pilot's flaw — `binding_replay_step_batch` steps `AdamW`, which normalizes updates
+>   by their second-moment estimate, so scaling the *loss* before backward (§44) was a no-op; §44's
+>   +440.6% and §36's unscaled +445% were statistically the same result, not "4× worse" as
+>   previously recorded. Renamed `--binding-replay-loss-scale` → `--binding-replay-lr-scale`, now
+>   scales the LR passed to `optimizer.step()` directly. Piloted for real at scale=0.1: still
+>   `mean_output_mse` +444.7% — genuinely dosage-invariant this time. **Candidate (a) is closed in
+>   both variants.**
+> - **Scoping a (c) pilot (decouple the salience/settle cascade) surfaced a sharper hypothesis
+>   instead — candidate (d).** Found via code reading (not ADR prose): ADR 0041's "gradients reach
+>   the encoders" claim was wrong (materialized `Vec<f32>` severs the graph — corrected in the
+>   ADR); and the production `mean_output_mse` metric is the head-reconstruction MSE on *stored*
+>   episodes (`fused_replay_wake_step_batch`), while `binding_replay_step_batch` trains the *same*
+>   five head weights on *live* episodes in the same NREM batch through the same optimizer — a
+>   dosage-independent interference mechanism that explains why both (a) variants failed
+>   identically. Implemented `--binding-replay-freeze-heads` (excludes head grads from the
+>   optimizer step; gradient still flows through them into binding) and pinned it with a dedicated
+>   unit test (`binding_replay_freeze_heads_trains_binding_not_heads`) before piloting.
+> - **Pilot launched, NOT YET COMPLETE at session end:** `scripts/ab_binding_replay_freeze_heads.sh`
+>   running in the background (control arm was in progress at last check; monitor task `bqfrlx3d3`
+>   watching `/tmp/claude-1000/-home-falcon-projects-fsvm88-somnus/943cc060-cdf3-40c9-bc25-56a29e65b413/scratchpad/ab_binding_replay_freeze_heads.log`).
+>   **On resume: check that log file for the finished comparison table before doing anything else
+>   on §33** — if the session ended before it completed, the pilot process may still be running
+>   unattended or may have finished with results never written up. Verdict not yet known.
+> - **Candidate (b) (fuse binding-replay into `fused_replay_wake_step_batch`'s existing optimizer
+>   step) was scoped/discussed but not implemented** — reframed from a pure cost optimization into
+>   a real second test of the interference hypothesis (joint gradient vs. sequential Adam steps on
+>   shared head weights). User was mid-decision on whether to implement/pilot it now or wait for
+>   (d)'s result when the session paused for shutdown. **Ask the user this question on resume if
+>   (d)'s pilot has landed and no further instruction was given.**
+> - **Scripts cleanup (unrelated, done same session):** removed `ab_lora.sh`/`train_lora.py`/
+>   `ab_q1_text_hidden.sh`/`export_qwen3.py` (dead, referenced Qwen2.5 files that no longer exist
+>   anywhere); fixed `profile.sh`/`quantize_kv.py`'s stale Qwen2.5 paths and constants; fixed a real
+>   `NameError`-on-first-run bug in `train_lora_qwen3.py` (`_Qwen25LMWrapper` call site never
+>   renamed when the class was renamed to `_LMWrapper`) — caught only because the script has never
+>   actually been run (gaps.md §39).
+> - **All work through this point is committed** (`6810cf6` is HEAD). The only outstanding thing is
+>   the still-running pilot process and its eventual write-up.
+>
+> ---
+>
+> **✅ CHECKPOINT (clean), 2026-08-16 — gaps.md triage: §41 (change-gated video encoder)
 > closed as a rejected null-result, no other open items needed action.**
 > - User asked to close open gaps; scoped down to triage-only (no new pilots, no campaign-affecting
 >   runs). Reviewed every open item in `gaps.md`: §4/§7/§10/§11/§15/§23/§40/§42 already carry real
@@ -51,23 +95,3 @@
 >   trigger revisiting it) and EMA-head-sync Option B's N_UNITS≥4096 trigger (crossed ~2.4×, not
 >   acted on). Phases 0-4 status lines were all still accurate — not touched.
 >
-> ---
->
-> **✅ CHECKPOINT (clean), 2026-08-15 — ADR 0041's third adoption attempt, candidate (a)
-> loss-scale reduction, tried and FAILED WORSE than both prior pilots. Detail: engineering-log.md
-> §44, ADR 0041 status + Validation-plan item 5.**
-> - **New `--binding-replay-loss-scale <f32>` flag** (default 1.0, no behavior change): scales the
->   live-episode loss tensor immediately before `.backward()`. Treatment: scale=0.1, step cap left
->   at its §36 default of N=1 — isolates the scale variable, not a combination.
-> - **Result: worse than both §35 (unbounded) and §36 (step-count cap alone).** `mean_output_mse`
->   +440.6% (every region worse, +25% to +81%), `traces_replayed` −49.2%, the same salience/settle
->   cascade signature as §36 (`settle_iters_sum`/`settle_trigger_count` both +39%) but ~4× the
->   quality damage at 10× *lower* gradient magnitude — the opposite of the theory being tested.
-> - **Verdict: loss-scale reduction abandoned as the lever**, same conclusion as §36 reached about
->   step count. Reading across all three failed pilots: the salience/settle cascade looks like a
->   structural consequence of live-episode training itself, not a dosage effect tunable via step
->   count or loss magnitude — **candidate (c) (decouple the cascade directly) is now favored** over
->   (b) (fuse into the existing optimizer step). **No path chosen yet — ask the user before writing
->   more code here.**
-> - **Docs:** ADR 0041 status line + new Validation-plan item 5; `gaps.md` §33 updated (candidate
->   (a) tried, (b)/(c) queued).
