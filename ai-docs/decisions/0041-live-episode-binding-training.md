@@ -67,6 +67,23 @@
   candidate for the next pilot** — it targets `mean_output_mse` directly and is code-grounded,
   vs. (c) which targets a wake-side symptom (the cascade) that this hypothesis says isn't even the
   cause. Pilot script: `scripts/ab_binding_replay_freeze_heads.sh`.
+  **2026-08-16 (later still): candidate (d), freeze heads, tried and FAILED — but reveals the
+  likely real root cause (engineering-log.md §46).** `mean_output_mse` +586.9%, same 445-587% band
+  as every prior pilot. This is stronger than a failed pilot: with heads frozen and encoders never
+  in binding-replay's loss graph, there is **no gradient path** for the treatment arm to move
+  `mean_output_mse` — yet it moved. Found by reading `crates/somnus/src/lib.rs:2451-2469`:
+  `rebuild_ort_session` fires after **every** sleep cycle once ORT is active, not only on growth as
+  this ADR's Consequences section implied. At 10x-growth scale ORT was active from cycle 1 in both
+  arms. Real channel: binding weights change → re-export picks them up → next wake phase forms
+  episodes through the new binder → those episodes get **stored** as new traces → later cycles'
+  `fused_replay_wake_step_batch` trains heads against these drifted stored episodes, which is
+  exactly what `mean_output_mse` measures. Explains dosage invariance (both variants of candidate
+  a), why freezing heads didn't help (d), and reproduces §35's original episode-space-drift finding
+  directly (`gist_recall_rate` −41.9%, `warm_recall_l2` +38.4% this pilot). **Not yet confirmed by
+  an isolating pilot** (disable/delay ORT rebuild during a binding-replay run, or force the
+  CPU/burn wake path) — leading hypothesis, not proven. **Blocks (b) and (c) as previously scoped**
+  — neither touches the re-export cadence this hypothesis implicates. No path chosen; next step is
+  the confirming diagnostic, not another optimizer/loss variant.
 - **Date:** 2026-08-15
 
 ## Context
@@ -341,6 +358,16 @@ that A/B runs always use full debugging metrics and record deviations:
    this hypothesis says isn't the actual cause. Pilot script: `scripts/ab_binding_replay_freeze_heads.sh`,
    not yet run. No path chosen until that pilot lands — per this project's working-with-user norm
    for exploratory/architectural calls, the user chose to scope this before running it.
+8. **Candidate (d) piloted — FAILED, but the failure reveals the likely real root cause
+   (engineering-log.md §46, 2026-08-16):** `mean_output_mse` +586.9%, same band as every prior
+   pilot. Since heads were frozen and encoders are never in binding-replay's loss graph, there was
+   no gradient path for the treatment arm to move this metric — the contradiction traced to
+   `rebuild_ort_session` firing after every sleep cycle (not only on growth), so a drifting binder
+   propagates into wake-time episode formation and then into later cycles' stored-episode training
+   independent of any gradient-level mechanism. See status header above for the full chain. **Not
+   yet confirmed by an isolating pilot** — the natural next step is disabling/delaying ORT rebuild
+   during a binding-replay run (or forcing the CPU/burn wake path) to see if `mean_output_mse`
+   recovers, rather than trying (b) or (c), neither of which touches this channel.
 
 ## What would invalidate this
 

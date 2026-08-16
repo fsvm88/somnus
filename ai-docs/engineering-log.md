@@ -431,3 +431,68 @@ cap already being the dominant driver of that particular symptom, separate from 
 remaining favored candidate, alongside the untried (b) (fuse into `fused_replay_wake_step_batch`).**
 
 ---
+
+## §46 — ADR 0041 fifth pilot: candidate (d), freeze heads — FAILED, and reveals the real channel is ORT re-export drift, not head/gradient interference (2026-08-16)
+
+**Setup:** `scripts/ab_binding_replay_freeze_heads.sh`, same harness as §35/§36/§44/§45, copied
+trained production state, 10 cycles, `fine-metrics`. New `--binding-replay-freeze-heads` flag:
+removes the five output heads' gradients from `GradientsParams` before `optimizer.step()` in
+`binding_replay_step_batch` — gradient still flows through the heads into binding, but the heads'
+own weights are excluded from this step's update (verified by a dedicated unit test,
+`binding_replay_freeze_heads_trains_binding_not_heads`, before piloting).
+
+**Numeric record:**
+
+| metric | control | treatment (freeze_heads) | delta |
+|---|---|---|---|
+| mean_output_mse | 0.010417 | 0.071558 | **+586.9%** |
+| gist_recall_rate | 0.857527 | 0.497865 | −41.9% |
+| warm_recall_l2 | 0.461350 | 0.638730 | +38.4% |
+| nrem_wall_ms | 6437.1 | 5787.1 | −10.1% |
+| rem_wall_ms | 9050.3 | 10315.1 | +14.0% |
+| settle_iters_sum | 18.2 | 34.0 | +87% |
+| traces_replayed | 439.8 | 194.6 | −56% |
+
+**mean_output_mse stayed in the same 445-587% band as every prior pilot — freezing the heads did
+not help.** This is a stronger result than "candidate (d) failed": with heads frozen and encoders
+never in binding-replay's loss graph (confirmed in code — `SparseActivation.values` are
+materialized to plain `Vec<f32>` before the binding forward), there is **no gradient path** by
+which this treatment arm can change `mean_output_mse` at all (it's `head.forward(stored_episode)`
+vs. a stored target, computed entirely within `fused_replay_wake_step_batch`, untouched by
+`binding_replay_step_batch` under this flag). Yet it moved. That's a contradiction, and finding it
+mattered more than the pilot's nominal pass/fail.
+
+**Root cause identified by reading `crates/somnus/src/lib.rs:2451-2469`, not by more pilots:
+`rebuild_ort_session` fires after *every* sleep cycle once ORT is active**, not only on growth as
+ADR 0041's Consequences section previously implied. At this campaign's 10x-growth scale
+(~9,980-10,030 units/region, vs. `onnx_crossover_units` default of 1,230), ORT was active from
+cycle 1 in both arms. The real channel, entirely independent of heads or gradients:
+`binding_replay_step_batch` changes binding/W_q/W_k/W_v → `rebuild_ort_session` re-exports those
+weights after that same cycle → the next wake phase's `settle_episode`/`try_bind` form episodes
+through the now-different binder → those episodes get **stored** as new traces → **later** NREM
+cycles' `fused_replay_wake_step_batch` trains heads against these drifted stored episodes, which
+is exactly what `mean_output_mse` measures.
+
+**This one mechanism explains every pilot in this saga:** dosage invariance (candidates a-both-
+variants) — any nonzero binding-weight change plus re-export corrupts the pipeline, so update
+*magnitude* was never the lever; why freezing the heads didn't help (d) — the heads were never the
+channel; and it's the same mechanism §35 originally caught as "episode-space drift"
+(`gist_recall_rate` collapse, `warm_recall_l2` rise), which this pilot reproduced strongly (−41.9%/
++38.4%, much bigger than §45's LR-scale pilot's −1.4%/−1.5% — an inconsistency across pilots worth
+flagging: the drift's severity apparently varies pilot to pilot for reasons not yet understood,
+possibly timing of growth/re-export relative to when binding-replay fires).
+
+**Caveat on confidence:** this is a code-grounded explanation with no remaining gap in the causal
+chain, but it has not been isolated by a dedicated pilot (e.g., disabling ORT rebuild after
+binding-replay-touched cycles, or forcing the CPU/burn inference path so wake-time episode
+formation can't pick up drifted binder weights mid-run). Treat as the leading hypothesis, not a
+confirmed result, until that diagnostic runs.
+
+**Blocks candidate (b) as previously scoped:** fusing binding-replay into `fused_replay_wake_step_batch`'s
+optimizer step doesn't touch the ORT re-export cadence at all, so under this reading it tests
+nothing about `mean_output_mse`. Candidates (a) and (d) are both closed as failed leads (though
+(d)'s failure carries the real finding above); (b) and (c) are both stalled pending confirmation of
+the re-export/drift hypothesis. **No path chosen; next step is the confirming diagnostic above, not
+another optimizer/loss variant.**
+
+---

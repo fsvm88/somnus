@@ -4,47 +4,43 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **🔄 CHECKPOINT (background pilot running), 2026-08-16 (latest) — §33 candidate (a) closed for
-> real via LR-scale dosage; candidate (d) (freeze heads) scoped, implemented, unit-tested, and
-> mid-pilot at session end.**
-> - **LR-scale dosage pilot (candidate (a) re-run, `engineering-log.md` §45):** corrected the §44
->   loss-scale pilot's flaw — `binding_replay_step_batch` steps `AdamW`, which normalizes updates
->   by their second-moment estimate, so scaling the *loss* before backward (§44) was a no-op; §44's
->   +440.6% and §36's unscaled +445% were statistically the same result, not "4× worse" as
->   previously recorded. Renamed `--binding-replay-loss-scale` → `--binding-replay-lr-scale`, now
->   scales the LR passed to `optimizer.step()` directly. Piloted for real at scale=0.1: still
->   `mean_output_mse` +444.7% — genuinely dosage-invariant this time. **Candidate (a) is closed in
->   both variants.**
-> - **Scoping a (c) pilot (decouple the salience/settle cascade) surfaced a sharper hypothesis
->   instead — candidate (d).** Found via code reading (not ADR prose): ADR 0041's "gradients reach
->   the encoders" claim was wrong (materialized `Vec<f32>` severs the graph — corrected in the
->   ADR); and the production `mean_output_mse` metric is the head-reconstruction MSE on *stored*
->   episodes (`fused_replay_wake_step_batch`), while `binding_replay_step_batch` trains the *same*
->   five head weights on *live* episodes in the same NREM batch through the same optimizer — a
->   dosage-independent interference mechanism that explains why both (a) variants failed
->   identically. Implemented `--binding-replay-freeze-heads` (excludes head grads from the
->   optimizer step; gradient still flows through them into binding) and pinned it with a dedicated
->   unit test (`binding_replay_freeze_heads_trains_binding_not_heads`) before piloting.
-> - **Pilot launched, NOT YET COMPLETE at session end:** `scripts/ab_binding_replay_freeze_heads.sh`
->   running in the background (control arm was in progress at last check; monitor task `bqfrlx3d3`
->   watching `/tmp/claude-1000/-home-falcon-projects-fsvm88-somnus/943cc060-cdf3-40c9-bc25-56a29e65b413/scratchpad/ab_binding_replay_freeze_heads.log`).
->   **On resume: check that log file for the finished comparison table before doing anything else
->   on §33** — if the session ended before it completed, the pilot process may still be running
->   unattended or may have finished with results never written up. Verdict not yet known.
-> - **Candidate (b) (fuse binding-replay into `fused_replay_wake_step_batch`'s existing optimizer
->   step) was scoped/discussed but not implemented** — reframed from a pure cost optimization into
->   a real second test of the interference hypothesis (joint gradient vs. sequential Adam steps on
->   shared head weights). User was mid-decision on whether to implement/pilot it now or wait for
->   (d)'s result when the session paused for shutdown. **Ask the user this question on resume if
->   (d)'s pilot has landed and no further instruction was given.**
+> **✅ CHECKPOINT (clean), 2026-08-16/17 (latest) — §33: candidates (a) and (d) both closed as
+> failed; (d)'s failure revealed the likely real root cause (ORT re-export drift), not yet
+> confirmed. (b) and (c) both stalled pending that confirmation.**
+> - **LR-scale dosage pilot (candidate (a) re-run, `engineering-log.md` §45):** corrected §44's
+>   loss-scale flaw (`AdamW` normalizes away a loss-tensor scale — that pilot was a no-op).
+>   Renamed `--binding-replay-loss-scale` → `--binding-replay-lr-scale`, scales the LR passed to
+>   `optimizer.step()` directly. Piloted for real at scale=0.1: `mean_output_mse` still +444.7% —
+>   genuinely dosage-invariant. **Candidate (a) closed, both variants.**
+> - **Freeze-heads pilot (candidate (d), `engineering-log.md` §46):** scoping a (c) pilot surfaced
+>   a sharper hypothesis — the production `mean_output_mse` metric is the head-reconstruction MSE
+>   on *stored* episodes, while `binding_replay_step_batch` trains the same heads on *live*
+>   episodes through the same optimizer. Implemented `--binding-replay-freeze-heads` (excludes head
+>   grads from the optimizer step; pinned by a dedicated unit test before piloting). **Piloted —
+>   FAILED: `mean_output_mse` +586.9%, same 445-587% band as every prior pilot.** This is stronger
+>   than a failed pilot: with heads frozen and encoders never in binding-replay's loss graph, there
+>   is no gradient path for the treatment arm to move this metric at all — yet it moved.
+> - **Root cause found by reading `crates/somnus/src/lib.rs:2451-2469` (not by more pilots):
+>   `rebuild_ort_session` fires after every sleep cycle once ORT is active**, not only on growth as
+>   ADR 0041 previously implied — true from cycle 1 at this campaign's 10x-growth scale. Real
+>   channel: binding weights change → re-export picks them up → next wake phase forms episodes
+>   through the new binder → those get **stored** as new traces → later cycles train heads against
+>   these drifted stored episodes, which is exactly what `mean_output_mse` measures. Explains
+>   dosage invariance in both (a) variants, why freezing heads (d) didn't help, and reproduces
+>   §35's original episode-drift finding directly. **Not yet confirmed by an isolating pilot**
+>   (disable/delay ORT rebuild during a binding-replay run, or force the CPU/burn wake path) —
+>   leading hypothesis, not proven.
+> - **Blocks (b) and (c) as previously scoped** — neither touches the ORT re-export cadence this
+>   hypothesis implicates. **No path chosen. Next step on resume: propose the confirming diagnostic
+>   to the user** (isolate whether ORT re-export drift is really the channel) before running any
+>   more optimizer/loss variant pilots on §33.
 > - **Scripts cleanup (unrelated, done same session):** removed `ab_lora.sh`/`train_lora.py`/
 >   `ab_q1_text_hidden.sh`/`export_qwen3.py` (dead, referenced Qwen2.5 files that no longer exist
 >   anywhere); fixed `profile.sh`/`quantize_kv.py`'s stale Qwen2.5 paths and constants; fixed a real
->   `NameError`-on-first-run bug in `train_lora_qwen3.py` (`_Qwen25LMWrapper` call site never
->   renamed when the class was renamed to `_LMWrapper`) — caught only because the script has never
->   actually been run (gaps.md §39).
-> - **All work through this point is committed** (`6810cf6` is HEAD). The only outstanding thing is
->   the still-running pilot process and its eventual write-up.
+>   `NameError`-on-first-run bug in `train_lora_qwen3.py` (caught only because the script has never
+>   actually been run, gaps.md §39).
+> - **All work is committed as of this checkpoint** — `gaps.md` §33, `engineering-log.md` §46, and
+>   ADR 0041 all updated with the §46 finding in the same commit as this checkpoint.
 >
 > ---
 >
