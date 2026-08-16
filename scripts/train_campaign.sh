@@ -22,6 +22,14 @@
 #   REPLAY_EPOCHS    NREM replay passes per sleep cycle (default: 4, matches somnus's own default)
 #   EXTRA_ARGS       Extra args passed to somnus   (default: none)
 #
+# This script no longer hardcodes --language/--action/--lang-use-lm/--settle-steps/
+# --working-memory-size/--replay-batch-size/--wake-reconstruct-interval/--recall-ef/
+# --max-warm-records — every one of those now matches somnus's own CLI default (ADR 0047,
+# 2026-08-16), so passing them here was pure duplication. To run at a different value,
+# use EXTRA_ARGS (e.g. EXTRA_ARGS="--working-memory-size 0"). --prior-beta and
+# --nrem-replay-epochs stay explicit because resume_growth_campaign.sh re-derives them
+# from a prior run's params.txt and must keep working even if somnus's default changes again.
+#
 # Example:
 #   SESSIONS=20 CYCLES=3 scripts/train_campaign.sh
 #   SESSIONS=5 EXTRA_ARGS="--prune-fraction 0.5" scripts/train_campaign.sh
@@ -132,21 +140,12 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             $FILE_FLAGS \
             --file-loop \
             --memory-dir "$MEMORY_DIR" \
-            --language \
-            --action \
             --action-distill-only \
-            --lang-use-lm \
             --prior-beta "$PRIOR_BETA" \
-            --settle-steps 1 \
-            --working-memory-size 8 \
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
-            --replay-batch-size 128 \
             --nrem-replay-epochs "$REPLAY_EPOCHS" \
-            --wake-reconstruct-interval 5 \
             --video-stride 2 \
-            --recall-ef 16 \
-            --max-warm-records 200000 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \
@@ -158,21 +157,12 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             $FILE_FLAGS \
             --file-loop \
             --memory-dir "$MEMORY_DIR" \
-            --language \
-            --action \
             --action-distill-only \
-            --lang-use-lm \
             --prior-beta "$PRIOR_BETA" \
-            --settle-steps 1 \
-            --working-memory-size 8 \
             --episodic-capacity "$CAPACITY" \
             --max-sleep-cycles "$CYCLES" \
-            --replay-batch-size 128 \
             --nrem-replay-epochs "$REPLAY_EPOCHS" \
-            --wake-reconstruct-interval 5 \
             --video-stride 2 \
-            --recall-ef 16 \
-            --max-warm-records 200000 \
             --metrics-file "$METRICS_FILE" \
             --log-file "$SESSION_LOG" \
             --session "$i" \

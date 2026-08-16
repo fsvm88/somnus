@@ -52,14 +52,14 @@ cargo build --profile release-debug -p somnus 2>&1
 SOMNUS_REL="$REPO_ROOT/target/release/somnus"
 SOMNUS_DBG="$REPO_ROOT/target/release-debug/somnus"
 
-# Shared somnus flags. Language + action enabled so the Qwen LM path fires.
+# Shared somnus flags. Language + action + working memory all on by default
+# (ADR 0047) — the Qwen LM path fires without needing to pass them explicitly.
 FILE_FLAGS=""
 for clip in $CLIPS; do FILE_FLAGS="$FILE_FLAGS --file $clip"; done
 
-COMMON_ARGS="$FILE_FLAGS --file-loop --language --action \
+COMMON_ARGS="$FILE_FLAGS --file-loop \
   --episodic-capacity $CAPACITY \
   --max-sleep-cycles 1 \
-  --working-memory-size 8 \
   --lang-oversample 9 \
   --asr-min-chars 5"
 
