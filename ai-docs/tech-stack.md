@@ -75,7 +75,7 @@ Embedded KV (`redb`/`fjall`/`sled`) and SQL (`rusqlite`/`sqlx`) are candidates o
 
 ## Python tooling (committed)
 
-A venv at `.venv/` — model export/fine-tuning scripts only, not runtime inference. **`peft`+`transformers`+`torch`** — LoRA fine-tuning (ADR 0033; written for Qwen2.5, base model since upgraded to Qwen3-0.6B per ADR 0036, the LoRA work itself is deferred item L). `scripts/train_lora.py`, `scripts/export_models.py`. **`onnxruntime`** — KV-cache INT8 quantization, `scripts/quantize_kv.py`, `scripts/export_kv_cache.py`.
+A venv at `.venv/` — model export/fine-tuning scripts only, not runtime inference. **`peft`+`transformers`+`torch`** — LoRA fine-tuning (ADR 0033; written for Qwen2.5 as `scripts/train_lora.py`, ported to Qwen3 as `scripts/train_lora_qwen3.py` — never run, still blocked on training-data export, gaps.md §39/deferred item L). `scripts/export_models.py`. **`onnxruntime`** — KV-cache INT8 quantization, `scripts/quantize_kv.py`, `scripts/export_kv_cache.py`/`export_kv_cache_qwen3.py`.
 
 ## Things we will *not* do (yet)
 

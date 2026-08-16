@@ -124,7 +124,7 @@ Three independent improvements. 12a (eval harness) lands first since 12c (distil
 
 ### 12c — Regional unit pruning ✓ (ADR 0018)
 
-Units above `N_UNITS=1024` are clamped by `to_dense_n` and don't enter the episode vector, so they're safe to prune. Trigger: REM, `region_sizes[i]>1024+prune_min_grown` AND `gist_recall_rate≥0.8`. Selection: rank grown units (index≥1024) by encoder-weight-row L1 norm, remove bottom `--prune-fraction` (default 0.5). Rebuilds encoder/decoder/head (He-init), resets that region's optimizer moments. `--prune-min-grown` default 64.
+Units above `N_UNITS=1024` are clamped by `to_dense_n` and don't enter the episode vector, so they're safe to prune. Trigger: REM, `region_sizes[i]>1024+prune_min_grown` AND `gist_recall_rate≥0.8`. Selection: rank grown units (index≥1024) by encoder-weight-row L1 norm, remove bottom `--prune-fraction` (0.5 was this phase's original default). Rebuilds encoder/decoder/head (He-init), resets that region's optimizer moments. `--prune-min-grown` default 64. **`--prune-fraction` default corrected 0.5→0.0 by ADR 0026** (2026-06-?? A/B FAIL — env-region prior cosine regressed persistently, −0.065, no recovery in a 3-session window) — pruning is disabled by default; see ADR 0026 for the current status.
 
 **Exit criterion:** after pruning 50%, `per_region_mse` stays within 5% of pre-prune baseline over the next cycle.
 
