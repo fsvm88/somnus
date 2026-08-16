@@ -55,9 +55,9 @@ When proposing or implementing a change: name which existing metrics already cov
 
 ## Session resume
 
-If the user says **"resume SOMNUS prompt"** (or a close variation: "resume", "resume SOMNUS", "where were we"), read `.claude/session-state.md` end-to-end and continue from where the previous session left off. That file is the canonical record of the conversation arc and what's queued next. After reading, state briefly where things stand and either ask for direction or proceed with the queued next step.
+If the user says **"resume SOMNUS prompt"** (or a close variation: "resume", "resume SOMNUS", "where were we"), read `.claude/session-state.md` end-to-end and continue from where the previous session left off. That file is a short crash-resume journal — the last 3 checkpoints only (N, N-1, N-2), not a durable history. After reading, state briefly where things stand and either ask for direction or proceed with the queued next step.
 
-When wrapping a session at a logical break point (a substantive set of edits has been committed), update `.claude/session-state.md` so the next resume is accurate.
+When wrapping a session at a logical break point (a substantive set of edits has been committed), update `.claude/session-state.md`: add the new checkpoint, drop the oldest if there are now more than 3, and file anything durable (decisions, research, campaign narratives, backlog triggers) under `ai-docs/` rather than letting it accumulate in this file.
 
 ## File-system landmarks
 
@@ -69,7 +69,7 @@ When wrapping a session at a logical break point (a substantive set of edits has
 
 ## Deferred architectural items (as of 2026-06-17)
 
-All remaining ADR backlog items are **deferred indefinitely** — do not propose or implement them unless the user explicitly raises one or a concrete trigger condition is met. The items and their triggers are tracked in `.claude/session-state.md`. Do not suggest revisiting them unprompted.
+All remaining ADR backlog items are **deferred indefinitely** — do not propose or implement them unless the user explicitly raises one or a concrete trigger condition is met. The items and their triggers are tracked in `ai-docs/gaps.md`'s "Deferred backlog" section. Do not suggest revisiting them unprompted.
 
 Items deferred: A (cold archive promotion index), C (sparse activation storage), E (separate output-head optimizer), F (post-k-WTA prior injection), I (knowledge distillation compression), J (Whisper-base), K (SigLIP-B), L (LoRA fine-tuning — done for Qwen2.5 pre-ADR-0036, orphaned by the Qwen3 swap; `scripts/train_lora_qwen3.py` exists but was never run, production `qwen3_lm.onnx` is not LoRA-tuned — see gaps.md §39, open), N (visual/audio grounding).
 

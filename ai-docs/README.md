@@ -27,6 +27,12 @@ For *behavioral* expectations on the assistant, see `../CLAUDE.md`. This folder 
   - 0025: SAE L1 coding loss — closed; λ=0.1 destabilised cold-start MSE by 27%; item D answered.
   - 0036: Adopt Qwen3-0.6B, drop Qwen2.5 — accepted 2026-07-05; supersedes 0035.
 
+## Tooling
+
+- `scripts/setup-hooks.sh` — installs `.git/hooks/pre-commit` (fmt + clippy, mirrors CI). `.git/hooks` isn't versioned by git, so re-run this after a fresh clone or if hooks ever go missing.
+- `scripts/ab_dinov3.sh`, `scripts/ab_qwen3.sh`, `scripts/ab_qwen3_longclips.sh`, `scripts/ab_binding_replay.sh`, `scripts/ab_binding_replay_loss_scale.sh`, `scripts/ab_video_change_threshold.sh` — A/B harnesses (isolated `--memory-dir` per arm, NDJSON metrics).
+- [`a_b_dinov3_findings.md`](a_b_dinov3_findings.md), [`a_b_qwen3_findings.md`](a_b_qwen3_findings.md) — raw A/B evidence trails referenced by ADRs 0045/0036.
+
 ## Conventions
 
 - New terms → define in `glossary.md` first, then link.

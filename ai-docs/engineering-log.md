@@ -259,6 +259,8 @@ Closed §31's two remaining thin spots. **27 new tests** (somnus-memory 35→47;
 
 **Unblocks:** `gaps.md` §33's binding-weights decision (options a/b/c), explicitly sequenced behind campaign completion.
 
+**Operational lesson (session 81's aborted relaunch):** a plain background launch (`nohup ... &` or similar) dies with its launching shell/process group. Long-running campaign sessions must be started via `setsid` (redirect stdin from `/dev/null`, log to file) so they survive the launcher exiting — this is what session 81's process-group-timeout kill traced back to.
+
 ---
 
 ## §35 — ADR 0041 isolated A/B pilot: mechanism validated, §33 fix engages, drift materializes (2026-08-15)

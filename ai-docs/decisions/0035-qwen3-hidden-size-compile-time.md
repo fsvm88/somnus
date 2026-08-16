@@ -7,7 +7,7 @@
 
 A 2026-06-27 commit bumped `LM_HIDDEN` (`action.rs`) 896(Qwen2.5-0.5B)→1024(Qwen3-0.6B) as a single global constant, while `ActionDecoder::new` kept loading Qwen2.5's real 896-wide `qwen25_embed_table.safetensors` by hardcoded filename — `embed_flat()` sliced it at stride 1024, silently misaligning every token embedding. A parallel copy of the same bug lived in `somnus-perception` (`REGION_DIMS[4]`, `CROSS_MODAL_DIM`, ~6 more scattered 896/1024 literals) and `main.rs` (`LANG_DIM`).
 
-Undetected for over a week because the 2026-06-28 Qwen3 A/B and 2026-07-05 DINOv3 A/B both ran with `--action-distill-only` (skips the one path, `generate()`, that calls the corrupted `lm_session`) and `--lang-use-lm` (prefers the separate unaffected `qwen25_text_hidden.onnx` for text embedding). Found 2026-07-05 while investigating unrelated `ort-smoke` output. Full incident: `a_b_qwen3_findings.md`, `.claude/session-state.md`.
+Undetected for over a week because the 2026-06-28 Qwen3 A/B and 2026-07-05 DINOv3 A/B both ran with `--action-distill-only` (skips the one path, `generate()`, that calls the corrupted `lm_session`) and `--lang-use-lm` (prefers the separate unaffected `qwen25_text_hidden.onnx` for text embedding). Found 2026-07-05 while investigating unrelated `ort-smoke` output.
 
 On top of that, the original A/B's Qwen3 arm never got matching GPU-path exports — it ran via a `cp qwen3_lm_base.onnx → qwen25_lm.onnx` file-swap trick whose restore step silently failed, leaving the wrong model on disk under the Qwen2.5 filename.
 

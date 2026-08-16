@@ -128,3 +128,23 @@ ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate 
 | §39 | **Qwen3 LoRA fine-tuning** (ADR 0033 follow-on) | Med (a campaign run) | Generation grounded in somnus's own distribution | Blocked infra never run; needs a priority decision |
 | §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); instrumented 2026-08-15 (AsrPanic/AsrPostPanic* counters + input capture); poisoning question + root cause still open, pending natural recurrence |
 | §42 | **ADR 0038 prerequisite 3 + revisit trigger** | — | Informs hierarchical WTA priority | All 3 prereqs resolved 2026-08-15 (3 with a caveat — see above); ADR stays `proposed`, campaign-scale `per_region_mse` check still open |
+
+---
+
+## Deferred backlog (do not raise unprompted)
+
+CLAUDE.md's "Deferred architectural items" section names these items and says not to suggest revisiting them unprompted; the trigger conditions live here (moved from `.claude/session-state.md` 2026-08-16 — that file is a short-window crash-resume journal now, not a durable record).
+
+| # | Source | Item | Trigger |
+|---|--------|------|---------|
+| A | ADR 0006 | Cold archive O(1) promotion index | `promote()` called AND cold > 500k records |
+| C | ADR 0006 | Per-region sparse activation storage | Replay analysis shows episode vectors insufficient for diagnostics; no sparse-code consumer currently exists |
+| E | ADR 0009 | Separate optimizer for output heads (independent LR schedule) | Conflicting gradient directions between output heads and k-WTA observed |
+| F | ADR 0010 | Post-k-WTA prior injection | Pre-k-WTA injection shows poor `prior_cosine` uptake |
+| I | ADR 0018 | Knowledge distillation compression | Grown regions exceed 2× baseline |
+| J | ADR 0003 | Whisper-tiny → Whisper-base / WavLM-base (audio quality) | — (Tier 3, revisit opportunistically) |
+| K | ADR 0003 | DINOv2-S → SigLIP-B (language-aligned visual embeddings, Phase 7+) | — (superseded in spirit by DINOv3-ViT-S, engineering-log.md §6/ADR 0045; SigLIP2-ViT-B/16 tracked separately as §7) |
+| L | ADR 0012 | LoRA fine-tuning of Qwen for episode-vector prefix | — (Tier 3) — **confirmed still open 2026-08-15 (engineering-log.md §37):** done 2026-06-25 for Qwen2.5 (ADR 0033), orphaned when Qwen2.5 was dropped (ADR 0036); `train_lora_qwen3.py` exists (committed 2026-06-27, same session as the abandoned KV-cache-decode half) but was never run — `qwen3_lm.onnx` is the corrected-export base model, not a LoRA merge. Tracked in more depth as §39 above. |
+| N | ADR 0014 | Visual/audio region grounding (captions, env sound labels) | — (Tier 3) |
+
+Items B, D, G, H (language last-token pooling, full differentiable SAE, learned per-region gate, activation-frequency pruning) are not in CLAUDE.md's current list — resolved/superseded/dropped at some point after the 2026-06-14 scan; check ADR history if one becomes relevant.
