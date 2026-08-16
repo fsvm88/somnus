@@ -330,7 +330,7 @@ Environment: `uv venv .venv && uv pip install torch onnx onnxruntime peft transf
 
 ---
 
-## §43 — Change-gated video encoder A/B (gaps.md §41): measured, 93.8% skip rate, quality tradeoff concentrated in the visual region — no default adopted
+## §43 — Change-gated video encoder A/B: measured, 93.8% skip rate, quality tradeoff concentrated in the visual region — REJECTED as null-result (2026-08-16)
 
 **Pilot:** `scripts/ab_video_change_threshold.sh` (new, follows the `ab_binding_replay.sh` template — copied trained `campaign_growth10x` state, sequential control/treatment, `--features fine-metrics`, 10 cycles). Control: no flag (`--video-change-threshold 0.0`, disabled, matches production default). Treatment: `--video-change-threshold 0.05`.
 
@@ -352,7 +352,7 @@ Other four regions' `per_region_mse` moved ≤4% either direction. The pattern i
 
 **Deviations recorded (standing A/B instruction) beyond the headline:** `snapshot_episodic_bytes_written` +53% and `synthetics_produced` +53% in the treatment arm — both moved together, consistent with each other, but not obviously explained by the change-gate mechanism itself (video-frame skipping shouldn't directly change episodic snapshot volume or REM synthesis count). Flagging as unexplained, not investigated further this pass — worth checking before adopting a default threshold, in case the change-gate is perturbing episode timing/salience in a way that has a second-order effect on synthesis.
 
-**Not adopted — no decision on a default threshold.** Real wake-path compute savings are large (93.8% fewer `enc.encode()` calls at threshold=0.05) and the NREM/REM wall-clock deltas point the same direction, but the quality cost isn't zero (visual-region MSE +10.8%, aggregate MSE +21.8%) and the two unexplained deviations above haven't been chased down. A single 10-cycle pilot at one threshold value is enough to answer "does this do anything" (yes) but not "what's the right threshold" or "is the visual-region cost acceptable" — those need either a threshold sweep or an explicit product/research-priority call this pilot doesn't make on its own. `--video-change-threshold` stays default-off (0.0) in production.
+**Rejected as null-result, closed 2026-08-16 (gaps.md §41 triage).** Real wake-path compute savings are large (93.8% fewer `enc.encode()` calls at threshold=0.05) and the NREM/REM wall-clock deltas point the same direction, but the quality cost is real and non-trivial (visual-region MSE +10.8%, aggregate MSE +21.8%) with two unexplained deviations never chased down, and no stated compute bottleneck justifies trading quality for it right now. `--video-change-threshold` stays default-off (0.0) in production; the flag stays opt-in (harmless when unset) for future revisit if wake-path compute ever becomes the bottleneck. A threshold sweep was never run and isn't planned unless that trigger occurs.
 
 ---
 

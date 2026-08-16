@@ -1,8 +1,8 @@
 # Gaps, candidates, and open work
 
-> **Contents:** Open, undecided items only — algorithm/encoder/LLM upgrade candidates awaiting a decision, and known incompleteness with no chosen fix yet. Items that reached a decision (accepted/deployed/adopted, or rejected/not-pursued/null-result) live in [`engineering-log.md`](engineering-log.md), verbatim, under the same section numbers. Pruned to open-only 2026-08-15 (was §0-§37; see `engineering-log.md`'s header for what moved and why). §38 (Qwen3 KV-cache generation speedup) resolved and removed from this file 2026-08-15; full record at `engineering-log.md` §38.
+> **Contents:** Open, undecided items only — algorithm/encoder/LLM upgrade candidates awaiting a decision, and known incompleteness with no chosen fix yet. Items that reached a decision (accepted/deployed/adopted, or rejected/not-pursued/null-result) live in [`engineering-log.md`](engineering-log.md), verbatim, under the same section numbers. Pruned to open-only 2026-08-15 (was §0-§37; see `engineering-log.md`'s header for what moved and why). §38 (Qwen3 KV-cache generation speedup) resolved and removed from this file 2026-08-15; full record at `engineering-log.md` §38. §41 (change-gated video encoder) rejected as a null-result and removed 2026-08-16; full record at `engineering-log.md` §43.
 > **When to read:** Picking the next item to try, or checking whether something is still undecided.
-> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `engineering-log.md`, not that it never existed. New items get the next unused number across both files (next: §44).
+> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `engineering-log.md`, not that it never existed. New items get the next unused number across both files (next: §45).
 
 ---
 
@@ -100,12 +100,6 @@ With training data in hand, `peft`/`transformers` are already installed in `.ven
 
 ---
 
-## §41 — Change-gated video encoder: measured 2026-08-15, no default threshold adopted
-
-The mechanism (`engineering-log.md` §13) is deployed and unit-tested — `VideoFrame::mean_abs_diff` skips `enc.encode()` below `--video-change-threshold` (default 0.0, disabled/opt-in). **A/B'd 2026-08-15** (`engineering-log.md` §43, `scripts/ab_video_change_threshold.sh`): at threshold=0.05, **93.8% of video frames skipped** (large real wake-path savings), but with a real, not just noise-level, quality cost concentrated in the visual region (`per_region_mse.Visual` +10.8%, aggregate `mean_output_mse` +21.8%) alongside some improved recall/gist metrics elsewhere. Two unexplained deviations (`snapshot_episodic_bytes_written`/`synthetics_produced`, both +53%) weren't chased down. **Still open:** what threshold value, if any, is worth the visual-region cost — needs a threshold sweep or an explicit priority call, neither done. `--video-change-threshold` stays default-off in production.
-
----
-
 ## §42 — ADR 0038 (hierarchical k-WTA encoder scoring): prerequisite 3 — resolved with a caveat, ADR stays `proposed`
 
 ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate sampling for encoder-side scaling (the k-WTA encoder is O(input_dim×n_units) and can't be sparsified the way `engineering-log.md` §25/§30 sparsified binding). Three prerequisites were named before implementation; 1 and 2 were already answered (`engineering-log.md` §28/§29 — live scoring cost is small/not dominant at current scale; doesn't matter yet at honeybee-order target).
@@ -133,5 +127,4 @@ ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate 
 | 🔍 §33 | **BindingArea weights never trained** | Med–High | Episode quality / temporal context / grown-unit participation | Decision (b), ADR 0041 implemented; three pilots FAIL (drift+cost, then worse instability, then worse still at lower loss scale); (c) favored among 2 remaining candidates |
 | §39 | **Qwen3 LoRA fine-tuning** (ADR 0033 follow-on) | Med (a campaign run) | Generation grounded in somnus's own distribution | Blocked infra never run; needs a priority decision |
 | §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); instrumented 2026-08-15 (AsrPanic/AsrPostPanic* counters + input capture); poisoning question + root cause still open, pending natural recurrence |
-| §41 | **Change-gated video encoder A/B** | Low | Wake-path compute savings vs. visual-region quality cost | Measured 2026-08-15 (`engineering-log.md` §43) — 93.8% skip rate, real quality tradeoff; no default threshold adopted |
 | §42 | **ADR 0038 prerequisite 3 + revisit trigger** | — | Informs hierarchical WTA priority | All 3 prereqs resolved 2026-08-15 (3 with a caveat — see above); ADR stays `proposed`, campaign-scale `per_region_mse` check still open |
