@@ -1,7 +1,7 @@
 # Architecture
 
 > **Contents:** High-level system structure — encoders, 5 regional concept areas (audio-speech, audio-env, visual, symbolic, language), binding area (cross-attention + GRU), 3-tier memory (hot/warm/cold), sleep cycle (NREM+REM), action decoder (Qwen3-0.6B). Implementation state as of 2026-06-07 included inline.  
-> **When to read:** Understanding how subsystems connect; checking which open architectural questions are resolved vs. open.
+> **When to read:** Understanding how subsystems connect; checking which open architectural questions are resolved vs. open. For the numeric constants/defaults themselves (source-cited), see [`constants.md`](constants.md) — keep both in sync when either changes.
 >
 > **Status:** working sketch. Reflects decisions through the vision discussion (Q1/Q2/Q3 + sub-Q1). Subject to further change as research matures. Update this doc when subsystem boundaries shift; record the *why* in an ADR.
 >

@@ -12,7 +12,7 @@ For *behavioral* expectations on the assistant, see `../CLAUDE.md`. This folder 
 - [`vision.md`](vision.md) — what we're building and why.
 - [`principles.md`](principles.md) — how we approach the work.
 - [`glossary.md`](glossary.md) — terminology, single source of truth for terms.
-- [`architecture.md`](architecture.md) — high-level system structure (a sketch; will evolve).
+- [`architecture.md`](architecture.md) — high-level system structure (a sketch; will evolve). [`architecture.svg`](architecture.svg) is its visual companion; [`constants.md`](constants.md) is the fast-reference table of every numeric constant/default shown in both, source-cited. All three must stay in sync — see `constants.md`'s own header for the update rule.
 - [`tech-stack.md`](tech-stack.md) — Rust crates, ML/audio/vision ecosystem notes, language choices.
 - [`roadmap.md`](roadmap.md) — coarse phasing.
 
