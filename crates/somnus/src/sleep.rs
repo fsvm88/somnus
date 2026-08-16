@@ -370,7 +370,7 @@ pub fn run_sleep_cycle(
     replay_epochs: usize,
     binding_replay: bool,
     binding_replay_steps: usize,
-    binding_replay_loss_scale: f32,
+    binding_replay_lr_scale: f32,
     max_warm_records: usize,
     max_cold_records: usize,
     growth_cooldown: usize,
@@ -733,7 +733,7 @@ pub fn run_sleep_cycle(
                 )
             {
                 if let Err(e) =
-                    perception.binding_replay_step_batch(&regionals, binding_replay_loss_scale)
+                    perception.binding_replay_step_batch(&regionals, binding_replay_lr_scale)
                 {
                     tracing::warn!(?e, "binding_replay_step_batch error — skipping batch");
                     somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);

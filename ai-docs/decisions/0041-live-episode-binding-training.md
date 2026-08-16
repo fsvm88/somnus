@@ -19,20 +19,27 @@
   nonzero, confirmed via `binding_row_norms`), so the mechanism isn't broken — but step-count
   capping decoupled cost from drift instead of taming both as hypothesized. **Step-count capping
   abandoned as the lever.**
-  **2026-08-15 (later still): candidate (a), loss-scale reduction, tried and FAILED WORSE (engineering-log.md §44).**
-  New `--binding-replay-loss-scale <f32>` flag (default 1.0) scales the live-episode loss tensor
+  **2026-08-15 (later still): candidate (a), loss-scale reduction, tried — result INVALIDATED, corrected
+  2026-08-16 (engineering-log.md §44).**
+  New `--binding-replay-loss-scale <f32>` flag (default 1.0) scaled the live-episode loss tensor
   immediately before `.backward()`. Pilot at scale=0.1 (step cap left at its default of 1) produced
-  `mean_output_mse` +440.6% vs. control -- every region worse (+25% to +81%), the same
-  salience/settle cascade signature as the N=1 pilot (`traces_replayed` -49%, `settle_iters_sum`
-  +39%) but roughly 4x the quality damage at 10x lower gradient magnitude. The opposite of the
-  theory being tested (weaker update expected to reduce instability, not worsen it) -- suggests a
-  partially-scaled update adds noise to the binding weights without enough signal to converge them
-  usefully, and that the cascade is a structural consequence of live-episode training itself, not
-  a dosage effect tunable via step count or loss magnitude. **Loss-scale reduction abandoned as the
-  lever.** Two candidates remain, neither tried: fuse into the existing `fused_replay_wake_step_batch`
-  step rather than a separate optimizer pass; decouple the salience/settle cascade directly (favored,
-  since the cascade -- not step count, not loss magnitude -- is the one symptom common to all three
-  failed pilots so far).
+  `mean_output_mse` +440.6% vs. control. **This was not a valid dosage test:**
+  `binding_replay_step_batch` steps an `AdamW` optimizer, which normalizes each parameter update by
+  its running second-moment estimate, so scaling the *loss* tensor before backward cancels out
+  almost entirely before it reaches the parameters. Read correctly, the +440.6% aggregate is
+  statistically the same as the N=1 pilot's own aggregate (+445%, engineering-log.md §36) — evidence
+  the scale had no real effect, not evidence that a weaker update makes things worse. The previously
+  recorded "roughly 4x the quality damage" compared this pilot's aggregate against §36's
+  same-cycle-on-fired-cycles figure (~10x), a different measurement — not a valid basis for that
+  claim. **Loss-scale is retired as the mechanism.** `--binding-replay-loss-scale` is renamed
+  `--binding-replay-lr-scale` and now scales the learning rate passed to `optimizer.step()`
+  directly, which does change the update magnitude — the real dosage test candidate (a) was meant to
+  be. Not yet piloted (`scripts/ab_binding_replay_lr_scale.sh`). Two further candidates remain
+  untried: fuse into the existing `fused_replay_wake_step_batch` step rather than a separate
+  optimizer pass; decouple the salience/settle cascade directly (note `sal_gate`/`settle_gate_val`,
+  `crates/somnus/src/lib.rs:2905-2922`, are homeostatic controllers correctly reacting to genuinely
+  degraded output — as literally described this candidate is symptom suppression, not a fix, and
+  any pilot needs `mean_output_mse`/`per_region_mse` as gating criteria, not just cascade metrics).
 - **Date:** 2026-08-15
 
 ## Context
@@ -239,18 +246,24 @@ that A/B runs always use full debugging metrics and record deviations:
    Candidates queued for the next attempt: reduce step magnitude (LR/loss-scale) instead of count;
    fuse into the existing fused-replay step instead of a separate optimizer pass; decouple the
    salience/settle cascade directly. No path chosen yet.
-5. **Candidate (a), loss-scale reduction — implemented and FAILED WORSE (engineering-log.md §44):**
-   new `--binding-replay-loss-scale <f32>` flag (default 1.0, no behavior change) scales the
-   live-episode loss immediately before `.backward()`. Pilot at scale=0.1 (step cap left at its
-   default of N=1) produced `mean_output_mse` +440.6% vs. control, every region worse (+25% to
-   +81%) — roughly 4× the quality damage of the §36 step-count pilot at 10× lower gradient
-   magnitude, the opposite of the theory being tested. Same salience/settle cascade signature as
-   §36. **Verdict: loss-scale reduction abandoned as the lever** — a partially-scaled update
-   appears to add noise to the binding weights without enough signal to converge them usefully;
-   the cascade reads as a structural consequence of live-episode training itself, not a dosage
-   effect tunable via step count or loss magnitude. Two candidates remain, neither tried: fuse
-   into the existing `fused_replay_wake_step_batch` step; decouple the salience/settle cascade
-   directly (favored — the one symptom common to all three failed pilots). No path chosen yet.
+5. **Candidate (a), loss-scale reduction — implemented, result INVALIDATED (engineering-log.md
+   §44, corrected 2026-08-16):** new `--binding-replay-loss-scale <f32>` flag (default 1.0, no
+   behavior change) scaled the live-episode loss immediately before `.backward()`. Pilot at
+   scale=0.1 (step cap left at its default of N=1) produced `mean_output_mse` +440.6% vs.
+   control. **Not a valid dosage test:** the step's optimizer is `AdamW`, which normalizes each
+   update by its running second-moment estimate, so a loss-tensor scale cancels out almost
+   entirely before reaching the parameters. The +440.6% aggregate is statistically the same as
+   §36's own aggregate (+445%) — the scale had no measurable effect, not a "4×" worsening (that
+   figure compared this pilot's aggregate against §36's same-cycle-on-fired-cycles number, a
+   different measurement). **Loss-scale retired as the lever.** Fixed 2026-08-16: the flag is
+   renamed `--binding-replay-lr-scale` and now scales the learning rate passed to
+   `optimizer.step()` directly (`crates/somnus-perception/src/lib.rs`), which does change the update
+   magnitude. Not yet piloted (`scripts/ab_binding_replay_lr_scale.sh`). Two further candidates
+   remain untried: fuse into the existing `fused_replay_wake_step_batch` step; decouple the
+   salience/settle cascade directly (note: `sal_gate`/`settle_gate_val` are homeostatic
+   controllers correctly reacting to genuinely degraded output, so as literally described this is
+   symptom suppression — any pilot needs quality metrics as gating criteria, not just cascade
+   metrics). No path chosen yet; the LR-scale pilot is the natural next step.
 
 ## What would invalidate this
 

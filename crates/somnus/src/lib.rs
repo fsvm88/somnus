@@ -492,16 +492,24 @@ struct Args {
     #[arg(long, default_value = "1")]
     binding_replay_steps: usize,
 
-    /// Loss-scale multiplier on `binding_replay`'s live-episode loss before backward (gaps.md
-    /// §33, candidate (a) of the three queued after step-count capping — §36's
-    /// `--binding-replay-steps 1` pilot — improved wall-clock but made quality *worse*, not
-    /// better). Untried: reducing step *magnitude* instead of step *count*, on the theory
-    /// that a full-strength gradient update through the live binding path is what's driving
-    /// the same-cycle MSE blowup and salience/settle cascade, not the number of times it
-    /// fires. Only meaningful when `--binding-replay` is set. Default 1.0 (no scaling,
-    /// byte-identical to pre-this-flag behavior).
+    /// Learning-rate multiplier on `binding_replay`'s optimizer step (gaps.md §33, candidate
+    /// (a) of the three queued after step-count capping — §36's `--binding-replay-steps 1`
+    /// pilot — improved wall-clock but made quality *worse*, not better). Reduces step
+    /// *magnitude* instead of step *count*, on the theory that a full-strength gradient
+    /// update through the live binding path is what's driving the same-cycle MSE blowup and
+    /// salience/settle cascade, not the number of times it fires.
+    ///
+    /// **Was a loss-scale multiplier (applied before `.backward()`) until 2026-08-16** — that
+    /// pilot (`engineering-log.md` §44) was a no-op by construction: `binding_replay_step_batch`
+    /// steps an AdamW optimizer, which normalizes each update by its running second-moment
+    /// estimate, so scaling the loss tensor cancels out almost entirely before it reaches the
+    /// parameters. §44's near-identical-to-§36 result (aggregate `mean_output_mse` +440.6% vs.
+    /// §36's +445%) is consistent with this — not, as previously recorded, evidence that dosage
+    /// doesn't matter. Now scales the learning rate passed to `optimizer.step()` directly, which
+    /// actually changes the update magnitude. Only meaningful when `--binding-replay` is set.
+    /// Default 1.0 (no scaling, byte-identical to pre-this-flag behavior).
     #[arg(long, default_value = "1.0")]
-    binding_replay_loss_scale: f32,
+    binding_replay_lr_scale: f32,
 
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
@@ -2085,7 +2093,7 @@ pub async fn run() -> Result<()> {
                 args.nrem_replay_epochs,
                 args.binding_replay,
                 args.binding_replay_steps,
-                args.binding_replay_loss_scale,
+                args.binding_replay_lr_scale,
                 args.max_warm_records,
                 effective_max_cold,
                 args.growth_cooldown,

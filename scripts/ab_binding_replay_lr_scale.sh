@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# A/B: ADR 0041 live-episode binding training (gaps.md §33) — third pilot, candidate
-# (a) from the queue after §35 (unbounded, FAIL — episode drift) and §36
-# (--binding-replay-steps 1, FAIL — worse instability via a salience/settle cascade).
+# A/B: ADR 0041 live-episode binding training (gaps.md §33) — fourth pilot, candidate
+# (a) re-run after §35 (unbounded, FAIL — episode drift), §36 (--binding-replay-steps 1,
+# FAIL — worse instability via a salience/settle cascade), and §44 (loss-scale variant of
+# this same candidate, invalidated — see below).
 #
-# Candidate (a): reduce step *magnitude* (loss scale) instead of step *count*, on
-# the theory that a full-strength gradient update through the live binding path is
-# what's driving the same-cycle MSE blowup, not how many times it fires per cycle.
+# Candidate (a): reduce step *magnitude* instead of step *count*, on the theory that a
+# full-strength gradient update through the live binding path is what's driving the
+# same-cycle MSE blowup, not how many times it fires per cycle.
+#
+# §44 correction (2026-08-16): the original version of this pilot scaled the *loss*
+# tensor before backward(). `binding_replay_step_batch` steps an AdamW optimizer, which
+# normalizes each parameter update by its running second-moment estimate — so scaling the
+# loss cancels out almost entirely before it reaches the parameters. §44's result
+# (aggregate mean_output_mse +440.6%) was statistically the same as §36's unscaled
+# aggregate (+445%), consistent with the loss-scale pilot having been a no-op, not
+# evidence that dosage doesn't matter. `--binding-replay-lr-scale` now scales the
+# *learning rate* passed to optimizer.step() directly, which actually changes the
+# update magnitude — this is the real dosage test candidate (a) was meant to be.
 #
 # Control:   trained production state, no flag (byte-identical NREM)
-# Treatment: same state + --binding-replay --binding-replay-loss-scale <SCALE>
+# Treatment: same state + --binding-replay --binding-replay-lr-scale <SCALE>
 #            (step count stays at the default cap of 1, per §36's finding that
 #            capping alone isn't the answer — this isolates the scale variable)
 #
@@ -19,16 +30,16 @@
 # comparison below records deviations, not just the headline verdict.
 #
 # Usage:
-#   bash scripts/ab_binding_replay_loss_scale.sh
-#   SCALE=0.1 CYCLES=10 bash scripts/ab_binding_replay_loss_scale.sh
-#   SKIP_BUILD=1 SKIP_COPY=1 bash scripts/ab_binding_replay_loss_scale.sh   # re-run/analyze only
+#   bash scripts/ab_binding_replay_lr_scale.sh
+#   SCALE=0.1 CYCLES=10 bash scripts/ab_binding_replay_lr_scale.sh
+#   SKIP_BUILD=1 SKIP_COPY=1 bash scripts/ab_binding_replay_lr_scale.sh   # re-run/analyze only
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 CYCLES="${CYCLES:-10}"
 SCALE="${SCALE:-0.1}"
-PILOT_ROOT="${PILOT_ROOT:-memory/ab_binding_replay_loss_scale}"
+PILOT_ROOT="${PILOT_ROOT:-memory/ab_binding_replay_lr_scale}"
 SRC_MEMORY="${SRC_MEMORY:-/data/somnus/memory}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_COPY="${SKIP_COPY:-0}"
@@ -36,14 +47,14 @@ SKIP_COPY="${SKIP_COPY:-0}"
 CLIPS="$(grep '^CLIPS=' "$SRC_MEMORY/campaign_growth10x/params.txt" | tail -1 | cut -d= -f2-)"
 
 if [ "$SKIP_BUILD" != "1" ]; then
-    echo "[ab-binding-replay-loss-scale] building somnus (release, fine-metrics)…"
+    echo "[ab-binding-replay-lr-scale] building somnus (release, fine-metrics)…"
     cargo build --release -p somnus --features fine-metrics 2>&1 | tail -2
 fi
 
 if [ "$SKIP_COPY" != "1" ]; then
     rm -rf "$PILOT_ROOT"
     for arm in control treatment; do
-        echo "[ab-binding-replay-loss-scale] copying trained state → $PILOT_ROOT/$arm …"
+        echo "[ab-binding-replay-lr-scale] copying trained state → $PILOT_ROOT/$arm …"
         mkdir -p "$PILOT_ROOT/$arm"
         cp -a --reflink=auto "$SRC_MEMORY/snapshot" "$PILOT_ROOT/$arm/snapshot"
         cp -a --reflink=auto "$SRC_MEMORY/warm" "$PILOT_ROOT/$arm/warm"
@@ -53,7 +64,7 @@ if [ "$SKIP_COPY" != "1" ]; then
 fi
 
 echo ""
-echo "[ab-binding-replay-loss-scale] ── Control: trained state, no --binding-replay ──"
+echo "[ab-binding-replay-lr-scale] ── Control: trained state, no --binding-replay ──"
 SESSIONS=1 CYCLES="$CYCLES" CAPACITY=8192 \
     CLIPS="$CLIPS" \
     MEMORY_DIR="$PILOT_ROOT/control" \
@@ -62,17 +73,17 @@ SESSIONS=1 CYCLES="$CYCLES" CAPACITY=8192 \
     bash scripts/train_campaign.sh
 
 echo ""
-echo "[ab-binding-replay-loss-scale] ── Treatment: --binding-replay --binding-replay-loss-scale $SCALE ──"
+echo "[ab-binding-replay-lr-scale] ── Treatment: --binding-replay --binding-replay-lr-scale $SCALE ──"
 SESSIONS=1 CYCLES="$CYCLES" CAPACITY=8192 \
     CLIPS="$CLIPS" \
     MEMORY_DIR="$PILOT_ROOT/treatment" \
     CAMPAIGN_DIR="$PILOT_ROOT/treatment/campaign" \
-    EXTRA_ARGS="--binding-replay --binding-replay-loss-scale $SCALE" \
+    EXTRA_ARGS="--binding-replay --binding-replay-lr-scale $SCALE" \
     SKIP_BUILD=1 \
     bash scripts/train_campaign.sh
 
 echo ""
-echo "[ab-binding-replay-loss-scale] both arms complete — comparison:"
+echo "[ab-binding-replay-lr-scale] both arms complete — comparison:"
 python3 - "$PILOT_ROOT" "$SCALE" <<'PYEOF'
 import json, statistics, struct, sys
 
@@ -122,7 +133,7 @@ for i, _ in enumerate(regs):
     print(f"{('per_region_mse.' + str(i)):34} {c:13.6f} {t:13.6f} {d:+8.1f}%")
 
 # ── ADR 0041 metrics, this pilot's own question: same-cycle MSE blowup (§36's
-# failure mode) and whether it's reduced at this loss scale ──
+# failure mode) and whether it's reduced at this lr scale ──
 print("\n-- ADR 0041 metrics --")
 br = [r.get("fine_metrics", {}).get("nrem_binding_replay") for r in trt]
 br = [x for x in br if x and x.get("count")]
@@ -140,7 +151,7 @@ for r in trt:
     if x and x.get("count") and steps:
         per_cycle.append((r["cycle"], x["count"] / steps / 1e6))
 if per_cycle:
-    print(f"binding_replay_loss per-cycle mean (treatment, unscaled — loss_scale={scale}):")
+    print(f"binding_replay_loss per-cycle mean (treatment, unscaled — lr_scale={scale}):")
     for cyc, v in per_cycle:
         print(f"  cycle {cyc}: {v:.6f}")
 leak = [r["cycle"] for r in ctrl
@@ -205,6 +216,6 @@ for arm, rows in (("control", ctrl), ("treatment", trt)):
 PYEOF
 
 echo ""
-echo "[ab-binding-replay-loss-scale] done. Artifacts:"
+echo "[ab-binding-replay-lr-scale] done. Artifacts:"
 echo "  Control:   $PILOT_ROOT/control/campaign/metrics.jsonl"
 echo "  Treatment: $PILOT_ROOT/treatment/campaign/metrics.jsonl"

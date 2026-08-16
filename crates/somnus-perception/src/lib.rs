@@ -1184,10 +1184,10 @@ impl PerceptionProcessor {
     pub fn binding_replay_step_batch(
         &mut self,
         batch: &[&[Vec<f32>; 5]],
-        loss_scale: f32,
+        lr_scale: f32,
     ) -> PerceptionResult<f32> {
         let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::NremBindingReplay, {
-            self.binding_replay_step_batch_inner(batch, loss_scale)
+            self.binding_replay_step_batch_inner(batch, lr_scale)
         });
         result
     }
@@ -1195,7 +1195,7 @@ impl PerceptionProcessor {
     fn binding_replay_step_batch_inner(
         &mut self,
         batch: &[&[Vec<f32>; 5]],
-        loss_scale: f32,
+        lr_scale: f32,
     ) -> PerceptionResult<f32> {
         if batch.is_empty() {
             return Ok(0.0);
@@ -1358,14 +1358,19 @@ impl PerceptionProcessor {
         }
 
         if let Some(loss) = total_loss {
-            // Unscaled value recorded in BindingReplayLoss below, for comparability across
-            // different loss_scale pilots — only the tensor entering backward() is scaled.
+            // lr_scale multiplies the *learning rate*, not the loss (gaps.md §33 / ADR 0041
+            // Validation-plan item 5 correction): the optimizer here is AdamW, which normalizes
+            // each parameter update by its running second-moment estimate, so scaling the loss
+            // tensor before backward() cancels out almost entirely — candidate (a)'s original
+            // "loss-scale" pilot was a no-op by construction, not a real dosage test. Scaling
+            // the step size actually changes the update magnitude.
             let loss_val: f32 = loss.clone().into_scalar();
-            let scaled_loss = loss.mul_scalar(loss_scale);
             let model = self.model.take().unwrap();
-            let grads = scaled_loss.backward();
+            let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
-            let model = self.optimizer.step(self.current_lr, model, grads_p);
+            let model = self
+                .optimizer
+                .step(self.current_lr * lr_scale as f64, model, grads_p);
             self.model = Some(model);
             // Fine tier: the A/B-comparison-specific signal for ADR 0041 (mean loss =
             // (summed scaled value / count) / 1e6).
