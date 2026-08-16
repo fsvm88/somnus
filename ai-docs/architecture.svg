@@ -21,7 +21,7 @@
   <!-- ══════════════════════════════════════
        TITLE
   ══════════════════════════════════════ -->
-  <text x="550" y="28" text-anchor="middle" font-size="16" font-weight="bold" fill="#222">somnus — Architecture (as of 2026-06-17)</text>
+  <text x="550" y="28" text-anchor="middle" font-size="16" font-weight="bold" fill="#222">somnus — Architecture (as of 2026-08-16)</text>
 
   <!-- ══════════════════════════════════════
        LAYER 0 — INPUT SOURCES  (y=50)
@@ -60,9 +60,9 @@
   <text x="236" y="178" text-anchor="middle" font-size="10" fill="#665">512-dim env</text>
   <text x="236" y="190" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX (frozen)</text>
 
-  <!-- DINOv2-S/14 -->
+  <!-- DINOv3-ViT-S -->
   <rect x="314" y="145" width="128" height="48" rx="6" fill="#fff3d0" stroke="#aa8800" stroke-width="1.5"/>
-  <text x="378" y="163" text-anchor="middle" font-weight="bold" fill="#554400">DINOv2-S/14</text>
+  <text x="378" y="163" text-anchor="middle" font-weight="bold" fill="#554400">DINOv3-ViT-S</text>
   <text x="378" y="178" text-anchor="middle" font-size="10" fill="#665">384-dim visual</text>
   <text x="378" y="190" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX (frozen)</text>
 
@@ -89,9 +89,9 @@
        LAYER 2 — REGIONAL CONCEPT AREAS (y=255)
   ══════════════════════════════════════ -->
   <rect x="22" y="242" width="784" height="76" rx="10" fill="#e8f4e8" stroke="#336633" stroke-width="2"/>
-  <text x="414" y="259" text-anchor="middle" font-weight="bold" font-size="13" fill="#224422">Regional concept areas — k-WTA (n=1024, k=20, 2% sparsity) + SAE decoder</text>
+  <text x="414" y="259" text-anchor="middle" font-weight="bold" font-size="13" fill="#224422">Regional concept areas — k-WTA (baseline n=1024, k=20, 2% sparsity) + SAE decoder</text>
   <text x="414" y="272" text-anchor="middle" font-size="10" fill="#224422">per-region: encoder weights, SAE decoder, output head, duty-cycle boosting — trainable (burn/CPU during NREM)</text>
-  <text x="414" y="285" text-anchor="middle" font-size="10" fill="#224422">inference: GPU via ORT/MIGraphX (perception_encoder.onnx)</text>
+  <text x="414" y="285" text-anchor="middle" font-size="10" fill="#224422">inference: GPU via ORT/MIGraphX (perception_encoder.onnx)  |  grown to n=9,821/region (2026-08-15)</text>
 
   <!-- Region boxes -->
   <rect x="34" y="293" width="110" height="18" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
@@ -256,12 +256,12 @@
        CAMPAIGN METRICS SIDEBAR (bottom right)
   ══════════════════════════════════════ -->
   <rect x="820" y="790" width="250" height="88" rx="8" fill="#f0f8f0" stroke="#336633" stroke-width="1.5"/>
-  <text x="945" y="808" text-anchor="middle" font-weight="bold" fill="#224422">Campaign state (50 sessions)</text>
-  <text x="830" y="823" font-size="9" fill="#224422">output_mse (wake): 0.026–0.053</text>
-  <text x="830" y="836" font-size="9" fill="#224422">prior_cosine: speech 0.97 · sym 0.94 · vis 0.89</text>
-  <text x="830" y="849" font-size="9" fill="#224422">               env 0.91 · language 0.84</text>
-  <text x="830" y="862" font-size="9" fill="#224422">p_lang peak: 0.910 (--lang-use-lm)</text>
-  <text x="830" y="875" font-size="9" fill="#224422">proj_loss: 0.0023→0.0007 (declining)</text>
+  <text x="945" y="808" text-anchor="middle" font-weight="bold" font-size="10" fill="#224422">10x campaign (82 sessions, done 2026-08-15)</text>
+  <text x="830" y="823" font-size="9" fill="#224422">[1024]×5 → [9821]×5 (101.7% of 9,660 target)</text>
+  <text x="830" y="836" font-size="9" fill="#224422">791 cycles · 188 growth events · 0 panics</text>
+  <text x="830" y="849" font-size="9" fill="#224422">output_mse 1st-vs-last-10: 0.0430→0.0112 (−74%)</text>
+  <text x="830" y="862" font-size="9" fill="#224422">gist_recall_rate 0.562 · warm_recall_l2 0.381</text>
+  <text x="830" y="875" font-size="9" fill="#224422">detail: engineering-log.md §34</text>
 
   <!-- ══════════════════════════════════════
        OBSERVABILITY / TELEMETRY (bottom left)
