@@ -1185,9 +1185,10 @@ impl PerceptionProcessor {
         &mut self,
         batch: &[&[Vec<f32>; 5]],
         lr_scale: f32,
+        freeze_heads: bool,
     ) -> PerceptionResult<f32> {
         let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::NremBindingReplay, {
-            self.binding_replay_step_batch_inner(batch, lr_scale)
+            self.binding_replay_step_batch_inner(batch, lr_scale, freeze_heads)
         });
         result
     }
@@ -1196,6 +1197,7 @@ impl PerceptionProcessor {
         &mut self,
         batch: &[&[Vec<f32>; 5]],
         lr_scale: f32,
+        freeze_heads: bool,
     ) -> PerceptionResult<f32> {
         if batch.is_empty() {
             return Ok(0.0);
@@ -1367,7 +1369,34 @@ impl PerceptionProcessor {
             let loss_val: f32 = loss.clone().into_scalar();
             let model = self.model.take().unwrap();
             let grads = loss.backward();
-            let grads_p = GradientsParams::from_grads(grads, &model);
+            let mut grads_p = GradientsParams::from_grads(grads, &model);
+            // freeze_heads (gaps.md §33 candidate (d), 2026-08-16): the five output heads are
+            // shared with fused_replay_wake_step_batch, which trains them on *stored* episodes
+            // in the same NREM batch while this pass trains them on *live* (still-moving)
+            // episodes — a plausible direct cause of the dosage-invariant mean_output_mse
+            // regression across all four prior pilots (ADR 0041). Removing the heads' grads
+            // here leaves them untouched by this step's optimizer.step() while gradient still
+            // flows *through* them into the live episode tensor and on into the binding
+            // weights (Burn only skips the update for params with no registered gradient —
+            // it doesn't prevent backward() from computing one).
+            if freeze_heads {
+                let model_ref = &model;
+                for head in [
+                    &model_ref.speech_head,
+                    &model_ref.env_head,
+                    &model_ref.visual_head,
+                    &model_ref.symbolic_head,
+                    &model_ref.language_head,
+                ] {
+                    // GradientsParams stores gradients keyed on the *inner* (non-autodiff)
+                    // backend — TrainB::InnerBackend, i.e. NdArray, not TrainB itself; using
+                    // TrainB here silently fails the downcast inside TensorContainer::remove.
+                    grads_p.remove::<NdArray, 2>(head.weight.id);
+                    if let Some(b) = &head.bias {
+                        grads_p.remove::<NdArray, 1>(b.id);
+                    }
+                }
+            }
             let model = self
                 .optimizer
                 .step(self.current_lr * lr_scale as f64, model, grads_p);
@@ -3500,11 +3529,15 @@ mod binding_replay_tests {
             "grown binding rows must start exactly zero"
         );
 
-        let first_loss = proc.binding_replay_step_batch(&[&regional], 1.0).unwrap();
+        let first_loss = proc
+            .binding_replay_step_batch(&[&regional], 1.0, false)
+            .unwrap();
         assert!(first_loss.is_finite() && first_loss >= 0.0);
         let mut last_loss = first_loss;
         for _ in 0..29 {
-            last_loss = proc.binding_replay_step_batch(&[&regional], 1.0).unwrap();
+            last_loss = proc
+                .binding_replay_step_batch(&[&regional], 1.0, false)
+                .unwrap();
             assert!(last_loss.is_finite(), "binding replay loss went non-finite");
         }
         assert!(
@@ -3525,6 +3558,69 @@ mod binding_replay_tests {
             temporal_norm(&proc),
             temporal_before,
             "temporal components must not train in the None-context binding pass"
+        );
+    }
+
+    /// `freeze_heads` (gaps.md §33 candidate (d), 2026-08-16): the loss must still fall (proof
+    /// gradient reaches the binding weights through the heads) while the heads' own weights
+    /// stay byte-identical (proof they're excluded from this step's optimizer.step()). Pins
+    /// the mechanism before piloting it — same discipline as the other `binding_replay_tests`.
+    #[test]
+    fn binding_replay_freeze_heads_trains_binding_not_heads() {
+        let device = NdArrayDevice::Cpu;
+        let mut proc = PerceptionProcessor::new(device);
+
+        let regional: [Vec<f32>; 5] = std::array::from_fn(|i| {
+            (0..REGION_DIMS[i])
+                .map(|j| ((j as f32 + 1.0) * 0.01 * (i as f32 + 1.0)).sin())
+                .collect()
+        });
+
+        let head_data = |p: &PerceptionProcessor| -> Vec<f32> {
+            p.model
+                .as_ref()
+                .unwrap()
+                .speech_head
+                .weight
+                .val()
+                .into_data()
+                .convert::<f32>()
+                .to_vec()
+                .unwrap()
+        };
+        let binding_norm = |p: &PerceptionProcessor| -> f32 {
+            p.binding_proj_row_norms(RegionId::AudioSpeech).iter().sum()
+        };
+
+        let head_before = head_data(&proc);
+        let binding_before = binding_norm(&proc);
+
+        let first_loss = proc
+            .binding_replay_step_batch(&[&regional], 1.0, true)
+            .unwrap();
+        assert!(first_loss.is_finite() && first_loss >= 0.0);
+        let mut last_loss = first_loss;
+        for _ in 0..29 {
+            last_loss = proc
+                .binding_replay_step_batch(&[&regional], 1.0, true)
+                .unwrap();
+            assert!(last_loss.is_finite(), "binding replay loss went non-finite");
+        }
+        assert!(
+            last_loss < first_loss,
+            "binding replay loss did not decrease under freeze_heads: {first_loss} -> {last_loss}"
+        );
+
+        assert_eq!(
+            head_data(&proc),
+            head_before,
+            "head weights must stay byte-identical under freeze_heads=true"
+        );
+        assert_ne!(
+            binding_norm(&proc),
+            binding_before,
+            "binding weights must still move under freeze_heads=true \
+             (gradient flows through the frozen heads, not into them)"
         );
     }
 }

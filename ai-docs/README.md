@@ -30,7 +30,7 @@ For *behavioral* expectations on the assistant, see `../CLAUDE.md`. This folder 
 ## Tooling
 
 - `scripts/setup-hooks.sh` — installs `.git/hooks/pre-commit` (fmt + clippy, mirrors CI). `.git/hooks` isn't versioned by git, so re-run this after a fresh clone or if hooks ever go missing.
-- `scripts/ab_dinov3.sh`, `scripts/ab_qwen3.sh`, `scripts/ab_qwen3_longclips.sh`, `scripts/ab_binding_replay.sh`, `scripts/ab_binding_replay_lr_scale.sh`, `scripts/ab_video_change_threshold.sh` — A/B harnesses (isolated `--memory-dir` per arm, NDJSON metrics).
+- `scripts/ab_dinov3.sh`, `scripts/ab_qwen3.sh`, `scripts/ab_qwen3_longclips.sh`, `scripts/ab_binding_replay.sh`, `scripts/ab_binding_replay_lr_scale.sh`, `scripts/ab_binding_replay_freeze_heads.sh`, `scripts/ab_video_change_threshold.sh` — A/B harnesses (isolated `--memory-dir` per arm, NDJSON metrics).
 - [`a_b_dinov3_findings.md`](a_b_dinov3_findings.md), [`a_b_qwen3_findings.md`](a_b_qwen3_findings.md) — raw A/B evidence trails referenced by ADRs 0045/0036.
 
 ## Conventions

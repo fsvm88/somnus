@@ -511,6 +511,22 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     binding_replay_lr_scale: f32,
 
+    /// Freeze the five output heads during `binding_replay`'s optimizer step (gaps.md §33
+    /// candidate (d), 2026-08-16, added after both variants of candidate (a) — loss-scale and
+    /// LR-scale — failed with the same dosage-invariant `mean_output_mse` regression). The
+    /// heads are shared, unguarded state: `fused_replay_wake_step_batch` trains them on
+    /// *stored* episodes (the source of the production `mean_output_mse` metric) while
+    /// `binding_replay_step_batch` trains the same weights on *live* episodes from the
+    /// currently-training binder, in the same NREM batch, through the same optimizer — a
+    /// plausible direct cause of the regression, independent of update magnitude. When set,
+    /// gradient still flows *through* the heads into the live episode tensor and on into the
+    /// binding weights (so binding still trains), but the heads' own weights are excluded from
+    /// this step's `optimizer.step()` — they're updated only by the fused path. Only
+    /// meaningful when `--binding-replay` is set. Default false (heads train normally,
+    /// byte-identical to pre-this-flag behavior).
+    #[arg(long, default_value = "false")]
+    binding_replay_freeze_heads: bool,
+
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.
@@ -2094,6 +2110,7 @@ pub async fn run() -> Result<()> {
                 args.binding_replay,
                 args.binding_replay_steps,
                 args.binding_replay_lr_scale,
+                args.binding_replay_freeze_heads,
                 args.max_warm_records,
                 effective_max_cold,
                 args.growth_cooldown,

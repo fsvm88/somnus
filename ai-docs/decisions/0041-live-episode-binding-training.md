@@ -51,6 +51,22 @@
   the flawed inference §44 rested on — that the damage isn't a dosage effect: **(c) decouple the
   salience/settle cascade is the favored remaining candidate**, with (b) fuse-into-existing-step
   still untried and lower priority (doesn't address the cascade).
+  **2026-08-16: new candidate (d) found while scoping (c) — shared-head interference, implemented
+  and unit-tested, pilot pending.** Reading the code (not just this ADR's own prose) against
+  `fused_replay_wake_step_batch` found two things: this ADR's "Gradients reach... the encoders
+  (through `z`)" claim was wrong (corrected in "Mechanism" below — `SparseActivation.values` are
+  materialized before the binding forward, severing the graph; encoders don't train here); and the
+  production `mean_output_mse` metric is the head-reconstruction MSE on **stored** episodes
+  (`sleep.rs`'s `fused_replay_wake_step_batch` return value), while this pass trains the *same*
+  five head weights on **live** episodes in the same NREM batch through the same optimizer — a
+  plausible dosage-independent cause of the regression, which would explain why both variants of
+  candidate (a) failed identically regardless of update magnitude. New
+  `--binding-replay-freeze-heads` flag excludes the heads' own weights from this step's
+  `optimizer.step()` (gradient still flows through them into binding). Verified by a dedicated
+  unit test (`binding_replay_freeze_heads_trains_binding_not_heads`). **(d) is now the favored
+  candidate for the next pilot** — it targets `mean_output_mse` directly and is code-grounded,
+  vs. (c) which targets a wake-side symptom (the cascade) that this hypothesis says isn't even the
+  cause. Pilot script: `scripts/ab_binding_replay_freeze_heads.sh`.
 - **Date:** 2026-08-15
 
 ## Context
@@ -96,13 +112,35 @@ Mechanism, per NREM batch (traces already carry `regional: [Vec<f32>; 5]`):
    ADR 0012's proj_loss trains) on the live episodes; MSE against the traces' stored regional
    inputs — the identical target `wake_reconstruct_step_batch` already uses, so the loss semantics
    are unchanged; only the episode's provenance changes (live-through-binding instead of stored).
-4. Accumulate with the SAE reconstruction term, one `backward()` + `optimizer.step()`.
+4. Sum the five heads' losses and run one `backward()` + `optimizer.step()` — **a separate step
+   from the SAE reconstruction term**, not accumulated into it (`binding_replay_step_batch` is a
+   distinct method with its own optimizer call; see "Contract changes" below for why).
 
 Gradients reach: the active rows of each region's binding projection (including grown units' rows
 the first time they win k-WTA selection — this is the fix for consequence 2 above), W_q/W_k/W_v,
-the encoders (through `z`), and the heads. **The GRU (`temporal_gru`/`temporal_proj`) is NOT
-trained by this pass** — see "Contract changes" for why, and option (c) under "Alternatives" for
-the sequenced follow-up that covers it.
+and the heads. **The encoders do NOT receive gradients from this pass, despite an earlier version
+of this document claiming otherwise (corrected 2026-08-16):** phase 1's `SparseActivation.values`
+are materialized to plain `Vec<f32>` (`z_batch.into_data().convert::<f32>().to_vec()`,
+`crates/somnus-perception/src/lib.rs`) before entering the binding forward, which severs the autodiff
+graph at that boundary — `BindingArea::project_regions` rebuilds a fresh leaf tensor from those
+values (`binding.rs`'s `vals_t = Tensor::from_data(...)`). Encoder columns are trained only by the
+SAE reconstruction term in the same NREM batch, exactly as the in-code doc comment on
+`binding_replay_step_batch` already stated (the discrepancy was between this ADR and the code, not
+within the code itself). **The GRU (`temporal_gru`/`temporal_proj`) is also NOT trained by this
+pass** — see "Contract changes" for why, and option (c) under "Alternatives" for the sequenced
+follow-up that covers it.
+
+**2026-08-16 finding, relevant to the four failed pilots (engineering-log.md §35/§36/§44/§45):**
+the five output heads are shared, unguarded state — this pass and `fused_replay_wake_step_batch`
+both call `model.speech_head.forward(...)` (etc.) and both write through the same
+`self.optimizer`, but on two different episode sources: this pass uses **live** episodes
+(recomputed through the currently-training binder), the fused path uses **stored** episodes (the
+production `mean_output_mse` metric is measured on the fused path's stored-episode task —
+`sleep.rs`'s `fused_replay_wake_step_batch` return value). Training the same head weights toward
+two different input distributions in the same NREM batch is a plausible direct cause of the
+dosage-invariant `mean_output_mse` regression seen across all four pilots so far — worth testing
+directly (freeze the heads during this pass; see gaps.md §33) before concluding (per the
+"Alternatives" candidate (c)) that the fix has to be on the wake-side cascade instead.
 
 **Gating:** new CLI flag `--binding-replay` (default off). Off = byte-identical to today's NREM
 (control arm); on = the new pass runs (treatment arm). No other behavior changes.
@@ -283,11 +321,26 @@ that A/B runs always use full debugging metrics and record deviations:
    worse; `gist_recall_rate`/`warm_recall_l2` barely moved instead of collapsing), but the
    headline number doesn't improve at lower magnitude. **Candidate (a) is now closed in both
    variants.** This is solid evidence — not the flawed inference item 5 previously rested on —
-   that the damage is not a dosage effect. **(c), decoupling the salience/settle cascade, is the
-   favored remaining candidate**; (b), fusing into the existing `fused_replay_wake_step_batch`
-   step, remains untried and lower priority since it doesn't address the cascade. No path chosen
-   yet — next step needs a decision from the user before more code is written, per this project's
-   working-with-user norm for exploratory/architectural calls.
+   that the damage is not a dosage effect.
+7. **Candidate (d), freeze the heads during binding-replay — implemented and unit-tested, pilot
+   pending (2026-08-16):** found while scoping a (c) pilot, by reading `binding_replay_step_batch`
+   against `fused_replay_wake_step_batch` rather than trusting this ADR's own "Mechanism" prose.
+   The production `mean_output_mse` metric is the head-reconstruction MSE on **stored** episodes
+   (`sleep.rs`'s `fused_replay_wake_step_batch` return value); this pass trains the same five head
+   weights on **live** episodes, in the same NREM batch, through the same shared optimizer — a
+   dosage-independent mechanism that would explain why both variants of candidate (a) failed
+   identically at 10× different update magnitudes. New `--binding-replay-freeze-heads` flag
+   (default false) removes the heads' own gradients from `GradientsParams` before
+   `optimizer.step()` — Burn skips the update only for params with no registered gradient, so
+   gradient still flows *through* the heads into the live episode tensor and on into the binding
+   weights, but the heads stop moving under this step (they're still updated by the fused path).
+   Verified: `binding_replay_freeze_heads_trains_binding_not_heads` (`crates/somnus-perception/src/lib.rs`)
+   pins loss falling + binding rows moving + head weights staying byte-identical. **(d) is now
+   favored for the next pilot** over (c) — it targets `mean_output_mse` directly via a
+   code-grounded mechanism, where (c) targets a wake-side symptom (the salience/settle cascade)
+   this hypothesis says isn't the actual cause. Pilot script: `scripts/ab_binding_replay_freeze_heads.sh`,
+   not yet run. No path chosen until that pilot lands — per this project's working-with-user norm
+   for exploratory/architectural calls, the user chose to scope this before running it.
 
 ## What would invalidate this
 
