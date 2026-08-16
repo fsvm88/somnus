@@ -151,9 +151,12 @@ struct Args {
     #[arg(long, default_value = "600")]
     max_wake_secs: u64,
 
-    /// Top-down prior blend weight β (0.0 = disabled). Enable only after
-    /// output_mse has converged; random heads inject noise if enabled too early.
-    #[arg(long, default_value = "0.0")]
+    /// Top-down prior blend weight β. Small non-zero base so cosines are always
+    /// measured from episode 1 (ADR 0024 S4 chicken-and-egg fix — `blend_with_prior`
+    /// returns no cosine at all when this is exactly 0.0, freezing S2's settle EWMA
+    /// at cold start); blend stays negligible until S4 scales it up once predictions
+    /// mature (3-cycle cosine ring all >0.65). Pass 0.0 explicitly to fully disable.
+    #[arg(long, default_value = "0.01")]
     prior_beta: f32,
 
     /// Per-region prior blend weights as five comma-separated floats:
