@@ -2,8 +2,8 @@
 INT8 dynamic quantization of KV-cache ONNX models (Q-B).
 
 Produces:
-  qwen25_lm_decode_kv_int8.onnx
-  qwen25_lm_prefill_kv_int8.onnx  (optional, --prefill)
+  qwen3_lm_decode_kv_int8.onnx
+  qwen3_lm_prefill_kv_int8.onnx  (optional, --prefill)
 
 Then benchmarks FP32 vs INT8 for the decode step (the per-token hot path).
 Without VNNI (AVX2 only, Ryzen 9 5950X), speedup comes from bandwidth reduction
@@ -20,10 +20,10 @@ import onnxruntime as ort
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
 
-N_KV_LAYERS = 24
-N_KV_HEADS  = 2
-HEAD_DIM    = 64
-LM_HIDDEN   = 896
+N_KV_LAYERS = 28
+N_KV_HEADS  = 8
+HEAD_DIM    = 128
+LM_HIDDEN   = 1024
 KV_SIZE     = 2048
 VOCAB_SIZE  = 151936
 
@@ -41,7 +41,7 @@ def quantize(src: Path, dst: Path, reduce_range: bool) -> None:
 
 
 def make_decode_inputs(seq_pos: int) -> dict:
-    """Synthetic single decode-step inputs matching qwen25_lm_decode_kv.onnx signature.
+    """Synthetic single decode-step inputs matching qwen3_lm_decode_kv.onnx signature.
 
     Inputs (from Rust generate_kv):
       inputs_embeds  [1, 1, LM_HIDDEN]     float32
@@ -140,10 +140,10 @@ def main():
     args = ap.parse_args()
 
     models = Path(args.models_dir)
-    decode_fp32  = models / "qwen25_lm_decode_kv.onnx"
-    decode_int8  = models / "qwen25_lm_decode_kv_int8.onnx"
-    prefill_fp32 = models / "qwen25_lm_prefill_kv.onnx"
-    prefill_int8 = models / "qwen25_lm_prefill_kv_int8.onnx"
+    decode_fp32  = models / "qwen3_lm_decode_kv.onnx"
+    decode_int8  = models / "qwen3_lm_decode_kv_int8.onnx"
+    prefill_fp32 = models / "qwen3_lm_prefill_kv.onnx"
+    prefill_int8 = models / "qwen3_lm_prefill_kv_int8.onnx"
 
     if not args.skip_quantize:
         print("── Quantizing decode model ──")

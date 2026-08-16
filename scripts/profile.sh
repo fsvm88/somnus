@@ -12,7 +12,7 @@
 #   CAPACITY   episodic buffer size (default: 64 — fast sleep trigger)
 #
 # Output:
-#   <OUTPUT_DIR>/ort/qwen25_lm_*.json   ORT op timeline (Perfetto / chrome://tracing)
+#   <OUTPUT_DIR>/ort/qwen3_lm_*.json   ORT op timeline (Perfetto / chrome://tracing)
 #   <OUTPUT_DIR>/rocprof/               GPU kernel CSV + JSON trace
 #   <OUTPUT_DIR>/flamegraph.svg         CPU flamegraph (open in browser)
 #   <OUTPUT_DIR>/metrics.jsonl          sleep-cycle metrics with wake timing
@@ -163,7 +163,7 @@ rm -rf \
 echo ""
 echo "=== Profile run complete: $OUTPUT_DIR/ ==="
 echo ""
-echo "  ort/qwen25_lm_*.json  — ORT op-level timeline for Qwen LM session"
+echo "  ort/qwen3_lm_*.json  — ORT op-level timeline for Qwen LM session"
 echo "  rocprof/              — GPU kernel timing for all MIGraphX models"
 echo "  flamegraph.svg        — CPU call-stack (burn, HNSW, serde, tokio, …)"
 echo "  metrics.jsonl         — sleep cycle metrics incl. wake-phase encode times"

@@ -1,7 +1,13 @@
 # ADR 0033 — LoRA fine-tuning of Qwen2.5-0.5B on episode prefixes (ADR 0012 item L)
 
 **Date:** 2026-06-21
-**Status:** Validated and deployed (2026-06-25)
+**Status:** Validated and deployed (2026-06-25) for Qwen2.5, since superseded by the Qwen3 swap
+(ADR 0036) and orphaned (gaps.md §39). `scripts/train_lora.py` (referenced throughout this ADR)
+was removed 2026-08-16 as dead code — `qwen25_lm.onnx` and every other Qwen2.5 model file no
+longer exist anywhere in the repo or `models/`, and its logic was already ported to
+`scripts/train_lora_qwen3.py`, the live script gaps.md §39 tracks. This ADR's procedure below is
+kept as the historical record of what was built and validated at the time, not as a runnable
+reference.
 
 ## Context
 

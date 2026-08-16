@@ -260,7 +260,7 @@ def export_onnx(model, tokenizer, onnx_path: str, device):
         os.rename(onnx_path, backup)
         print(f"  backed up existing model to {backup}")
 
-    wrapper = _Qwen25LMWrapper(model).to(device).eval()
+    wrapper = _LMWrapper(model).to(device).eval()
     dummy = torch.zeros(1, 4, LM_HIDDEN, dtype=torch.float32, device=device)
 
     with torch.no_grad():
@@ -280,7 +280,7 @@ def export_onnx(model, tokenizer, onnx_path: str, device):
             dynamo=False,
         )
     print(f"ONNX export complete: {onnx_path}")
-    print("NOTE: run scripts/export_models.py to rebuild qwen25_gain.onnx and qwen25_text_hidden.onnx")
+    print("NOTE: run scripts/export_models.py to rebuild qwen3_gain.onnx and qwen3_text_hidden.onnx")
     print("      if gain drift is observed after LoRA deployment (see ADR 0033).")
 
 
