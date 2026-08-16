@@ -88,7 +88,7 @@ k-means (k=32, Lloyd's, up to 2048-record sample) on warm episode vectors; probe
 
 ### 10d — Working memory ✓
 
-Fixed-capacity ring of recent episode vectors (`--working-memory-size`, default 0=disabled). During binding, the ring feeds a GRU (input=EPISODE_DIM=640, hidden=256); final hidden projects to `[5,D_PROJ=128]`, appended to K/V (Q stays `[5,128]`, output shape unchanged, ~852K new params) — supersedes the originally-described WM-mean-pool approach (ADR 0008 amendment). Cleared on sleep entry (wake-local). Validated: WM=8 vs. WM=0 on the same snapshot — output_mse 40-50% lower with WM (e.g. ep 6: 0.29 vs 0.58).
+Fixed-capacity ring of recent episode vectors (`--working-memory-size`, default **8**, hardened 2026-08-16 per ADR 0047; `0` disables it). During binding, the ring feeds a GRU (input=EPISODE_DIM=640, hidden=256); final hidden projects to `[5,D_PROJ=128]`, appended to K/V (Q stays `[5,128]`, output shape unchanged, ~852K new params) — supersedes the originally-described WM-mean-pool approach (ADR 0008 amendment). Cleared on sleep entry (wake-local). Validated: WM=8 vs. WM=0 on the same snapshot — output_mse 40-50% lower with WM (e.g. ep 6: 0.29 vs 0.58).
 
 **Exit criterion:** ✓ output_mse measurably lower with WM enabled on temporally coherent content.
 

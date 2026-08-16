@@ -166,9 +166,13 @@ struct Args {
     #[arg(long)]
     prior_beta_regions: Option<String>,
 
-    /// Number of settling iterations per episode (0 = disabled). Enable only
-    /// after output_mse has converged; random heads distort settling inputs (ADR 0011).
-    #[arg(long, default_value = "0")]
+    /// Number of settling iterations per episode (0 = disabled). Default 1 — the
+    /// value every real campaign has run since 2026-05-31 (ADR 0047 hardened this
+    /// into the default 2026-08-16); `SETTLE_EPS` is calibrated for it (see
+    /// `somnus-perception::SETTLE_EPS` doc comment). A cold-start WARN still fires
+    /// with no prior snapshot (random output heads distort early settling inputs,
+    /// ADR 0011) — harmless noise, not a functional gate.
+    #[arg(long, default_value = "1")]
     settle_steps: usize,
 
     /// Settling blend weight β: fraction of output-head prediction mixed into
@@ -187,16 +191,21 @@ struct Args {
     settle_every: usize,
 
     /// Working-memory ring size: number of recent episode vectors to carry as
-    /// cross-attention context in the binding area (ADR 0010/10d). 0 = disabled (default).
-    /// Cleared at sleep entry (wake-local by design).
-    #[arg(long, default_value = "0")]
+    /// cross-attention context in the binding area (ADR 0010/10d). Default 8 —
+    /// validated (roadmap.md §10d): WM=8 vs WM=0 on the same snapshot, output_mse
+    /// 40-50% lower with WM (ADR 0047 hardened this into the default 2026-08-16).
+    /// 0 disables the ring entirely. Cleared at sleep entry (wake-local by design).
+    #[arg(long, default_value = "8")]
     working_memory_size: usize,
 
     /// Cap on the number of records in the warm HNSW index. When warm reaches
     /// this limit, the index is rebuilt during sleep keeping only the most recent
-    /// N records from cold. 0 = unlimited (default). Suggested: 200_000 for
-    /// long-running sessions to bound RAM usage (~500 MB at 640-dim f32).
-    #[arg(long, default_value = "0")]
+    /// N records from cold. Default 200_000 (~500 MB at 640-dim f32) — the value
+    /// every real campaign has run since 2026-06-17 (ADR 0047 hardened this into
+    /// the default 2026-08-16). 0 = auto-derive from free RAM instead
+    /// (`free_ram_bytes×0.35/2500`, clamped [1_000, 1_000_000], ADR 0024 S5) —
+    /// pass 0 explicitly to opt back into the auto formula.
+    #[arg(long, default_value = "200000")]
     max_warm_records: usize,
 
     /// ef parameter for HNSW warm-memory queries. Higher ef = more accurate recall
@@ -311,12 +320,14 @@ struct Args {
     export_proj_weights: Option<PathBuf>,
 
     /// Use LM forward-pass hidden states for language region input instead of
-    /// the frozen embed-table mean-pool. Requires --action (loads qwen3_lm.onnx).
+    /// the frozen embed-table mean-pool. Requires --action (loads qwen3_lm.onnx);
+    /// falls back to the embed-table baseline if the decoder is unavailable.
     /// Each text line runs a single non-autoregressive LM forward pass; hidden
     /// states are mean-pooled and L2-normalised to produce the 1024-dim embedding.
-    /// A/B flag: compare p_lang vs embed-table baseline to confirm representation
-    /// quality is the bottleneck before hardening.
-    #[arg(long, default_value = "false")]
+    /// Default true — the A/B this flag existed to run concluded in its favor
+    /// (the 4x p_lang improvement, gaps.md item 10) and every real campaign has
+    /// run with it on; hardened into the default 2026-08-16 (ADR 0047).
+    #[arg(long, default_value = "true")]
     lang_use_lm: bool,
 
     /// L1 sparsity penalty coefficient on SAE activations, added to the NREM

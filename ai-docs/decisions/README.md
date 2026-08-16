@@ -93,3 +93,4 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0044](0044-derpp-stale-blocking-and-auto-lambda.md) | DER++: stale-output blocking (adopted) and auto-λ loss weighting (rejected) | mixed — stale-output blocking shipped; auto-λ closed/FAIL |
 | [0045](0045-dinov3-visual-encoder.md) | Adopt DINOv3-ViT-S as the visual encoder; drop DINOv2-S/14 | implemented |
 | [0046](0046-audio-env-encoder-candidates.md) | Audio env encoder candidates surveyed: CLAP-HTSAT retained | closed — status quo confirmed |
+| [0047](0047-harden-cli-defaults-to-production-settings.md) | Harden four CLI defaults (`--working-memory-size`, `--settle-steps`, `--max-warm-records`, `--lang-use-lm`) to match already-adopted production settings | accepted, shipped as default |
