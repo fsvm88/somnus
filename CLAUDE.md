@@ -4,6 +4,8 @@ This is **somnus**: a long-running research project toward an AI system that con
 
 This file describes **how to behave** on this project. Project content — vision, architecture, terminology, research, decisions — lives in `ai-docs/`. Read `ai-docs/README.md` first to navigate.
 
+> Shared conventions (`ai-docs/` layout, ADRs, Rust code-quality gates, session-resume pattern, solo-project defaults, director-mode delegation to local LLMs) live in [claude-global](https://github.com/fsvm88/claude-global) — this file only covers what's specific to *somnus*.
+
 ## Mindset
 
 - **Research, not product.** Optimize for learning velocity, reversibility, and clarity. Robustness, polish, generality, and backward compatibility are non-goals at this stage. A small ugly working demo beats a clean hypothetical design.
@@ -11,28 +13,15 @@ This file describes **how to behave** on this project. Project content — visio
 - **Rust is a constraint we accepted, not a religion.** When the ecosystem has a gap, prefer in this order: (1) wrap an existing crate, (2) FFI to a mature C/CUDA/Python lib, (3) build a minimal in-tree shim, (4) write from scratch only when the surface is small and well-understood. Don't hand-roll a tensor library or an audio codec.
 - **Small experiments first.** New ideas land as standalone binaries or in `experiments/`. They graduate into the main system only after they've earned it, via an explicit ADR.
 
-## Documentation discipline
+## Documentation discipline (project-specific, on top of the global `ai-docs/` convention)
 
-Everything durable belongs in `ai-docs/`. Treat docs as the project's long-term memory; conversation context is not.
-
-- Non-obvious decisions get a short ADR in `ai-docs/decisions/NNNN-title.md` (sequentially numbered). Capture *why*, alternatives considered, and what would invalidate the decision.
-- Research that informs design lands in `ai-docs/research/<topic>.md`, with citations (paper title, authors, year, link, one-line takeaway).
-- Update `ai-docs/architecture.md` when system structure changes. It is the canonical mental model.
 - Update `ai-docs/architecture.svg` whenever the architecture or its key parameters change (encoders, region count, EPISODE_DIM, GRU_HIDDEN, D_PROJ, N_UNITS, K_ACTIVE, memory tier sizing, new subsystems, removed/closed items). The SVG is the visual companion to `architecture.md`; both must stay in sync. The SVG lives in git alongside the docs.
 - `ai-docs/constants.md` is the source-cited fast-reference table backing both. **Any commit that changes a constant/default covered there must update all three in the same commit:** the Rust source (authoritative), `constants.md`, and `architecture.svg` if the constant appears in the diagram. When touching perception/memory/action code, check whether the changed value has a `constants.md` row before considering the change done.
-- Define new terms in `ai-docs/glossary.md` once and link from elsewhere.
-- Keep `ai-docs/README.md` as the working index of what's where.
-- **Don't write speculative architecture into the foundation docs.** Speculation goes in `research/`, clearly marked. Foundation docs describe what *is* or what was just decided.
-- **Don't delete a doc that looks stale** without checking — staleness can mean we lost track of a research thread, not that the thread is dead.
-- Honesty about state: if a subsystem is a stub, say so. If a result is from a toy dataset, say so. Aspirational docs are a research liability.
 
 ## Code conventions
 
-- `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` before declaring work done.
-- New deps: name 2–3 alternatives, pick one, justify in an ADR or `tech-stack.md` if non-obvious. Pin versions.
-- Workspace layout: a top-level Cargo workspace; split crates along architectural boundaries (`sensory`, `memory`, `cognition`, etc.) only once those boundaries are real. Don't pre-create empty crates.
-- Tests scale with stakes: integration tests at crate boundaries; `proptest` for stateful logic (memory, learning rules); `criterion` benches only when there is a target to hit.
-- Public APIs of shared crates get rustdoc. Internal modules: only when *why* is non-obvious.
+- Tests: integration tests at crate boundaries; `proptest` for stateful logic (memory, learning rules); `criterion` benches only when there is a target to hit.
+- Workspace layout: split crates along architectural boundaries (`sensory`, `memory`, `cognition`, etc.) only once those boundaries are real.
 - Seeds fixed in experiments. Configs and dataset versions recorded. We don't yet need MLflow-grade infra, but we should always be able to answer "how did you get this number?"
 
 ## Metrics discipline (standing policy as of 2026-07-15)
@@ -48,11 +37,7 @@ When proposing or implementing a change: name which existing metrics already cov
 
 ## Working with the user
 
-- Exploratory prompts ("how should we…", "what about X") get a recommendation + the main trade-off in a few sentences, not a finished plan. Wait for the go-ahead before implementing.
-- Before adding a new external dependency or starting a new top-level subsystem, name what's coming and check.
 - When biology and engineering pragmatism conflict, default to engineering pragmatism and note the divergence in the relevant doc.
-- Updates and end-of-turn summaries stay short. Diffs and docs speak for themselves.
-- This is a one-developer research repo. There is no team to coordinate with, no external users, no SLAs.
 
 ## Session resume
 
