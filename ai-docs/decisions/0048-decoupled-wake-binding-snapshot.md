@@ -51,8 +51,9 @@ scope extends to cover it at that point, not before.
    at whatever dosage/step-count settings are already in place.
 3. A new `sync_wake_binding()` copies `region_0..region_4`/`w_q`/`w_k`/`w_v`'s values from
    `binding` into `wake_binding` (plain tensor copy, no gradient tracking needed on the target).
-   The sleep-cycle driver loop (`crates/somnus/src/lib.rs`, near the existing NREM/wake boundary
-   around `:2451`) calls it only when `cycle_count % lag_cycles == 0`.
+   The driver loop's existing `sleep_cycle_count` counter (`crates/somnus/src/lib.rs:1347`,
+   incremented at `:2150`) is the natural gate: call `sync_wake_binding()` right alongside the
+   existing `rebuild_ort_session` call (`:2451-2469`) when `sleep_cycle_count % lag_cycles == 0`.
 4. `try_bind`, `settle_episode`, `binding_only`, and `export_weights_for_onnx`/`rebuild_ort_session`
    all switch from reading `model.binding` to reading `model.wake_binding`. This is the critical
    correctness point: burn's wake path and the ORT-exported graph must read the *same* generation,
@@ -64,6 +65,53 @@ scope extends to cover it at that point, not before.
 6. New CLI flag `--binding-wake-lag-cycles <u32>` (default 1), meaningful only when
    `--binding-replay` is set. `lag=1` reproduces today's behavior exactly (sync every cycle) —
    this is the control-arm equivalent for the upcoming pilot's sweep.
+
+## Implementation notes (found during review, 2026-09-13 — before any code was written)
+
+A pre-implementation review of the actual call sites turned up gaps in the mechanism as first
+scoped above. These are corrections, not changes of direction:
+
+1. **`prune_region_inner` was missing from the growth-lockstep list.** There are three structural
+   mutators of `model.binding`'s per-region tensors, not two: `grow_region_inner` (:2095),
+   `grow_region_seeded_inner` (:2187), and `prune_region_inner` (:2338) — all three splice rows into
+   or out of `region_0..4`. All three must apply the identical splice to `wake_binding` in the same
+   call, unconditionally (never gated by the lag counter), or the two copies' shapes diverge and the
+   next `wake_binding.forward()` panics on a dimension mismatch against the (already-resized)
+   encoder output it's fed.
+2. **`export_weights_for_onnx_inner` (:2774) must read every binding field — including
+   `temporal_gru`/`temporal_proj`, currently untrained by any path — from `wake_binding`, not
+   `model.binding`.** ORT's exported graph must be internally self-consistent; simplest correct rule
+   is "the ORT graph always mirrors `wake_binding` in full," not "the trained tensors come from one
+   copy and the untrained ones from another."
+3. **`binding_proj_row_norms` (:1835) stays pointed at `model.binding`, unchanged.** It's ADR 0041's
+   own pilot-verification probe into training progress (do grown rows move under
+   `binding_replay_step_batch`), not a wake-time read — this ADR must not touch it.
+4. **`homeostatic_decay` (:2058) needs no change.** It mutates `model.binding`'s trained tensors
+   (region_0..4/w_q/w_k/w_v) in place, same as `binding_replay_step_batch` does — `sync_wake_binding`
+   copying whatever `binding` currently holds already carries decay's effect along for free, exactly
+   the batching behavior this ADR wants. No special-casing needed.
+5. **`wake_binding` must be seeded as `binding.clone()` at construction, not an independent
+   `BindingArea::new(device)` call.** `PerceptionModel::new()` (:233) currently does `binding:
+   BindingArea::new(device)`; a second independent `BindingArea::new(device)` call for
+   `wake_binding` would draw different random initial weights (two separate RNG draws), causing a
+   spurious day-0 divergence between the two copies before any training has happened. Construct
+   `binding` first, then set `wake_binding` to a clone of it (burn `Module` types implement `Clone`;
+   `PerceptionModel` itself is already cloned elsewhere, e.g. `save_weights` at :2691).
+6. **Snapshot save/load:** `wake_binding` is a normal (non-`#[module(skip)]`) field, so burn's
+   `BinFileRecorder` serializes/deserializes it automatically alongside every other field — no
+   special handling needed for the weight *values*. But `region_n` is `#[module(skip)]` on
+   `BindingArea` and is **not** persisted; `load_weights` (:2702) already has a manual
+   reconstruction block for `loaded.binding.region_n` from the region weight shapes (:2716-2722) —
+   the identical block is needed for `loaded.wake_binding.region_n`. The load-failure fallback path
+   (constructs a fresh `PerceptionModel::new()` and re-grows it, :2731 onward) also needs
+   `wake_binding` grown in lockstep there, same as point 1 above.
+7. **`wake_binding` becomes the sole stateful copy.** Wake-time `forward()` (not `forward_tracked`)
+   caches `gru_hidden` across calls for the GRU temporal-context branch. After `try_bind`/
+   `settle_episode`/`binding_only` switch to `wake_binding.forward(...)`, `wake_binding` owns that
+   cache exclusively; `model.binding`'s own `gru_hidden`/`temporal_gru`/`temporal_proj` become
+   permanently inert (never forward()'d, never trained, by any path, before or after this ADR —
+   that's unchanged; candidate (c) is what would eventually train the GRU). Harmless, but worth
+   naming so it isn't mistaken for a bug in review.
 
 ## Alternatives considered
 
