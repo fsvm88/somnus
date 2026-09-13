@@ -504,3 +504,48 @@ mod tests {
         );
     }
 }
+
+/// Regression pin for a non-obvious burn quirk found while implementing ADR 0048
+/// (gaps.md §33): `Linear::clone()` does NOT preserve a materialized weight
+/// value — it re-runs `Param`'s lazy random initializer independently per clone,
+/// even though bare `Tensor::clone()` does preserve values correctly. This is why
+/// `PerceptionModel::new()` seeds `wake_binding` by explicitly copying each
+/// trained tensor's `.val()` into a fresh `Param::initialized(...)` rather than
+/// `binding.clone()` — if this test ever starts passing on `assert_ne`, burn's
+/// `Param`/`Module` clone semantics have changed and `PerceptionModel::new()`'s
+/// explicit-copy workaround may have become unnecessary (or, if it flips the
+/// other direction, insufficient).
+#[cfg(test)]
+mod burn_linear_clone_quirk {
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::NdArray;
+    use burn::nn::LinearConfig;
+
+    #[test]
+    fn linear_clone_does_not_preserve_materialized_values() {
+        let device = NdArrayDevice::Cpu;
+        let lin = LinearConfig::new(10, 10)
+            .with_bias(false)
+            .init::<NdArray>(&device);
+        let cloned = lin.clone();
+        let a: Vec<f32> = lin
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        let b: Vec<f32> = cloned
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        assert_ne!(
+            a, b,
+            "burn's Linear::clone() now preserves values — re-check PerceptionModel::new()'s \
+             explicit wake_binding seeding workaround (ADR 0048), it may no longer be needed"
+        );
+    }
+}

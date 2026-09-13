@@ -540,4 +540,81 @@ mod tests {
             "base binding rows must remain live"
         );
     }
+
+    // ── ADR 0048: decoupled wake-time binding snapshot ──────────────────────
+
+    /// `wake_binding` must stay byte-identical to its last sync while `binding`
+    /// keeps moving under `binding_replay_step_batch` — that's the entire point
+    /// of the lag. Only an explicit `sync_wake_binding()` call may change it.
+    #[test]
+    fn wake_binding_stays_frozen_until_synced() {
+        let mut proc = make_proc();
+        proc.refresh_autodiff_state();
+        let regional = regional_inputs();
+
+        let wake_before = proc.wake_binding_proj_row_norms(RegionId::AudioSpeech);
+        let live_before = proc.binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_eq!(
+            wake_before, live_before,
+            "wake_binding must start as an exact clone of binding"
+        );
+
+        for _ in 0..10 {
+            proc.binding_replay_step_batch(&[&regional], 1.0, false)
+                .unwrap();
+        }
+        let live_after_training = proc.binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_ne!(
+            live_before, live_after_training,
+            "binding must move under binding_replay_step_batch"
+        );
+        let wake_after_training = proc.wake_binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_eq!(
+            wake_before, wake_after_training,
+            "wake_binding must not move just because binding trained — no sync happened yet"
+        );
+
+        proc.sync_wake_binding();
+        let wake_after_sync = proc.wake_binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_eq!(
+            wake_after_sync, live_after_training,
+            "sync_wake_binding must copy binding's exact current values into wake_binding"
+        );
+    }
+
+    /// `grow_region`/`grow_region_seeded`/`prune_region` must reshape `binding` and
+    /// `wake_binding` in lockstep, unconditionally — shape never lags, only trained
+    /// values do (ADR 0048). A shape mismatch here would panic the next
+    /// `wake_binding.forward()` call at production scale, not just fail this test.
+    #[test]
+    fn growth_and_prune_keep_binding_and_wake_binding_in_lockstep() {
+        let mut proc = make_proc();
+
+        proc.grow_region(RegionId::Visual, 32);
+        assert_eq!(
+            proc.binding_proj_row_norms(RegionId::Visual).len(),
+            proc.wake_binding_proj_row_norms(RegionId::Visual).len(),
+            "grow_region must grow wake_binding's shape alongside binding's"
+        );
+
+        let seeds: Vec<Vec<f32>> = (0..4)
+            .map(|k| (0..REGION_DIMS[2]).map(|j| (j + k) as f32 * 0.01).collect())
+            .collect();
+        proc.grow_region_seeded(RegionId::Visual, 16, &seeds);
+        assert_eq!(
+            proc.binding_proj_row_norms(RegionId::Visual).len(),
+            proc.wake_binding_proj_row_norms(RegionId::Visual).len(),
+            "grow_region_seeded must grow wake_binding's shape alongside binding's"
+        );
+
+        proc.prune_region(RegionId::Visual, 0.5);
+        assert_eq!(
+            proc.binding_proj_row_norms(RegionId::Visual).len(),
+            proc.wake_binding_proj_row_norms(RegionId::Visual).len(),
+            "prune_region must shrink wake_binding's shape alongside binding's"
+        );
+        // Confirm pruning actually did something, or the three shape checks above
+        // would trivially pass without exercising prune's row-removal path at all.
+        assert!(proc.binding_proj_row_norms(RegionId::Visual).len() < N_UNITS + 32 + 16);
+    }
 }

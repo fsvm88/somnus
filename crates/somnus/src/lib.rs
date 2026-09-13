@@ -527,6 +527,26 @@ struct Args {
     #[arg(long, default_value = "false")]
     binding_replay_freeze_heads: bool,
 
+    /// Sleep-cycle cadence for `sync_wake_binding` — how often the wake-time binding
+    /// snapshot (`PerceptionModel::wake_binding`) is hard-copied from the live
+    /// `binding_replay`-trained copy (ADR 0048, gaps.md §33 candidate (e), 2026-09-13).
+    /// Added after the confirming diagnostic (engineering-log.md §47) disconfirmed the
+    /// leading hypothesis that ORT re-export cadence was the cause of every prior
+    /// pilot's `mean_output_mse` regression — the real, backend-independent mechanism is
+    /// that wake-time inference (burn or ORT) always reads the *currently-training*
+    /// binder, so every sleep cycle forms and stores episodes through a newer generation
+    /// than the ones already stored. This flag decouples "how often the binder trains"
+    /// (`binding_replay_steps`/`binding_replay_lr_scale`, unaffected) from "how often
+    /// wake sees a new binder generation." Applies regardless of `--binding-replay`:
+    /// `homeostatic_decay` mutates the trained binding tensors every cycle
+    /// unconditionally, so the sync must run on this cadence even with
+    /// `--binding-replay` off, or `wake_binding` would freeze at its initial values
+    /// forever on the default/production path. Default 1 (sync every cycle —
+    /// byte-identical to pre-this-flag behavior, the control-arm equivalent for
+    /// this ADR's own validation pilot).
+    #[arg(long, default_value = "1")]
+    binding_wake_lag_cycles: usize,
+
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.
@@ -2444,6 +2464,26 @@ pub async fn run() -> Result<()> {
                 w.set_weights(perception.head_weights_flat());
             }
             wake_start = std::time::Instant::now();
+
+            // ADR 0048 (gaps.md §33 candidate (e)): hard-copy the live binding
+            // training copy into the wake-time snapshot only every
+            // `--binding-wake-lag-cycles` cycles, not every cycle — decouples "how
+            // often the binder trains" from "how often wake sees a new binder
+            // generation". Must run BEFORE the ORT rebuild below so a sync cycle's
+            // ORT export reflects the just-synced snapshot, not a stale one.
+            //
+            // NOT gated on `args.binding_replay`: `homeostatic_decay` (sleep.rs)
+            // mutates `binding`'s trained tensors every cycle unconditionally, so
+            // even with `--binding-replay` off, `binding` still moves and
+            // `wake_binding` must still be kept in sync at the configured cadence
+            // — gating this on `binding_replay` would leave `wake_binding` frozen
+            // at its initial values forever whenever binding-replay is off (the
+            // default/production path), which is not this ADR's intent. lag=1
+            // (the default) reproduces the pre-ADR-0048 always-immediate behavior
+            // exactly in both configurations.
+            if sleep_cycle_count.is_multiple_of(args.binding_wake_lag_cycles.max(1)) {
+                perception.sync_wake_binding();
+            }
 
             // Rebuild ORT binding session with updated weights after sleep training —
             // or, if not active yet, check whether growth just crossed the ORT

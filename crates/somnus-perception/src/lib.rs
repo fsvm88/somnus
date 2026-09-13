@@ -218,6 +218,15 @@ pub struct PerceptionModel<B: burn::tensor::backend::Backend> {
     pub symbolic_decoder: SaeDecoder<B>,
     pub language_decoder: SaeDecoder<B>,
     pub binding: BindingArea<B>,
+    /// Lagged snapshot of `binding`'s trained tensors (region_0..4, w_q/w_k/w_v),
+    /// hard-copied from `binding` only every `--binding-wake-lag-cycles` sleep
+    /// cycles (ADR 0048). All wake-time inference (`try_bind`/`settle_episode`/
+    /// `binding_only`) and ORT export read from this copy, never from `binding`
+    /// directly — `binding` is the training-only copy `binding_replay_step_batch`
+    /// writes to. Decouples "how often the binder trains" from "how often wake
+    /// sees a new binder generation", the confirmed root cause of gaps.md §33's
+    /// mean_output_mse regression (engineering-log.md §47).
+    pub wake_binding: BindingArea<B>,
     pub speech_head: Linear<B>,
     pub env_head: Linear<B>,
     pub visual_head: Linear<B>,
@@ -231,6 +240,30 @@ pub struct PerceptionModel<B: burn::tensor::backend::Backend> {
 
 impl PerceptionModel<TrainB> {
     pub fn new(device: &NdArrayDevice) -> Self {
+        // wake_binding must start byte-identical to binding (ADR 0048). A plain
+        // `binding.clone()` does NOT achieve this: burn's derived `Module` Clone
+        // re-runs each `Param`'s lazy random initializer independently per clone
+        // (confirmed empirically — `Linear::clone()` does not preserve a
+        // materialized weight value, only `Tensor::clone()` does), so two
+        // BindingArea::new() calls or one clone() would each draw fresh random
+        // weights. Copy each trained tensor's already-materialized value
+        // explicitly instead — the same pattern `sync_wake_binding` uses later.
+        let binding = BindingArea::new(device);
+        let mut wake_binding = BindingArea::new(device);
+        macro_rules! seed_wake_binding_field {
+            ($field:ident) => {
+                wake_binding.$field.weight =
+                    Param::initialized(ParamId::new(), binding.$field.weight.val());
+            };
+        }
+        seed_wake_binding_field!(region_0);
+        seed_wake_binding_field!(region_1);
+        seed_wake_binding_field!(region_2);
+        seed_wake_binding_field!(region_3);
+        seed_wake_binding_field!(region_4);
+        seed_wake_binding_field!(w_q);
+        seed_wake_binding_field!(w_k);
+        seed_wake_binding_field!(w_v);
         Self {
             speech_layer: KWtaLayer::new(RegionId::AudioSpeech, 384, device),
             env_layer: KWtaLayer::new(RegionId::AudioEnv, ENV_DIM, device),
@@ -242,7 +275,8 @@ impl PerceptionModel<TrainB> {
             visual_decoder: SaeDecoder::new(RegionId::Visual, 384, device),
             symbolic_decoder: SaeDecoder::new(RegionId::Symbolic, 384, device),
             language_decoder: SaeDecoder::new(RegionId::Language, LANG_HIDDEN, device),
-            binding: BindingArea::new(device),
+            binding,
+            wake_binding,
             speech_head: LinearConfig::new(EPISODE_DIM, 384)
                 .with_bias(false)
                 .init(device),
@@ -968,7 +1002,7 @@ impl PerceptionProcessor {
                     tracing::warn!(?e, "ORT binding failed; falling back to burn");
                     somnus_metrics::counted_core!(somnus_metrics::Metric::OrtBindingFallback, 1);
                     let device = self.device;
-                    self.model.as_mut().unwrap().binding.forward(
+                    self.model.as_mut().unwrap().wake_binding.forward(
                         &[sp, en, vi, sy, lang],
                         latest_episode,
                         &device,
@@ -978,7 +1012,7 @@ impl PerceptionProcessor {
         } else {
             // Burn path (original)
             let device = self.device;
-            self.model.as_mut().unwrap().binding.forward(
+            self.model.as_mut().unwrap().wake_binding.forward(
                 &[sp, en, vi, sy, lang],
                 latest_episode,
                 &device,
@@ -1181,6 +1215,82 @@ impl PerceptionProcessor {
     /// into `fused_replay_wake_step_batch`: keeps the existing fused path byte-identical
     /// for the A/B control arm (ADR 0041). Gated behind `--binding-replay` at the call
     /// site; the `NremBindingReplay` Core metric stays at zero when off.
+    /// Hard-copy `binding`'s currently-trained tensors (region_0..4, w_q, w_k, w_v)
+    /// into `wake_binding` (ADR 0048). Plain value copy — the target gets a fresh
+    /// `ParamId` and no autodiff graph link back to `binding`; GRU/temporal_proj are
+    /// untouched (neither copy trains them; see `BindingArea`'s doc comment).
+    /// Called by the sleep-cycle driver loop on a `--binding-wake-lag-cycles` cadence,
+    /// not every cycle — that's the whole point of this ADR.
+    pub fn sync_wake_binding(&mut self) {
+        somnus_metrics::timed_core!(somnus_metrics::Metric::BindingWakeSync, {
+            let model = self.model.as_mut().unwrap();
+
+            // Fine-tier divergence gauge (ADR 0048): L2 distance between binding and
+            // wake_binding, summed across the 8 trained tensors, measured *before* this
+            // sync overwrites wake_binding — quantifies how much the live copy drifted
+            // during the lag window just closed. Textually absent (not just skipped) when
+            // `fine-metrics` is off, per this tier's cost discipline.
+            #[cfg(feature = "fine-metrics")]
+            {
+                let mut divergence_l2_sq = 0.0f64;
+                macro_rules! accumulate_divergence {
+                    ($field:ident) => {{
+                        let live: Vec<f32> = model
+                            .binding
+                            .$field
+                            .weight
+                            .val()
+                            .into_data()
+                            .convert::<f32>()
+                            .to_vec()
+                            .unwrap();
+                        let wake: Vec<f32> = model
+                            .wake_binding
+                            .$field
+                            .weight
+                            .val()
+                            .into_data()
+                            .convert::<f32>()
+                            .to_vec()
+                            .unwrap();
+                        for (a, b) in live.iter().zip(wake.iter()) {
+                            let d = (*a - *b) as f64;
+                            divergence_l2_sq += d * d;
+                        }
+                    }};
+                }
+                accumulate_divergence!(region_0);
+                accumulate_divergence!(region_1);
+                accumulate_divergence!(region_2);
+                accumulate_divergence!(region_3);
+                accumulate_divergence!(region_4);
+                accumulate_divergence!(w_q);
+                accumulate_divergence!(w_k);
+                accumulate_divergence!(w_v);
+                let divergence_l2 = divergence_l2_sq.sqrt() as f32;
+                somnus_metrics::counted!(
+                    somnus_metrics::Metric::BindingWakeDivergenceL2,
+                    (divergence_l2 * 1e6) as u64
+                );
+            }
+
+            macro_rules! copy_linear {
+                ($field:ident) => {
+                    model.wake_binding.$field.weight =
+                        Param::initialized(ParamId::new(), model.binding.$field.weight.val());
+                };
+            }
+            copy_linear!(region_0);
+            copy_linear!(region_1);
+            copy_linear!(region_2);
+            copy_linear!(region_3);
+            copy_linear!(region_4);
+            copy_linear!(w_q);
+            copy_linear!(w_k);
+            copy_linear!(w_v);
+        });
+    }
+
     pub fn binding_replay_step_batch(
         &mut self,
         batch: &[&[Vec<f32>; 5]],
@@ -1859,6 +1969,37 @@ impl PerceptionProcessor {
             .collect()
     }
 
+    /// Same as `binding_proj_row_norms` but for `wake_binding` (ADR 0048 inspection
+    /// surface): lets a test or pilot confirm the wake copy stays frozen between
+    /// `sync_wake_binding` calls while `binding` (via `binding_proj_row_norms`) keeps
+    /// moving under `binding_replay_step_batch`.
+    pub fn wake_binding_proj_row_norms(&self, region: RegionId) -> Vec<f32> {
+        let m = self.model.as_ref().unwrap();
+        let proj = match region {
+            RegionId::AudioSpeech => &m.wake_binding.region_0,
+            RegionId::AudioEnv => &m.wake_binding.region_1,
+            RegionId::Visual => &m.wake_binding.region_2,
+            RegionId::Symbolic => &m.wake_binding.region_3,
+            RegionId::Language => &m.wake_binding.region_4,
+        };
+        let flat: Vec<f32> = proj
+            .weight
+            .val()
+            .inner()
+            .into_data()
+            .convert::<f32>()
+            .to_vec()
+            .unwrap();
+        let dims = proj.weight.val().inner().dims();
+        let (n, d) = (dims[0], dims[1]);
+        (0..n)
+            .map(|r| {
+                let row = &flat[r * d..(r + 1) * d];
+                row.iter().map(|v| v * v).sum::<f32>().sqrt()
+            })
+            .collect()
+    }
+
     /// Apply worker-streamed flat EMA weights to the inference path.
     pub fn apply_ema_flat(&mut self, flat: [Vec<f32>; 5]) {
         self.ema_heads.set_flat(flat);
@@ -2147,6 +2288,26 @@ impl PerceptionProcessor {
             model.binding.region_n[region.as_index()] = new_n;
         }
 
+        {
+            // ADR 0048: wake_binding's shape must never lag behind binding's — only
+            // trained *values* lag (via sync_wake_binding), never shape. Mirror the
+            // identical zero-row append applied to binding above.
+            let wake_binding_proj = match region {
+                RegionId::AudioSpeech => &mut model.wake_binding.region_0,
+                RegionId::AudioEnv => &mut model.wake_binding.region_1,
+                RegionId::Visual => &mut model.wake_binding.region_2,
+                RegionId::Symbolic => &mut model.wake_binding.region_3,
+                RegionId::Language => &mut model.wake_binding.region_4,
+            };
+            let old_w: Tensor<NdArray, 2> = wake_binding_proj.weight.val().inner();
+            let d_proj = old_w.dims()[1];
+            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<TrainB, 2> =
+                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            wake_binding_proj.weight = Param::initialized(ParamId::new(), new_w);
+            model.wake_binding.region_n[region.as_index()] = new_n;
+        }
+
         // No optimizer reset: burn's OptimizerAdaptor keys momentum state by ParamId
         // (see burn_optim::simple::adaptor). The three tensors touched above got fresh
         // ParamIds, so they naturally start with fresh (zero) Adam state on the next
@@ -2249,6 +2410,25 @@ impl PerceptionProcessor {
                 Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             binding_proj.weight = Param::initialized(ParamId::new(), new_w);
             model.binding.region_n[region.as_index()] = new_n;
+        }
+
+        {
+            // ADR 0048: mirror the shape change onto wake_binding — same reasoning
+            // as grow_region_inner (shape lockstep, values lag separately).
+            let wake_binding_proj = match region {
+                RegionId::AudioSpeech => &mut model.wake_binding.region_0,
+                RegionId::AudioEnv => &mut model.wake_binding.region_1,
+                RegionId::Visual => &mut model.wake_binding.region_2,
+                RegionId::Symbolic => &mut model.wake_binding.region_3,
+                RegionId::Language => &mut model.wake_binding.region_4,
+            };
+            let old_w: Tensor<NdArray, 2> = wake_binding_proj.weight.val().inner();
+            let d_proj = old_w.dims()[1];
+            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<TrainB, 2> =
+                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            wake_binding_proj.weight = Param::initialized(ParamId::new(), new_w);
+            model.wake_binding.region_n[region.as_index()] = new_n;
         }
 
         // See grow_region: no optimizer reset needed, ParamId-keyed state handles it (gaps.md §18).
@@ -2443,6 +2623,34 @@ impl PerceptionProcessor {
                 Tensor::from_data(TensorData::new(new_bind_flat, [new_n, d_proj]), &device);
             binding_proj.weight = Param::initialized(ParamId::new(), new_bind);
             model.binding.region_n[region.as_index()] = new_n;
+        }
+
+        {
+            // ADR 0048: mirror the identical row-removal onto wake_binding using the
+            // same `keep` index set — shape must never lag, only trained values do.
+            let wake_binding_proj = match region {
+                RegionId::AudioSpeech => &mut model.wake_binding.region_0,
+                RegionId::AudioEnv => &mut model.wake_binding.region_1,
+                RegionId::Visual => &mut model.wake_binding.region_2,
+                RegionId::Symbolic => &mut model.wake_binding.region_3,
+                RegionId::Language => &mut model.wake_binding.region_4,
+            };
+            let bind_flat: Vec<f32> = wake_binding_proj
+                .weight
+                .val()
+                .into_data()
+                .convert::<f32>()
+                .to_vec()
+                .unwrap();
+            let d_proj = bind_flat.len() / current_n;
+            let new_bind_flat: Vec<f32> = keep
+                .iter()
+                .flat_map(|&i| bind_flat[i * d_proj..(i + 1) * d_proj].iter().copied())
+                .collect();
+            let new_bind: Tensor<TrainB, 2> =
+                Tensor::from_data(TensorData::new(new_bind_flat, [new_n, d_proj]), &device);
+            wake_binding_proj.weight = Param::initialized(ParamId::new(), new_bind);
+            model.wake_binding.region_n[region.as_index()] = new_n;
         }
 
         // See grow_region: no optimizer reset needed, ParamId-keyed state handles it (gaps.md §18).
@@ -2720,6 +2928,16 @@ impl PerceptionProcessor {
                     loaded.binding.region_3.weight.val().inner().dims()[0],
                     loaded.binding.region_4.weight.val().inner().dims()[0],
                 ];
+                // ADR 0048: wake_binding.region_n is equally #[module(skip)] and equally
+                // unserialized — same reconstruction, from wake_binding's own shapes (not
+                // binding's; growth/prune keep both in lockstep but this stays explicit).
+                loaded.wake_binding.region_n = [
+                    loaded.wake_binding.region_0.weight.val().inner().dims()[0],
+                    loaded.wake_binding.region_1.weight.val().inner().dims()[0],
+                    loaded.wake_binding.region_2.weight.val().inner().dims()[0],
+                    loaded.wake_binding.region_3.weight.val().inner().dims()[0],
+                    loaded.wake_binding.region_4.weight.val().inner().dims()[0],
+                ];
                 self.ema_heads = EmaOutputHeads::from_model(&loaded);
                 self.model = Some(loaded);
                 Ok(())
@@ -2831,11 +3049,11 @@ impl PerceptionProcessor {
 
         // ── BindingArea region projections [N_UNITS, D_PROJ] ─────────────────
         let region_projs = [
-            &m.binding.region_0,
-            &m.binding.region_1,
-            &m.binding.region_2,
-            &m.binding.region_3,
-            &m.binding.region_4,
+            &m.wake_binding.region_0,
+            &m.wake_binding.region_1,
+            &m.wake_binding.region_2,
+            &m.wake_binding.region_3,
+            &m.wake_binding.region_4,
         ];
         for (i, proj) in region_projs.iter().enumerate() {
             let dims = proj.weight.val().dims();
@@ -2851,9 +3069,9 @@ impl PerceptionProcessor {
 
         // ── Attention QKV [D_PROJ, D_PROJ] ───────────────────────────────────
         for (name, param) in [
-            ("W_q", &m.binding.w_q),
-            ("W_k", &m.binding.w_k),
-            ("W_v", &m.binding.w_v),
+            ("W_q", &m.wake_binding.w_q),
+            ("W_k", &m.wake_binding.w_k),
+            ("W_v", &m.wake_binding.w_v),
         ] {
             let dims = param.weight.val().dims();
             let w: Vec<f32> = param
@@ -2867,7 +3085,7 @@ impl PerceptionProcessor {
         }
 
         // ── GRU weights [in, out] (burn convention; Python script transposes) ─
-        let gru = &m.binding.temporal_gru;
+        let gru = &m.wake_binding.temporal_gru;
         for (gate_name, gate) in [
             ("update", &gru.update_gate),
             ("reset", &gru.reset_gate),
@@ -2906,9 +3124,9 @@ impl PerceptionProcessor {
 
         // ── temporal_proj [GRU_HIDDEN, EPISODE_DIM] ──────────────────────────
         {
-            let dims = m.binding.temporal_proj.weight.val().dims();
+            let dims = m.wake_binding.temporal_proj.weight.val().dims();
             let w: Vec<f32> = m
-                .binding
+                .wake_binding
                 .temporal_proj
                 .weight
                 .val()
@@ -3065,7 +3283,7 @@ impl PerceptionProcessor {
             }
         });
         let act_refs: [&SparseActivation; 5] = [&acts[0], &acts[1], &acts[2], &acts[3], &acts[4]];
-        let ep = self.model.as_mut().unwrap().binding.forward(
+        let ep = self.model.as_mut().unwrap().wake_binding.forward(
             &act_refs,
             prev_ep.map(|p| p.to_vec()).as_ref(),
             &device,
@@ -3074,7 +3292,7 @@ impl PerceptionProcessor {
             .model
             .as_ref()
             .unwrap()
-            .binding
+            .wake_binding
             .gru_hidden
             .clone()
             .unwrap_or_else(|| vec![0.0; 256]);
@@ -3289,7 +3507,7 @@ impl PerceptionProcessor {
                                 n_units: N_UNITS,
                             };
                             let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-                            self.model.as_mut().unwrap().binding.forward(
+                            self.model.as_mut().unwrap().wake_binding.forward(
                                 &[a0, a1, a2, a3, a4],
                                 None,
                                 &device,
@@ -3309,7 +3527,7 @@ impl PerceptionProcessor {
                         n_units: N_UNITS,
                     };
                     let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-                    self.model.as_mut().unwrap().binding.forward(
+                    self.model.as_mut().unwrap().wake_binding.forward(
                         &[a0, a1, a2, a3, a4],
                         None,
                         &device,

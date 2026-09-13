@@ -419,10 +419,23 @@ pub enum Metric {
     /// count comes from `NremBindingReplay` (fires once per step), so mean loss per
     /// step = binding_replay_loss.count / nrem_binding_replay.count / 1e6.
     BindingReplayLoss,
+    /// `sync_wake_binding` — one hard-copy of `binding`'s trained tensors into `wake_binding`
+    /// (ADR 0048, gaps.md §33 candidate (e)). Fires on the `--binding-wake-lag-cycles` cadence,
+    /// not every cycle — the count directly confirms the configured lag is taking effect,
+    /// same discipline ADR 0041 used for `binding_row_norms`/its own unit test.
+    BindingWakeSync,
+    /// L2 distance between `binding` and `wake_binding` (summed across the 8 trained tensors),
+    /// measured immediately before each `sync_wake_binding` call (ADR 0048). Recorded via
+    /// `counted!` (Fine tier — an A/B-comparison-specific signal, not a health metric):
+    /// quantifies how much the live copy drifted during the lag window just closed, informing
+    /// whether a given `--binding-wake-lag-cycles` value is "enough" drift-batching without
+    /// needing a full pilot re-run to eyeball it. Scaled ×1e6 before accumulation, same
+    /// convention as `BindingReplayLoss`.
+    BindingWakeDivergenceL2,
 }
 
 impl Metric {
-    pub const COUNT: usize = 105;
+    pub const COUNT: usize = 107;
 
     const fn as_index(self) -> usize {
         match self {
@@ -531,6 +544,8 @@ impl Metric {
             Metric::AsrPanic => 102,
             Metric::AsrPostPanicSuccess => 103,
             Metric::AsrPostPanicFailure => 104,
+            Metric::BindingWakeSync => 105,
+            Metric::BindingWakeDivergenceL2 => 106,
         }
     }
 
@@ -641,6 +656,8 @@ impl Metric {
             Metric::AsrPanic => "asr_panic",
             Metric::AsrPostPanicSuccess => "asr_post_panic_success",
             Metric::AsrPostPanicFailure => "asr_post_panic_failure",
+            Metric::BindingWakeSync => "binding_wake_sync",
+            Metric::BindingWakeDivergenceL2 => "binding_wake_divergence_l2",
         }
     }
 
@@ -750,6 +767,8 @@ impl Metric {
         Metric::AsrPanic,
         Metric::AsrPostPanicSuccess,
         Metric::AsrPostPanicFailure,
+        Metric::BindingWakeSync,
+        Metric::BindingWakeDivergenceL2,
     ];
 }
 
