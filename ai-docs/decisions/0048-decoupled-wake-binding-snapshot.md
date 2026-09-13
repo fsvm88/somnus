@@ -2,8 +2,13 @@
 
 - **Status:** implemented 2026-09-13 (`wake_binding` field, `sync_wake_binding`, growth/prune
   lockstep, all wake-time call sites, ORT export, snapshot save/load, `--binding-wake-lag-cycles`
-  CLI flag, 2 new unit tests, `cargo fmt`/`clippy -D warnings`/full test suite all clean). **Not
-  yet piloted** — this ADR's own validation plan (below) has not been run.
+  CLI flag, 2 new unit tests, `cargo fmt`/`clippy -D warnings`/full test suite all clean).
+  **Independently re-reviewed 2026-09-13** via a second model (local Lemonade/gpt-oss-20b through
+  `opencode`, dispatched per this project's director-mode convention), against the full commit
+  diff split into 6 self-contained chunks (metrics registry, the burn-clone-quirk regression test,
+  the CLI flag/sleep-loop gating, the two new unit tests, and the `somnus-perception/src/lib.rs`
+  changes split in two) — 26/26 checks came back clean, no issues found, independently confirming
+  the self-review. **Not yet piloted** — this ADR's own validation plan (below) has not been run.
 - **Date:** 2026-09-13
 
 ## Implementation findings (2026-09-13, during the build — corrections to the plan above)
