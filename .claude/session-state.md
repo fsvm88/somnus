@@ -4,7 +4,46 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **✅ CHECKPOINT (clean), 2026-09-13 (latest) — §33: confirming diagnostic run, ORT re-export
+> **✅ CHECKPOINT (clean), 2026-09-13 (latest) — §33 candidate (e) implemented: decoupled
+> wake-time binding snapshot (ADR 0048). Not yet piloted.**
+> - **Scoped, reviewed, then implemented directly** (not delegated to opencode/Lemonade — its
+>   first real attempt on this file was destructive, deleted an existing struct field, then blew
+>   its 65280-token context window on the very next step; reverted via `git checkout` and built by
+>   hand per the director-mode escape valve).
+> - **What changed:** `PerceptionModel` gains `wake_binding: BindingArea<TrainB>`. New
+>   `sync_wake_binding()` hard-copies the 8 live-trained tensors (region_0..4, w_q/w_k/w_v) from
+>   `binding` into `wake_binding`. All wake-time call sites (`try_bind`/`settle_episode`/
+>   `binding_only`, plus `export_weights_for_onnx`) now read `wake_binding`, never `binding`
+>   directly. `grow_region`/`grow_region_seeded`/`prune_region` reshape both copies in lockstep
+>   (shape never lags, only trained values do). New CLI flag `--binding-wake-lag-cycles` (default
+>   1 = today's always-immediate behavior). 2 new unit tests (`wake_binding_stays_frozen_until_synced`,
+>   `growth_and_prune_keep_binding_and_wake_binding_in_lockstep`) plus a regression pin for a real
+>   burn quirk found during the build.
+> - **Two implementation-time findings, not caught by review** (both fixed, documented in ADR
+>   0048's "Implementation findings"): (1) `binding.clone()` does NOT preserve materialized weight
+>   values — burn's derived `Linear`/`Module` `Clone` re-runs each `Param`'s lazy random
+>   initializer independently per clone (confirmed empirically, now a regression test); fixed by
+>   explicitly copying each trained tensor's `.val()` at construction, same pattern as
+>   `sync_wake_binding`. (2) The sync gate must NOT be conditioned on `--binding-replay`:
+>   `homeostatic_decay` (`sleep.rs:896`) mutates the trained binding tensors every cycle
+>   unconditionally, so gating on the flag would leave `wake_binding` frozen forever on the
+>   default/production path (binding-replay off). Also caught: `binding_only`'s `gru_hidden`
+>   readback needed to switch to `wake_binding` too (missed in the original scoping pass, found by
+>   re-grepping every `.gru_hidden` site after the call-site swap).
+> - **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, and the full test
+>   suite all clean in both feature configs (default and `fine-metrics`) across `somnus-perception`
+>   and `somnus`. Live smoke run (`--binding-replay --binding-wake-lag-cycles 2`, small clip set)
+>   completed 2 full sleep cycles with no errors.
+> - **Not done: the actual validation pilot.** ADR 0048's plan (4-arm sweep: control, lag=1
+>   baseline, lag=10, lag=30, over 30-50 cycles, `mean_output_mse` reported as a cycle-range trend
+>   rather than one aggregate mean) has not been run — needs a decision from the user on when to
+>   launch it, since it's a real campaign-affecting pilot.
+> - **All work committed** — `gaps.md` §33, ADR 0048, and this checkpoint updated in the same
+>   session; code changes committed separately per the usual code/docs split.
+>
+> ---
+>
+> **✅ CHECKPOINT (clean), 2026-09-13 — §33: confirming diagnostic run, ORT re-export
 > hypothesis DISCONFIRMED; real root cause is backend-independent live-weight drift, now confirmed.**
 > - **Sixth pilot (`engineering-log.md` §47):** repeated the candidate-(d) freeze-heads pilot
 >   (`scripts/ab_binding_replay_freeze_heads_cpu.sh`, new script) with `--force-cpu-inference` added
@@ -71,27 +110,3 @@
 >   actually been run, gaps.md §39).
 > - **All work is committed as of this checkpoint** — `gaps.md` §33, `engineering-log.md` §46, and
 >   ADR 0041 all updated with the §46 finding in the same commit as this checkpoint.
->
-> ---
->
-> **✅ CHECKPOINT (clean), 2026-08-16 — gaps.md triage: §41 (change-gated video encoder)
-> closed as a rejected null-result, no other open items needed action.**
-> - User asked to close open gaps; scoped down to triage-only (no new pilots, no campaign-affecting
->   runs). Reviewed every open item in `gaps.md`: §4/§7/§10/§11/§15/§23/§40/§42 already carry real
->   revisit triggers and needed no change; §33 and §39 need actual implementation/campaign decisions
->   the user explicitly deferred this round.
-> - **§41 verdict: reject, close as null-result.** A/B (`engineering-log.md` §43) showed
->   threshold=0.05 skips 93.8% of video-encode calls but costs +21.8% `mean_output_mse` (+10.8%
->   visual-region), with no stated compute bottleneck to justify the tradeoff. Moved from `gaps.md`
->   into `engineering-log.md` §43 (updated in place, same section, now marked REJECTED); removed
->   from `gaps.md`'s open list and priority table. `--video-change-threshold` stays default-off
->   (0.0), flag stays opt-in for future revisit if wake-path compute ever becomes the bottleneck.
-> - **This file's scope narrowed** (this checkpoint): trimmed to a 3-checkpoint crash-resume
->   journal per explicit user request. Moved the old "Key files" pointers into `ai-docs/README.md`'s
->   new Tooling section, and the "Deferred backlog" trigger table into `gaps.md`'s new
->   "Deferred backlog" section; `CLAUDE.md` updated to point at `gaps.md` instead of this file.
->   Everything in the old "Historical" checkpoint log was already covered by `engineering-log.md`/
->   ADRs (confirmed by the 2026-08-15 §37 audit) or self-documenting in code/scripts, with two
->   exceptions folded into `engineering-log.md` §34: the `setsid` background-launch lesson (added)
->   and the pre-commit-hook fix (already self-documented in `scripts/setup-hooks.sh`'s own comment,
->   no separate entry needed).

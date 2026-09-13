@@ -1,7 +1,38 @@
 # 0048. Decoupled wake-time binding snapshot (§33 candidate (e), scoped after confirming the real root cause)
 
-- **Status:** proposed, not yet implemented or piloted.
+- **Status:** implemented 2026-09-13 (`wake_binding` field, `sync_wake_binding`, growth/prune
+  lockstep, all wake-time call sites, ORT export, snapshot save/load, `--binding-wake-lag-cycles`
+  CLI flag, 2 new unit tests, `cargo fmt`/`clippy -D warnings`/full test suite all clean). **Not
+  yet piloted** — this ADR's own validation plan (below) has not been run.
 - **Date:** 2026-09-13
+
+## Implementation findings (2026-09-13, during the build — corrections to the plan above)
+
+Two real issues surfaced only by writing and testing the code, not by review:
+
+1. **`binding.clone()` does NOT seed `wake_binding` correctly.** Empirically confirmed (regression
+   test `binding::burn_linear_clone_quirk::linear_clone_does_not_preserve_materialized_values`):
+   burn's derived `Module`/`Linear` `Clone` re-runs each `Param`'s lazy random initializer
+   independently per clone — it does not copy the already-materialized weight value the way a bare
+   `Tensor::clone()` does. The originally-planned `let wake_binding = binding.clone();` therefore
+   gave `wake_binding` **different random initial weights** than `binding`, not an exact copy.
+   Fixed in `PerceptionModel::new()` by explicitly copying each of the 8 trained tensors' `.val()`
+   into a fresh `Param::initialized(...)` — the same pattern `sync_wake_binding` uses at runtime,
+   just inlined at construction time.
+2. **The sync gate must not be conditioned on `--binding-replay`.** `homeostatic_decay`
+   (`crates/somnus/src/sleep.rs:896`) mutates `binding`'s trained tensors (region_0..4/w_q/w_k/w_v)
+   every sleep cycle **unconditionally**, regardless of the `--binding-replay` flag. Gating
+   `sync_wake_binding()` on `args.binding_replay` (as first implemented) would leave `wake_binding`
+   frozen at its initial values forever whenever `--binding-replay` is off — the default/production
+   configuration. Fixed: the cadence gate (`sleep_cycle_count.is_multiple_of(lag_cycles)`) applies
+   unconditionally; `--binding-wake-lag-cycles 1` (the default) reproduces the pre-ADR-0048
+   always-immediate behavior in both configurations.
+
+Also found and fixed one more call site the original scoping missed: `binding_only` (`:3146` at
+scoping time) reads `gru_hidden` right after its `forward()` call to return it to the caller — this
+must read `wake_binding.gru_hidden` (the copy `forward()` was actually called on), not
+`binding.gru_hidden` (which the GRU never touches). Caught by re-grepping every `.gru_hidden`
+reference after the call-site swap, not anticipated during scoping.
 
 ## Context
 
