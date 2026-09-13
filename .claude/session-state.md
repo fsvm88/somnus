@@ -4,7 +4,37 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **✅ CHECKPOINT (clean), 2026-08-16/17 (latest) — §33: candidates (a) and (d) both closed as
+> **✅ CHECKPOINT (clean), 2026-09-13 (latest) — §33: confirming diagnostic run, ORT re-export
+> hypothesis DISCONFIRMED; real root cause is backend-independent live-weight drift, now confirmed.**
+> - **Sixth pilot (`engineering-log.md` §47):** repeated the candidate-(d) freeze-heads pilot
+>   (`scripts/ab_binding_replay_freeze_heads_cpu.sh`, new script) with `--force-cpu-inference` added
+>   to both arms, structurally removing ORT (`rebuild_ort_session` never runs; confirmed
+>   `ort_binding_forward` fired 0 times in both arms). `mean_output_mse` still +462.0% — same
+>   445-587% band as every prior pilot with ORT active. **ORT re-export is not the cause.** The
+>   mechanism is backend-independent: whatever serves wake-time binding inference (ORT or burn) uses
+>   live weights that changed during the immediately preceding NREM cycle; those episodes get
+>   stored; later cycles train heads against the now-drifted stored-episode distribution. This is
+>   §35's original "episode-space drift" finding, now positively confirmed rather than inferred from
+>   head/gradient elimination.
+> - **New deviation:** treatment arm's salience/settle gate degenerates much harder than §46's
+>   comparable pilot — `settle_gate_dynamic` collapses to exactly 0.0 by cycle 10, `sal_threshold`
+>   exceeds its designed [0,1] range. Not explained; flagged per standing A/B deviation policy, not
+>   investigated further.
+> - **Docs corrected same session:** `gaps.md` §33 (verdict + priority table), `engineering-log.md`
+>   §47 (new entry), ADR 0041 (both the changelog and its stale "ORT inference picks up trained
+>   weights" Consequences bullet) — the ORT-specific framing in all three was actively wrong, not
+>   just unconfirmed, and is now corrected in place rather than left to accumulate as a stale lead.
+> - **Open — root cause confirmed, no path chosen.** (a) and (d) closed as failed leads. (b) and (c)
+>   are no longer blocked by ORT-specific reasoning (there is no ORT-specific cadence), but neither
+>   addresses the now-confirmed real constraint (live weight updates immediately consumed by the next
+>   wake phase). A candidate that would: decouple wake-time binding inference from the NREM-training
+>   copy of the weights (e.g. an EMA/lagged snapshot for episode formation, reconciled on a slower
+>   cadence). **Not scoped or piloted — needs a decision from the user before more pilots run.**
+> - **All docs committed as of this checkpoint.**
+>
+> ---
+>
+> **✅ CHECKPOINT (clean), 2026-08-16/17 — §33: candidates (a) and (d) both closed as
 > failed; (d)'s failure revealed the likely real root cause (ORT re-export drift), not yet
 > confirmed. (b) and (c) both stalled pending that confirmation.**
 > - **LR-scale dosage pilot (candidate (a) re-run, `engineering-log.md` §45):** corrected §44's
@@ -65,29 +95,3 @@
 >   exceptions folded into `engineering-log.md` §34: the `setsid` background-launch lesson (added)
 >   and the pre-commit-hook fix (already self-documented in `scripts/setup-hooks.sh`'s own comment,
 >   no separate entry needed).
->
-> ---
->
-> **✅ CHECKPOINT (clean), 2026-08-16 — docs cleanup: split the resolved-items archive into ADRs +
-> a trimmed engineering log, per explicit user request ("go through all of it, document reasons why
-> in ADRs, remove it from the changelog where already documented").**
-> - **Renamed** `gaps-resolved.md` → `engineering-log.md` (66 cross-file §N citations updated
->   mechanically, no renumbering). New header declares its real scope: bug fixes, pilot/A-B numeric
->   results, campaign narratives — not decision rationale.
-> - **Synced 7 existing ADRs** (0034/0036/0037/0038/0039/0040/0041) against the log before trimming
->   anything — found ADR 0034 never mentioned Qwen3 at all (the KV-cache fast path silently fell
->   back to the slow path for a month after ADR 0036 made Qwen3 the sole LM); added the missing
->   outcome. ADR 0041 was missing its own §44 Validation-plan entry.
-> - **Wrote 5 new ADRs** (0042 BatchTopK SAE, 0043 replay ratio N=4, 0044 DER++, 0045 DINOv3
->   encoder, 0046 audio-env-encoder candidates) for decision-shaped log sections that had real
->   alternatives-considered material but no ADR. Each verified current code against the log's claims
->   rather than trusting it — caught one real staleness (§1 said `--batch-topk` defaults false; code
->   has it flipped true post-A/B).
-> - **`research/gpu-unification-design.md`:** found one real staleness — §4's Binding-graph
->   description still described the pre-ADR-0040 dense-matmul contract (`sp_i[1,N_UNITS]` inputs),
->   superseded 2026-08-12 by the Gather-based sparse rewrite. Fixed inline, with a pointer to ADR
->   0040. Also flagged two long-open questions (§13) that got overtaken by events without being
->   revisited: D_PROJ scaling policy (still fixed at 128 after a 10x campaign that was supposed to
->   trigger revisiting it) and EMA-head-sync Option B's N_UNITS≥4096 trigger (crossed ~2.4×, not
->   acted on). Phases 0-4 status lines were all still accurate — not touched.
->

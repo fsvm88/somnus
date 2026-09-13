@@ -496,3 +496,62 @@ the re-export/drift hypothesis. **No path chosen; next step is the confirming di
 another optimizer/loss variant.**
 
 ---
+
+## §47 — Confirming diagnostic: ORT re-export hypothesis DISCONFIRMED; drift is backend-independent (2026-09-13)
+
+**Setup:** `scripts/ab_binding_replay_freeze_heads_cpu.sh`, identical to §46's candidate-(d)
+freeze-heads pilot except `--force-cpu-inference` added to **both** arms. This flag
+(`crates/somnus/src/lib.rs:1046`) skips resolving `onnx_dir` entirely, so `rebuild_ort_session` never
+runs and binding inference stays on burn for the whole run — the ORT re-export channel §46
+implicated is structurally absent, not just unlikely to fire (confirmed: `ort_binding_forward`
+fired 0 times in both arms). 10 cycles, `fine-metrics`, copied trained production state (no
+`campaign_growth10x` process was running at copy time).
+
+**Numeric record:**
+
+| metric | control | treatment (freeze_heads, forced CPU) | delta |
+|---|---|---|---|
+| mean_output_mse | 0.015143 | 0.085100 | **+462.0%** |
+| mean_real_inference_mse | 0.012155 | 0.102045 | +740% |
+| gist_recall_rate | 0.739218 | 0.376980 | −49.0% |
+| warm_recall_l2 | 0.447374 | 0.702039 | +56.9% |
+| nrem_wall_ms | 12245.6 | 10669.0 | −12.9% |
+| settle_iters_sum | 22.9 | 37.8 | +65% |
+| settle_gate_dynamic (first→last, treatment) | 0.784 | 0.000 | collapsed to 0 by cycle 10 |
+| sal_threshold (first→last, treatment) | 0.531 | 1.074 | broke above normal [0,1] range |
+| traces_replayed | 464.9 | 251.7 | −46% |
+
+**Verdict: ORT re-export hypothesis DISCONFIRMED as the specific cause.** `mean_output_mse`'s
++462.0% delta lands squarely in the same 445-587% band every prior pilot showed (§35/§36/§44/§45/
+§46), **with ORT structurally out of the loop.** If ORT re-export were the real channel, removing it
+entirely should have collapsed the regression toward the control's own noise floor — it didn't move
+outside the established band at all. **The mechanism is backend-independent**: whatever forms
+episodes at wake time (ORT or burn) uses live binding weights that changed during the immediately
+preceding NREM cycle; those episodes get stored; later cycles train heads against this now-drifted
+stored-episode distribution. §46's "ORT re-export" framing was a plausible, code-grounded read of
+*one* delivery mechanism this campaign happened to have active, not the causal root — burn delivers
+the identical drift with no export step at all, since it always evaluates the current live weights.
+This is the same underlying phenomenon §35 originally named "episode-space drift," now positively
+confirmed rather than inferred from head/gradient elimination.
+
+**New deviation, not seen in §46 at this magnitude:** the treatment arm's salience/settle gate
+degenerates hard by the end of the run — `settle_gate_dynamic` reaches exactly 0.0 (§46's
+comparable pilot only moved `settle_iters_sum` +87%, no gate collapse) and `sal_threshold` exceeds
+1.0, outside its designed range. Not yet explained; plausibly `--force-cpu-inference`'s different
+per-cycle latency profile interacts with the salience/settle-gate timing (`engineering-log.md` §36
+originally described a similar-shaped cascade under a different variable, step-count capping) —
+flagged per the standing A/B deviation-recording policy, not investigated further this pass.
+
+**Consequence for (b)/(c):** both were blocked in §46 on the reasoning that neither "touches the ORT
+re-export cadence" the hypothesis implicated. That blocking reasoning no longer applies — there is
+no ORT-specific cadence to touch. The real constraint, now confirmed rather than hypothesized: **any
+design that trains binding weights live during NREM and lets the very next wake phase form and store
+episodes through the updated weights will show this drift**, regardless of backend, optimizer
+dosage, or whether heads are in the gradient path. (b) (fuse into `fused_replay_wake_step_batch`) and
+(c) (temporal prediction loss) don't address this constraint either — both still update binding
+weights mid-campaign and let wake immediately consume the change. A candidate that would address it
+directly: delay live weight updates from affecting stored-episode formation until some reconciliation
+point (e.g. an EMA/lagged copy of binding weights for wake-time inference, decoupled from the
+NREM-training copy) — not scoped or piloted this pass; needs a decision from the user.
+
+---

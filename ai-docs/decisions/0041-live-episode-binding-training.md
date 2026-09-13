@@ -84,6 +84,22 @@
   CPU/burn wake path) — leading hypothesis, not proven. **Blocks (b) and (c) as previously scoped**
   — neither touches the re-export cadence this hypothesis implicates. No path chosen; next step is
   the confirming diagnostic, not another optimizer/loss variant.
+  **2026-09-13 — confirming diagnostic run, and the ORT-specific framing above is WRONG
+  (engineering-log.md §47).** Repeated the candidate-(d) pilot with `--force-cpu-inference` on both
+  arms — `rebuild_ort_session` never runs under this flag (`onnx_dir` is never resolved), so the
+  re-export channel is structurally absent, confirmed by `ort_binding_forward` firing 0 times in
+  both arms. `mean_output_mse` was still +462.0% — the same 445-587% band as every ORT-active pilot.
+  **ORT re-export is not the cause; the mechanism is backend-independent.** Whatever serves wake-time
+  binding inference (ORT or burn) uses live weights that changed during the immediately preceding
+  NREM cycle; those episodes get stored; later cycles train heads against the now-drifted
+  stored-episode distribution — burn delivers the identical drift with no export step at all. This
+  is §35's original "episode-space drift" finding, now positively confirmed rather than inferred.
+  **(b) and (c) are no longer blocked by an ORT-specific reasoning** (there is no ORT-specific
+  cadence to touch), but neither addresses the now-confirmed real constraint either — both still
+  update binding weights mid-campaign and let the very next wake phase consume the change
+  unmediated. A candidate that would: decouple wake-time binding inference from the NREM-training
+  copy of the weights (e.g. an EMA/lagged snapshot for episode formation). Not scoped or piloted.
+  Needs a decision from the user.
 - **Date:** 2026-08-15
 
 ## Context
@@ -229,6 +245,15 @@ directly (freeze the heads during this pass; see gaps.md §33) before concluding
   on growth/restart — already part of the lifecycle; `export_weights_for_onnx` already exports all
   22 tensors including the binding's). Between training and re-export, wake inference runs the
   stale binder — same lag that already exists for every other weight class after growth.
+  **(2026-09-13 correction, engineering-log.md §47): this bullet's original framing treated ORT
+  re-export as the specific channel by which trained binding weights reach wake-time inference —
+  it isn't specific to ORT. `rebuild_ort_session` in fact fires after *every* sleep cycle once ORT
+  is active, not just on growth/restart (§46), and a confirming pilot with `--force-cpu-inference`
+  (ORT structurally disabled) showed the identical `mean_output_mse` regression band (§47) — burn's
+  wake path always evaluates the live weights directly, with no re-export lag at all, and still
+  drifts identically. The real, backend-independent mechanism: whatever serves wake-time binding
+  inference uses weights that changed during the immediately preceding NREM cycle, and the episodes
+  formed then get stored and later corrupt head training.**
 - **Cost:** one extra binding forward per trace per NREM batch (burn path, sparse-gather — the
   §25/§30 fast path, since training always runs on burn/CPU), plus the head forwards already
   shared with the proj_loss semantics. Expected ≪ cycle wall-clock; measured live by the new Core
