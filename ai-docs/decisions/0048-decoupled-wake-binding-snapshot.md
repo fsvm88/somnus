@@ -1,0 +1,163 @@
+# 0048. Decoupled wake-time binding snapshot (§33 candidate (e), scoped after confirming the real root cause)
+
+- **Status:** proposed, not yet implemented or piloted.
+- **Date:** 2026-09-13
+
+## Context
+
+`gaps.md` §33 / ADR 0041 confirmed that BindingArea's ~1.72M params never received a gradient
+before ADR 0041, and implemented decision (b) — a live-episode NREM pass, `binding_replay_step_batch`
+— to fix it. Six pilots since (`engineering-log.md` §35/§36/§44/§45/§46/§47) all show the same
+`mean_output_mse` regression (+445% to +587%) regardless of update dosage, loss scale, LR scale, or
+whether the output heads are excluded from the optimizer step (candidate (d) — froze the heads,
+regression persisted with **no gradient path** for it to occur, disproving a head/gradient cause).
+
+§47's confirming diagnostic (`--force-cpu-inference`, structurally removing ORT) proved the
+mechanism is backend-independent: **the single problem is that `binding_replay_step_batch` trains
+the one live copy of `BindingArea` (`PerceptionModel.binding`), and the very next wake phase's
+`try_bind`/`settle_episode`/`binding_only` read from that same copy (directly on burn, or via an
+ORT export that's just a copy of the same values) to form episodes that get stored.** Every sleep
+cycle, the binder that forms and stores episodes is a newer generation than the one the stored
+episodes already in warm/cold were formed by; `fused_replay_wake_step_batch`'s head training then
+straddles both generations at once. This was ADR 0041's own predicted risk ("Episode-space drift
+across binder generations"), now confirmed as the primary driver of every pilot's headline number,
+not a secondary effect.
+
+Grepped confirmed: there is exactly one `BindingArea<TrainB>` instance
+(`PerceptionModel::binding`, `crates/somnus-perception/src/lib.rs:220`). `binding_replay_step_batch`
+(same file, `:1184`) trains it via `forward_tracked`. `try_bind` (`:887`), `settle_episode`
+(`:3117`), and `binding_only` (`:3038`) all read `self.model.binding` (or its ORT-exported mirror)
+at wake time. `grow_region`/`grow_region_seeded` mutate the same tensors in place. There is no
+existing seam between "the copy that trains" and "the copy that infers" — this ADR adds one.
+
+## Decision
+
+**Add a second, lagged copy of the currently-trained binding weights — `wake_binding` — that wake-time
+inference and ORT export read from, hard-copied from the live training copy only every
+`--binding-wake-lag-cycles` sleep cycles (default 1, i.e. today's always-immediate behavior, so
+existing runs are unaffected unless the flag is raised).**
+
+Scope: only the tensors `binding_replay_step_batch` actually trains — `region_0..region_4`
+(per-region projections) and `w_q`/`w_k`/`w_v`. The GRU and `temporal_proj` are deliberately
+excluded from live training by ADR 0041's own `None`-context pass and stay untouched here too; if
+candidate (c) (temporal prediction loss) is later adopted and starts training the GRU, this ADR's
+scope extends to cover it at that point, not before.
+
+**Mechanism:**
+
+1. `PerceptionModel` gains `wake_binding: BindingArea<TrainB>` (or a plain inference-only variant —
+   see Alternatives), initialized as a clone of `binding` at model construction/load.
+2. `binding_replay_step_batch` is unchanged — it keeps training `model.binding` every NREM cycle,
+   at whatever dosage/step-count settings are already in place.
+3. A new `sync_wake_binding()` copies `region_0..region_4`/`w_q`/`w_k`/`w_v`'s values from
+   `binding` into `wake_binding` (plain tensor copy, no gradient tracking needed on the target).
+   The sleep-cycle driver loop (`crates/somnus/src/lib.rs`, near the existing NREM/wake boundary
+   around `:2451`) calls it only when `cycle_count % lag_cycles == 0`.
+4. `try_bind`, `settle_episode`, `binding_only`, and `export_weights_for_onnx`/`rebuild_ort_session`
+   all switch from reading `model.binding` to reading `model.wake_binding`. This is the critical
+   correctness point: burn's wake path and the ORT-exported graph must read the *same* generation,
+   or we reintroduce a burn-vs-ORT split identical in spirit to the one §47 just ruled out.
+5. `grow_region`/`grow_region_seeded` apply their shape change (append rows/columns) to **both**
+   `binding` and `wake_binding` immediately, unconditionally — growth is a structural change, not a
+   value update, and the two copies must never disagree on shape. Only weight *values* lag; shapes
+   never do.
+6. New CLI flag `--binding-wake-lag-cycles <u32>` (default 1), meaningful only when
+   `--binding-replay` is set. `lag=1` reproduces today's behavior exactly (sync every cycle) —
+   this is the control-arm equivalent for the upcoming pilot's sweep.
+
+## Alternatives considered
+
+- **EMA-smoothed wake copy** (`wake_binding = (1-α)·wake_binding + α·binding` every cycle) instead
+  of a periodic hard copy: rejected as the first thing to try. It still lets *some* drift through
+  every single cycle rather than batching it into discrete, measurable promotion events, which
+  makes it harder to isolate "does spacing out promotions help" as a clean yes/no from the pilot.
+  Worth a follow-up ADR if the hard-copy lag helps but produces visible step-discontinuities in
+  `mean_output_mse` at sync boundaries.
+- **Throttle training frequency instead of adding a second copy** (call `binding_replay_step_batch`
+  only every N cycles, no `wake_binding` at all): simpler — no new state, no new call-site
+  plumbing — but conflates two different things: how often the binder *trains* vs. how often wake
+  *sees* a new generation. A future need (e.g. more frequent training for faster convergence, but
+  still-infrequent promotion for episode-storage stability) can't be expressed under this
+  alternative. Rejected in favor of the explicit two-copy design after discussing tradeoffs with
+  the user.
+- **Validated/gated promotion** (only copy `binding` → `wake_binding` if a held-out proxy metric
+  doesn't regress): the principled long-term answer, but needs a cheap held-out evaluation signal
+  that doesn't yet exist, and adds real complexity (what data, what threshold, what happens on a
+  failed promotion — skip forever? retry next cycle?). Deferred; revisit only if the periodic
+  hard-copy lag in this ADR is not sufficient on its own.
+- **Reduce warm-store eviction rate instead of controlling promotion** (let more old-generation
+  episodes linger so heads see a more stable mixture): rejected — this is exactly the "warm-store
+  turnover" mitigation ADR 0041 already named as tolerable-but-passive; it does not address the
+  cause, only dilutes the symptom, and ties the fix to unrelated memory-capacity tuning.
+
+## Consequences
+
+- **Cost:** one extra `BindingArea` weight copy (~1.72M params × 4 bytes ≈ 6.9MB) plus one
+  `Tensor::clone`/copy operation on `sync_wake_binding()` calls — negligible relative to a sleep
+  cycle's existing cost.
+- **New drift-controlling knob, not a drift-eliminating one:** stored episodes will still show
+  generational drift when a sync happens — this ADR controls *how often* that generational jump
+  occurs, not whether it occurs at all. If `mean_output_mse` still regresses at every lag setting
+  tried, that's a real result (points toward validated/gated promotion or reconsidering decision
+  (b) itself), not a failed pilot to retry with different numbers.
+- **Interacts with growth:** growth events force both copies to reshape in lockstep regardless of
+  lag setting, so a lag setting doesn't delay a region-growth-triggered `wake_binding` shape change
+  — only value updates lag.
+- **Interacts with ORT:** `rebuild_ort_session`'s existing "fires after every sleep cycle" behavior
+  (§46) is unchanged, but it now exports `wake_binding`'s (lagged) values instead of `binding`'s
+  (live) values — so ORT re-export cadence and binding-promotion cadence become independently
+  controllable, closing the conflation §46 originally (and incorrectly) attributed causal weight to.
+
+## Metrics
+
+Per the standing metrics policy (`CLAUDE.md`):
+
+- **New Core counter `BindingWakeSyncCount`**: fires once per `sync_wake_binding()` call — lets a
+  production run confirm the lag cadence is actually taking effect, the same discipline ADR 0041
+  used for `binding_row_norms`/unit tests.
+- **New Core gauge `BindingWakeDivergenceL2`**: L2 distance between `binding` and `wake_binding`
+  (summed across the 8 trained tensors) measured immediately *before* each sync — quantifies how
+  much the live copy drifted during the lag window just closed. Directly informs whether a given
+  `--binding-wake-lag-cycles` value is "enough" drift-batching or still too frequent, without
+  needing a full pilot re-run to eyeball it.
+- **Existing coverage named:** `mean_output_mse`, `gist_recall_rate`, `warm_recall_l2`,
+  `settle_gate_dynamic`/`sal_threshold`/`settle_iters_sum` (the §36/§47 cascade signature) are
+  already Core/Fine-tier covered and are exactly what the validation plan below reads.
+
+## Validation plan (before adoption)
+
+**Longer pilot than every prior §33 pilot.** All six pilots so far ran 10 cycles; ADR 0041 itself
+argues warm-store turnover (~30 cycles at the 200k cap) is the real drift-absorption mechanism, so
+a 10-cycle window may be too short to observe whether `mean_output_mse` reaches a new steady state
+after a binder-generation change, versus permanently regressing. Run **30-50 cycles** this time,
+and report the metric as a **trend** (e.g. mean over cycles 1-10 vs. 11-25 vs. 26-50), not just one
+aggregate mean — the previous pilot scripts' single-number aggregate cannot distinguish "transient
+adaptation cost after each promotion" from "permanently broken."
+
+**Sweep, one variable per arm per project discipline:**
+
+| arm | `--binding-wake-lag-cycles` | purpose |
+|---|---|---|
+| control | binding-replay off | pre-existing baseline, as in every prior pilot |
+| baseline-lag | 1 | today's always-immediate behavior, reproduced under the new code path — must match §35/§47's magnitude to prove this ADR's plumbing didn't silently change anything before testing the actual lever |
+| lag-10 | 10 | roughly the step-count-cap order of magnitude tried (unsuccessfully) in §36, now applied to promotion frequency instead of training frequency |
+| lag-30 | 30 | matches ADR 0041's own warm-turnover-window citation |
+
+**Adopt if:** `mean_output_mse`'s cycles-26-50 mean at lag-10 or lag-30 is materially below
+baseline-lag's cycles-26-50 mean (i.e., the system reaches a *better* steady state, not just a
+slower path to the same one), without `gist_recall_rate`/`warm_recall_l2` regressing further and
+without reproducing §47's settle-gate collapse at a similar or worse magnitude.
+
+**Reject / iterate if:** all three lag settings converge to the same steady-state band — that would
+mean promotion *frequency* isn't the lever either, and the next candidate is validated/gated
+promotion (this ADR's "Alternatives considered" deferred option) or revisiting decision (b) itself.
+
+## What would invalidate this
+
+- If `BindingWakeDivergenceL2` shows negligible drift even at `lag-30` (i.e., `binding_replay`'s own
+  updates are already small enough that lag doesn't matter) — would mean the lag lever has nothing
+  to work with, and the real fix has to act on update magnitude or promotion validation instead.
+- If growth events during the pilot force enough lockstep reshapes that the "lag" is effectively
+  never longer than the growth cadence — would mean this design needs a smarter growth interaction
+  (e.g. resetting the lag counter, or growth-triggered syncs counting toward `BindingWakeSyncCount`
+  separately) before a real read is possible.
