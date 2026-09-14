@@ -33,9 +33,9 @@ Verified against code 2026-08-16 (this file's creation pass). If a value here di
 
 | Name | Value | Kind | Source | Note |
 |---|---|---|---|---|
-| Whisper-tiny sample window | 480,000 (30s @ 16kHz) | const | `somnus/src/lib.rs:553`, `somnus-encoding/src/audio.rs:42` | `WHISPER_SAMPLES`. |
-| CLAP-HTSAT env window | 480,000 @ 48kHz | const | `somnus/src/lib.rs:557-559` | Default (non-`mn10_env`) path. |
-| mn10 env window | 320,000 @ 32kHz | const | `somnus/src/lib.rs:561-563` | `mn10_env` feature path. |
+| Whisper-tiny sample window | 480,000 (30s @ 16kHz) | const | `somnus/src/lib.rs:611`, `somnus-encoding/src/audio.rs:42` | `WHISPER_SAMPLES`. |
+| CLAP-HTSAT env window | 480,000 @ 48kHz | const | `somnus/src/lib.rs:613-616` | Default (non-`mn10_env`) path. |
+| mn10 env window | 320,000 @ 32kHz | const | `somnus/src/lib.rs:619-621` | `mn10_env` feature path. |
 | `WHISPER_ENC_SEQ` | 1500 | const | `somnus/src/whisper_asr.rs:12` | Whisper encoder sequence length. |
 | Visual encoder | DINOv3-ViT-S, 384-dim | — | ADR 0045 | Replaced DINOv2-S/14 2026-07-05. |
 
