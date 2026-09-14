@@ -778,8 +778,10 @@ impl LangEmbedder {
             .map_err(|e| anyhow::anyhow!("embed_tokens.weight missing: {e}"))?;
         let embed_table: Vec<f32> = tv
             .data()
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;

@@ -35,7 +35,7 @@ fn to_rgb24(frame: &VideoFrame) -> EncodingResult<Vec<u8>> {
         PixelFormat::Rgb8 => Ok(frame.data.to_vec()),
         PixelFormat::Bgr8 => {
             let mut out = frame.data.to_vec();
-            for px in out.chunks_exact_mut(3) {
+            for px in out.as_chunks_mut::<3>().0 {
                 px.swap(0, 2);
             }
             Ok(out)
@@ -48,7 +48,7 @@ fn to_rgb24(frame: &VideoFrame) -> EncodingResult<Vec<u8>> {
 fn yuyv_to_rgb(yuyv: &[u8]) -> Vec<u8> {
     let n_pixels = yuyv.len() / 2;
     let mut rgb = Vec::with_capacity(n_pixels * 3);
-    for chunk in yuyv.chunks_exact(4) {
+    for chunk in yuyv.as_chunks::<4>().0 {
         let (y0, u, y1, v) = (
             chunk[0] as f32,
             chunk[1] as f32,

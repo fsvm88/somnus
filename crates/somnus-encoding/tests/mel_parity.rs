@@ -22,8 +22,10 @@ mod helpers {
             .collect();
         let bytes = std::fs::read(dir.join(format!("{name}.f32"))).unwrap();
         let data: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         (shape, data)
     }
