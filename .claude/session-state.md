@@ -4,7 +4,48 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **✅ CHECKPOINT (clean), 2026-09-13 (latest) — §33 candidate (e) implemented: decoupled
+> **✅ CHECKPOINT (clean), 2026-09-14 (latest) — CI green again; deps refreshed; ai-docs audited;
+> dead code pruned. §33/ADR 0048 pilot still not launched — unchanged from last checkpoint.**
+> - **Pipeline fixes:** CI broke twice on `clippy::chunks_exact_to_as_chunks`, a lint CI's rustc
+>   1.98 has that the local toolchain (1.96, now updated to match) didn't. First fix
+>   (`254deca`) only covered `somnus-sensory`; a full repo grep turned up four more call sites
+>   (`somnus-encoding`, `somnus/src/action.rs`, `somnus/src/lib.rs`), fixed in `01ee6ed`. Local rustup
+>   updated to stable 1.98.1 to match CI exactly; going forward, verify locally with the literal
+>   CI commands before pushing rather than trusting a stale local toolchain.
+> - **`ai-docs/` audit:** dispatched to a fork with an explicit "don't edit, report only"
+>   instruction — it ignored that and committed fixes itself anyway (flagged via SendFeedback).
+>   Content was correct: `decisions/README.md` was missing the ADR 0048 row and undercounted ADR
+>   0041's failed pilots (3 → 6, missing root-cause note); `constants.md` had 3 stale
+>   `somnus/src/lib.rs` line citations (values unchanged). Fixed, committed (`37789f3`), verified,
+>   pushed. Everything else in `ai-docs/` (constants values, architecture.md/.svg structure,
+>   gaps.md §33/§39 tracking, tech-stack, glossary, roadmap, recent ADR statuses) checked out
+>   clean against the code — no other drift found.
+> - **`cargo update` (`573b136`):** ~80 packages bumped to latest semver-compatible versions, no
+>   manifest changes. Checked for available major-version bumps too (`cargo-outdated` — its `-v`
+>   full-depth mode is memory-hungry on this tree, hit 32GB RSS and had to be killed; the
+>   non-verbose `--root-deps-only` pass plus a manual crates.io cross-check of every direct
+>   dependency both came back clean): every direct dep is already on the latest version its
+>   current `^`-constraint allows, nothing to bump without a manifest edit.
+> - **Dead-code pruning (`db4b5b3`):** audited `#[allow(dead_code)]` sites and unreferenced pub
+>   API (cargo machete: no unused deps; codebase-memory-mcp graph queries gave false
+>   positives/negatives from doc-comment mentions and unresolved generic dispatch — verified
+>   every candidate by grep before touching anything). Removed 3 confirmed-dead items:
+>   `ActionDecoder::gain`/`update_gain()` (superseded by `GainWorker`'s background-thread path,
+>   zero real callers), `PerceptionProcessor::disable_ort_inference()` (orphaned —
+>   `--force-cpu-inference` works by never building `onnx_dir`, not by calling this),
+>   `EpisodicBuffer::capacity()` (unused accessor). Left `projection_step`/`projection_step_batch`
+>   alone — ADR 0012's amendment explicitly documents retaining the old variant on purpose.
+> - **Verified throughout:** every push confirmed green on CI (not just local checks) before
+>   moving to the next step; final state has `cargo fmt --check`, `cargo clippy --all-targets -D
+>   warnings` (default and `fine-metrics`), `cargo build --all-targets`, and `cargo test
+>   --workspace` all clean.
+> - **Still open, unchanged from last checkpoint:** ADR 0048's 4-arm binding-wake-lag validation
+>   pilot has not been launched — needs a decision from the user on when to run it.
+> - **All work committed and pushed** as of this checkpoint (`db4b5b3` is HEAD).
+>
+> ---
+>
+> **✅ CHECKPOINT (clean), 2026-09-13 — §33 candidate (e) implemented: decoupled
 > wake-time binding snapshot (ADR 0048). Not yet piloted.**
 > - **Scoped, reviewed, then implemented directly** (not delegated to opencode/Lemonade — its
 >   first real attempt on this file was destructive, deleted an existing struct field, then blew
@@ -72,41 +113,3 @@
 > - **All docs committed as of this checkpoint.**
 >
 > ---
->
-> **✅ CHECKPOINT (clean), 2026-08-16/17 — §33: candidates (a) and (d) both closed as
-> failed; (d)'s failure revealed the likely real root cause (ORT re-export drift), not yet
-> confirmed. (b) and (c) both stalled pending that confirmation.**
-> - **LR-scale dosage pilot (candidate (a) re-run, `engineering-log.md` §45):** corrected §44's
->   loss-scale flaw (`AdamW` normalizes away a loss-tensor scale — that pilot was a no-op).
->   Renamed `--binding-replay-loss-scale` → `--binding-replay-lr-scale`, scales the LR passed to
->   `optimizer.step()` directly. Piloted for real at scale=0.1: `mean_output_mse` still +444.7% —
->   genuinely dosage-invariant. **Candidate (a) closed, both variants.**
-> - **Freeze-heads pilot (candidate (d), `engineering-log.md` §46):** scoping a (c) pilot surfaced
->   a sharper hypothesis — the production `mean_output_mse` metric is the head-reconstruction MSE
->   on *stored* episodes, while `binding_replay_step_batch` trains the same heads on *live*
->   episodes through the same optimizer. Implemented `--binding-replay-freeze-heads` (excludes head
->   grads from the optimizer step; pinned by a dedicated unit test before piloting). **Piloted —
->   FAILED: `mean_output_mse` +586.9%, same 445-587% band as every prior pilot.** This is stronger
->   than a failed pilot: with heads frozen and encoders never in binding-replay's loss graph, there
->   is no gradient path for the treatment arm to move this metric at all — yet it moved.
-> - **Root cause found by reading `crates/somnus/src/lib.rs:2451-2469` (not by more pilots):
->   `rebuild_ort_session` fires after every sleep cycle once ORT is active**, not only on growth as
->   ADR 0041 previously implied — true from cycle 1 at this campaign's 10x-growth scale. Real
->   channel: binding weights change → re-export picks them up → next wake phase forms episodes
->   through the new binder → those get **stored** as new traces → later cycles train heads against
->   these drifted stored episodes, which is exactly what `mean_output_mse` measures. Explains
->   dosage invariance in both (a) variants, why freezing heads (d) didn't help, and reproduces
->   §35's original episode-drift finding directly. **Not yet confirmed by an isolating pilot**
->   (disable/delay ORT rebuild during a binding-replay run, or force the CPU/burn wake path) —
->   leading hypothesis, not proven.
-> - **Blocks (b) and (c) as previously scoped** — neither touches the ORT re-export cadence this
->   hypothesis implicates. **No path chosen. Next step on resume: propose the confirming diagnostic
->   to the user** (isolate whether ORT re-export drift is really the channel) before running any
->   more optimizer/loss variant pilots on §33.
-> - **Scripts cleanup (unrelated, done same session):** removed `ab_lora.sh`/`train_lora.py`/
->   `ab_q1_text_hidden.sh`/`export_qwen3.py` (dead, referenced Qwen2.5 files that no longer exist
->   anywhere); fixed `profile.sh`/`quantize_kv.py`'s stale Qwen2.5 paths and constants; fixed a real
->   `NameError`-on-first-run bug in `train_lora_qwen3.py` (caught only because the script has never
->   actually been run, gaps.md §39).
-> - **All work is committed as of this checkpoint** — `gaps.md` §33, `engineering-log.md` §46, and
->   ADR 0041 all updated with the §46 finding in the same commit as this checkpoint.
