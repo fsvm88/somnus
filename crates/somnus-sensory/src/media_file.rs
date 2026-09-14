@@ -309,8 +309,10 @@ struct MediaFileHandles {
 fn f32_samples_from_frame(frame: &frame::Audio) -> Vec<f32> {
     frame
         .data(0)
-        .chunks_exact(4)
-        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_ne_bytes(*b))
         .collect()
 }
 
