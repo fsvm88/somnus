@@ -2760,11 +2760,6 @@ impl PerceptionProcessor {
         Ok(())
     }
 
-    /// Disable ORT inference (fall back to burn for all inference).
-    pub fn disable_ort_inference(&mut self) {
-        self.ort_session = None;
-    }
-
     /// True if ORT binding inference is active.
     pub fn ort_active(&self) -> bool {
         self.ort_session.is_some()

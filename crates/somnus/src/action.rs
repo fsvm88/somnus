@@ -259,9 +259,6 @@ pub struct ActionDecoder {
     /// 2-layer MLP. A/B control arm for ADR 0032 validation (--linear-proj flag).
     linear_proj: bool,
     tokenizer: Tokenizer,
-    /// Current gain multipliers: set by update_gain, applied to the next episode's k-WTA inputs.
-    #[allow(dead_code)]
-    pub gain: [f32; 5],
     device: NdArrayDevice,
     /// Cross-cycle LM hidden-state cache. Clips loop so token sequences repeat; after the first
     /// cycle each unique text pays the ORT cost exactly once for the lifetime of the session.
@@ -439,52 +436,11 @@ impl ActionDecoder {
             kv_cache,
             linear_proj,
             tokenizer,
-            gain: [1.0; 5],
             device,
             lm_hidden_cache: std::collections::HashMap::new(),
             conversation: std::collections::VecDeque::new(),
             conv_token_count: 0,
         })
-    }
-
-    /// Project episode vector → 4 region tokens → LM forward →
-    /// update `self.gain` from hidden-state L2 norms (ADR 0012).
-    ///
-    /// No-ops if gain_session was moved to GainWorker via `create_gain_worker`.
-    #[allow(dead_code)]
-    pub fn update_gain(&mut self, episode: &[f32]) -> Result<()> {
-        if self.gain_session.is_none() {
-            return Ok(());
-        }
-        // Compute projection before borrowing gain_session to avoid self re-borrow conflict.
-        let proj_flat = self.project_flat(episode)?;
-
-        let sess = self.gain_session.as_mut().unwrap();
-        let inputs = Array3::from_shape_vec((1, N_REGIONS, LM_HIDDEN), proj_flat)
-            .map_err(|e| anyhow::anyhow!("ndarray shape error: {e}"))?;
-        let tensor = TensorRef::from_array_view(&inputs)?;
-        // Extract hidden data inside a block so outputs (and its borrow of sess) drops
-        // before we write to self.gain.
-        let norms: [f32; 5] = {
-            let outputs = sess.run(ort::inputs!["inputs_embeds" => tensor])?;
-            let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
-            if shape.len() < 3 || shape[1] != N_REGIONS as i64 {
-                bail!("unexpected last_hidden_state shape: {:?}", shape);
-            }
-            let h = data.to_vec();
-            std::array::from_fn(|i| {
-                let row = &h[i * LM_HIDDEN..(i + 1) * LM_HIDDEN];
-                row.iter().map(|x| x * x).sum::<f32>().sqrt()
-            })
-        };
-
-        let max_n = norms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp: [f32; 5] = norms.map(|n| ((n - max_n) / 10.0).exp());
-        let sum_e: f32 = exp.iter().sum();
-        let attn = exp.map(|e| e / sum_e);
-        self.gain = attn.map(|a| (a * 5.0).clamp(0.5, 2.0));
-        tracing::info!(gain = ?self.gain, norms = ?norms, "action gain updated");
-        Ok(())
     }
 
     /// Autoregressive greedy generation given a current episode vector and a text query.

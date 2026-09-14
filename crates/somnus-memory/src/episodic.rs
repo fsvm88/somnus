@@ -85,10 +85,6 @@ impl EpisodicBuffer {
         self.buf.is_empty()
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
     /// Maximum id currently in the buffer, or None if empty.
     pub fn max_id(&self) -> Option<u64> {
         self.buf.back().map(|t| t.record.id)
