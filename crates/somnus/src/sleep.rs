@@ -460,6 +460,131 @@ fn prune_grown_units(
     (regions_pruned, total_units_pruned)
 }
 
+/// One REM trace: `(episode vector, regional inputs, ingest source, salience)`.
+type RemTrace = (Vec<f32>, [Vec<f32>; 5], IngestSource, f32);
+
+/// Result of the REM creative-recombination pass.
+#[derive(Default)]
+struct Recombination {
+    synthetics_produced: usize,
+    /// `(episode, regional inputs, salience)` of each synthetic, to seed the next NREM cycle.
+    synth_traces: Vec<(Vec<f32>, [Vec<f32>; 5], f32)>,
+    mean_synthetic_output_mse: Option<f32>,
+    mean_real_inference_mse: Option<f32>,
+}
+
+/// REM creative recombination (11b): measure inference-mode output MSE on a sub-sample of real
+/// episodes, then blend pairs of sufficiently different traces into synthetic episodes and
+/// measure how novel they are to the trained output heads.
+fn recombine_episodes(
+    perception: &mut PerceptionProcessor,
+    traces_for_rem: &[RemTrace],
+) -> Recombination {
+    let mut synthetics_produced = 0usize;
+    let mut synth_traces: Vec<(Vec<f32>, [Vec<f32>; 5], f32)> = Vec::new();
+    let mut mean_synthetic_output_mse: Option<f32> = None;
+    let mut mean_real_inference_mse: Option<f32> = None;
+
+    // Measure real inference MSE on a sub-sample of traces_for_rem.
+    let real_sample_n = traces_for_rem.len().min(REM_SYNTH_MAX_N);
+    let step = traces_for_rem.len().max(1);
+    let mut real_mse_total = 0.0f32;
+    let mut real_mse_n = 0usize;
+    for j in 0..real_sample_n {
+        let idx = j * step / real_sample_n;
+        let (ep_vec, regional, _, _) = &traces_for_rem[idx];
+        match perception.measure_output_mse_inference(ep_vec, regional) {
+            Ok(mse) => {
+                real_mse_total += mse;
+                real_mse_n += 1;
+            }
+            Err(e) => {
+                tracing::warn!(?e, "measure_output_mse_inference error (real)");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
+            }
+        }
+    }
+    if real_mse_n > 0 {
+        mean_real_inference_mse = Some(real_mse_total / real_mse_n as f32);
+    }
+
+    // Synthesize pairs with L2 > REM_SYNTH_MIN_L2 (different content).
+    let mut synth_mse_total = 0.0f32;
+    let mut synth_mse_n = 0usize;
+    'outer: for i in 0..traces_for_rem.len() {
+        if synthetics_produced >= REM_SYNTH_MAX_N {
+            break;
+        }
+        for j in (i + 1)..traces_for_rem.len() {
+            if synthetics_produced >= REM_SYNTH_MAX_N {
+                break 'outer;
+            }
+            let (ep_a, reg_a, _, _) = &traces_for_rem[i];
+            let (_, reg_b, _, _) = &traces_for_rem[j];
+            let l2 = l2_sq(ep_a, &traces_for_rem[j].0).sqrt();
+            if l2 < REM_SYNTH_MIN_L2 {
+                continue;
+            }
+            match perception.synthesize_episode(reg_a, reg_b, REM_SYNTH_ALPHA) {
+                Ok(synth_ep) => {
+                    synthetics_produced += 1;
+                    // Blend regional inputs with the same alpha used for synthesis so
+                    // NREM can train on the synthetic's own encoder representation.
+                    let synth_regional: [Vec<f32>; 5] = std::array::from_fn(|k| {
+                        let a = &reg_a[k];
+                        let b = &reg_b[k];
+                        if a.is_empty() || b.is_empty() {
+                            vec![]
+                        } else {
+                            a.iter()
+                                .zip(b.iter())
+                                .map(|(&x, &y)| REM_SYNTH_ALPHA * x + (1.0 - REM_SYNTH_ALPHA) * y)
+                                .collect()
+                        }
+                    });
+                    // Salience = source-pair L2 distance (how different the parents were).
+                    synth_traces.push((synth_ep.clone(), synth_regional, l2));
+                    // Measure novelty: MSE of both source regionals against the synthetic.
+                    let mse_a = perception.measure_output_mse_inference(&synth_ep, reg_a);
+                    let mse_b = perception.measure_output_mse_inference(&synth_ep, reg_b);
+                    match (mse_a, mse_b) {
+                        (Ok(a), Ok(b)) => {
+                            synth_mse_total += (a + b) / 2.0;
+                            synth_mse_n += 1;
+                        }
+                        (Ok(a), Err(_)) | (Err(_), Ok(a)) => {
+                            synth_mse_total += a;
+                            synth_mse_n += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(?e, "synthesize_episode error");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
+                }
+            }
+        }
+    }
+    if synth_mse_n > 0 {
+        mean_synthetic_output_mse = Some(synth_mse_total / synth_mse_n as f32);
+    }
+
+    tracing::info!(
+        synthetics_produced,
+        mean_real_inference_mse = ?mean_real_inference_mse,
+        mean_synthetic_output_mse = ?mean_synthetic_output_mse,
+        "REM creative recombination complete"
+    );
+
+    Recombination {
+        synthetics_produced,
+        synth_traces,
+        mean_synthetic_output_mse,
+        mean_real_inference_mse,
+    }
+}
+
 /// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
 /// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
 /// Plain data so a cycle can be driven from a test without building the CLI `Args`.
@@ -1088,7 +1213,6 @@ pub fn run_sleep_cycle(
     let mut cross_modal_gist_entropy: Option<f32> = None;
     let mut within_session_gist_rate: Option<f32> = None;
 
-    type RemTrace = (Vec<f32>, [Vec<f32>; 5], IngestSource, f32);
     // Collect traces once for reuse in both warm probe and MSE measurement.
     let traces_for_rem: Vec<RemTrace> = if !was_interrupted {
         episodic
@@ -1482,109 +1606,19 @@ pub fn run_sleep_cycle(
     // ── REM creative recombination (11b) ─────────────────────────────────────
     // After NREM training completes, measure inference-mode output MSE on both
     // real and synthetic (blended) episodes to confirm synthetics are novel to
-    // the trained output heads.
-    let mut synthetics_produced = 0usize;
-    // Collected during REM synthesis; pushed to episodic after clear so the
-    // next NREM cycle trains on creative recombinations (item 1).
-    let mut synth_traces: Vec<(Vec<f32>, [Vec<f32>; 5], f32)> = Vec::new();
-    let mut mean_synthetic_output_mse: Option<f32> = None;
-    let mut mean_real_inference_mse: Option<f32> = None;
-
-    if !was_interrupted && !traces_for_rem.is_empty() {
-        // Measure real inference MSE on a sub-sample of traces_for_rem.
-        let real_sample_n = traces_for_rem.len().min(REM_SYNTH_MAX_N);
-        let step = traces_for_rem.len().max(1);
-        let mut real_mse_total = 0.0f32;
-        let mut real_mse_n = 0usize;
-        for j in 0..real_sample_n {
-            let idx = j * step / real_sample_n;
-            let (ep_vec, regional, _, _) = &traces_for_rem[idx];
-            match perception.measure_output_mse_inference(ep_vec, regional) {
-                Ok(mse) => {
-                    real_mse_total += mse;
-                    real_mse_n += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(?e, "measure_output_mse_inference error (real)");
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
-                }
-            }
-        }
-        if real_mse_n > 0 {
-            mean_real_inference_mse = Some(real_mse_total / real_mse_n as f32);
-        }
-
-        // Synthesize pairs with L2 > REM_SYNTH_MIN_L2 (different content).
-        let mut synth_mse_total = 0.0f32;
-        let mut synth_mse_n = 0usize;
-        'outer: for i in 0..traces_for_rem.len() {
-            if synthetics_produced >= REM_SYNTH_MAX_N {
-                break;
-            }
-            for j in (i + 1)..traces_for_rem.len() {
-                if synthetics_produced >= REM_SYNTH_MAX_N {
-                    break 'outer;
-                }
-                let (ep_a, reg_a, _, _) = &traces_for_rem[i];
-                let (_, reg_b, _, _) = &traces_for_rem[j];
-                let l2 = l2_sq(ep_a, &traces_for_rem[j].0).sqrt();
-                if l2 < REM_SYNTH_MIN_L2 {
-                    continue;
-                }
-                match perception.synthesize_episode(reg_a, reg_b, REM_SYNTH_ALPHA) {
-                    Ok(synth_ep) => {
-                        synthetics_produced += 1;
-                        // Blend regional inputs with the same alpha used for synthesis so
-                        // NREM can train on the synthetic's own encoder representation.
-                        let synth_regional: [Vec<f32>; 5] = std::array::from_fn(|k| {
-                            let a = &reg_a[k];
-                            let b = &reg_b[k];
-                            if a.is_empty() || b.is_empty() {
-                                vec![]
-                            } else {
-                                a.iter()
-                                    .zip(b.iter())
-                                    .map(|(&x, &y)| {
-                                        REM_SYNTH_ALPHA * x + (1.0 - REM_SYNTH_ALPHA) * y
-                                    })
-                                    .collect()
-                            }
-                        });
-                        // Salience = source-pair L2 distance (how different the parents were).
-                        synth_traces.push((synth_ep.clone(), synth_regional, l2));
-                        // Measure novelty: MSE of both source regionals against the synthetic.
-                        let mse_a = perception.measure_output_mse_inference(&synth_ep, reg_a);
-                        let mse_b = perception.measure_output_mse_inference(&synth_ep, reg_b);
-                        match (mse_a, mse_b) {
-                            (Ok(a), Ok(b)) => {
-                                synth_mse_total += (a + b) / 2.0;
-                                synth_mse_n += 1;
-                            }
-                            (Ok(a), Err(_)) | (Err(_), Ok(a)) => {
-                                synth_mse_total += a;
-                                synth_mse_n += 1;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(?e, "synthesize_episode error");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
-                    }
-                }
-            }
-        }
-        if synth_mse_n > 0 {
-            mean_synthetic_output_mse = Some(synth_mse_total / synth_mse_n as f32);
-        }
-
-        tracing::info!(
-            synthetics_produced,
-            mean_real_inference_mse = ?mean_real_inference_mse,
-            mean_synthetic_output_mse = ?mean_synthetic_output_mse,
-            "REM creative recombination complete"
-        );
-    }
+    // the trained output heads. The synthetics are pushed to the hot buffer after
+    // it is cleared so the next NREM cycle trains on them.
+    let recombination = if !was_interrupted && !traces_for_rem.is_empty() {
+        recombine_episodes(perception, &traces_for_rem)
+    } else {
+        Recombination::default()
+    };
+    let Recombination {
+        synthetics_produced,
+        synth_traces,
+        mean_synthetic_output_mse,
+        mean_real_inference_mse,
+    } = recombination;
 
     // ── Clear hot buffer after spill + REM ───────────────────────────────────
     if !was_interrupted {
