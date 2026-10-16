@@ -43,6 +43,7 @@ somnus-perception     = { path = "../somnus-perception" }
 somnus-memory         = { path = "../somnus-memory" }
 burn               = { workspace = true }
 burn-flex  = { workspace = true }
+rayon              = { workspace = true }
 burn-store   = { workspace = true }
 safetensors        = { workspace = true }
 ndarray            = { workspace = true }

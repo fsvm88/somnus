@@ -62,6 +62,27 @@ pub(crate) fn cpu_session(
     Ok(builder.commit_from_file(path)?)
 }
 
+/// Resolve the `--rayon-threads` / `--encoder-ort-threads` settings (0 = auto) against the machine:
+/// rayon gets half the logical cores, each encoder ORT session one eighth (at least 2).
+fn thread_budgets(args: &cli::Args) -> (usize, usize) {
+    thread_budgets_for(
+        std::thread::available_parallelism().map_or(4, |n| n.get()),
+        args.rayon_threads,
+        args.encoder_ort_threads,
+    )
+}
+
+fn thread_budgets_for(cores: usize, rayon: usize, encoder: usize) -> (usize, usize) {
+    (
+        if rayon > 0 { rayon } else { (cores / 2).max(1) },
+        if encoder > 0 {
+            encoder
+        } else {
+            (cores / 8).max(2)
+        },
+    )
+}
+
 /// Compute (intra_op, inter_op) thread counts for ONNX sessions.
 ///
 /// Reserves roughly half the logical cores for burn-flex's rayon thread pool.
@@ -447,6 +468,20 @@ pub async fn run() -> Result<()> {
     startup::init_tracing(&args)?;
 
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
+
+    // Thread budgets must be set before the first rayon use / encoder session is created.
+    let (rayon_threads, encoder_ort_threads) = thread_budgets(&args);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("rayon pool: {e}"))?;
+    somnus_encoding::set_ort_intra_threads(encoder_ort_threads);
+    info!(
+        rayon_threads,
+        encoder_ort_threads,
+        logical_cores = std::thread::available_parallelism().map_or(0, |n| n.get()),
+        "thread budgets"
+    );
 
     if let Some(seed) = args.seed {
         Device::flex().seed(seed);
@@ -3206,6 +3241,17 @@ mod main_helpers_tests {
     use super::*;
     use somnus_memory::IngestSource;
     use proptest::prelude::*;
+
+    // ── thread_budgets ────────────────────────────────────────────────────────
+
+    #[test]
+    fn thread_budgets_auto_scales_with_cores_and_explicit_values_win() {
+        assert_eq!(thread_budgets_for(32, 0, 0), (16, 4));
+        assert_eq!(thread_budgets_for(8, 0, 0), (4, 2));
+        assert_eq!(thread_budgets_for(1, 0, 0), (1, 2));
+        assert_eq!(thread_budgets_for(32, 12, 6), (12, 6));
+        assert_eq!(thread_budgets_for(32, 12, 0), (12, 4));
+    }
 
     // ── onnx_thread_budget ────────────────────────────────────────────────────
 

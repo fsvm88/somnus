@@ -40,6 +40,10 @@ name = "bench_nrem_batch"
 path = "src/bin/bench_nrem_batch.rs"
 
 [[bin]]
+name = "bench_inference_device"
+path = "src/bin/bench_inference_device.rs"
+
+[[bin]]
 name = "bench_wake_percep"
 path = "src/bin/bench_wake_percep.rs"
 

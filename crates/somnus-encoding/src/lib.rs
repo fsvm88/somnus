@@ -8,6 +8,18 @@ pub mod audio;
 pub mod preprocess;
 pub mod video;
 
+/// Intra-op thread count for the encoder ORT sessions (0 = ORT's default, i.e. every core).
+static ORT_INTRA_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cap the intra-op threads of the encoder sessions created after this call (0 = ORT default).
+///
+/// The encoders run alongside burn's rayon pool, the perception ORT sessions and the ASR decoder;
+/// leaving each session at "all cores" oversubscribes the machine (measured: `encode_speech`
+/// 1.08 s/call in the live pipeline vs ~54 ms in isolation).
+pub fn set_ort_intra_threads(n: usize) {
+    ORT_INTRA_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register MIGraphX EP on a session builder using the generic key-value ORT API.
 ///
 /// The struct-based `SessionOptionsAppendExecutionProvider_MIGraphX` triggers MIGraphX's
@@ -20,6 +32,15 @@ pub(crate) fn session_with_migraphx(
     use ort::AsPointer;
     use std::ffi::CString;
     let mut builder = ort::session::Session::builder()?;
+    let intra = ORT_INTRA_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+    if intra > 0 {
+        builder = builder
+            .with_intra_threads(intra)
+            .map_err(|e| EncodingError::Ort(e.into()))?;
+        builder = builder
+            .with_inter_threads(1)
+            .map_err(|e| EncodingError::Ort(e.into()))?;
+    }
     let name = CString::new("MIGraphXExecutionProvider").unwrap();
     let status = unsafe {
         (ort::api().SessionOptionsAppendExecutionProvider)(

@@ -29,6 +29,18 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) seed: Option<u64>,
 
+    /// Size of the global rayon pool that burn-flex's CPU kernels run on. 0 = auto: half the
+    /// logical cores. The encoder/ASR ONNX sessions share the machine with it; with every library
+    /// at "all cores" the wake loop ran 2x slower (ADR 0049 pilot, gaps.md Q14/R5).
+    #[arg(long, default_value = "0")]
+    pub(crate) rayon_threads: usize,
+
+    /// Intra-op threads for each audio/video encoder ONNX session. 0 = auto: one eighth of the
+    /// logical cores, at least 2 (the GPU does the heavy lifting; the threads only run fallback
+    /// ops and pre/post-processing).
+    #[arg(long, default_value = "0")]
+    pub(crate) encoder_ort_threads: usize,
+
     #[arg(long)]
     pub(crate) embeddings_out: Option<PathBuf>,
 

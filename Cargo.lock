@@ -2498,6 +2498,7 @@ dependencies = [
  "ndarray 0.17.2",
  "ort",
  "proptest",
+ "rayon",
  "safetensors 0.8.0",
  "serde_json",
  "sysinfo",
