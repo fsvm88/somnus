@@ -2,7 +2,7 @@
 
 > **Contents:** Open, undecided items only — algorithm/encoder/LLM upgrade candidates awaiting a decision, and known incompleteness with no chosen fix yet. Items that reached a decision (accepted/deployed/adopted, or rejected/not-pursued/null-result) live in [`engineering-log.md`](engineering-log.md), verbatim, under the same section numbers. Pruned to open-only 2026-08-15 (was §0-§37; see `engineering-log.md`'s header for what moved and why). §38 (Qwen3 KV-cache generation speedup) resolved and removed from this file 2026-08-15; full record at `engineering-log.md` §38. §41 (change-gated video encoder) rejected as a null-result and removed 2026-08-16; full record at `engineering-log.md` §43.
 > **When to read:** Picking the next item to try, or checking whether something is still undecided.
-> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `engineering-log.md`, not that it never existed. New items get the next unused number across both files (next: §48).
+> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `engineering-log.md`, not that it never existed. New items get the next unused number across both files (next: §49).
 
 ---
 
@@ -142,6 +142,30 @@ ADR 0038 picks hierarchical/coarse-to-fine WTA over MoE-routing and approximate 
 | §39 | **Qwen3 LoRA fine-tuning** (ADR 0033 follow-on) | Med (a campaign run) | Generation grounded in somnus's own distribution | Blocked infra never run; needs a priority decision |
 | §40 | **Whisper `decode_greedy` panic root cause** | Low–Med (diagnosis first) | ASR reliability under prolonged unattended runs | Mitigated (catch_unwind); instrumented 2026-08-15 (AsrPanic/AsrPostPanic* counters + input capture); poisoning question + root cause still open, pending natural recurrence |
 | §42 | **ADR 0038 prerequisite 3 + revisit trigger** | — | Informs hierarchical WTA priority | All 3 prereqs resolved 2026-08-15 (3 with a caveat — see above); ADR stays `proposed`, campaign-scale `per_region_mse` check still open |
+
+---
+
+## §48 — Improvement queue (repo sweep, 2026-10-16)
+
+Collected by a read-only sweep of code, CI, scripts, metrics coverage and docs. **Nothing here is started or decided** — each item is a candidate; pick by priority. Findings are from grep/clippy inspection, not from runtime verification, unless stated. Items marked *(verify)* need a quick check before acting. Deferred-backlog items (A, C, E, F, I-N) were deliberately not touched.
+
+| # | Pri | Area | Item |
+|---|-----|------|------|
+| Q1 | High | Reproducibility | **No RNG seeding found in `crates/`** (grep for `seed(`, `--seed`, `SeedableRng`, `manual_seed`: only test/bench helpers hit). Burn param init is therefore unseeded, which conflicts with CLAUDE.md "Seeds fixed in experiments" and with §33's finding that `Param` init is lazy and random per clone. A/B arms differ by init noise as well as by the flag. *(verify burn's default seeding first)* Fix: add a `--seed` flag calling the backend's seed fn at startup, record it in run metadata, pass it from `ab_*.sh`. |
+| Q2 | High | CI | **CI never runs `cargo test`** (`.github/workflows/ci.yml` has fmt, clippy, build only) and does not lint `--features fine-metrics`, though session-state says both configs were verified locally. Add `cargo test --workspace` (tests that need `models/` already skip when absent, e.g. `encode_models.rs:39`) and a `fine-metrics` clippy step. Mirror both in `scripts/hooks/pre-commit`, which is documented as mirroring CI. |
+| Q3 | Med | CI | Pre-commit hook and CI use `--all-targets` without `--workspace`; confirm the root manifest is a virtual workspace, otherwise some crates are skipped. *(verify)* |
+| Q4 | Med | A/B scripts | 8 of 13 `scripts/ab_*.sh` never mention `fine-metrics` (`ab_batch_topk`, `ab_dinov3`, `ab_der_auto_lambda`, `ab_mlp_proj`, `ab_qwen3_longclips`, `ab_qwen3`, `ab_replay_ratio`, `ab_efficientat_mn10`), against the 2026-08-15 standing instruction. They predate it; either retrofit or mark them as historical in a header comment so nobody reruns them as-is. |
+| Q5 | Med | Scripts | `scripts/stop_graceful.sh` has no `set -e`/`-u`/`-o pipefail` (the only script without). Lower priority since it is a shutdown helper. |
+| Q6 | Med | Panics | `somnus-perception/src/lib.rs` has ~96 `.unwrap()` calls before its test module, mostly `self.model.as_ref().unwrap()` and tensor readbacks (e.g. lines 108, 419-633). `somnus/src/action.rs` repeats the pattern (`proj_weight_norm`, `self.model.as_ref().unwrap()`). Research-grade is acceptable, but a mid-campaign panic loses a long run; consider one `model()` accessor returning `Result`, so failures carry context (relates to §40's undiagnosed intermittent panic). |
+| Q7 | Med | File size | `somnus/src/lib.rs` is 4605 lines (71 `#[arg]` CLI fields in it) and `somnus-perception/src/lib.rs` 3839; `run_sleep_cycle` in `sleep.rs` spans ~1200 lines (354-1558). Splitting is cheap per CLAUDE.md only once boundaries are real, so queue as: (a) move the CLI struct to its own module, (b) extract NREM/REM phases from `run_sleep_cycle`. No behavior change; do not mix with feature work. |
+| Q8 | Low | Dead code | Remaining `#[allow(dead_code)]`: `SleepStats` (`sleep.rs:156`, struct is only returned, fields unread?), `proj_weight_norm` (`action.rs:922`), `_decode_thread` and `stream` handles (legitimate keep-alive fields; rename or comment instead of allow), `resample.rs:1` module-wide allow ("used by binary, not the lib itself"; replace with a scoped allow or `pub`). `projection_step`/`_batch` stay (ADR 0012 amendment). |
+| Q9 | Low | Lints | Clippy pedantic (excluding casts/docs) reports ~50 `float_cmp`, 27 `cast_lossless` f32->f64, 25 `redundant_closure_for_method_calls`, 16 `items_after_statements`, 8 `unnecessary_wraps`, 14 `needless_pass_by_value`. Not worth gating; if cleaning, only the `unnecessary_wraps` and `needless_pass_by_value` groups (they signal API shape) and the `float_cmp` hits outside tests. |
+| Q10 | Low | Scripts | `scripts/` has ~40 files with no index of which are live, historical or one-shot, and no Python requirements/pyproject (only gitignored venvs). Add `scripts/README.md` (one line per script) and a pinned `requirements.txt` for the export venv. |
+| Q11 | Low | Crate hygiene | Already tracked in §15 and not re-listed: usearch, burn-flex (check the 0.22 timeline against today, 2026-10), ffmpeg-the-third. Worth a dated re-check since burn's expected date has passed. |
+| Q12 | Info | Metrics | Core-tier macros are widely used (somnus/lib.rs 58, perception/lib.rs 54, sleep.rs 29). Thin spots: `somnus-encoding/video.rs` (1), `whisper_asr.rs` (1), `wake_worker.rs` (2), `somnus-sensory` (media_file 2, audio capture 0). Candidate: failure/fallback counters on the ORT-panic path in `whisper_asr.rs` (§40), which would also help diagnose it. Not a policy violation found, just the least-covered files. |
+| Q13 | Info | Docs | Docs were audited 2026-09-14 (`37789f3`) and no new drift was looked for beyond constants/ADR index. Not re-audited here. |
+
+**Suggested order:** Q2 (cheap, closes a real hole), Q1 (verify, then fix before the ADR 0048 pilot so its arms are comparable), Q6, Q7, then the rest.
 
 ---
 
