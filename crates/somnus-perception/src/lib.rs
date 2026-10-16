@@ -2933,13 +2933,18 @@ impl PerceptionProcessor {
             .map_err(|e| PerceptionError::Burn(format!("{e:?}")))
             .and_then(|r| {
                 if r.errors.is_empty() {
-                    Ok(())
+                    // Snapshots from before ADR 0048 (or converted from them) carry no
+                    // `wake_binding.*`: those must be derived from `binding`. A snapshot that
+                    // does carry them must keep its (possibly lagged) wake copy untouched.
+                    Ok(r.missing
+                        .iter()
+                        .any(|(p, _)| p.starts_with("wake_binding.")))
                 } else {
                     Err(PerceptionError::Burn(format!("{:?}", r.errors)))
                 }
             });
         match applied {
-            Ok(()) => {
+            Ok(wake_missing) => {
                 // `region_n` is #[module(skip)], so it is not serialised; rebuild it from the
                 // loaded projection shapes (binding and wake_binding independently, ADR 0048).
                 let m = self.model_mut();
@@ -2950,11 +2955,19 @@ impl PerceptionProcessor {
                     m.binding.region_3.weight.val().inner().dims()[0],
                     m.binding.region_4.weight.val().inner().dims()[0],
                 ];
-                m.wake_binding.region_n = m.binding.region_n;
+                m.wake_binding.region_n = [
+                    m.wake_binding.region_0.weight.val().inner().dims()[0],
+                    m.wake_binding.region_1.weight.val().inner().dims()[0],
+                    m.wake_binding.region_2.weight.val().inner().dims()[0],
+                    m.wake_binding.region_3.weight.val().inner().dims()[0],
+                    m.wake_binding.region_4.weight.val().inner().dims()[0],
+                ];
                 // Loaded tensors carry no autodiff association: re-wrap every parameter as a
                 // fresh tracked leaf (and reset the optimizer) before any training step.
                 self.refresh_autodiff_state();
-                self.sync_wake_binding();
+                if wake_missing {
+                    self.sync_wake_binding();
+                }
                 self.ema_heads = EmaOutputHeads::from_model(self.model_ref());
                 Ok(())
             }

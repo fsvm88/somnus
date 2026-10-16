@@ -559,8 +559,8 @@ pub async fn run() -> Result<()> {
 
     // ── Pre-grow perception to match last session's region sizes ─────────────
     // Must happen before ORT build so the ONNX is exported from the correct
-    // (possibly grown) model. Weight restore later just loads weights into an
-    // already-correct-sized model and never needs to rebuild ONNX again.
+    // (possibly grown) model *shape*. The ONNX graph carries frozen weights though, so the
+    // snapshot restore below rebuilds the ORT session once the real weights are loaded.
     {
         let sizes = load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
         let regions = [
@@ -642,46 +642,69 @@ pub async fn run() -> Result<()> {
 
     // Restore from snapshot if available; otherwise start fresh.
     let mut snapshot_found = false;
-    let (mut episodic, mut semantic) =
-        match load_snapshot(&args.memory_dir, args.episodic_capacity, EPISODE_DIM) {
-            Ok(Some((ep, sem))) => {
-                snapshot_found = true;
-                info!(
-                    episodic_len = ep.len(),
-                    semantic_len = sem.len(),
-                    "restored from snapshot"
-                );
-                // Restore perception weights; pre-grow regions if they grew last session.
-                // save_weights writes `<stem>.safetensors`; check that, not the stem path itself.
-                let w_path = weights_path(&args.memory_dir);
-                if w_path.with_extension("safetensors").exists() {
-                    let sizes =
-                        load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
-                    if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
-                        tracing::warn!(?e, "weight restore failed — starting with fresh weights");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-                    } else {
-                        info!(sizes = ?sizes, "perception weights restored");
+    let (mut episodic, mut semantic) = match load_snapshot(
+        &args.memory_dir,
+        args.episodic_capacity,
+        EPISODE_DIM,
+    ) {
+        Ok(Some((ep, sem))) => {
+            snapshot_found = true;
+            info!(
+                episodic_len = ep.len(),
+                semantic_len = sem.len(),
+                "restored from snapshot"
+            );
+            // Restore perception weights; pre-grow regions if they grew last session.
+            // save_weights writes `<stem>.safetensors`; check that, not the stem path itself.
+            let w_path = weights_path(&args.memory_dir);
+            if w_path.with_extension("safetensors").exists() {
+                let sizes =
+                    load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
+                if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
+                    tracing::warn!(?e, "weight restore failed — starting with fresh weights");
+                    somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
+                } else {
+                    info!(sizes = ?sizes, "perception weights restored");
+                    // The ORT binding session above was exported from the pre-grown but
+                    // still randomly-initialised model; its graph carries frozen weights, so
+                    // without a rebuild the whole first wake phase would infer on them.
+                    if perception.ort_active() {
+                        if let (Some(ref dir), Some(ref script)) = (&onnx_dir, &onnx_script_path) {
+                            match perception.rebuild_ort_session(script, dir, args.onnx_migraphx) {
+                                Ok(()) => {
+                                    info!("ORT binding session rebuilt from restored weights")
+                                }
+                                Err(e) => {
+                                    tracing::warn!(?e, "ORT rebuild after restore failed — running with burn inference");
+                                    somnus_metrics::counted_core!(
+                                        somnus_metrics::Metric::OrtSessionRebuildFailed,
+                                        1
+                                    );
+                                    onnx_failed = true;
+                                }
+                            }
+                        }
                     }
                 }
-                (ep, sem)
             }
-            Ok(None) => {
-                info!("no snapshot found — starting fresh");
-                (
-                    EpisodicBuffer::new(args.episodic_capacity),
-                    SemanticStore::new(EPISODE_DIM),
-                )
-            }
-            Err(e) => {
-                tracing::warn!(?e, "snapshot load failed — starting fresh");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-                (
-                    EpisodicBuffer::new(args.episodic_capacity),
-                    SemanticStore::new(EPISODE_DIM),
-                )
-            }
-        };
+            (ep, sem)
+        }
+        Ok(None) => {
+            info!("no snapshot found — starting fresh");
+            (
+                EpisodicBuffer::new(args.episodic_capacity),
+                SemanticStore::new(EPISODE_DIM),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(?e, "snapshot load failed — starting fresh");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
+            (
+                EpisodicBuffer::new(args.episodic_capacity),
+                SemanticStore::new(EPISODE_DIM),
+            )
+        }
+    };
 
     // S5: auto-seed max_warm_records from available RAM when not set (ADR 0024).
     // Warm HNSW is ~2500 bytes/record (640-dim f32 + graph edges); target 35% of free RAM.

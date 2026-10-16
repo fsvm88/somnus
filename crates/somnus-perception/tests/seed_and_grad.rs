@@ -22,9 +22,9 @@ fn lcg(seed: u64, len: usize) -> Vec<f32> {
 static RNG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn init_heads(seed: u64) -> Vec<Vec<f32>> {
-    let device = Device::flex();
-    device.seed(seed);
-    PerceptionProcessor::new(device)
+    // Seed one device instance, construct from a *fresh* one: that is how `run()` does it.
+    Device::flex().seed(seed);
+    PerceptionProcessor::new(Device::flex())
         .head_weights_flat()
         .to_vec()
 }
@@ -57,4 +57,43 @@ fn replay_step_moves_weights_and_reduces_loss() {
         "repeated steps on one batch must reduce the loss: {losses:?}"
     );
     assert_ne!(mse_before, mse_after, "weights must move");
+}
+
+/// ADR 0048: a saved `wake_binding` is the *lagged* copy and must survive a restart untouched;
+/// only snapshots without `wake_binding.*` (pre-ADR-0048) get it derived from `binding`.
+#[test]
+fn restore_keeps_saved_lagged_wake_binding() {
+    use somnus_perception::RegionId;
+    let _g = RNG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let device = Device::flex();
+    device.seed(3);
+    let mut a = PerceptionProcessor::new(device.clone());
+    let regional: [Vec<f32>; 5] = std::array::from_fn(|i| lcg(50 + i as u64, REGION_DIMS[i]));
+    // Train `binding` live without syncing: binding drifts away from its wake copy.
+    for _ in 0..3 {
+        a.binding_replay_step_batch(&[&regional], 1.0, false)
+            .unwrap();
+    }
+    let r = RegionId::AudioSpeech;
+    let (live_a, wake_a) = (
+        a.binding_proj_row_norms(r),
+        a.wake_binding_proj_row_norms(r),
+    );
+    assert_ne!(
+        live_a, wake_a,
+        "binding must have drifted from wake_binding"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("weights");
+    a.save_weights(&path).unwrap();
+
+    let mut b = PerceptionProcessor::new(device);
+    b.load_weights(&path).unwrap();
+    assert_eq!(b.binding_proj_row_norms(r), live_a, "binding restored");
+    assert_eq!(
+        b.wake_binding_proj_row_norms(r),
+        wake_a,
+        "restore must keep the saved lagged wake_binding, not re-sync it from binding"
+    );
 }
