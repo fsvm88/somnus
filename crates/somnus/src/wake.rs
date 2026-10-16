@@ -4,15 +4,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use somnus_memory::{EpisodicBuffer, RecollectionLayer};
-use somnus_perception::{IngestPerfBreakdown, PerceptionProcessor};
+use somnus_perception::{
+    IngestPerfBreakdown, PerceptionOutput, PerceptionProcessor, PerceptionResult, WakeReconWorker,
+};
 
 use crate::{
     accumulate_cosines, accumulate_salience, accumulate_wakefulness_pressure,
     action::{ActionDecoder, GainWorker},
     build_query_with_history,
     cli::Args,
-    episode_cosine_mean, is_introspective_query, query_recalled_episodes, sal_gate,
-    settle_gate_val,
+    episode_cosine_mean, is_introspective_query, maybe_startup_query, query_recalled_episodes,
+    record_episode, sal_gate, settle_gate_val,
     sleep::SleepStats,
     update_perf_ewma, update_sal_ewma, update_settle_ewma,
     wake_state::WakeState,
@@ -337,6 +339,168 @@ pub(crate) fn cycle_metrics_json(
         "s7_mse_ewma":           if st.s7_ewma_n > 0 { Some(st.s7_mse_ewma) } else { None },
         "fine_metrics":          fine_metrics,
     })
+}
+
+/// The mutable resources the per-embedding handlers need, borrowed from `run()`'s locals for the
+/// duration of one call (the owning variables stay locals because `select!` also borrows the
+/// channel receivers).
+pub(crate) struct WakeResources<'a> {
+    pub(crate) perception: &'a mut PerceptionProcessor,
+    pub(crate) sink: &'a mut Option<std::io::BufWriter<std::fs::File>>,
+    pub(crate) episodic: &'a mut EpisodicBuffer,
+    pub(crate) recall: &'a RecollectionLayer,
+    pub(crate) decoder: &'a mut Option<ActionDecoder>,
+    pub(crate) gain_worker: Option<&'a GainWorker>,
+    pub(crate) wake_recon_worker: Option<&'a WakeReconWorker>,
+    pub(crate) args: &'a Args,
+}
+
+/// Handle the perception result for one audio or video embedding: salience/cosine/settle
+/// accounting, episode recording, throttled wake reconstruction (async worker or inline), the
+/// adaptive EWMAs, the one-shot startup query and the gain-worker request. `modality` only labels
+/// the error log ("audio" / "video"). The audio and video `select!` arms used to carry two
+/// identical copies of this body.
+pub(crate) fn process_media_output(
+    st: &mut WakeState,
+    res: &mut WakeResources<'_>,
+    result: PerceptionResult<PerceptionOutput>,
+    timestamp: &somnus_sensory::Timestamp,
+    modality: &str,
+) {
+    match result {
+        Ok(out) => {
+            accumulate_cosines(
+                &out.prior_cosines,
+                &mut st.prior_cosine_sums,
+                &mut st.prior_cosine_counts,
+            );
+            if out.settle_iters > 0 {
+                st.settle_trigger_count += 1;
+                st.settle_iters_sum += out.settle_iters;
+                st.settle_delta_sum += out.settle_delta as f64;
+            }
+            let rec = record_episode(
+                &out,
+                timestamp,
+                res.sink,
+                res.episodic,
+                res.args.top_k,
+                res.recall,
+            );
+            if let Some(ref rec) = rec {
+                let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
+                accumulate_salience(
+                    rec,
+                    sal_thresh,
+                    &mut st.salience_sum,
+                    &mut st.salience_n,
+                    &mut st.salience_min,
+                    &mut st.high_salience_episodes,
+                    &mut st.blend_count,
+                    &mut st.episodes_speech,
+                    &mut st.episodes_env,
+                    &mut st.episodes_visual,
+                    &mut st.episodes_language,
+                    &mut st.episodes_mixed,
+                );
+                update_sal_ewma(
+                    rec.salience,
+                    &mut st.sal_mu,
+                    &mut st.sal_sigma,
+                    &mut st.sal_n,
+                );
+                accumulate_wakefulness_pressure(
+                    rec.salience,
+                    sal_thresh,
+                    &mut st.wakefulness_pressure,
+                );
+                st.hnsw_query_us_sum += rec.hnsw_query_us;
+                st.hnsw_query_n += 1;
+            }
+            if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
+                st.wake_reconstruct_counter += 1;
+                if st
+                    .wake_reconstruct_counter
+                    .is_multiple_of(st.effective_wake_interval)
+                {
+                    st.wake_reconstruct_throttle_passed += 1;
+                    if rec
+                        .as_ref()
+                        .is_some_and(|r| r.salience > sal_gate(st.sal_mu, st.sal_sigma, st.sal_n))
+                    {
+                        if let Some(w) = res.wake_recon_worker {
+                            if !w.request_train(
+                                ep.0.clone(),
+                                regional.clone(),
+                                res.perception.learning_rate(),
+                            ) {
+                                st.wake_recon_dropped += 1;
+                            }
+                        } else {
+                            match res.perception.wake_reconstruct_step(&ep.0, regional) {
+                                Ok(mse) => {
+                                    st.wake_output_mse_sum += mse as f64;
+                                    st.wake_output_mse_n += 1;
+                                    tracing::info!(output_mse = mse, "wake reconstruction");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(?e, "wake reconstruct error");
+                                    somnus_metrics::counted_core!(
+                                        somnus_metrics::Metric::WakeReconstructError,
+                                        1
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Refresh autodiff graph every N episodes to prevent
+                    // node accumulation from forward passes slowing into_data().
+                    res.perception.refresh_autodiff_state();
+                }
+                st.wake_episodes += 1;
+                if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
+                    update_perf_ewma(
+                        m,
+                        &mut st.cosine_ewma,
+                        &mut st.cosine_baseline,
+                        &mut st.cosine_baseline_accum,
+                        &mut st.cosine_baseline_n,
+                        &mut st.perf_sleep_flag,
+                        res.args.perf_sleep_threshold,
+                    );
+                    update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
+                    res.perception.set_settle_gate(settle_gate_val(
+                        st.settle_mu,
+                        st.settle_n,
+                        res.args.settle_gate,
+                    ));
+                }
+            }
+            if !st.startup_query_fired && out.episode.is_some() {
+                st.startup_query_fired = maybe_startup_query(
+                    &res.args.query,
+                    res.decoder,
+                    &*res.episodic,
+                    res.args.action_max_tokens,
+                );
+            }
+            if let Some(gw) = res.gain_worker {
+                if let Some(ep) = &out.episode {
+                    st.gain_episode_counter += 1;
+                    if st
+                        .gain_episode_counter
+                        .is_multiple_of(res.args.gain_interval)
+                    {
+                        gw.request_gain(ep.0.clone());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(?e, modality, "perception error");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::PerceptionIngestError, 1);
+        }
+    }
 }
 
 #[cfg(test)]

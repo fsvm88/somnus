@@ -1823,76 +1823,22 @@ pub async fn run() -> Result<()> {
                             }
                         );
                         st.perception_total_ms += d_perc.as_millis() as u64;
-                        match result {
-                            Ok(out) => {
-                                accumulate_cosines(&out.prior_cosines, &mut st.prior_cosine_sums, &mut st.prior_cosine_counts);
-                                if out.settle_iters > 0 { st.settle_trigger_count += 1; st.settle_iters_sum += out.settle_iters; st.settle_delta_sum += out.settle_delta as f64; }
-                                let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
-                                if let Some(ref rec) = rec {
-                                    let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
-                                    accumulate_salience(rec, sal_thresh, &mut st.salience_sum, &mut st.salience_n, &mut st.salience_min, &mut st.high_salience_episodes, &mut st.blend_count, &mut st.episodes_speech, &mut st.episodes_env, &mut st.episodes_visual, &mut st.episodes_language, &mut st.episodes_mixed);
-                                    update_sal_ewma(rec.salience, &mut st.sal_mu, &mut st.sal_sigma, &mut st.sal_n);
-                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut st.wakefulness_pressure);
-                                    st.hnsw_query_us_sum += rec.hnsw_query_us;
-                                    st.hnsw_query_n += 1;
-                                }
-                                if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                                    st.wake_reconstruct_counter += 1;
-                                    if st.wake_reconstruct_counter.is_multiple_of(st.effective_wake_interval) {
-                                        st.wake_reconstruct_throttle_passed += 1;
-                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(st.sal_mu, st.sal_sigma, st.sal_n)) {
-                                            if let Some(ref w) = wake_recon_worker {
-                                                if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
-                                                    st.wake_recon_dropped += 1;
-                                                }
-                                            } else {
-                                                match perception.wake_reconstruct_step(&ep.0, regional) {
-                                                    Ok(mse) => {
-                                                        st.wake_output_mse_sum += mse as f64;
-                                                        st.wake_output_mse_n += 1;
-                                                        tracing::info!(output_mse = mse, "wake reconstruction");
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(?e, "wake reconstruct error");
-                                                        somnus_metrics::counted_core!(
-                                                            somnus_metrics::Metric::WakeReconstructError,
-                                                            1
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Refresh autodiff graph every N episodes to prevent
-                                        // node accumulation from forward passes slowing into_data().
-                                        perception.refresh_autodiff_state();
-                                    }
-                                    st.wake_episodes += 1;
-                                    if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
-                                        update_perf_ewma(m, &mut st.cosine_ewma, &mut st.cosine_baseline, &mut st.cosine_baseline_accum, &mut st.cosine_baseline_n, &mut st.perf_sleep_flag, args.perf_sleep_threshold);
-                                        update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
-                                        perception.set_settle_gate(settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate));
-                                    }
-                                }
-                                if !st.startup_query_fired && out.episode.is_some() {
-                                    st.startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
-                                }
-                                if let Some(ref gw) = gain_worker {
-                                    if let Some(ep) = &out.episode {
-                                        st.gain_episode_counter += 1;
-                                        if st.gain_episode_counter.is_multiple_of(args.gain_interval) {
-                                            gw.request_gain(ep.0.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(?e, "perception error (audio)");
-                                somnus_metrics::counted_core!(
-                                    somnus_metrics::Metric::PerceptionIngestError,
-                                    1
-                                );
-                            }
-                        }
+                        wake::process_media_output(
+                            &mut st,
+                            &mut wake::WakeResources {
+                                perception: &mut perception,
+                                sink: &mut sink,
+                                episodic: &mut episodic,
+                                recall: &recall,
+                                decoder: &mut decoder,
+                                gain_worker: gain_worker.as_ref(),
+                                wake_recon_worker: wake_recon_worker.as_ref(),
+                                args: &args,
+                            },
+                            result,
+                            &emb.timestamp,
+                            "audio",
+                        );
                     }
                     None => { audio_emb_closed = true; }
                 }
@@ -1903,81 +1849,27 @@ pub async fn run() -> Result<()> {
                         let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &video_emb_json(&emb));
                         st.video_encode_total_ms += emb.encode_ms;
-                        let (vis_result, d_perc) = somnus_metrics::timed_core!(
+                        let (result, d_perc) = somnus_metrics::timed_core!(
                             somnus_metrics::Metric::MainPerceptionIngest,
                             perception.ingest_visual(&emb.values)
                         );
                         st.perception_total_ms += d_perc.as_millis() as u64;
-                        match vis_result {
-                            Ok(out) => {
-                                accumulate_cosines(&out.prior_cosines, &mut st.prior_cosine_sums, &mut st.prior_cosine_counts);
-                                if out.settle_iters > 0 { st.settle_trigger_count += 1; st.settle_iters_sum += out.settle_iters; st.settle_delta_sum += out.settle_delta as f64; }
-                                let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
-                                if let Some(ref rec) = rec {
-                                    let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
-                                    accumulate_salience(rec, sal_thresh, &mut st.salience_sum, &mut st.salience_n, &mut st.salience_min, &mut st.high_salience_episodes, &mut st.blend_count, &mut st.episodes_speech, &mut st.episodes_env, &mut st.episodes_visual, &mut st.episodes_language, &mut st.episodes_mixed);
-                                    update_sal_ewma(rec.salience, &mut st.sal_mu, &mut st.sal_sigma, &mut st.sal_n);
-                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut st.wakefulness_pressure);
-                                    st.hnsw_query_us_sum += rec.hnsw_query_us;
-                                    st.hnsw_query_n += 1;
-                                }
-                                if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                                    st.wake_reconstruct_counter += 1;
-                                    if st.wake_reconstruct_counter.is_multiple_of(st.effective_wake_interval) {
-                                        st.wake_reconstruct_throttle_passed += 1;
-                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(st.sal_mu, st.sal_sigma, st.sal_n)) {
-                                            if let Some(ref w) = wake_recon_worker {
-                                                if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
-                                                    st.wake_recon_dropped += 1;
-                                                }
-                                            } else {
-                                                match perception.wake_reconstruct_step(&ep.0, regional) {
-                                                    Ok(mse) => {
-                                                        st.wake_output_mse_sum += mse as f64;
-                                                        st.wake_output_mse_n += 1;
-                                                        tracing::info!(output_mse = mse, "wake reconstruction");
-                                                    }
-                                                    Err(e) => {
-                                                        tracing::warn!(?e, "wake reconstruct error");
-                                                        somnus_metrics::counted_core!(
-                                                            somnus_metrics::Metric::WakeReconstructError,
-                                                            1
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Refresh autodiff graph every N episodes to prevent
-                                        // node accumulation from forward passes slowing into_data().
-                                        perception.refresh_autodiff_state();
-                                    }
-                                    st.wake_episodes += 1;
-                                    if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
-                                        update_perf_ewma(m, &mut st.cosine_ewma, &mut st.cosine_baseline, &mut st.cosine_baseline_accum, &mut st.cosine_baseline_n, &mut st.perf_sleep_flag, args.perf_sleep_threshold);
-                                        update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
-                                        perception.set_settle_gate(settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate));
-                                    }
-                                }
-                                if !st.startup_query_fired && out.episode.is_some() {
-                                    st.startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
-                                }
-                                if let Some(ref gw) = gain_worker {
-                                    if let Some(ep) = &out.episode {
-                                        st.gain_episode_counter += 1;
-                                        if st.gain_episode_counter.is_multiple_of(args.gain_interval) {
-                                            gw.request_gain(ep.0.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(?e, "perception error (video)");
-                                somnus_metrics::counted_core!(
-                                    somnus_metrics::Metric::PerceptionIngestError,
-                                    1
-                                );
-                            }
-                        }
+                        wake::process_media_output(
+                            &mut st,
+                            &mut wake::WakeResources {
+                                perception: &mut perception,
+                                sink: &mut sink,
+                                episodic: &mut episodic,
+                                recall: &recall,
+                                decoder: &mut decoder,
+                                gain_worker: gain_worker.as_ref(),
+                                wake_recon_worker: wake_recon_worker.as_ref(),
+                                args: &args,
+                            },
+                            result,
+                            &emb.timestamp,
+                            "video",
+                        );
                     }
                     None => { video_emb_closed = true; }
                 }
