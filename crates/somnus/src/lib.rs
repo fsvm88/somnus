@@ -3,6 +3,7 @@
 mod action;
 mod cli;
 mod sleep;
+mod startup;
 mod util;
 mod whisper_asr;
 
@@ -443,26 +444,7 @@ fn video_emb_json(emb: &VideoEmbedding) -> String {
 pub async fn run() -> Result<()> {
     let args = cli::Args::parse();
 
-    // Init tracing before ort so startup errors are captured.
-    // When --log-file is set, write directly to that file to avoid the
-    // broken-pipe problem that occurs when running under `cargo run` and
-    // redirecting stderr (cargo's internal pipe breaks when cargo exits).
-    {
-        use tracing_subscriber::fmt::writer::BoxMakeWriter;
-        let writer: BoxMakeWriter = if let Some(ref path) = args.log_file {
-            let f = std::fs::File::create(path)?;
-            BoxMakeWriter::new(std::sync::Mutex::new(f))
-        } else {
-            BoxMakeWriter::new(std::io::stderr)
-        };
-        tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ort=warn")),
-            )
-            .init();
-    }
+    startup::init_tracing(&args)?;
 
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
 
@@ -476,34 +458,7 @@ pub async fn run() -> Result<()> {
         std::fs::write(pid_path, format!("{}\n", std::process::id()))?;
     }
 
-    // Audio/visual model files are only needed when a media file is provided.
-    if !args.file.is_empty() {
-        #[cfg(not(feature = "mn10_env"))]
-        let env_encoder_name = "clap_audio_encoder.onnx";
-        #[cfg(feature = "mn10_env")]
-        let env_encoder_name = "efficientat_mn10_encoder_fp16.onnx";
-        for name in &[
-            "whisper_tiny_encoder.onnx",
-            env_encoder_name,
-            "dinov2_small.onnx",
-        ] {
-            let p = args.models_dir.join(name);
-            if !p.exists() {
-                anyhow::bail!("model file not found: {}", p.display());
-            }
-        }
-    }
-
-    if args.language {
-        for suffix in &["_embed_table.safetensors", "_tokenizer.json"] {
-            let p = args
-                .models_dir
-                .join(format!("{}{suffix}", args.action_model_prefix));
-            if !p.exists() {
-                anyhow::bail!("language model file not found: {}", p.display());
-            }
-        }
-    }
+    startup::check_model_files(&args)?;
 
     let mut sink: Option<BufWriter<std::fs::File>> = if let Some(path) = &args.embeddings_out {
         let f = std::fs::File::create(path)?;
@@ -514,36 +469,7 @@ pub async fn run() -> Result<()> {
     };
 
     // ── perception processor ──────────────────────────────────────────────────
-    let mut perception = PerceptionProcessor::new(Device::flex());
-    let prior_beta_regions_static: Option<[f32; 5]> = if let Some(ref s) = args.prior_beta_regions {
-        let betas = parse_prior_beta_regions(s)?;
-        perception.set_prior_beta(0.0); // clear base first
-        for (i, &b) in betas.iter().enumerate() {
-            perception.set_prior_beta_region(i, b);
-        }
-        Some(betas)
-    } else {
-        perception.set_prior_beta(args.prior_beta);
-        None
-    };
-    perception.set_settle_steps(args.settle_steps);
-    perception.set_settle_beta(args.settle_beta);
-    perception.set_settle_gate(args.settle_gate);
-    perception.set_settle_every(args.settle_every);
-    perception.set_wm_size(args.working_memory_size);
-    perception.set_sae_l1_coeff(args.sae_l1_coeff);
-    perception.set_batch_topk(args.batch_topk);
-    perception.set_der_auto_lambda(args.der_auto_lambda);
-    info!(
-        prior_beta = args.prior_beta,
-        prior_beta_regions = ?prior_beta_regions_static,
-        settle_steps = args.settle_steps,
-        settle_beta = args.settle_beta,
-        working_memory_size = args.working_memory_size,
-        batch_topk = args.batch_topk,
-        der_auto_lambda = args.der_auto_lambda,
-        "perception processor initialised (n=1024, k=20, cpu)"
-    );
+    let (mut perception, prior_beta_regions_static) = startup::build_perception(&args)?;
 
     // Capture process-start time as the within-session warm filter boundary (ADR 0024).
     // Warm records with timestamp_secs >= session_start_secs belong to this session only.
