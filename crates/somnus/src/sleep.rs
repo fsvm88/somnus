@@ -154,6 +154,7 @@ fn binding_replay_step_budget_remaining(steps_done: usize, cap: usize) -> bool {
     steps_done < cap
 }
 
+#[derive(Default)]
 pub struct SleepStats {
     pub traces_replayed: usize,
     pub mean_train_loss: f32,
