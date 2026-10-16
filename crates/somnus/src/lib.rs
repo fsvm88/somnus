@@ -103,7 +103,6 @@ use action::{ActionDecoder, GainWorker};
 use whisper_asr::WhisperDecoder;
 
 use anyhow::{Context as _, Result};
-use burn::tensor::Device;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use somnus_encoding::{
@@ -111,18 +110,16 @@ use somnus_encoding::{
     VideoEmbedding, VideoEncoder,
 };
 use somnus_memory::{
-    load_growth_cooldown_remaining, load_region_sizes, load_sal_ewma, load_settle_ewma,
-    load_snapshot, load_wake_ewma, weights_path, ColdArchive, EpisodicBuffer, IngestSource,
-    RecollectionLayer, SemanticStore,
+    load_growth_cooldown_remaining, load_sal_ewma, load_settle_ewma, load_wake_ewma,
+    EpisodicBuffer, IngestSource, RecollectionLayer,
 };
-use somnus_perception::{PerceptionProcessor, WakeReconWorker, EPISODE_DIM};
+use somnus_perception::{PerceptionProcessor, WakeReconWorker};
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, SensorMetrics, Timestamp, VideoCapture, VideoFrame,
 };
 use safetensors::SafeTensors;
 use std::{
     io::{BufWriter, Write},
-    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -469,41 +466,9 @@ pub async fn run() -> Result<()> {
 
     startup::init_tracing(&args)?;
 
-    ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
+    startup::init_process(&args)?;
 
-    // Thread budgets must be set before the first rayon use / encoder session is created.
-    let (rayon_threads, encoder_ort_threads) = thread_budgets(&args);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(rayon_threads)
-        .build_global()
-        .map_err(|e| anyhow::anyhow!("rayon pool: {e}"))?;
-    somnus_encoding::set_ort_intra_threads(encoder_ort_threads);
-    info!(
-        rayon_threads,
-        encoder_ort_threads,
-        logical_cores = std::thread::available_parallelism().map_or(0, |n| n.get()),
-        "thread budgets"
-    );
-
-    if let Some(seed) = args.seed {
-        Device::flex().seed(seed);
-        info!(seed, "burn RNG seeded");
-    }
-
-    // Write PID file for status scripts.
-    if let Some(ref pid_path) = args.pid_file {
-        std::fs::write(pid_path, format!("{}\n", std::process::id()))?;
-    }
-
-    startup::check_model_files(&args)?;
-
-    let mut sink: Option<BufWriter<std::fs::File>> = if let Some(path) = &args.embeddings_out {
-        let f = std::fs::File::create(path)?;
-        info!(path = %path.display(), "embedding sink opened");
-        Some(BufWriter::new(f))
-    } else {
-        None
-    };
+    let mut sink = startup::open_embedding_sink(&args)?;
 
     // ── perception processor ──────────────────────────────────────────────────
     let (mut perception, prior_beta_regions_static) = startup::build_perception(&args)?;
@@ -525,27 +490,7 @@ pub async fn run() -> Result<()> {
     // Must happen before the weight restore (which needs the grown shape) and the ORT build
     // (the ONNX is exported from the correct, possibly grown, model). The ORT session itself is
     // built after the restore: its graph carries frozen weights.
-    {
-        let sizes = load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
-        let regions = [
-            somnus_perception::RegionId::AudioSpeech,
-            somnus_perception::RegionId::AudioEnv,
-            somnus_perception::RegionId::Visual,
-            somnus_perception::RegionId::Symbolic,
-            somnus_perception::RegionId::Language,
-        ];
-        let current = perception.region_sizes();
-        let mut grew = false;
-        for (i, &region) in regions.iter().enumerate() {
-            if sizes[i] > current[i] {
-                perception.grow_region(region, sizes[i] - current[i]);
-                grew = true;
-            }
-        }
-        if grew {
-            info!(sizes = ?sizes, "perception pre-grown to match saved region sizes");
-        }
-    }
+    startup::pregrow_perception(&args, &mut perception);
 
     // ── ORT binding session (Phase 1 GPU unification, ADR 0023/0037) ──────────
     // Enabled automatically once any region crosses `onnx_crossover_units` — see
@@ -553,239 +498,37 @@ pub async fn run() -> Result<()> {
     // unconditionally (unless --force-cpu-inference) so the same paths are ready
     // whether the crossover trips at startup (a resumed, already-grown snapshot)
     // or mid-run (growth during this process).
-    let onnx_dir: Option<PathBuf> = if args.force_cpu_inference {
-        None
-    } else {
-        Some(
-            args.onnx_models_dir
-                .clone()
-                .unwrap_or_else(|| args.memory_dir.join("onnx_models")),
-        )
-    };
-    let onnx_script_path: Option<PathBuf> = onnx_dir.as_ref().map(|_| {
-        args.onnx_script.clone().unwrap_or_else(|| {
-            // Default: find script relative to the binary
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("../../scripts/export_perception_graph.py")
-        })
-    });
+    let (onnx_dir, onnx_script_path) = startup::resolve_onnx_paths(&args);
     // Sticky: once an attempt fails (missing Python/onnx/onnxruntime, MIGraphX
     // unavailable, ...), don't retry every sleep cycle — log once and stay on burn
     // CPU for the rest of the process. The environment problem won't fix itself.
-    let mut onnx_failed = false;
     // ── memory hierarchy ──────────────────────────────────────────────────────
-    std::fs::create_dir_all(&args.memory_dir)?;
-    let cold = match ColdArchive::open(&args.memory_dir) {
-        Ok(c) => c,
-        Err(e) => anyhow::bail!("cold archive init failed: {e}"),
-    };
-
-    // Restore from snapshot if available; otherwise start fresh.
-    let mut snapshot_found = false;
-    let (mut episodic, mut semantic) =
-        match load_snapshot(&args.memory_dir, args.episodic_capacity, EPISODE_DIM) {
-            Ok(Some((ep, sem))) => {
-                snapshot_found = true;
-                info!(
-                    episodic_len = ep.len(),
-                    semantic_len = sem.len(),
-                    "restored from snapshot"
-                );
-                // Restore perception weights; pre-grow regions if they grew last session.
-                // save_weights writes `<stem>.safetensors`; check that, not the stem path itself.
-                let w_path = weights_path(&args.memory_dir);
-                if w_path.with_extension("safetensors").exists() {
-                    let sizes =
-                        load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
-                    if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
-                        tracing::warn!(?e, "weight restore failed — starting with fresh weights");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-                    } else {
-                        info!(sizes = ?sizes, "perception weights restored");
-                    }
-                }
-                (ep, sem)
-            }
-            Ok(None) => {
-                info!("no snapshot found — starting fresh");
-                (
-                    EpisodicBuffer::new(args.episodic_capacity),
-                    SemanticStore::new(EPISODE_DIM),
-                )
-            }
-            Err(e) => {
-                tracing::warn!(?e, "snapshot load failed — starting fresh");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-                (
-                    EpisodicBuffer::new(args.episodic_capacity),
-                    SemanticStore::new(EPISODE_DIM),
-                )
-            }
-        };
+    let startup::RestoredMemory {
+        cold,
+        mut episodic,
+        mut semantic,
+        snapshot_found,
+    } = startup::restore_memory(&args, &mut perception)?;
 
     // ── ORT binding session (Phase 1 GPU unification, ADR 0023/0037) ──────────
     // Built *after* the snapshot restore: an ONNX graph carries frozen weights, so building it
     // from the pre-grown but still random-init model (as this used to) inferred on random
     // weights for the whole first wake phase, and the fix of rebuilding after the restore cost a
     // second ~10 s session export on every restored start (ADR 0049).
-    if let (Some(ref dir), Some(ref script)) = (&onnx_dir, &onnx_script_path) {
-        if should_use_ort_inference(&perception.region_sizes(), args.onnx_crossover_units) {
-            std::fs::create_dir_all(dir)?;
-            info!(
-                onnx_dir = %dir.display(),
-                migraphx = args.onnx_migraphx,
-                region_sizes = ?perception.region_sizes(),
-                threshold = args.onnx_crossover_units,
-                "region size past ORT crossover — building ORT binding session"
-            );
-            match perception.rebuild_ort_session(script, dir, args.onnx_migraphx) {
-                Ok(()) => info!("ORT binding session active"),
-                Err(e) => {
-                    tracing::warn!(?e, "ORT session init failed — running with burn inference");
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::OrtSessionInitFailed, 1);
-                    onnx_failed = true;
-                }
-            }
-        }
-    }
+    let onnx_failed = startup::init_ort_session(
+        &args,
+        &mut perception,
+        onnx_dir.as_deref(),
+        onnx_script_path.as_deref(),
+    )?;
 
-    // S5: auto-seed max_warm_records from available RAM when not set (ADR 0024).
-    // Warm HNSW is ~2500 bytes/record (640-dim f32 + graph edges); target 35% of free RAM.
-    let effective_max_warm = if args.max_warm_records > 0 {
-        args.max_warm_records
-    } else {
-        let mut sys = System::new();
-        sys.refresh_memory();
-        let free_bytes = sys.available_memory(); // bytes
-        let auto = ((free_bytes as f64 * 0.35) / 2500.0) as usize;
-        auto.clamp(1_000, 1_000_000)
-    };
-    semantic.set_max_records(effective_max_warm);
-
-    // P1a: auto-derive --max-cold-records from disk free space when unset (ADR 0024 ops table).
-    // Formula: free_disk_bytes × 0.20 / RECORD_BYTES.
-    let cold_record_bytes = somnus_memory::cold::RECORD_BYTES as u64;
-    let effective_max_cold = if args.max_cold_records > 0 {
-        args.max_cold_records
-    } else {
-        let free_bytes = memory_dir_disk_free_bytes(&args.memory_dir);
-        if free_bytes == 0 {
-            // Disk not found via sysinfo (btrfs subvolumes, network fs, etc.).
-            // Fall back to unlimited so we don't cap too aggressively.
-            tracing::warn!(
-                memory_dir = %args.memory_dir.display(),
-                "auto cold cap: disk not found via sysinfo — cap disabled"
-            );
-            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
-            0
-        } else {
-            let auto = ((free_bytes as f64 * 0.20) / cold_record_bytes as f64) as usize;
-            auto.clamp(10_000, 10_000_000)
-        }
-    };
-    tracing::info!(effective_max_cold, "cold archive cap (auto)");
-
-    if args.settle_steps > 0 && !snapshot_found {
-        tracing::warn!(
-            settle_steps = args.settle_steps,
-            "settling active but no prior snapshot — output heads are random; \
-             settle noise expected until output_mse converges"
-        );
-        somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
-    }
+    let (effective_max_warm, effective_max_cold) = startup::apply_memory_caps(&args, &mut semantic);
+    startup::warn_if_settling_without_snapshot(&args, snapshot_found);
 
     // ── action decoder ────────────────────────────────────────────────────────
-    let mut decoder: Option<ActionDecoder> = if args.action {
-        match ActionDecoder::new(
-            &args.models_dir,
-            Device::flex(),
-            args.ort_profile_dir.as_deref(),
-            args.gpu_generation,
-            args.linear_proj,
-            &args.action_model_prefix,
-        ) {
-            Ok(mut d) => {
-                // save_weights/load_weights take the stem path and add ".safetensors".
-                let dec_w = args.memory_dir.join("snapshot").join("decoder_weights");
-                if dec_w.with_extension("safetensors").exists() {
-                    if let Err(e) = d.load_weights(&dec_w) {
-                        tracing::warn!(?e, "decoder weight restore failed — starting fresh");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-                    } else {
-                        info!("decoder projection weights restored");
-                    }
-                } else if snapshot_found {
-                    tracing::warn!(
-                        "snapshot found but no decoder_weights.safetensors — \
-                         projection starts fresh; generation incoherent until trained"
-                    );
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-                }
-                info!("action decoder ready");
-                Some(d)
-            }
-            Err(e) => {
-                tracing::warn!(?e, "action decoder init failed — decoder disabled");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let mut decoder = startup::init_action_decoder(&args, snapshot_found);
 
-    // Export projection weights for offline LoRA training and exit (ADR 0033).
-    if let Some(ref export_dir) = args.export_proj_weights {
-        let dec = decoder
-            .as_ref()
-            .expect("--export-proj-weights requires --action");
-        std::fs::create_dir_all(export_dir).expect("failed to create export dir");
-        let weights = dec.proj_weights_flat();
-        // MLP: W1=[640,LM_HIDDEN] then W2=[LM_HIDDEN,N_REGIONS*LM_HIDDEN];
-        // linear: W1=[640,N_REGIONS*LM_HIDDEN] only.
-        // gaps.md §39: this used to hardcode the Qwen2.5-era 4480 (5*896) for the linear-proj
-        // case — silently wrong under Qwen3's 1024-dim LM (5*1024=5120). The default MLP path
-        // was never affected (w2 was always "everything remaining").
-        let out_dim = action::N_REGIONS * action::LM_HIDDEN;
-        let w1_len = if args.linear_proj {
-            640 * out_dim
-        } else {
-            640 * action::LM_HIDDEN
-        };
-        let w1_bytes: Vec<u8> = weights[..w1_len]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        let w2_bytes: Vec<u8> = weights[w1_len..]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
-        std::fs::write(export_dir.join("w1.bin"), &w1_bytes).expect("w1.bin write failed");
-        std::fs::write(export_dir.join("w2.bin"), &w2_bytes).expect("w2.bin write failed");
-        println!("exported projection weights to {}", export_dir.display());
-        println!(
-            "  w1.bin  {} f32  shape=[640,{}]",
-            w1_len,
-            if args.linear_proj {
-                out_dim
-            } else {
-                action::LM_HIDDEN
-            }
-        );
-        println!(
-            "  w2.bin  {} f32  shape=[{},{out_dim}]",
-            weights.len() - w1_len,
-            if args.linear_proj {
-                0
-            } else {
-                action::LM_HIDDEN
-            }
-        );
-        std::process::exit(0);
-    }
+    startup::export_proj_weights_and_exit(&args, decoder.as_ref());
 
     // Move the gain ORT session to a background thread so ~54ms Qwen calls don't
     // block the tokio event loop. Only created when both --action and --action-gain are set.
