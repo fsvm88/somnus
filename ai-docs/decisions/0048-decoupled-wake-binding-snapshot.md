@@ -10,6 +10,13 @@
   changes split in two) — 26/26 checks came back clean, no issues found, independently confirming
   the self-review. **Not yet piloted** — this ADR's own validation plan (below) has not been run.
 - **Date:** 2026-09-13
+- **Correction 2026-10-16 (found during the burn 0.22 migration, ADR 0049):** the "plain value copy
+  of the eight trained tensors" left `wake_binding`'s GRU gates and `temporal_proj` independently
+  random-initialised (the doc comment assumed neither copy trains them, but also that they started
+  equal; they did not). A restored session therefore ran its wake path on fresh random temporal
+  weights, differing from the saved `binding` and from run to run. Fixed by
+  `BindingArea::copy_temporal_from` (construction + every `sync_wake_binding`). Any ADR 0048 pilot
+  must run on a build with this fix.
 
 ## Implementation findings (2026-09-13, during the build — corrections to the plan above)
 

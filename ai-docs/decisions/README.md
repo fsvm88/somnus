@@ -95,3 +95,4 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0046](0046-audio-env-encoder-candidates.md) | Audio env encoder candidates surveyed: CLAP-HTSAT retained | closed — status quo confirmed |
 | [0047](0047-harden-cli-defaults-to-production-settings.md) | Harden four CLI defaults (`--working-memory-size`, `--settle-steps`, `--max-warm-records`, `--lang-use-lm`) to match already-adopted production settings | accepted, shipped as default |
 | [0048](0048-decoupled-wake-binding-snapshot.md) | Decoupled wake-time binding snapshot (§33 candidate (e): `wake_binding` copy, `--binding-wake-lag-cycles`) | implemented; not yet piloted |
+| [0049](0049-burn-0.22-flex-safetensors.md) | Migrate burn 0.21 → 0.22 (NdArray → burn-flex, BinFile → safetensors, device-based autodiff) | implemented on branch `burn-0.22` |

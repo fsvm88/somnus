@@ -14,7 +14,7 @@
 **Split runtime — [committed], see `research/ml-runtimes.md`:**
 
 - **`ort`** (ONNX Runtime bindings) — **[committed]** frozen pretrained encoder inference (Phase 2+) and wake-time perception inference (ADR 0023, GPU unification). Best inference latency; MIGraphX EP for AMD RDNA4/gfx1201.
-- **`burn`** (NdArray backend, CPU) — **[committed]** cognitive-layer training (NREM replay, wake_reconstruct, AdamW). Wake inference migrated to ORT (ADR 0023) — burn is training-only now. `candle` was originally planned; `burn` chosen instead for autograd ergonomics and backend agnosticism.
+- **`burn`** 0.22 (`burn-flex` backend, CPU; autodiff is a device property; weights persisted as safetensors via `burn-store` — ADR 0049) — **[committed]** cognitive-layer training (NREM replay, wake_reconstruct, AdamW). Wake inference migrated to ORT (ADR 0023) — burn is training-only now. `candle` was originally planned; `burn` chosen instead for autograd ergonomics and backend agnosticism.
 
 **Not adopted:** `candle` (originally planned, `burn` chosen instead — removed from `[workspace.dependencies]` in the 2026-08-12 sweep); `tch-rs` (full libtorch, fallback if `burn` can't support a needed op); `dfdx` (pure-Rust autograd, slower-moving).
 
