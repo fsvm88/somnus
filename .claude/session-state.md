@@ -4,7 +4,7 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **✅ CHECKPOINT (clean), 2026-10-16 (latest, later) — Q11 done: burn 0.22 + burn-flex + safetensors (ADR 0049).**
+> **✅ CHECKPOINT (clean), 2026-10-16 (latest) — Q11 done: burn 0.22 + burn-flex + safetensors (ADR 0049).**
 > - Merged to `main` from branch `burn-0.22`. Device-based API, flex with rayon requested via a direct
 >   `burn-flex` dep, weights now `*.safetensors` (burn-store). Parity vs 0.21 on real converted weights:
 >   0 diffs at rtol 1e-3 (`scripts/compare_golden.py`, `ai-docs/research/burn-021-golden.json`).
@@ -30,7 +30,7 @@
 >
 > ---
 >
-> **✅ CHECKPOINT (clean), 2026-09-14 (latest) — CI green again; deps refreshed; ai-docs audited;
+> **✅ CHECKPOINT (clean), 2026-09-14 — CI green again; deps refreshed; ai-docs audited;
 > dead code pruned. §33/ADR 0048 pilot still not launched — unchanged from last checkpoint.**
 > - **Pipeline fixes:** CI broke twice on `clippy::chunks_exact_to_as_chunks`, a lint CI's rustc
 >   1.98 has that the local toolchain (1.96, now updated to match) didn't. First fix
