@@ -12,7 +12,7 @@
 > - **Awaiting user:** R1 (do REM scoring passes `measure_mse`/`collect_high_residual_inputs` mutate k-WTA duty
 >   cycles on purpose? history says accidental; switching to `forward_no_dc` changes REM numerics, needs an A/B).
 >   R4 (batch REM scoring) is queued behind it.
-> - `run()` 2006 -> 405 lines (loop ~285): `startup.rs`, `pipeline.rs`, `wake_state.rs`, `wake.rs`; metrics line key set pinned by a test. **Open bug found:** R19, `generate_kv` panics on the Qwen3 KV models (pre-existing).
+> - `run()` 2006 -> 405 lines (loop ~285): `startup.rs`, `pipeline.rs`, `wake_state.rs`, `wake.rs`; metrics line key set pinned by a test. R19 (`generate_kv` panic on the Qwen3 KV models) found and FIXED: layout is now derived from the sessions; KV output verified token-identical to the reference path.
 >   Two mechanical-rename bugs were caught by review (st.* prefixes leaked into tracing field names and into the metrics JSON keys);
 >   string-literal sets verified equal to the pre-refactor tree. 
 > - Always run `cargo test` before committing (the pre-commit hook only runs fmt + clippy; one commit this session
