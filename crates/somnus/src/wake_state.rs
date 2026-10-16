@@ -6,6 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use somnus_memory::{load_growth_cooldown_remaining, load_sal_ewma, load_settle_ewma, load_wake_ewma};
+
+use crate::cli::Args;
+
 /// All mutable scalars/buffers the wake loop and the sleep trigger carry between iterations.
 /// Heavy resources (perception, episodic buffer, decoder, channels, sinks) stay as locals of
 /// `run()`; this holds only plain state, so helper functions can take `&mut WakeState`.
@@ -110,6 +114,83 @@ impl WakeState {
 }
 
 impl WakeState {
+    /// Fresh state at process start: the adaptive EWMAs and growth cooldown come back from the
+    /// last session's snapshot (cold-start defaults when absent: salience mu 0.8 / sigma 0.2,
+    /// settle mu 0.85, wake mu 0), every per-cycle accumulator starts at zero.
+    pub(crate) fn restore(args: &Args, onnx_failed: bool) -> Self {
+        let dir = &args.memory_dir;
+        let cooldown_remaining = load_growth_cooldown_remaining(dir);
+        // ADR 0024 S1 / S2 / S6.
+        let (sal_mu, sal_sigma, sal_n) = load_sal_ewma(dir);
+        let (settle_mu, settle_n) = load_settle_ewma(dir);
+        let (wake_ewma_mu, wake_ewma_n) = load_wake_ewma(dir);
+        Self {
+            cooldown_remaining,
+            sal_mu,
+            sal_sigma,
+            sal_n,
+            settle_mu,
+            settle_n,
+            wake_ewma_mu,
+            wake_ewma_n,
+            // Sticky: once an ORT attempt fails, don't retry every sleep cycle.
+            onnx_failed,
+            wake_recon_dropped: 0,
+            max_wake: Duration::from_secs(crate::recompute_max_wake_secs(
+                wake_ewma_mu,
+                wake_ewma_n,
+                args.max_wake_secs,
+            )),
+            wake_start: Instant::now(),
+            sleep_cycle_count: 0,
+            // Whether the --query one-shot generation has already fired.
+            startup_query_fired: false,
+            wake_episodes: 0,
+            wake_output_mse_sum: 0.0,
+            wake_output_mse_n: 0,
+            prior_cosine_sums: [0.0; 5],
+            prior_cosine_counts: [0; 5],
+            lang_ingest_count: 0,
+            gain_episode_counter: 0,
+            wake_reconstruct_counter: 0,
+            salience_sum: 0.0,
+            salience_n: 0,
+            salience_min: f32::MAX,
+            high_salience_episodes: 0,
+            blend_count: 0,
+            hnsw_query_us_sum: 0,
+            hnsw_query_n: 0,
+            wake_reconstruct_throttle_passed: 0,
+            episodes_speech: 0,
+            episodes_env: 0,
+            episodes_visual: 0,
+            episodes_language: 0,
+            episodes_mixed: 0,
+            settle_trigger_count: 0,
+            settle_iters_sum: 0,
+            settle_delta_sum: 0.0,
+            speech_encode_total_ms: 0,
+            env_encode_total_ms: 0,
+            video_encode_total_ms: 0,
+            perception_total_ms: 0,
+            cosine_ewma: None,
+            cosine_baseline: None,
+            cosine_baseline_accum: 0.0,
+            cosine_baseline_n: 0,
+            perf_sleep_flag: false,
+            // Wakefulness pressure starts fresh each session (ADR 0024 S3).
+            wakefulness_pressure: 0.0,
+            s4_ring: [None; 3],
+            s4_ring_pos: 0,
+            s4_beta_active: false,
+            sleep_dur_secs_history: VecDeque::with_capacity(5),
+            s7_mse_ewma: 0.0,
+            s7_ewma_n: 0,
+            s7_stagnant: 0,
+            effective_wake_interval: args.wake_reconstruct_interval,
+        }
+    }
+
     /// S4 prior-beta scale-up controller (ADR 0024). Called once per sleep cycle: records the
     /// cycle's global prior cosine and returns the new prior beta to apply, if it changed.
     /// Scales from the base `--prior-beta` to 0.05 when the global prior cosine stays above 0.65
@@ -363,5 +444,48 @@ mod tests {
             st.s7_step(Some(1.0), 4);
         }
         assert_eq!(st.effective_wake_interval, 1);
+    }
+
+    fn args_for(dir: &std::path::Path) -> Args {
+        use clap::Parser;
+        Args::try_parse_from(["somnus", "--memory-dir", dir.to_str().unwrap()]).unwrap()
+    }
+
+    #[test]
+    fn restore_without_a_snapshot_uses_cold_start_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = args_for(dir.path());
+        let st = WakeState::restore(&args, false);
+        assert_eq!((st.sal_mu, st.sal_sigma, st.sal_n), (0.8, 0.2, 0));
+        assert_eq!((st.settle_mu, st.settle_n), (0.85, 0));
+        assert_eq!((st.wake_ewma_mu, st.wake_ewma_n), (0.0, 0));
+        assert_eq!(st.cooldown_remaining, 0);
+        assert_eq!(st.max_wake, Duration::from_secs(args.max_wake_secs));
+        assert_eq!(st.effective_wake_interval, args.wake_reconstruct_interval);
+        assert_eq!(st.sleep_cycle_count, 0);
+        assert_eq!(st.salience_min, f32::MAX);
+        assert!(!st.onnx_failed && !st.startup_query_fired && !st.perf_sleep_flag);
+    }
+
+    #[test]
+    fn restore_reads_the_persisted_ewmas_and_widens_the_wake_ceiling() {
+        use somnus_memory::{
+            save_growth_cooldown_remaining, save_sal_ewma, save_settle_ewma, save_wake_ewma,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("snapshot")).unwrap();
+        save_sal_ewma(0.5, 0.1, 700, dir.path()).unwrap();
+        save_settle_ewma(0.6, 42, dir.path()).unwrap();
+        save_growth_cooldown_remaining(2, dir.path()).unwrap();
+        let args = args_for(dir.path());
+        // 3 cycles observed with a long mean wake: ceiling = max(floor, 3 x mean).
+        let long = (args.max_wake_secs as f32) * 2.0;
+        save_wake_ewma(long, 3, dir.path()).unwrap();
+        let st = WakeState::restore(&args, true);
+        assert_eq!((st.sal_mu, st.sal_sigma, st.sal_n), (0.5, 0.1, 700));
+        assert_eq!((st.settle_mu, st.settle_n), (0.6, 42));
+        assert_eq!(st.cooldown_remaining, 2);
+        assert_eq!(st.max_wake, Duration::from_secs((3.0 * long) as u64));
+        assert!(st.onnx_failed, "the sticky ORT-failure flag is carried in");
     }
 }

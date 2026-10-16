@@ -109,10 +109,7 @@ use somnus_encoding::{
     preprocess::resample::SincResampler, AudioEmbedding, AudioEncoder, AudioEncoderSource,
     VideoEmbedding, VideoEncoder,
 };
-use somnus_memory::{
-    load_growth_cooldown_remaining, load_sal_ewma, load_settle_ewma, load_wake_ewma,
-    EpisodicBuffer, IngestSource, RecollectionLayer,
-};
+use somnus_memory::{EpisodicBuffer, IngestSource, RecollectionLayer};
 use somnus_perception::{PerceptionProcessor, WakeReconWorker};
 use somnus_sensory::{
     AudioCapture, AudioFrame, MediaFile, SensorMetrics, Timestamp, VideoCapture, VideoFrame,
@@ -477,15 +474,6 @@ pub async fn run() -> Result<()> {
     // Warm records with timestamp_secs >= session_start_secs belong to this session only.
     let session_start_secs = wall_secs(&SystemTime::now());
 
-    // Load growth cooldown remaining from last session (0 if absent).
-    let cooldown_remaining = load_growth_cooldown_remaining(&args.memory_dir);
-    // Load salience EWMA state (ADR 0024 S1). Cold-start: μ=0.8, σ=0.2, n=0.
-    let (sal_mu, sal_sigma, sal_n) = load_sal_ewma(&args.memory_dir);
-    // Load settle-cosine EWMA state (ADR 0024 S2). Cold-start: μ=0.85, n=0.
-    let (settle_mu, settle_n) = load_settle_ewma(&args.memory_dir);
-    // Load wake-duration EWMA state (ADR 0024 S6). Cold-start: μ=0.0, n=0.
-    let (wake_ewma_mu, wake_ewma_n) = load_wake_ewma(&args.memory_dir);
-
     // ── Pre-grow perception to match last session's region sizes ─────────────
     // Must happen before the weight restore (which needs the grown shape) and the ORT build
     // (the ONNX is exported from the correct, possibly grown, model). The ORT session itself is
@@ -548,7 +536,7 @@ pub async fn run() -> Result<()> {
     } else {
         None
     };
-    let wake_recon_dropped: u64 = 0;
+    let _wake_recon_dropped: u64 = 0;
 
     // ── language embedder ─────────────────────────────────────────────────────
     let lang_embedder: Option<LangEmbedder> = if args.language {
@@ -572,16 +560,8 @@ pub async fn run() -> Result<()> {
     );
 
     let high_water = (args.episodic_capacity as f64 * args.sleep_high_water) as usize;
-    // S6: adaptive ceiling — widen when rolling mean wake > floor (ADR 0024).
-    // Cold-start (n<3): hold at floor. α=0.3 (per-cycle, not per-episode).
+    // S6 adaptive wake ceiling floor (ADR 0024); the live ceiling lives in `WakeState::max_wake`.
     let wake_ewma_floor = args.max_wake_secs;
-    let effective_max_wake_secs = if wake_ewma_n >= 3 {
-        wake_ewma_floor.max((3.0 * wake_ewma_mu) as u64)
-    } else {
-        wake_ewma_floor
-    };
-    let max_wake = Duration::from_secs(effective_max_wake_secs);
-    let wake_start = std::time::Instant::now();
 
     let interrupt = Arc::new(AtomicBool::new(false));
     let interrupt_sleep = Arc::clone(&interrupt);
@@ -591,75 +571,7 @@ pub async fn run() -> Result<()> {
     let pending_embs = Arc::new(AtomicUsize::new(0));
 
     // ── metrics infrastructure ────────────────────────────────────────────────
-    let mut metrics_sink: Option<std::fs::File> = if let Some(ref path) = args.metrics_file {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        info!(path = %path.display(), "metrics file opened");
-        Some(f)
-    } else {
-        None
-    };
-    let sleep_cycle_count: usize = 0;
-    // Tracks whether the --query one-shot generation has already fired.
-    let startup_query_fired = false;
-    // Per-wake-cycle counters — reset after each sleep cycle.
-    let wake_episodes: usize = 0;
-    let wake_output_mse_sum: f64 = 0.0;
-    let wake_output_mse_n: usize = 0;
-    let prior_cosine_sums: [f64; 5] = [0.0; 5];
-    let prior_cosine_counts: [usize; 5] = [0; 5];
-    let lang_ingest_count: usize = 0;
-    let gain_episode_counter: usize = 0;
-    let wake_reconstruct_counter: usize = 0;
-    // ADR 0022 instrumentation additions.
-    let salience_sum: f64 = 0.0;
-    let salience_n: usize = 0;
-    let salience_min: f32 = f32::MAX;
-    let high_salience_episodes: usize = 0;
-    let blend_count: usize = 0;
-    let hnsw_query_us_sum: u64 = 0;
-    let hnsw_query_n: u64 = 0;
-    let wake_reconstruct_throttle_passed: usize = 0;
-    let episodes_speech: usize = 0;
-    let episodes_env: usize = 0;
-    let episodes_visual: usize = 0;
-    let episodes_language: usize = 0;
-    let episodes_mixed: usize = 0;
-    let settle_trigger_count: usize = 0;
-    let settle_iters_sum: usize = 0;
-    let settle_delta_sum: f64 = 0.0;
-    // Per-cycle encode/perception timing (ms) — reset after each sleep cycle.
-    let speech_encode_total_ms: u64 = 0;
-    let env_encode_total_ms: u64 = 0;
-    let video_encode_total_ms: u64 = 0;
-    let perception_total_ms: u64 = 0;
-    // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
-    // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
-    // cosine_ewma: exponentially weighted moving average (α = COSINE_EWMA_ALPHA).
-    // perf_sleep_flag: set when EWMA drops > perf_sleep_threshold below baseline.
-    let cosine_ewma: Option<f64> = None;
-    let cosine_baseline: Option<f64> = None;
-    let cosine_baseline_accum: f64 = 0.0;
-    let cosine_baseline_n: usize = 0;
-    let perf_sleep_flag = false;
-    // Wakefulness pressure accumulator P (ADR 0024 S3). Starts fresh each session;
-    // dissipated by NREM consolidation quality; fires sleep when P >= P_THRESHOLD.
-    let wakefulness_pressure: f32 = 0.0;
-    // S4: prior-beta auto-enable ring buffer (3 cycles) and active flag (ADR 0024).
-    let s4_ring: [Option<f64>; 3] = [None; 3];
-    let s4_ring_pos: usize = 0;
-    let s4_beta_active: bool = false;
-    // P1b: rolling sleep-duration history for auto --sleep-max-secs (ADR 0024 ops table).
-    // Cap activates after the first completed cycle; floor = 300s prevents over-tightening.
-    let sleep_dur_secs_history: std::collections::VecDeque<f64> =
-        std::collections::VecDeque::with_capacity(5);
-    // P2a / S7: wake-reconstruct-interval adaptation from cycle-level MSE trend (ADR 0024).
-    let s7_mse_ewma: f64 = 0.0;
-    let s7_ewma_n: usize = 0;
-    let s7_stagnant: u32 = 0;
-    let effective_wake_interval: usize = args.wake_reconstruct_interval;
+    let mut metrics_sink = startup::open_metrics_sink(&args)?;
     // ASR count shared with the audio encoder task.
     let asr_count = Arc::new(AtomicUsize::new(0));
 
@@ -1092,64 +1004,7 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    let mut st = wake_state::WakeState {
-        cooldown_remaining,
-        sal_mu,
-        sal_sigma,
-        sal_n,
-        settle_mu,
-        settle_n,
-        wake_ewma_mu,
-        wake_ewma_n,
-        onnx_failed,
-        wake_recon_dropped,
-        max_wake,
-        wake_start,
-        sleep_cycle_count,
-        startup_query_fired,
-        wake_episodes,
-        wake_output_mse_sum,
-        wake_output_mse_n,
-        prior_cosine_sums,
-        prior_cosine_counts,
-        lang_ingest_count,
-        gain_episode_counter,
-        wake_reconstruct_counter,
-        salience_sum,
-        salience_n,
-        salience_min,
-        high_salience_episodes,
-        blend_count,
-        hnsw_query_us_sum,
-        hnsw_query_n,
-        wake_reconstruct_throttle_passed,
-        episodes_speech,
-        episodes_env,
-        episodes_visual,
-        episodes_language,
-        episodes_mixed,
-        settle_trigger_count,
-        settle_iters_sum,
-        settle_delta_sum,
-        speech_encode_total_ms,
-        env_encode_total_ms,
-        video_encode_total_ms,
-        perception_total_ms,
-        cosine_ewma,
-        cosine_baseline,
-        cosine_baseline_accum,
-        cosine_baseline_n,
-        perf_sleep_flag,
-        wakefulness_pressure,
-        s4_ring,
-        s4_ring_pos,
-        s4_beta_active,
-        sleep_dur_secs_history,
-        s7_mse_ewma,
-        s7_ewma_n,
-        s7_stagnant,
-        effective_wake_interval,
-    };
+    let mut st = wake_state::WakeState::restore(&args, onnx_failed);
 
     // ── main loop ─────────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));

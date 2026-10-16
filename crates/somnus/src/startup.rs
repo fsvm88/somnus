@@ -461,6 +461,21 @@ pub(crate) fn export_proj_weights_and_exit(args: &Args, decoder: Option<&ActionD
     }
 }
 
+/// Open (append) the `--metrics-file` NDJSON sink written after every sleep cycle, if requested.
+pub(crate) fn open_metrics_sink(args: &Args) -> Result<Option<std::fs::File>> {
+    let sink: Option<std::fs::File> = if let Some(ref path) = args.metrics_file {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        info!(path = %path.display(), "metrics file opened");
+        Some(f)
+    } else {
+        None
+    };
+    Ok(sink)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
