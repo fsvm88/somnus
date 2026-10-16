@@ -1,5 +1,3 @@
-#![allow(dead_code)] // SincResampler used by binary, not the lib itself
-
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,

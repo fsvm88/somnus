@@ -301,7 +301,6 @@ impl MediaFile {
 // ── private helpers ───────────────────────────────────────────────────────────
 
 struct MediaFileHandles {
-    #[allow(dead_code)]
     _decode_thread: std::thread::JoinHandle<()>,
 }
 

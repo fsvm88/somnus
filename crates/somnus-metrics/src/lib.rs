@@ -432,10 +432,16 @@ pub enum Metric {
     /// needing a full pilot re-run to eyeball it. Scaled ×1e6 before accumulation, same
     /// convention as `BindingReplayLoss`.
     BindingWakeDivergenceL2,
+    /// DER++ staleness detection (ADR 0010): one NREM replay trace dropped because the mean
+    /// cosine between its stored output targets and the current model's outputs fell below
+    /// `STALE_COSINE_THRESHOLD`. Core tier (`counted_core!`) — a rising count means stored
+    /// targets are drifting away from the live model, the §33 failure mode, and it was
+    /// previously computed into `SleepStats` but never read or reported.
+    NremStaleTraceSkipped,
 }
 
 impl Metric {
-    pub const COUNT: usize = 107;
+    pub const COUNT: usize = 108;
 
     const fn as_index(self) -> usize {
         match self {
@@ -546,6 +552,7 @@ impl Metric {
             Metric::AsrPostPanicFailure => 104,
             Metric::BindingWakeSync => 105,
             Metric::BindingWakeDivergenceL2 => 106,
+            Metric::NremStaleTraceSkipped => 107,
         }
     }
 
@@ -658,6 +665,7 @@ impl Metric {
             Metric::AsrPostPanicFailure => "asr_post_panic_failure",
             Metric::BindingWakeSync => "binding_wake_sync",
             Metric::BindingWakeDivergenceL2 => "binding_wake_divergence_l2",
+            Metric::NremStaleTraceSkipped => "nrem_stale_trace_skipped",
         }
     }
 
@@ -769,6 +777,7 @@ impl Metric {
         Metric::AsrPostPanicFailure,
         Metric::BindingWakeSync,
         Metric::BindingWakeDivergenceL2,
+        Metric::NremStaleTraceSkipped,
     ];
 }
 

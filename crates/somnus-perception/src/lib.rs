@@ -375,6 +375,22 @@ pub struct PerceptionProcessor {
 }
 
 impl PerceptionProcessor {
+    /// The model is `None` only while moved into an optimizer step (`take()` / put-back);
+    /// any access in that window is a logic bug, so fail with a message that says so.
+    #[inline]
+    fn model_ref(&self) -> &PerceptionModel<TrainB> {
+        self.model
+            .as_ref()
+            .expect("PerceptionProcessor.model accessed while taken for an optimizer step")
+    }
+
+    #[inline]
+    fn model_mut(&mut self) -> &mut PerceptionModel<TrainB> {
+        self.model
+            .as_mut()
+            .expect("PerceptionProcessor.model accessed while taken for an optimizer step")
+    }
+
     pub fn new(device: NdArrayDevice) -> Self {
         let model = PerceptionModel::new(&device);
         let ema_heads = EmaOutputHeads::from_model(&model);
@@ -416,7 +432,7 @@ impl PerceptionProcessor {
     /// Sync the flat cross_modal_proj weight copy after model weights update (NREM).
     /// Called whenever ORT sessions are rebuilt so the inference copy stays in sync.
     pub fn sync_cross_modal_flat(&mut self) {
-        let model = self.model.as_ref().unwrap();
+        let model = self.model_ref();
         let w: Vec<f32> = model
             .cross_modal_proj
             .weight
@@ -465,7 +481,7 @@ impl PerceptionProcessor {
                 // ORT encoder recomputes all 5 regions in try_bind; skip burn forward.
                 // Bootstrap latest[0] if needed so try_bind gate can fire.
                 if self.latest[RegionId::AudioSpeech.as_index()].is_none() {
-                    let n = self.model.as_ref().unwrap().speech_layer.n_units;
+                    let n = self.model_ref().speech_layer.n_units;
                     self.latest[RegionId::AudioSpeech.as_index()] =
                         Some(bootstrap_placeholder(RegionId::AudioSpeech, n));
                 }
@@ -540,7 +556,7 @@ impl PerceptionProcessor {
         let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
             if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
                 if self.latest[RegionId::AudioEnv.as_index()].is_none() {
-                    let n = self.model.as_ref().unwrap().env_layer.n_units;
+                    let n = self.model_ref().env_layer.n_units;
                     self.latest[RegionId::AudioEnv.as_index()] =
                         Some(bootstrap_placeholder(RegionId::AudioEnv, n));
                 }
@@ -615,7 +631,7 @@ impl PerceptionProcessor {
         let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
             if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
                 if self.latest[RegionId::Visual.as_index()].is_none() {
-                    let n = self.model.as_ref().unwrap().visual_layer.n_units;
+                    let n = self.model_ref().visual_layer.n_units;
                     self.latest[RegionId::Visual.as_index()] =
                         Some(bootstrap_placeholder(RegionId::Visual, n));
                 }
@@ -863,7 +879,7 @@ impl PerceptionProcessor {
         // can fire; try_bind overwrites it immediately with the real ORT z3 activation.
         if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
             if self.latest[RegionId::Symbolic.as_index()].is_none() {
-                let n = self.model.as_ref().unwrap().symbolic_layer.n_units;
+                let n = self.model_ref().symbolic_layer.n_units;
                 self.latest[RegionId::Symbolic.as_index()] =
                     Some(bootstrap_placeholder(RegionId::Symbolic, n));
             }
@@ -957,7 +973,9 @@ impl PerceptionProcessor {
                 .run_encoder(&enc_in[0], &enc_in[1], &enc_in[2], &enc_in[3]);
             match z_result {
                 Ok([z0, z1, z2, z3, z4]) => {
-                    let model = self.model.as_mut().unwrap();
+                    let model = self.model.as_mut().expect(
+                        "PerceptionProcessor.model accessed while taken for an optimizer step",
+                    );
                     self.latest[0] = Some(model.speech_layer.topk_from_z(z0));
                     self.latest[1] = Some(model.env_layer.topk_from_z(z1));
                     self.latest[2] = Some(model.visual_layer.topk_from_z(z2));
@@ -979,7 +997,7 @@ impl PerceptionProcessor {
             region: RegionId::Language,
             indices: vec![],
             values: vec![],
-            n_units: self.model.as_ref().unwrap().language_layer.n_units,
+            n_units: self.model_ref().language_layer.n_units,
         };
         let sp = self.latest[0].as_ref().unwrap();
         let en = self.latest[1].as_ref().unwrap();
@@ -1002,21 +1020,23 @@ impl PerceptionProcessor {
                     tracing::warn!(?e, "ORT binding failed; falling back to burn");
                     somnus_metrics::counted_core!(somnus_metrics::Metric::OrtBindingFallback, 1);
                     let device = self.device;
-                    self.model.as_mut().unwrap().wake_binding.forward(
-                        &[sp, en, vi, sy, lang],
-                        latest_episode,
-                        &device,
-                    )
+                    self.model
+                        .as_mut()
+                        .expect(
+                            "PerceptionProcessor.model accessed while taken for an optimizer step",
+                        )
+                        .wake_binding
+                        .forward(&[sp, en, vi, sy, lang], latest_episode, &device)
                 }
             }
         } else {
             // Burn path (original)
             let device = self.device;
-            self.model.as_mut().unwrap().wake_binding.forward(
-                &[sp, en, vi, sy, lang],
-                latest_episode,
-                &device,
-            )
+            self.model
+                .as_mut()
+                .expect("PerceptionProcessor.model accessed while taken for an optimizer step")
+                .wake_binding
+                .forward(&[sp, en, vi, sy, lang], latest_episode, &device)
         };
 
         let regional = [
@@ -1039,7 +1059,7 @@ impl PerceptionProcessor {
 
         // Phase 1: forward passes (duty-cycle updates happen here).
         {
-            let model = self.model.as_mut().unwrap();
+            let model = self.model_mut();
             for (region_idx, input) in regional.iter().enumerate() {
                 if input.is_empty() {
                     continue;
@@ -1108,7 +1128,7 @@ impl PerceptionProcessor {
         let mut n_terms = 0usize;
 
         {
-            let model = self.model.as_mut().unwrap();
+            let model = self.model_mut();
 
             for region_idx in 0..5usize {
                 let valid: Vec<&Vec<f32>> = batch
@@ -1223,7 +1243,7 @@ impl PerceptionProcessor {
     /// not every cycle — that's the whole point of this ADR.
     pub fn sync_wake_binding(&mut self) {
         somnus_metrics::timed_core!(somnus_metrics::Metric::BindingWakeSync, {
-            let model = self.model.as_mut().unwrap();
+            let model = self.model_mut();
 
             // Fine-tier divergence gauge (ADR 0048): L2 distance between binding and
             // wake_binding, summed across the 8 trained tensors, measured *before* this
@@ -1325,7 +1345,7 @@ impl PerceptionProcessor {
         let mut n_terms = 0usize;
 
         {
-            let model = self.model.as_mut().unwrap();
+            let model = self.model_mut();
 
             // Phase 1: per-region batched encoder forwards (same pattern as
             // replay_step_batch) → per-sample SparseActivations.
@@ -1571,7 +1591,7 @@ impl PerceptionProcessor {
                 Tensor::from_data(TensorData::new(flat_targets, [b, n_out]), &device);
 
             let pred = {
-                let model = self.model.as_ref().unwrap();
+                let model = self.model_ref();
                 match head_idx {
                     0 => model.speech_head.forward(ep_batch),
                     1 => model.env_head.forward(ep_batch),
@@ -1631,7 +1651,7 @@ impl PerceptionProcessor {
                 let mut sae_loss: Option<Tensor<TrainB, 1>> = None;
                 let mut sae_n_terms = 0usize;
                 {
-                    let model = self.model.as_mut().unwrap();
+                    let model = self.model_mut();
                     for region_idx in 0..5usize {
                         let valid: Vec<&Vec<f32>> = batch
                             .iter()
@@ -1758,7 +1778,7 @@ impl PerceptionProcessor {
                             Tensor::from_data(TensorData::new(flat_tgt, [b, n_out]), &device);
 
                         let pred = {
-                            let model = self.model.as_ref().unwrap();
+                            let model = self.model_ref();
                             match head_idx {
                                 0 => model.speech_head.forward(ep_batch),
                                 1 => model.env_head.forward(ep_batch),
@@ -1848,7 +1868,7 @@ impl PerceptionProcessor {
                     Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
 
                 let pred = {
-                    let model = self.model.as_ref().unwrap();
+                    let model = self.model_ref();
                     match head_idx {
                         0 => model.speech_head.forward(ep_t.clone()),
                         1 => model.env_head.forward(ep_t.clone()),
@@ -1894,7 +1914,7 @@ impl PerceptionProcessor {
 
     /// Flat [EPISODE_DIM × d_out] copies of the 5 output-head weights.
     pub fn head_weights_flat(&self) -> [Vec<f32>; 5] {
-        let m = self.model.as_ref().unwrap();
+        let m = self.model_ref();
         [
             &m.speech_head,
             &m.env_head,
@@ -1917,7 +1937,7 @@ impl PerceptionProcessor {
     /// ParamIds are preserved so the main optimizer's AdamW moments stay attached.
     pub fn set_head_weights_flat(&mut self, weights: [Vec<f32>; 5]) {
         let device = self.device;
-        let m = self.model.as_mut().unwrap();
+        let m = self.model_mut();
         let heads = [
             &mut m.speech_head,
             &mut m.env_head,
@@ -1943,7 +1963,7 @@ impl PerceptionProcessor {
     /// `binding_replay_step_batch` ever trains them — this is how the A/B pilot
     /// verifies they actually learn.
     pub fn binding_proj_row_norms(&self, region: RegionId) -> Vec<f32> {
-        let m = self.model.as_ref().unwrap();
+        let m = self.model_ref();
         let proj = match region {
             RegionId::AudioSpeech => &m.binding.region_0,
             RegionId::AudioEnv => &m.binding.region_1,
@@ -1974,7 +1994,7 @@ impl PerceptionProcessor {
     /// `sync_wake_binding` calls while `binding` (via `binding_proj_row_norms`) keeps
     /// moving under `binding_replay_step_batch`.
     pub fn wake_binding_proj_row_norms(&self, region: RegionId) -> Vec<f32> {
-        let m = self.model.as_ref().unwrap();
+        let m = self.model_ref();
         let proj = match region {
             RegionId::AudioSpeech => &m.wake_binding.region_0,
             RegionId::AudioEnv => &m.wake_binding.region_1,
@@ -2017,7 +2037,7 @@ impl PerceptionProcessor {
                     continue;
                 }
                 let act = {
-                    let model = self.model.as_mut().unwrap();
+                    let model = self.model_mut();
                     match idx {
                         0 => model.speech_layer.forward(input, &device),
                         1 => model.env_layer.forward(input, &device),
@@ -2028,7 +2048,7 @@ impl PerceptionProcessor {
                     }
                 };
                 let err = {
-                    let model = self.model.as_ref().unwrap();
+                    let model = self.model_ref();
                     match idx {
                         0 => model
                             .speech_decoder
@@ -2093,7 +2113,7 @@ impl PerceptionProcessor {
                 .zip(b.iter())
                 .map(|(&x, &y)| alpha * x + (1.0 - alpha) * y)
                 .collect();
-            let model = self.model.as_ref().unwrap();
+            let model = self.model_ref();
             acts[i] = Some(match i {
                 0 => model.speech_layer.forward_no_dc(&blended, &device),
                 1 => model.env_layer.forward_no_dc(&blended, &device),
@@ -2128,7 +2148,7 @@ impl PerceptionProcessor {
                 let device = self.device;
                 let ep_t: Tensor<TrainB, 2> =
                     Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
-                let model = self.model.as_ref().unwrap();
+                let model = self.model_ref();
                 let mut total = 0.0f32;
                 let mut n = 0usize;
                 for (head_idx, input) in regional.iter().enumerate() {
@@ -2168,7 +2188,7 @@ impl PerceptionProcessor {
             let device = self.device;
             let ep_t: Tensor<TrainB, 2> =
                 Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
-            let model = self.model.as_ref().unwrap();
+            let model = self.model_ref();
 
             let mut outputs: [Vec<f32>; 5] = Default::default();
             let heads: [&Linear<TrainB>; 5] = [
@@ -2199,7 +2219,7 @@ impl PerceptionProcessor {
     pub fn homeostatic_decay(&mut self, rate: f32) {
         somnus_metrics::timed_core!(somnus_metrics::Metric::HomeostaticDecay, {
             let scale = 1.0 - rate;
-            let model = self.model.as_mut().unwrap();
+            let model = self.model_mut();
             scale_weight(&mut model.speech_layer.linear, scale);
             scale_weight(&mut model.env_layer.linear, scale);
             scale_weight(&mut model.visual_layer.linear, scale);
@@ -2236,7 +2256,7 @@ impl PerceptionProcessor {
     fn grow_region_inner(&mut self, region: RegionId, n_new: usize) {
         let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
-        let model = self.model.as_mut().unwrap();
+        let model = self.model_mut();
 
         let new_n = {
             let layer = Self::layer_mut(model, region);
@@ -2353,7 +2373,7 @@ impl PerceptionProcessor {
     ) {
         let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
-        let model = self.model.as_mut().unwrap();
+        let model = self.model_mut();
 
         let new_n = {
             let layer = Self::layer_mut(model, region);
@@ -2464,7 +2484,7 @@ impl PerceptionProcessor {
                             continue;
                         }
                         let (act, recon) = {
-                            let model = self.model.as_mut().unwrap();
+                            let model = self.model_mut();
                             let act = match idx {
                                 0 => model.speech_layer.forward(input, &device),
                                 1 => model.env_layer.forward(input, &device),
@@ -2518,7 +2538,7 @@ impl PerceptionProcessor {
     fn prune_region_inner(&mut self, region: RegionId, prune_fraction: f32) -> usize {
         let device = self.device;
         let n_in = REGION_DIMS[region.as_index()];
-        let model = self.model.as_mut().unwrap();
+        let model = self.model_mut();
 
         let current_n = Self::layer_mut(model, region).n_units;
         let n_grown = current_n.saturating_sub(N_UNITS);
@@ -2846,7 +2866,7 @@ impl PerceptionProcessor {
     }
 
     pub fn region_sizes(&self) -> [usize; 5] {
-        let m = self.model.as_ref().unwrap();
+        let m = self.model_ref();
         [
             m.speech_layer.n_units,
             m.env_layer.n_units,
@@ -2891,7 +2911,7 @@ impl PerceptionProcessor {
             .map_err(|e| PerceptionError::Burn(e.to_string()))?;
 
         // Clone is cheap (Arc-backed tensors); saves clone, keeps original in self.model.
-        let model_clone = self.model.as_ref().unwrap().clone();
+        let model_clone = self.model_ref().clone();
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         let path_str = path
             .to_str()
@@ -2986,7 +3006,7 @@ impl PerceptionProcessor {
 
     fn export_weights_for_onnx_inner(&self, dir: &std::path::Path) -> PerceptionResult<()> {
         std::fs::create_dir_all(dir).map_err(|e| PerceptionError::Burn(e.to_string()))?;
-        let m = self.model.as_ref().unwrap();
+        let m = self.model_ref();
 
         let mut manifest: Vec<serde_json::Value> = Vec::new();
 
@@ -3165,7 +3185,7 @@ impl PerceptionProcessor {
 
     /// Return per-region duty cycles (for ONNX validation: must pass same dc to Python topk).
     pub fn duty_cycles(&self) -> [Vec<f32>; 5] {
-        let m = self.model.as_ref().unwrap();
+        let m = self.model_ref();
         [
             m.speech_layer.duty_cycle.clone(),
             m.env_layer.duty_cycle.clone(),
@@ -3186,7 +3206,7 @@ impl PerceptionProcessor {
         language: Option<&[f32]>,
     ) -> [Vec<f32>; 5] {
         let device = self.device;
-        let m = self.model.as_ref().unwrap();
+        let m = self.model_ref();
 
         let lang_zeros: Vec<f32>;
         let lang = match language {
@@ -3278,7 +3298,7 @@ impl PerceptionProcessor {
             }
         });
         let act_refs: [&SparseActivation; 5] = [&acts[0], &acts[1], &acts[2], &acts[3], &acts[4]];
-        let ep = self.model.as_mut().unwrap().wake_binding.forward(
+        let ep = self.model_mut().wake_binding.forward(
             &act_refs,
             prev_ep.map(|p| p.to_vec()).as_ref(),
             &device,
@@ -3388,7 +3408,7 @@ impl PerceptionProcessor {
                     Ok([z0, z1, z2, z3, z4]) => {
                         // topk_no_dc: immutable model borrow, dropped before binding.
                         let sparse: [SparseActivation; 5] = {
-                            let m = self.model.as_ref().unwrap();
+                            let m = self.model_ref();
                             [
                                 m.speech_layer.topk_from_z_no_dc(z0),
                                 m.env_layer.topk_from_z_no_dc(z1),
@@ -3429,7 +3449,9 @@ impl PerceptionProcessor {
                 // ── Paths B & C: burn kwta (both), then ORT or burn binding ─────
                 let mut acts: [Option<SparseActivation>; 5] = Default::default();
                 {
-                    let model = self.model.as_mut().unwrap();
+                    let model = self.model.as_mut().expect(
+                        "PerceptionProcessor.model accessed while taken for an optimizer step",
+                    );
                     for i in 0..5 {
                         if let Some(raw) = &self.latest_inputs[i] {
                             let rn = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
@@ -3502,7 +3524,7 @@ impl PerceptionProcessor {
                                 n_units: N_UNITS,
                             };
                             let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-                            self.model.as_mut().unwrap().wake_binding.forward(
+                            self.model_mut().wake_binding.forward(
                                 &[a0, a1, a2, a3, a4],
                                 None,
                                 &device,
@@ -3522,11 +3544,9 @@ impl PerceptionProcessor {
                         n_units: N_UNITS,
                     };
                     let a4 = acts[4].as_ref().unwrap_or(&lang_zero);
-                    self.model.as_mut().unwrap().wake_binding.forward(
-                        &[a0, a1, a2, a3, a4],
-                        None,
-                        &device,
-                    )
+                    self.model_mut()
+                        .wake_binding
+                        .forward(&[a0, a1, a2, a3, a4], None, &device)
                 }
             };
 

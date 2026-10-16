@@ -153,7 +153,6 @@ fn binding_replay_step_budget_remaining(steps_done: usize, cap: usize) -> bool {
     steps_done < cap
 }
 
-#[allow(dead_code)]
 pub struct SleepStats {
     pub traces_replayed: usize,
     pub mean_train_loss: f32,
@@ -193,8 +192,6 @@ pub struct SleepStats {
     /// Excludes prior-session embeddings that may have drifted due to NREM weight updates.
     /// None when the within-session warm subset is below GIST_MIN_WARM (typical for cycle 1).
     pub within_session_gist_rate: Option<f32>,
-    /// DER++ stale-output blocking: number of traces skipped due to diverged stored targets.
-    pub stale_traces_skipped: usize,
     /// Regions that had grown units pruned during REM (12c).
     pub regions_pruned: Vec<RegionId>,
     /// Total grown units removed across all pruned regions.
@@ -393,7 +390,6 @@ pub fn run_sleep_cycle(
     let mut total_proj_loss = 0.0f32;
     let mut proj_loss_n = 0usize;
     let mut proj_loss_max = 0.0f32;
-    let mut stale_traces_skipped = 0usize; // DER++ Phase 2: staleness detection
 
     // Snapshot warm size before spill so REM can detect cross-cycle entries.
     let pre_spill_warm_len = recall.warm.len();
@@ -647,7 +643,10 @@ pub fn run_sleep_cycle(
                         if mean_cosine >= STALE_COSINE_THRESHOLD {
                             filtered_indices.push(i);
                         } else {
-                            stale_traces_skipped += 1;
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::NremStaleTraceSkipped,
+                                1
+                            );
                             tracing::debug!(
                                 mean_cosine,
                                 "skipping stale trace (cosine below {:.2})",
@@ -1553,7 +1552,6 @@ pub fn run_sleep_cycle(
         nrem_budget_traces: n_traces,
         nrem_unique_traces,
         growth_cooldown_remaining,
-        stale_traces_skipped, // DER++ Phase 2: staleness detection counter
     })
 }
 

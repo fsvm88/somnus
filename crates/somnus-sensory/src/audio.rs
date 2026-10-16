@@ -17,8 +17,7 @@ pub const AUDIO_CHANNEL_CAPACITY: usize = 256;
 /// native sample format.
 pub struct AudioCapture {
     /// Held only for its `Drop` impl; releasing this stops playback.
-    #[allow(dead_code)]
-    stream: cpal::Stream,
+    _stream: cpal::Stream,
     pub receiver: Receiver<AudioFrame>,
     pub metrics: Arc<SensorMetrics>,
 }
@@ -43,7 +42,7 @@ impl AudioCapture {
         stream.play().map_err(SensorError::AudioPlay)?;
 
         Ok(Self {
-            stream,
+            _stream: stream,
             receiver: rx,
             metrics,
         })

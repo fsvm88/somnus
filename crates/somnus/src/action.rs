@@ -271,6 +271,15 @@ pub struct ActionDecoder {
 }
 
 impl ActionDecoder {
+    /// The model is `None` only while moved into an optimizer step (`take()` / put-back);
+    /// any access in that window is a logic bug, so fail with a message that says so.
+    #[inline]
+    fn model_ref(&self) -> &ProjModel<TrainB> {
+        self.model
+            .as_ref()
+            .expect("ActionDecoder.model accessed while taken for an optimizer step")
+    }
+
     /// Load all model artifacts from `models_dir`.
     /// Returns Err if any required file is absent.
     ///
@@ -675,7 +684,7 @@ impl ActionDecoder {
         let ep_data = TensorData::new(episode.to_vec(), [1, EPISODE_DIM]);
         let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
 
-        let model = self.model.as_ref().unwrap();
+        let model = self.model_ref();
         let proj_out = if self.linear_proj {
             model.fc1.forward(ep_t) // [1, N_REGIONS * LM_HIDDEN]
         } else {
@@ -811,7 +820,7 @@ impl ActionDecoder {
         let ep_t: Tensor<TrainB, 2> =
             Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
 
-        let model = self.model.as_ref().unwrap();
+        let model = self.model_ref();
         let proj_out = if self.linear_proj {
             model.fc1.forward(ep_t) // [N, N_REGIONS * LM_HIDDEN]
         } else {
@@ -863,7 +872,7 @@ impl ActionDecoder {
         let ep_t: Tensor<TrainB, 2> =
             Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
 
-        let model = self.model.as_ref().unwrap();
+        let model = self.model_ref();
         let proj_out = if self.linear_proj {
             model.fc1.forward(ep_t) // [N, N_REGIONS * LM_HIDDEN]
         } else {
@@ -919,9 +928,8 @@ impl ActionDecoder {
     }
 
     /// Frobenius norm of the projection weight matrices (monitoring, Phase 8).
-    #[allow(dead_code)]
     pub fn proj_weight_norm(&self) -> Result<f32> {
-        let model = self.model.as_ref().unwrap();
+        let model = self.model_ref();
         let w1 = model
             .fc1
             .weight
@@ -965,7 +973,7 @@ impl ActionDecoder {
     ///   W1: [EPISODE_DIM, N_REGIONS*LM_HIDDEN]
     /// gain_from_episode() receives `linear_proj` separately to interpret the layout.
     pub fn proj_weights_flat(&self) -> Vec<f32> {
-        let model = self.model.as_ref().unwrap();
+        let model = self.model_ref();
         let w1 = model
             .fc1
             .weight
@@ -995,7 +1003,7 @@ impl ActionDecoder {
 
     /// Save projection weights to a burn binary file.
     pub fn save_weights(&self, path: &std::path::Path) -> Result<()> {
-        let model_clone = self.model.as_ref().unwrap().clone();
+        let model_clone = self.model_ref().clone();
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         let path_str = path
             .to_str()
@@ -1262,7 +1270,7 @@ impl ActionDecoder {
 
     /// Project episode → flat Vec<f32> of length [N_REGIONS * LM_HIDDEN].
     fn project_flat(&self, episode: &[f32]) -> Result<Vec<f32>> {
-        let model = self.model.as_ref().unwrap();
+        let model = self.model_ref();
         let ep_data = TensorData::new(episode.to_vec(), [1, EPISODE_DIM]);
         let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
         let proj = if self.linear_proj {
