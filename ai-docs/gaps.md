@@ -217,22 +217,28 @@ needs a measurement before acting.
 | R17 | Python overlap: `export_kv_cache.py` vs `export_kv_cache_qwen3.py` (276/295 lines, graph-flagged), and three reporting scripts (`eval_metrics.py` 754, `campaign_status.py` 535, `status.py` 249). | Verified sizes; overlap *partly* assumed. | Share a module for the KV-export boilerplate; check whether `status.py` is subsumed by `campaign_status.py`. |
 | R18 | Dependency tree carries duplicate majors (`rand` 0.9/0.10, `getrandom` x3, `regex-*`, `darling` x3, `itertools`, `hashbrown` x3). | Verified (`cargo tree --duplicates`). | Upstream-driven; low value. Revisit only when a dependency refresh removes them for free. |
 
-**Decisions (user, 2026-10-17) and status** — updated as work lands:
+**Decisions (user, 2026-10-17) and status:**
 
 | # | Decision | Status |
 |---|----------|--------|
-| R1 | Investigate docs/history first | **Researched, awaiting user decision.** `measure_mse` was written 2026-05-10 (Phase 5, commit `69d1971`); `forward_no_dc` only appeared the next day for the ADR 0011 settling loop. ADR 0011 states the invariant "settling uses `forward_no_dc` throughout; the primary ingest-path `forward` updates duty cycles once per input" but never mentions the REM probes, and no ADR/log entry discusses REM scoring touching duty cycles. By chronology the side effect is accidental (probe predates the API that avoids it). Not changed: it alters REM numerics and needs an A/B. |
-| R2 | Do | queued |
-| R3 | Do | queued |
-| R4 | Queue only | **queued (not started)** |
-| R5 | Try to shave | queued |
-| R6 | Improve | queued |
-| R7 | Queue a benchmark | queued |
-| R9 | Add LTO profile and test it | queued |
-| R11 | Clean up | queued |
-| R12 | Do | queued |
-| R13/R14 | Tests first, then split | queued |
-| R15-R18 | Cleanup as appropriate | queued |
+| R1 | Investigate docs/history first | **Researched, awaiting your call.** `measure_mse` was written 2026-05-10 (Phase 5, `69d1971`); `forward_no_dc` appeared the next day for the ADR 0011 settling loop. ADR 0011 states "settling uses `forward_no_dc` throughout; the primary ingest-path `forward` updates duty cycles once per input" but never mentions the REM probes, and no ADR/log entry discusses REM scoring touching duty cycles. By chronology the side effect is accidental (the probe predates the API that avoids it). Not changed: it alters REM numerics and needs an A/B. |
+| R2 | Do | **Done** (`fsutil`, in-place atomic replace; `save_snapshot` no longer wipes sibling state; tests). Also fixed a flaky HNSW-order test found on the way. |
+| R3 | Do | **Done** (ORT session built once, after the restore; pilot: 1 build, trained-level MSE from cycle 1). |
+| R4 | Queue only | **Queued, not started.** Batch the REM scoring matmul (`measure_mse` 11.6 s, `collect_high_residual_inputs` 12 s at growth). Blocked on the R1 decision (`forward_no_dc` is `&self`, which is what makes batching/parallelism easy). |
+| R5 | Try to shave | **Done, bigger than expected.** Preprocessing was cheap (0.4 ms); the cost was thread oversubscription. ADR 0050: automatic thread budgets, wall 448 -> 336 s, per-op 1.5-3x. Also: bit-identical `u8`-sampling preprocessing (1.66 -> 0.44 ms at 1080p). Untried: move the video encoder to the CPU EP (23 ms vs 54 ms via MIGraphX, measured isolated). |
+| R6 | Improve | **Done** (concurrent session/embedding/tokenizer loading: 32.5 -> 16.5 s). Remaining ~16 s is the two FP32 KV sessions and MIGraphX compiles. |
+| R7 | Queue a benchmark | **Done, hypothesis rejected.** `bench_inference_device`: autodiff vs plain device inference 0.93-1.11x (<=0.05 ms absolute), within noise. No change made. |
+| R8 | (not decided by user) | Queued. |
+| R9 | Add and test | **Done.** `release-lto` profile (opt-in). Measured on `bench_nrem_batch` x3: <=5 % at batch 128, <2 % at 32/64, within noise, for +2m22s of build time. Not made default. |
+| R10 | (not decided by user) | Not done: spill is ~0.7 s of a ~100 s cycle. |
+| R11 | Clean up | **Done** (`ingest_region`, `PerceptionModel::layer/layer_mut/decoder`; 15 five-way matches collapsed; -263 lines; golden parity 0 diffs). |
+| R12 | Do | **Done** (`TensorF32Ext::to_f32_vec`, 42 sites; one deliberately keeps its error mapping). |
+| R13 | Clean up | **Partly done.** `run_sleep_cycle` 1205 -> 260 lines (`prepare_replay_traces`, `run_nrem`, `staleness_cosine`, `warm_recall_probe`, `within_session_gist`, `spill_hot_buffer`, `measure_region_mse`, `grow_poor_regions`, `prune_grown_units`, `recombine_episodes`, `reset_hot_buffer`, `persist_snapshot`) and its 26 arguments became `SleepParams`/`SleepSignals`. `run()` 2006 -> 1919 lines (`startup.rs`: tracing, model-file preflight, perception build). **Not done:** the ~1000-line wake main loop of `run()` (needs a `WakeState` struct for ~100 mutable locals, and has no end-to-end test; plan: characterise first with a fake-media harness). |
+| R14 | Add tests | **Done for the sleep cycle**: end-to-end characterization (24 episodes, replay count, spill, snapshot files, determinism) + interrupt test + `staleness_cosine` and `startup` tests. `run()` itself remains untested (needs ORT + models). |
+| R15 | Cleanup | **Done** (`save_state`/`load_state` for the three EWMA files; one shared `argmax`). |
+| R16 | Cleanup | Kept: documented in `scripts/README.md`. Fixed a real rot instead: `bench_nrem_batch`/`bench_wake_percep` hardcoded the old language dim (896) and panicked; now use `REGION_DIMS`. |
+| R17 | Cleanup | Left: `status.py` (live process status) and `campaign_status.py` (campaign report) are different tools; KV-export scripts are model-specific copies. |
+| R18 | - | Left (upstream-driven). |
 
 **Suggested order:** R1 (decide intent) and R2 (small, protects 250 MB state), R3, then R4+R7 together (measure R7 first), R14 -> R11/R13, R9 as a quick experiment, the rest opportunistically.
 
