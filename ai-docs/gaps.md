@@ -217,6 +217,23 @@ needs a measurement before acting.
 | R17 | Python overlap: `export_kv_cache.py` vs `export_kv_cache_qwen3.py` (276/295 lines, graph-flagged), and three reporting scripts (`eval_metrics.py` 754, `campaign_status.py` 535, `status.py` 249). | Verified sizes; overlap *partly* assumed. | Share a module for the KV-export boilerplate; check whether `status.py` is subsumed by `campaign_status.py`. |
 | R18 | Dependency tree carries duplicate majors (`rand` 0.9/0.10, `getrandom` x3, `regex-*`, `darling` x3, `itertools`, `hashbrown` x3). | Verified (`cargo tree --duplicates`). | Upstream-driven; low value. Revisit only when a dependency refresh removes them for free. |
 
+**Decisions (user, 2026-10-17) and status** — updated as work lands:
+
+| # | Decision | Status |
+|---|----------|--------|
+| R1 | Investigate docs/history first | **Researched, awaiting user decision.** `measure_mse` was written 2026-05-10 (Phase 5, commit `69d1971`); `forward_no_dc` only appeared the next day for the ADR 0011 settling loop. ADR 0011 states the invariant "settling uses `forward_no_dc` throughout; the primary ingest-path `forward` updates duty cycles once per input" but never mentions the REM probes, and no ADR/log entry discusses REM scoring touching duty cycles. By chronology the side effect is accidental (probe predates the API that avoids it). Not changed: it alters REM numerics and needs an A/B. |
+| R2 | Do | queued |
+| R3 | Do | queued |
+| R4 | Queue only | **queued (not started)** |
+| R5 | Try to shave | queued |
+| R6 | Improve | queued |
+| R7 | Queue a benchmark | queued |
+| R9 | Add LTO profile and test it | queued |
+| R11 | Clean up | queued |
+| R12 | Do | queued |
+| R13/R14 | Tests first, then split | queued |
+| R15-R18 | Cleanup as appropriate | queued |
+
 **Suggested order:** R1 (decide intent) and R2 (small, protects 250 MB state), R3, then R4+R7 together (measure R7 first), R14 -> R11/R13, R9 as a quick experiment, the rest opportunistically.
 
 ---
