@@ -994,135 +994,45 @@ fn spill_hot_buffer(
     }
 }
 
-/// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
-/// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
-/// Plain data so a cycle can be driven from a test without building the CLI `Args`.
-#[derive(Debug, Clone)]
-pub struct SleepParams {
-    pub sleep_loss_target: f32,
-    pub sleep_max_secs: u64,
-    pub prune_fraction: f32,
-    pub prune_min_grown: usize,
-    pub replay_batch_size: usize,
-    pub nrem_min_traces: usize,
-    pub nrem_salience_threshold: usize,
-    pub lang_oversample: usize,
-    pub replay_epochs: usize,
-    pub binding_replay: bool,
-    pub binding_replay_steps: usize,
-    pub binding_replay_lr_scale: f32,
-    pub binding_replay_freeze_heads: bool,
-    pub max_warm_records: usize,
-    pub max_cold_records: usize,
-    pub growth_cooldown: usize,
-    pub cooldown_remaining: usize,
-    pub session_start_secs: f64,
-    /// Where to export replay traces as training data (`--export-training-data`), if anywhere.
-    pub training_data_path: Option<PathBuf>,
+/// `(episode, regional inputs, text target token ids, salience)` as read from the hot buffer.
+type RawTrace = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32);
+
+/// A raw trace plus its precomputed LM hidden state (Gap 6 distillation target).
+type TraceSnapshot = (
+    Vec<f32>,
+    [Vec<f32>; 5],
+    Option<Vec<u32>>,
+    f32,
+    Option<Vec<f32>>,
+);
+
+/// The ordered, oversampled trace list NREM replays, plus bookkeeping about how it was built.
+struct PreparedTraces {
+    traces: Vec<TraceSnapshot>,
+    /// Language traces for which a valid LM hidden-state target was computed.
+    lm_hidden_computed: usize,
+    /// Unique LM inference calls (deduplicated by token-id content).
+    lm_hidden_unique: usize,
+    distill_precompute_ms: u64,
+    /// Number of distinct traces before language oversampling.
+    nrem_unique_traces: usize,
 }
 
-/// Cross-thread signals observed during a sleep cycle.
-pub struct SleepSignals {
-    /// Set by the main loop to cut the cycle short.
-    pub interrupt: Arc<AtomicBool>,
-    /// Embeddings produced by encoder tasks but not yet consumed by the main loop.
-    pub pending_embs: Arc<AtomicUsize>,
-}
-
-impl Default for SleepParams {
-    /// The CLI defaults (`cli.rs`).
-    fn default() -> Self {
-        Self {
-            sleep_loss_target: 0.0,
-            sleep_max_secs: 0,
-            prune_fraction: 0.0,
-            prune_min_grown: 64,
-            replay_batch_size: 128,
-            nrem_min_traces: 0,
-            nrem_salience_threshold: 0,
-            lang_oversample: 0,
-            replay_epochs: 4,
-            binding_replay: false,
-            binding_replay_steps: 1,
-            binding_replay_lr_scale: 1.0,
-            binding_replay_freeze_heads: false,
-            max_warm_records: 200_000,
-            max_cold_records: 0,
-            growth_cooldown: 3,
-            cooldown_remaining: 0,
-            session_start_secs: 0.0,
-            training_data_path: None,
-        }
-    }
-}
-
-pub fn run_sleep_cycle(
-    perception: &mut PerceptionProcessor,
+/// Snapshot the hot buffer into replay traces: precompute LM distillation targets, optionally
+/// export (episode, text) pairs for offline LoRA training (ADR 0033), order language-tagged traces
+/// first then by descending salience, and prepend `lang_oversample` extra copies of the
+/// language traces.
+fn prepare_replay_traces(
     episodic: &mut EpisodicBuffer,
-    recall: &mut RecollectionLayer,
-    memory_dir: &Path,
     decoder: &mut Option<ActionDecoder>,
-    signals: SleepSignals,
-    params: &SleepParams,
-) -> Result<SleepStats> {
-    let SleepSignals {
-        interrupt,
-        pending_embs,
-    } = signals;
-    let training_data_path = params.training_data_path.as_deref();
-    let sleep_loss_target = params.sleep_loss_target;
-    let sleep_max_secs = params.sleep_max_secs;
-    let prune_fraction = params.prune_fraction;
-    let prune_min_grown = params.prune_min_grown;
-    let replay_batch_size = params.replay_batch_size;
-    let nrem_min_traces = params.nrem_min_traces;
-    let nrem_salience_threshold = params.nrem_salience_threshold;
-    let lang_oversample = params.lang_oversample;
-    let replay_epochs = params.replay_epochs;
-    let binding_replay = params.binding_replay;
-    let binding_replay_steps = params.binding_replay_steps;
-    let binding_replay_lr_scale = params.binding_replay_lr_scale;
-    let binding_replay_freeze_heads = params.binding_replay_freeze_heads;
-    let max_warm_records = params.max_warm_records;
-    let max_cold_records = params.max_cold_records;
-    let growth_cooldown = params.growth_cooldown;
-    let cooldown_remaining = params.cooldown_remaining;
-    let session_start_secs = params.session_start_secs;
-
-    let sleep_start = Instant::now();
-    tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
-    // rem_wall_ms is accumulated across two REM sub-sections; the others are one-shot.
-    let mut rem_wall_ms = 0u64;
-
-    let mut traces_replayed = 0usize;
-    let mut total_train_loss = 0.0f32;
-    let mut total_output_mse = 0.0f32;
-    let mut output_mse_n = 0usize;
-    let mut was_interrupted = false;
-    let mut nrem_exit_reason: &'static str = "traces_exhausted";
-    let mut total_proj_loss = 0.0f32;
-    let mut proj_loss_n = 0usize;
-    let mut proj_loss_max = 0.0f32;
-
-    // Snapshot warm size before spill so REM can detect cross-cycle entries.
-    let pre_spill_warm_len = recall.warm.len();
-
-    // ── NREM-like: replay + train ─────────────────────────────────────────────
+    lang_oversample: usize,
+    training_data_path: Option<&Path>,
+) -> PreparedTraces {
+    // Collect snapshots; avoids borrowing episodic during training.
     // Collect snapshots; avoids borrowing episodic during training.
     // Always start from 0 each cycle: language-priority ordering makes the
     // cross-cycle checkpoint unnecessary and would misplace prioritized traces.
     episodic.replay_checkpoint = 0;
-    // Inner tuple for building raw traces before LM hidden states are attached.
-    type RawTrace = (Vec<f32>, [Vec<f32>; 5], Option<Vec<u32>>, f32);
-    // Fifth field: precomputed LM hidden state (Gap 6 distillation target).
-    type TraceSnapshot = (
-        Vec<f32>,
-        [Vec<f32>; 5],
-        Option<Vec<u32>>,
-        f32,
-        Option<Vec<f32>>,
-    );
-
     // Precompute LM hidden states before the NREM loop so the hot path doesn't
     // pay the lm_session cost per batch. text_hidden_states is &self (inference
     // only), so we borrow decoder immutably here, before the mutable NREM step.
@@ -1251,6 +1161,136 @@ pub fn run_sleep_cycle(
         }
     }
 
+    PreparedTraces {
+        traces,
+        lm_hidden_computed,
+        lm_hidden_unique,
+        distill_precompute_ms,
+        nrem_unique_traces,
+    }
+}
+
+/// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
+/// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
+/// Plain data so a cycle can be driven from a test without building the CLI `Args`.
+#[derive(Debug, Clone)]
+pub struct SleepParams {
+    pub sleep_loss_target: f32,
+    pub sleep_max_secs: u64,
+    pub prune_fraction: f32,
+    pub prune_min_grown: usize,
+    pub replay_batch_size: usize,
+    pub nrem_min_traces: usize,
+    pub nrem_salience_threshold: usize,
+    pub lang_oversample: usize,
+    pub replay_epochs: usize,
+    pub binding_replay: bool,
+    pub binding_replay_steps: usize,
+    pub binding_replay_lr_scale: f32,
+    pub binding_replay_freeze_heads: bool,
+    pub max_warm_records: usize,
+    pub max_cold_records: usize,
+    pub growth_cooldown: usize,
+    pub cooldown_remaining: usize,
+    pub session_start_secs: f64,
+    /// Where to export replay traces as training data (`--export-training-data`), if anywhere.
+    pub training_data_path: Option<PathBuf>,
+}
+
+/// Cross-thread signals observed during a sleep cycle.
+pub struct SleepSignals {
+    /// Set by the main loop to cut the cycle short.
+    pub interrupt: Arc<AtomicBool>,
+    /// Embeddings produced by encoder tasks but not yet consumed by the main loop.
+    pub pending_embs: Arc<AtomicUsize>,
+}
+
+impl Default for SleepParams {
+    /// The CLI defaults (`cli.rs`).
+    fn default() -> Self {
+        Self {
+            sleep_loss_target: 0.0,
+            sleep_max_secs: 0,
+            prune_fraction: 0.0,
+            prune_min_grown: 64,
+            replay_batch_size: 128,
+            nrem_min_traces: 0,
+            nrem_salience_threshold: 0,
+            lang_oversample: 0,
+            replay_epochs: 4,
+            binding_replay: false,
+            binding_replay_steps: 1,
+            binding_replay_lr_scale: 1.0,
+            binding_replay_freeze_heads: false,
+            max_warm_records: 200_000,
+            max_cold_records: 0,
+            growth_cooldown: 3,
+            cooldown_remaining: 0,
+            session_start_secs: 0.0,
+            training_data_path: None,
+        }
+    }
+}
+
+pub fn run_sleep_cycle(
+    perception: &mut PerceptionProcessor,
+    episodic: &mut EpisodicBuffer,
+    recall: &mut RecollectionLayer,
+    memory_dir: &Path,
+    decoder: &mut Option<ActionDecoder>,
+    signals: SleepSignals,
+    params: &SleepParams,
+) -> Result<SleepStats> {
+    let SleepSignals {
+        interrupt,
+        pending_embs,
+    } = signals;
+    let training_data_path = params.training_data_path.as_deref();
+    let sleep_loss_target = params.sleep_loss_target;
+    let sleep_max_secs = params.sleep_max_secs;
+    let prune_fraction = params.prune_fraction;
+    let prune_min_grown = params.prune_min_grown;
+    let replay_batch_size = params.replay_batch_size;
+    let nrem_min_traces = params.nrem_min_traces;
+    let nrem_salience_threshold = params.nrem_salience_threshold;
+    let lang_oversample = params.lang_oversample;
+    let replay_epochs = params.replay_epochs;
+    let binding_replay = params.binding_replay;
+    let binding_replay_steps = params.binding_replay_steps;
+    let binding_replay_lr_scale = params.binding_replay_lr_scale;
+    let binding_replay_freeze_heads = params.binding_replay_freeze_heads;
+    let max_warm_records = params.max_warm_records;
+    let max_cold_records = params.max_cold_records;
+    let growth_cooldown = params.growth_cooldown;
+    let cooldown_remaining = params.cooldown_remaining;
+    let session_start_secs = params.session_start_secs;
+
+    let sleep_start = Instant::now();
+    tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
+    // rem_wall_ms is accumulated across two REM sub-sections; the others are one-shot.
+    let mut rem_wall_ms = 0u64;
+
+    let mut traces_replayed = 0usize;
+    let mut total_train_loss = 0.0f32;
+    let mut total_output_mse = 0.0f32;
+    let mut output_mse_n = 0usize;
+    let mut was_interrupted = false;
+    let mut nrem_exit_reason: &'static str = "traces_exhausted";
+    let mut total_proj_loss = 0.0f32;
+    let mut proj_loss_n = 0usize;
+    let mut proj_loss_max = 0.0f32;
+
+    // Snapshot warm size before spill so REM can detect cross-cycle entries.
+    let pre_spill_warm_len = recall.warm.len();
+
+    // ── NREM-like: replay + train ─────────────────────────────────────────────
+    let PreparedTraces {
+        traces,
+        lm_hidden_computed,
+        lm_hidden_unique,
+        distill_precompute_ms,
+        nrem_unique_traces,
+    } = prepare_replay_traces(episodic, decoder, lang_oversample, training_data_path);
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
