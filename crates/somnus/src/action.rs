@@ -43,143 +43,136 @@ const MAX_GEN_SEQ: usize = 1024;
 /// Token budget for conversation history across turns (R2).
 /// Oldest turns are evicted when the total exceeds this limit.
 const CONV_HISTORY_BUDGET: usize = 256;
-/// Static KV cache size for the split prefill/decode generation path (ADR 0034).
-/// KV_SIZE=2048 covers a 400-token prefix plus 1600 generated tokens.
-const KV_SIZE: usize = 2048;
-const N_KV_LAYERS: usize = 24;
-const N_KV_HEADS: usize = 2;
-const KV_HEAD_DIM: usize = 64;
+/// Shape and tensor names of the split prefill/decode KV-cache models (ADR 0034), read from the
+/// loaded ONNX sessions instead of hard-coded: the Qwen2.5 export (24 layers, 2 KV heads, head
+/// dim 64, `past_key_i`/`new_key_i` names) and the Qwen3 export (28 layers, 8 KV heads, head dim
+/// 128, `kv_j` inputs and `k_i`/`v_i` outputs) differ in all of it, and hard-coding the former made
+/// every generation on the latter panic (`no output named past_key_0`, gaps.md R19).
+#[derive(Debug, Clone, PartialEq)]
+struct KvLayout {
+    n_layers: usize,
+    n_heads: usize,
+    head_dim: usize,
+    /// Decode-model cache length; also the longest prefix the KV path accepts.
+    kv_size: usize,
+    /// Decode-model input names of layer `i`'s key / value buffers.
+    in_key: Vec<String>,
+    in_val: Vec<String>,
+    /// Prefill-model output names of layer `i`'s key / value.
+    prefill_key: Vec<String>,
+    prefill_val: Vec<String>,
+    /// Decode-model output names of layer `i`'s new key / value.
+    out_key: Vec<String>,
+    out_val: Vec<String>,
+}
 
-// Pre-computed ORT key name slices — eliminates format!() heap allocs in the decode hot loop.
-static PAST_KEY_NAMES: [&str; N_KV_LAYERS] = [
-    "past_key_0",
-    "past_key_1",
-    "past_key_2",
-    "past_key_3",
-    "past_key_4",
-    "past_key_5",
-    "past_key_6",
-    "past_key_7",
-    "past_key_8",
-    "past_key_9",
-    "past_key_10",
-    "past_key_11",
-    "past_key_12",
-    "past_key_13",
-    "past_key_14",
-    "past_key_15",
-    "past_key_16",
-    "past_key_17",
-    "past_key_18",
-    "past_key_19",
-    "past_key_20",
-    "past_key_21",
-    "past_key_22",
-    "past_key_23",
-];
-static PAST_VALUE_NAMES: [&str; N_KV_LAYERS] = [
-    "past_value_0",
-    "past_value_1",
-    "past_value_2",
-    "past_value_3",
-    "past_value_4",
-    "past_value_5",
-    "past_value_6",
-    "past_value_7",
-    "past_value_8",
-    "past_value_9",
-    "past_value_10",
-    "past_value_11",
-    "past_value_12",
-    "past_value_13",
-    "past_value_14",
-    "past_value_15",
-    "past_value_16",
-    "past_value_17",
-    "past_value_18",
-    "past_value_19",
-    "past_value_20",
-    "past_value_21",
-    "past_value_22",
-    "past_value_23",
-];
-static NEW_KEY_NAMES: [&str; N_KV_LAYERS] = [
-    "new_key_0",
-    "new_key_1",
-    "new_key_2",
-    "new_key_3",
-    "new_key_4",
-    "new_key_5",
-    "new_key_6",
-    "new_key_7",
-    "new_key_8",
-    "new_key_9",
-    "new_key_10",
-    "new_key_11",
-    "new_key_12",
-    "new_key_13",
-    "new_key_14",
-    "new_key_15",
-    "new_key_16",
-    "new_key_17",
-    "new_key_18",
-    "new_key_19",
-    "new_key_20",
-    "new_key_21",
-    "new_key_22",
-    "new_key_23",
-];
-static NEW_VALUE_NAMES: [&str; N_KV_LAYERS] = [
-    "new_value_0",
-    "new_value_1",
-    "new_value_2",
-    "new_value_3",
-    "new_value_4",
-    "new_value_5",
-    "new_value_6",
-    "new_value_7",
-    "new_value_8",
-    "new_value_9",
-    "new_value_10",
-    "new_value_11",
-    "new_value_12",
-    "new_value_13",
-    "new_value_14",
-    "new_value_15",
-    "new_value_16",
-    "new_value_17",
-    "new_value_18",
-    "new_value_19",
-    "new_value_20",
-    "new_value_21",
-    "new_value_22",
-    "new_value_23",
-];
+impl KvLayout {
+    /// Derive the layout from the two sessions. Both exporters put `inputs_embeds`,
+    /// `position_ids`, `attention_mask` first on the decode model and `logits` first on both
+    /// outputs; outputs list all keys then all values. The 2N cache inputs are either grouped
+    /// (`past_key_*` then `past_value_*`, Qwen2.5) or interleaved key,value per layer (`kv_*`,
+    /// Qwen3).
+    fn discover(prefill: &Session, decode: &Session) -> Result<Self> {
+        let dec_in: Vec<String> = decode
+            .inputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        let dec_out: Vec<String> = decode
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        let pre_out: Vec<String> = prefill
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        if dec_in.len() < 5 || !(dec_in.len() - 3).is_multiple_of(2) {
+            bail!(
+                "decode KV model has {} inputs; expected 3 + 2*layers",
+                dec_in.len()
+            );
+        }
+        let n = (dec_in.len() - 3) / 2;
+        if dec_out.len() != 1 + 2 * n || pre_out.len() != 1 + 2 * n {
+            bail!(
+                "KV model output counts (prefill {}, decode {}) do not match 1 + 2*{n} layers",
+                pre_out.len(),
+                dec_out.len()
+            );
+        }
+        let kv_in = &dec_in[3..];
+        let grouped = kv_in[0].starts_with("past_key");
+        let pick = |i: usize, value: bool| -> String {
+            match (grouped, value) {
+                (true, false) => kv_in[i].clone(),
+                (true, true) => kv_in[n + i].clone(),
+                (false, false) => kv_in[2 * i].clone(),
+                (false, true) => kv_in[2 * i + 1].clone(),
+            }
+        };
+        let dims = decode.inputs()[3]
+            .dtype()
+            .tensor_shape()
+            .map(|s| s.iter().copied().collect::<Vec<i64>>())
+            .unwrap_or_default();
+        if dims.len() != 4 || dims.iter().any(|&d| d <= 0) {
+            bail!("decode KV input {:?} has shape {dims:?}; expected static [1, heads, kv_size, head_dim]", dec_in[3]);
+        }
+        Ok(Self {
+            n_layers: n,
+            n_heads: dims[1] as usize,
+            kv_size: dims[2] as usize,
+            head_dim: dims[3] as usize,
+            in_key: (0..n).map(|i| pick(i, false)).collect(),
+            in_val: (0..n).map(|i| pick(i, true)).collect(),
+            prefill_key: pre_out[1..1 + n].to_vec(),
+            prefill_val: pre_out[1 + n..].to_vec(),
+            out_key: dec_out[1..1 + n].to_vec(),
+            out_val: dec_out[1 + n..].to_vec(),
+        })
+    }
+
+    /// Floats in one key or value buffer: `[heads, kv_size, head_dim]`.
+    fn buf_len(&self) -> usize {
+        self.n_heads * self.kv_size * self.head_dim
+    }
+}
 
 /// KV-cache state for the split prefill/decode generation path (ADR 0034).
 struct KvCache {
-    /// 24 key buffers and 24 value buffers, alternating k0,v0,k1,v1,...
-    /// Each buffer holds [N_KV_HEADS, KV_SIZE, KV_HEAD_DIM] floats in row-major order.
+    /// Key and value buffers, alternating k0,v0,k1,v1,...
+    /// Each buffer holds [n_heads, kv_size, head_dim] floats in row-major order.
     bufs: Vec<Vec<f32>>,
-    /// Attention mask [KV_SIZE + 1]: 0.0 = attend, -1e4 = masked.
-    /// Position KV_SIZE is the current token's self-attention slot (always 0.0).
+    /// Attention mask [kv_size + 1]: 0.0 = attend, -1e4 = masked.
+    /// Position kv_size is the current token's self-attention slot (always 0.0).
     mask: Vec<f32>,
     /// Next write position in the cache.
     pos: usize,
-    /// Reusable logits buffer [vocab_size] — avoids 607 KB allocation per decode step.
+    /// Reusable logits buffer [vocab_size] — avoids a ~600 KB allocation per decode step.
     logits_scratch: Vec<f32>,
-    /// Per-layer scratch for new K/V output [N_KV_LAYERS*2][N_KV_HEADS*KV_HEAD_DIM].
-    /// Eliminates 48 heap allocations per decode step.
+    /// Per-layer scratch for new K/V output [2 * n_layers][n_heads * head_dim].
+    /// Eliminates 2 * n_layers heap allocations per decode step.
     new_kv_scratch: Vec<Vec<f32>>,
 }
 
 impl KvCache {
-    fn new() -> Self {
-        let buf_len = N_KV_HEADS * KV_SIZE * KV_HEAD_DIM;
-        let mut mask = vec![-1e4f32; KV_SIZE + 1];
-        mask[KV_SIZE] = 0.0; // self-attention slot is always valid
+    /// Buffers sized for `layout`; empty (and unused) when the KV models are absent.
+    fn new(layout: Option<&KvLayout>) -> Self {
+        let Some(l) = layout else {
+            return Self {
+                bufs: Vec::new(),
+                mask: Vec::new(),
+                pos: 0,
+                logits_scratch: Vec::new(),
+                new_kv_scratch: Vec::new(),
+            };
+        };
+        let mut mask = vec![-1e4f32; l.kv_size + 1];
+        mask[l.kv_size] = 0.0; // self-attention slot is always valid
         Self {
-            bufs: vec![vec![0.0f32; buf_len]; N_KV_LAYERS * 2],
+            bufs: vec![vec![0.0f32; l.buf_len()]; l.n_layers * 2],
             mask,
             pos: 0,
             logits_scratch: Vec::new(),
@@ -188,9 +181,11 @@ impl KvCache {
     }
 
     /// Allocate scratch buffers. Called once after vocab_size is known.
-    fn init_scratch(&mut self, vocab_size: usize) {
+    fn init_scratch(&mut self, vocab_size: usize, layout: Option<&KvLayout>) {
         self.logits_scratch = vec![0.0f32; vocab_size];
-        self.new_kv_scratch = vec![vec![0.0f32; N_KV_HEADS * KV_HEAD_DIM]; N_KV_LAYERS * 2];
+        if let Some(l) = layout {
+            self.new_kv_scratch = vec![vec![0.0f32; l.n_heads * l.head_dim]; l.n_layers * 2];
+        }
     }
 
     fn reset(&mut self) {
@@ -198,7 +193,9 @@ impl KvCache {
             buf.fill(0.0);
         }
         self.mask.fill(-1e4);
-        self.mask[KV_SIZE] = 0.0;
+        if let Some(last) = self.mask.last_mut() {
+            *last = 0.0;
+        }
         self.pos = 0;
     }
 }
@@ -273,7 +270,7 @@ fn load_gpu_sessions(
 fn load_kv_sessions(
     models_dir: &std::path::Path,
     model_prefix: &str,
-) -> Result<(Option<Session>, Option<Session>)> {
+) -> Result<(Option<Session>, Option<Session>, Option<KvLayout>)> {
     let prefill_kv_int8 = models_dir.join(format!("{model_prefix}_lm_prefill_kv_int8.onnx"));
     let decode_kv_int8 = models_dir.join(format!("{model_prefix}_lm_decode_kv_int8.onnx"));
     let prefill_kv_fp32 = models_dir.join(format!("{model_prefix}_lm_prefill_kv.onnx"));
@@ -295,7 +292,31 @@ fn load_kv_sessions(
             tracing::info!("KV-cache models absent — generate() using slow lm_session path");
             (None, None)
         };
-    Ok((prefill_kv_session, decode_kv_session))
+    // A model pair whose shapes we cannot read is unusable: fall back to the slow path (logged)
+    // instead of panicking later in generation.
+    if let (Some(p), Some(d)) = (&prefill_kv_session, &decode_kv_session) {
+        match KvLayout::discover(p, d) {
+            Ok(layout) => {
+                tracing::info!(
+                    layers = layout.n_layers,
+                    kv_heads = layout.n_heads,
+                    head_dim = layout.head_dim,
+                    kv_size = layout.kv_size,
+                    "KV-cache layout"
+                );
+                return Ok((prefill_kv_session, decode_kv_session, Some(layout)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    "KV-cache models unusable — generate() using slow lm_session path"
+                );
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+                return Ok((None, None, None));
+            }
+        }
+    }
+    Ok((prefill_kv_session, decode_kv_session, None))
 }
 
 /// The frozen token-embedding table as a flat row-major `f32` vector.
@@ -384,6 +405,8 @@ pub struct ActionDecoder {
     /// Loaded from qwen3_lm_decode_kv.onnx when present.
     decode_kv_session: Option<Session>,
     /// KV cache state for generate_kv(). Reset at each generate() call.
+    /// Shape/name layout of the KV models above; `Some` exactly when both sessions are.
+    kv_layout: Option<std::sync::Arc<KvLayout>>,
     kv_cache: KvCache,
     /// Use a single linear layer (EPISODE_DIM → N_REGIONS*LM_HIDDEN) instead of the
     /// 2-layer MLP. A/B control arm for ADR 0032 validation (--linear-proj flag).
@@ -490,14 +513,14 @@ impl ActionDecoder {
             text_hidden: text_hidden_session,
             lm_fixed: lm_fixed_session,
         } = gpu;
-        let (prefill_kv_session, decode_kv_session) = kv;
+        let (prefill_kv_session, decode_kv_session, kv_layout) = kv;
 
         let model = ProjModel::new(&device, linear_proj);
         let optimizer: ProjOptim = AdamWConfig::new().init();
         let kv_cache = {
             let vocab_size = embed_table.len() / LM_HIDDEN;
-            let mut kv = KvCache::new();
-            kv.init_scratch(vocab_size);
+            let mut kv = KvCache::new(kv_layout.as_ref());
+            kv.init_scratch(vocab_size, kv_layout.as_ref());
             kv
         };
 
@@ -512,6 +535,7 @@ impl ActionDecoder {
             lm_fixed_session,
             prefill_kv_session,
             decode_kv_session,
+            kv_layout: kv_layout.map(std::sync::Arc::new),
             kv_cache,
             linear_proj,
             tokenizer,
@@ -603,7 +627,12 @@ impl ActionDecoder {
 
         let mut generated: Vec<u32> = Vec::new();
 
-        if self.prefill_kv_session.is_some() && seq_len <= KV_SIZE {
+        if self.prefill_kv_session.is_some()
+            && self
+                .kv_layout
+                .as_ref()
+                .is_some_and(|l| seq_len <= l.kv_size)
+        {
             generated = self.generate_kv(all_embeds, seq_len, max_tokens)?;
         } else if self.use_gpu_gen {
             // GPU path: fixed [1, MAX_GEN_SEQ, LM_HIDDEN] buffer.
@@ -1104,6 +1133,17 @@ impl ActionDecoder {
         prefix_len: usize,
         max_tokens: usize,
     ) -> Result<Vec<u32>> {
+        let layout = std::sync::Arc::clone(
+            self.kv_layout
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("generate_kv called without KV models"))?,
+        );
+        let (n_layers, n_heads, head_dim, kv_size) = (
+            layout.n_layers,
+            layout.n_heads,
+            layout.head_dim,
+            layout.kv_size,
+        );
         // ── Step 1: Prefill ──────────────────────────────────────────────────
         // prefill_sess is a local — outputs borrows it, not self, so we can write
         // to self.kv_cache.bufs while outputs is alive. No intermediate Vec needed.
@@ -1120,18 +1160,20 @@ impl ActionDecoder {
             let first_logits: Vec<f32> = logit_data[(prefix_len - 1) * vocab..].to_vec();
 
             // Scatter KV directly into cache — eliminates ~7 MB intermediate Vec<Vec<f32>>.
-            // KV shape from prefill: [1, N_KV_HEADS, prefix_len, KV_HEAD_DIM].
+            // KV shape from prefill: [1, n_heads, prefix_len, head_dim].
             self.kv_cache.reset();
-            for i in 0..N_KV_LAYERS {
-                let (_, k_src) = outputs[PAST_KEY_NAMES[i]].try_extract_tensor::<f32>()?;
-                let (_, v_src) = outputs[PAST_VALUE_NAMES[i]].try_extract_tensor::<f32>()?;
-                for h in 0..N_KV_HEADS {
-                    let src_off = h * prefix_len * KV_HEAD_DIM;
-                    let dst_off = h * KV_SIZE * KV_HEAD_DIM;
-                    self.kv_cache.bufs[2 * i][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
-                        .copy_from_slice(&k_src[src_off..src_off + prefix_len * KV_HEAD_DIM]);
-                    self.kv_cache.bufs[2 * i + 1][dst_off..dst_off + prefix_len * KV_HEAD_DIM]
-                        .copy_from_slice(&v_src[src_off..src_off + prefix_len * KV_HEAD_DIM]);
+            for i in 0..n_layers {
+                let (_, k_src) =
+                    outputs[layout.prefill_key[i].as_str()].try_extract_tensor::<f32>()?;
+                let (_, v_src) =
+                    outputs[layout.prefill_val[i].as_str()].try_extract_tensor::<f32>()?;
+                for h in 0..n_heads {
+                    let src_off = h * prefix_len * head_dim;
+                    let dst_off = h * kv_size * head_dim;
+                    self.kv_cache.bufs[2 * i][dst_off..dst_off + prefix_len * head_dim]
+                        .copy_from_slice(&k_src[src_off..src_off + prefix_len * head_dim]);
+                    self.kv_cache.bufs[2 * i + 1][dst_off..dst_off + prefix_len * head_dim]
+                        .copy_from_slice(&v_src[src_off..src_off + prefix_len * head_dim]);
                 }
             }
             // outputs dropped here; prefill_sess borrow ends.
@@ -1162,7 +1204,7 @@ impl ActionDecoder {
 
             let mut decode_sess = self.decode_kv_session.take().unwrap();
             for _ in 1..max_tokens {
-                if next_id == EOS_TOKEN_ID || self.kv_cache.pos >= KV_SIZE {
+                if next_id == EOS_TOKEN_ID || self.kv_cache.pos >= kv_size {
                     break;
                 }
                 let pos = self.kv_cache.pos;
@@ -1173,26 +1215,26 @@ impl ActionDecoder {
                 // Zero-copy views into KV buffers — no clone needed (decode_sess already taken out).
                 // Block ensures views drop before we write back to self.kv_cache.bufs below.
                 let outputs = {
-                    let k_views: Vec<ArrayView4<f32>> = (0..N_KV_LAYERS)
+                    let k_views: Vec<ArrayView4<f32>> = (0..n_layers)
                         .map(|i| {
                             ArrayView4::from_shape(
-                                (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                                (1, n_heads, kv_size, head_dim),
                                 &self.kv_cache.bufs[2 * i],
                             )
                             .map_err(|e| anyhow::anyhow!("ndarray: {e}"))
                         })
                         .collect::<Result<_>>()?;
-                    let v_views: Vec<ArrayView4<f32>> = (0..N_KV_LAYERS)
+                    let v_views: Vec<ArrayView4<f32>> = (0..n_layers)
                         .map(|i| {
                             ArrayView4::from_shape(
-                                (1, N_KV_HEADS, KV_SIZE, KV_HEAD_DIM),
+                                (1, n_heads, kv_size, head_dim),
                                 &self.kv_cache.bufs[2 * i + 1],
                             )
                             .map_err(|e| anyhow::anyhow!("ndarray: {e}"))
                         })
                         .collect::<Result<_>>()?;
                     let mask_view =
-                        ArrayView4::from_shape((1, 1, 1, KV_SIZE + 1), &self.kv_cache.mask)
+                        ArrayView4::from_shape((1, 1, 1, kv_size + 1), &self.kv_cache.mask)
                             .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
 
                     let emb_arr = Array3::from_shape_vec((1, 1, LM_HIDDEN), embed_vec)
@@ -1202,7 +1244,7 @@ impl ActionDecoder {
 
                     // Use &str keys to avoid 96 String heap allocs per token.
                     let mut feed: Vec<(&str, ValueRef<'_, DynValueTypeMarker>)> =
-                        Vec::with_capacity(3 + N_KV_LAYERS * 2);
+                        Vec::with_capacity(3 + n_layers * 2);
                     feed.push((
                         "inputs_embeds",
                         TensorRef::from_array_view(&emb_arr)?.into_dyn(),
@@ -1215,13 +1257,13 @@ impl ActionDecoder {
                         "attention_mask",
                         TensorRef::from_array_view(mask_view)?.into_dyn(),
                     ));
-                    for i in 0..N_KV_LAYERS {
+                    for i in 0..n_layers {
                         feed.push((
-                            PAST_KEY_NAMES[i],
+                            layout.in_key[i].as_str(),
                             TensorRef::from_array_view(k_views[i])?.into_dyn(),
                         ));
                         feed.push((
-                            PAST_VALUE_NAMES[i],
+                            layout.in_val[i].as_str(),
                             TensorRef::from_array_view(v_views[i])?.into_dyn(),
                         ));
                     }
@@ -1234,10 +1276,10 @@ impl ActionDecoder {
                 self.kv_cache.logits_scratch.copy_from_slice(logit_data);
 
                 // Copy new KV into scratch — avoids 48 Vec allocs per step.
-                // new_key shape: [1, N_KV_HEADS, 1, KV_HEAD_DIM].
-                for i in 0..N_KV_LAYERS {
-                    let (_, k) = outputs[NEW_KEY_NAMES[i]].try_extract_tensor::<f32>()?;
-                    let (_, v) = outputs[NEW_VALUE_NAMES[i]].try_extract_tensor::<f32>()?;
+                // new_key shape: [1, n_heads, 1, head_dim].
+                for i in 0..n_layers {
+                    let (_, k) = outputs[layout.out_key[i].as_str()].try_extract_tensor::<f32>()?;
+                    let (_, v) = outputs[layout.out_val[i].as_str()].try_extract_tensor::<f32>()?;
                     self.kv_cache.new_kv_scratch[2 * i].copy_from_slice(k);
                     self.kv_cache.new_kv_scratch[2 * i + 1].copy_from_slice(v);
                 }
@@ -1252,16 +1294,16 @@ impl ActionDecoder {
                         ref mut bufs,
                         ..
                     } = self.kv_cache;
-                    for i in 0..N_KV_LAYERS {
+                    for i in 0..n_layers {
                         let k_new = &new_kv_scratch[2 * i];
                         let v_new = &new_kv_scratch[2 * i + 1];
-                        for h in 0..N_KV_HEADS {
-                            let src = h * KV_HEAD_DIM;
-                            let dst = h * KV_SIZE * KV_HEAD_DIM + pos * KV_HEAD_DIM;
-                            bufs[2 * i][dst..dst + KV_HEAD_DIM]
-                                .copy_from_slice(&k_new[src..src + KV_HEAD_DIM]);
-                            bufs[2 * i + 1][dst..dst + KV_HEAD_DIM]
-                                .copy_from_slice(&v_new[src..src + KV_HEAD_DIM]);
+                        for h in 0..n_heads {
+                            let src = h * head_dim;
+                            let dst = h * kv_size * head_dim + pos * head_dim;
+                            bufs[2 * i][dst..dst + head_dim]
+                                .copy_from_slice(&k_new[src..src + head_dim]);
+                            bufs[2 * i + 1][dst..dst + head_dim]
+                                .copy_from_slice(&v_new[src..src + head_dim]);
                         }
                     }
                 }
@@ -1493,6 +1535,102 @@ fn gain_from_episode_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── KV-cache models (gaps.md R19) ────────────────────────────────────────
+    // Artifact-dependent: skipped when the (gitignored) exported models are absent.
+
+    fn kv_models_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models")
+    }
+
+    fn kv_sessions() -> Option<(Session, Session)> {
+        let dir = kv_models_dir();
+        let (p, d) = (
+            dir.join("qwen3_lm_prefill_kv.onnx"),
+            dir.join("qwen3_lm_decode_kv.onnx"),
+        );
+        if !p.exists() || !d.exists() {
+            eprintln!("skipping: Qwen3 KV models not present");
+            return None;
+        }
+        Some((
+            crate::cpu_session(&p, None).unwrap(),
+            crate::cpu_session(&d, None).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn kv_layout_is_read_from_the_exported_qwen3_models() {
+        let Some((prefill, decode)) = kv_sessions() else {
+            return;
+        };
+        let l = KvLayout::discover(&prefill, &decode).unwrap();
+        assert_eq!(
+            (l.n_layers, l.n_heads, l.head_dim, l.kv_size),
+            (28, 8, 128, 2048)
+        );
+        // Decode cache inputs interleave key, value per layer; outputs group keys then values.
+        assert_eq!(
+            (l.in_key[0].as_str(), l.in_val[0].as_str()),
+            ("kv_0", "kv_1")
+        );
+        assert_eq!(
+            (l.in_key[27].as_str(), l.in_val[27].as_str()),
+            ("kv_54", "kv_55")
+        );
+        assert_eq!(
+            (l.prefill_key[0].as_str(), l.prefill_val[0].as_str()),
+            ("k_0", "v_0")
+        );
+        assert_eq!(
+            (l.out_key[27].as_str(), l.out_val[27].as_str()),
+            ("k_27", "v_27")
+        );
+        assert_eq!(l.buf_len(), 8 * 2048 * 128);
+    }
+
+    /// The regression test for R19: a real prefill + decode loop over the exported Qwen3 models
+    /// used to abort the process with `no output named past_key_0`.
+    #[test]
+    fn generate_runs_through_the_kv_cache_path_on_the_qwen3_models() {
+        let dir = kv_models_dir();
+        if kv_sessions().is_none() || !dir.join("qwen3_lm.onnx").exists() {
+            return;
+        }
+        let mut dec = match ActionDecoder::new(&dir, Device::flex(), None, false, false, "qwen3") {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: ActionDecoder::new failed ({e})");
+                return;
+            }
+        };
+        assert!(
+            dec.kv_layout.is_some(),
+            "KV path must be active with these models"
+        );
+        let episode: Vec<f32> = (0..EPISODE_DIM)
+            .map(|i| ((i % 17) as f32) * 0.02 - 0.15)
+            .collect();
+        // Conversation history is part of the prompt, so reset it before every call.
+        dec.clear_conversation();
+        let a = dec.generate(&episode, &[], "what do you see?", 16).unwrap();
+        dec.clear_conversation();
+        let b = dec.generate(&episode, &[], "what do you see?", 16).unwrap();
+        // Greedy decoding is deterministic, and the cache is fully reset between calls.
+        assert_eq!(a, b);
+
+        // The KV path must agree with the slow full-recompute path (lm_session) token for token:
+        // same greedy decoding and repetition penalty, only the attention bookkeeping differs.
+        let (p, d) = (dec.prefill_kv_session.take(), dec.decode_kv_session.take());
+        dec.clear_conversation();
+        let slow = dec.generate(&episode, &[], "what do you see?", 16).unwrap();
+        dec.prefill_kv_session = p;
+        dec.decode_kv_session = d;
+        assert_eq!(
+            a, slow,
+            "KV-cache generation diverged from the reference path"
+        );
+    }
 
     /// ProjModel safetensors round trip: tensor names are the on-disk contract with snapshots
     /// converted from burn 0.21 (`fc1.weight`, `fc2.weight`), values survive, and the reloaded
