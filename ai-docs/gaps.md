@@ -164,6 +164,7 @@ Collected by a read-only sweep of code, CI, scripts, metrics coverage and docs. 
 | Q11 | Low | Crate hygiene | Already tracked in §15 and not re-listed: usearch, burn-flex (check the 0.22 timeline against today, 2026-10), ffmpeg-the-third. Worth a dated re-check since burn's expected date has passed. |
 | Q12 | Info | Metrics | Core-tier macros are widely used (somnus/lib.rs 58, perception/lib.rs 54, sleep.rs 29). Thin spots: `somnus-encoding/video.rs` (1), `whisper_asr.rs` (1), `wake_worker.rs` (2), `somnus-sensory` (media_file 2, audio capture 0). Candidate: failure/fallback counters on the ORT-panic path in `whisper_asr.rs` (§40), which would also help diagnose it. Not a policy violation found, just the least-covered files. |
 | Q13 | Info | Docs | Docs were audited 2026-09-14 (`37789f3`) and no new drift was looked for beyond constants/ADR index. Not re-audited here. |
+| Q14 | Med | Threading | Size rayon's global pool (`ThreadPoolBuilder::build_global`, e.g. total cores minus the ORT intra budget) so the `onnx_thread_budget` comment is true; the burn-flex migration made the contention measurable (`encode_video` +28 % per call, ADR 0049). |
 
 **Status after the 2026-10-16 fix pass** (commits `170aa76`, `b3b0136` and the `cli.rs` split):
 
