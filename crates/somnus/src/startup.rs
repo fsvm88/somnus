@@ -11,16 +11,19 @@ use std::{
 use anyhow::Result;
 use burn::tensor::Device;
 use somnus_memory::{
-    load_region_sizes, load_snapshot, weights_path, ColdArchive, EpisodicBuffer, SemanticStore,
+    load_region_sizes, load_snapshot, weights_path, ColdArchive, EpisodicBuffer, RecollectionLayer,
+    SemanticStore,
 };
-use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
+use somnus_perception::{PerceptionProcessor, WakeReconWorker, EPISODE_DIM};
 use sysinfo::System;
 use tracing::info;
 
 use crate::{
-    action::{self, ActionDecoder},
+    action::{self, ActionDecoder, GainWorker},
     cli::Args,
     memory_dir_disk_free_bytes, parse_prior_beta_regions, should_use_ort_inference, thread_budgets,
+    whisper_asr::WhisperDecoder,
+    LangEmbedder,
 };
 
 /// Initialise tracing before ORT so startup errors are captured. With `--log-file`, write
@@ -474,6 +477,89 @@ pub(crate) fn open_metrics_sink(args: &Args) -> Result<Option<std::fs::File>> {
         None
     };
     Ok(sink)
+}
+
+/// Background workers that keep slow per-episode work off the event loop: the Qwen gain worker
+/// (needs `--action` and `--action-gain`) and the wake-reconstruction worker (`--wake-recon-async`,
+/// created after the perception weights are restored so it starts from them).
+pub(crate) fn spawn_workers(
+    args: &Args,
+    decoder: &mut Option<ActionDecoder>,
+    perception: &PerceptionProcessor,
+) -> (Option<GainWorker>, Option<WakeReconWorker>) {
+    // Move the gain ORT session to a background thread so ~54ms Qwen calls don't
+    // block the tokio event loop. Only created when both --action and --action-gain are set.
+    let gain_worker: Option<GainWorker> = if args.action_gain {
+        decoder.as_mut().and_then(|d| d.create_gain_worker())
+    } else {
+        None
+    };
+    if gain_worker.is_some() {
+        info!("gain worker spawned — Qwen gain updates running in background");
+    }
+
+    let wake_recon_worker: Option<WakeReconWorker> = if args.wake_recon_async {
+        info!("wake-recon worker spawned — wake_reconstruct_step running in background");
+        Some(perception.create_wake_recon_worker())
+    } else {
+        None
+    };
+    (gain_worker, wake_recon_worker)
+}
+
+/// Load the language embedder when `--language` is set; a missing model is a hard error.
+pub(crate) fn init_language_embedder(args: &Args) -> Result<Option<LangEmbedder>> {
+    let lang_embedder: Option<LangEmbedder> = if args.language {
+        match LangEmbedder::new(&args.models_dir, &args.action_model_prefix) {
+            Ok(le) => Some(le),
+            Err(e) => anyhow::bail!("language embedder init failed: {e}"),
+        }
+    } else {
+        None
+    };
+    Ok(lang_embedder)
+}
+
+/// Assemble the warm/cold recollection layer and apply the HNSW search width.
+pub(crate) fn build_recall(
+    args: &Args,
+    semantic: SemanticStore,
+    cold: ColdArchive,
+    effective_max_warm: usize,
+) -> RecollectionLayer {
+    let mut recall = RecollectionLayer::new(semantic, cold);
+    recall.warm.set_search_ef(args.recall_ef);
+    info!(
+        episodic_capacity = args.episodic_capacity,
+        memory_dir = %args.memory_dir.display(),
+        recall_ef = args.recall_ef,
+        max_warm_records = effective_max_warm,
+        max_warm_auto = args.max_warm_records == 0,
+        "memory hierarchy ready"
+    );
+    recall
+}
+
+/// Whisper ASR decoder (Stage B, ADR 0013). Soft failure: a missing decoder ONNX just disables ASR.
+pub(crate) fn init_whisper(args: &Args) -> Option<WhisperDecoder> {
+    if args.language {
+        match WhisperDecoder::new(&args.models_dir) {
+            Ok(d) => {
+                info!("whisper ASR decoder ready");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    "whisper ASR decoder not available — text-only language ingestion"
+                );
+                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+                None
+            }
+        }
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

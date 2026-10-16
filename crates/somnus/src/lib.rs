@@ -100,8 +100,7 @@ fn onnx_thread_budget() -> (usize, usize) {
     (intra, inter)
 }
 
-use action::{ActionDecoder, GainWorker};
-use whisper_asr::WhisperDecoder;
+use action::ActionDecoder;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -485,9 +484,6 @@ pub async fn run() -> Result<()> {
     // whether the crossover trips at startup (a resumed, already-grown snapshot)
     // or mid-run (growth during this process).
     let (onnx_dir, onnx_script_path) = startup::resolve_onnx_paths(&args);
-    // Sticky: once an attempt fails (missing Python/onnx/onnxruntime, MIGraphX
-    // unavailable, ...), don't retry every sleep cycle — log once and stay on burn
-    // CPU for the rest of the process. The environment problem won't fix itself.
     // ── memory hierarchy ──────────────────────────────────────────────────────
     let startup::RestoredMemory {
         cold,
@@ -516,46 +512,12 @@ pub async fn run() -> Result<()> {
 
     startup::export_proj_weights_and_exit(&args, decoder.as_ref());
 
-    // Move the gain ORT session to a background thread so ~54ms Qwen calls don't
-    // block the tokio event loop. Only created when both --action and --action-gain are set.
-    let gain_worker: Option<GainWorker> = if args.action_gain {
-        decoder.as_mut().and_then(|d| d.create_gain_worker())
-    } else {
-        None
-    };
-    if gain_worker.is_some() {
-        info!("gain worker spawned — Qwen gain updates running in background");
-    }
-
-    // ── wake-reconstruction worker (perception weights already restored above) ─
-    let wake_recon_worker: Option<WakeReconWorker> = if args.wake_recon_async {
-        info!("wake-recon worker spawned — wake_reconstruct_step running in background");
-        Some(perception.create_wake_recon_worker())
-    } else {
-        None
-    };
-    let _wake_recon_dropped: u64 = 0;
+    let (gain_worker, wake_recon_worker) = startup::spawn_workers(&args, &mut decoder, &perception);
 
     // ── language embedder ─────────────────────────────────────────────────────
-    let lang_embedder: Option<LangEmbedder> = if args.language {
-        match LangEmbedder::new(&args.models_dir, &args.action_model_prefix) {
-            Ok(le) => Some(le),
-            Err(e) => anyhow::bail!("language embedder init failed: {e}"),
-        }
-    } else {
-        None
-    };
+    let lang_embedder = startup::init_language_embedder(&args)?;
 
-    let mut recall = RecollectionLayer::new(semantic, cold);
-    recall.warm.set_search_ef(args.recall_ef);
-    info!(
-        episodic_capacity = args.episodic_capacity,
-        memory_dir = %args.memory_dir.display(),
-        recall_ef = args.recall_ef,
-        max_warm_records = effective_max_warm,
-        max_warm_auto = args.max_warm_records == 0,
-        "memory hierarchy ready"
-    );
+    let mut recall = startup::build_recall(&args, semantic, cold, effective_max_warm);
 
     let high_water = (args.episodic_capacity as f64 * args.sleep_high_water) as usize;
     // S6 adaptive wake ceiling floor (ADR 0024); the live ceiling lives in `WakeState::max_wake`.
@@ -575,24 +537,7 @@ pub async fn run() -> Result<()> {
 
     // ── Whisper ASR decoder (Stage B, ADR 0013) ──────────────────────────────
     // Soft failure: if the decoder ONNX is absent, ASR is silently disabled.
-    let whisper_dec: Option<WhisperDecoder> = if args.language {
-        match WhisperDecoder::new(&args.models_dir) {
-            Ok(d) => {
-                info!("whisper ASR decoder ready");
-                Some(d)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    ?e,
-                    "whisper ASR decoder not available — text-only language ingestion"
-                );
-                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let whisper_dec = startup::init_whisper(&args);
 
     // ── stdin channels ────────────────────────────────────────────────────────
     // query_rx: stdin lines routed to ActionDecoder for generation (ADR 0012).
