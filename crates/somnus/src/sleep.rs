@@ -585,6 +585,138 @@ fn recombine_episodes(
     }
 }
 
+/// REM self-probe: mean SAE reconstruction MSE per region over `traces_for_rem` (inference only),
+/// and how many traces contributed to each region's mean.
+fn measure_region_mse(
+    perception: &mut PerceptionProcessor,
+    traces_for_rem: &[RemTrace],
+) -> ([f32; 5], [usize; 5]) {
+    let mut per_region_mse = [0.0f32; 5];
+    let mut per_region_count = [0usize; 5];
+    // Measure SAE reconstruction quality without updating weights.
+    for (_, regional, _, _) in traces_for_rem {
+        match perception.measure_mse(regional) {
+            Ok(mse) => {
+                for i in 0..5 {
+                    if !regional[i].is_empty() {
+                        per_region_mse[i] += mse[i];
+                        per_region_count[i] += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(?e, "measure_mse error");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
+            }
+        }
+    }
+
+    for i in 0..5 {
+        if per_region_count[i] > 0 {
+            per_region_mse[i] /= per_region_count[i] as f32;
+        }
+    }
+    (per_region_mse, per_region_count)
+}
+
+/// Inputs to the growth decision, gathered by the REM probes.
+struct GrowthSignals {
+    per_region_mse: [f32; 5],
+    per_region_count: [usize; 5],
+    /// Cross-session warm-recall gist rate (noisy at cycle 1 of a session).
+    gist_recall_rate: Option<f32>,
+    /// Within-session gist rate (no cross-session drift); None before the first spill.
+    within_session_gist_rate: Option<f32>,
+    warm_recall_l2: Option<f32>,
+    /// Cycles left in the post-growth cooldown; growth is suppressed while > 0.
+    cooldown_remaining: usize,
+}
+
+/// Grow every region whose quality signal is poor (cascade-correlation init from high-residual
+/// inputs, ADR 0007 P2b). Returns the regions that grew.
+fn grow_poor_regions(
+    perception: &mut PerceptionProcessor,
+    traces_for_rem: &[RemTrace],
+    sig: &GrowthSignals,
+) -> Vec<RegionId> {
+    let GrowthSignals {
+        per_region_mse,
+        per_region_count,
+        gist_recall_rate,
+        within_session_gist_rate,
+        warm_recall_l2,
+        cooldown_remaining,
+    } = *sig;
+    let mut regions_grown: Vec<RegionId> = Vec::new();
+    // Growth trigger: within-session gist is the primary signal (no cross-session drift).
+    // Falls back to cross-session gist at c1 of each session (within_session always None
+    // before the first spill). Last resort: SAE MSE when no warm existed at all (S1C1).
+    // warm_recall_poor is logged but no longer gates growth (too noisy).
+    //
+    // Cooldown: suppresses growth for `growth_cooldown` cycles after any event.
+    // c1 cross-session gist is still noisy; cooldown backstops spurious c1 growth.
+    let _warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
+    let gist_poor = gist_recall_rate.is_none_or(|r| r < GIST_GROWTH_THRESHOLD);
+    let growth_blocked = cooldown_remaining > 0;
+    if growth_blocked {
+        tracing::info!(
+            cooldown_remaining,
+            gist_recall_rate = ?gist_recall_rate,
+            "growth suppressed by cooldown"
+        );
+    }
+    let region_ids = [
+        RegionId::AudioSpeech,
+        RegionId::AudioEnv,
+        RegionId::Visual,
+        RegionId::Symbolic,
+        RegionId::Language,
+    ];
+    if !growth_blocked {
+        // Cascade-correlation init (ADR 0007, P2b): collect high-residual inputs once
+        // before the growth loop so that any regions that trigger growth can use them.
+        // Cap at 2 × GROWTH_BATCH_MAX seeds per region to bound memory (worst case: every
+        // triggered region gets the largest possible batch).
+        let cc_seeds =
+            perception.collect_high_residual_inputs(traces_for_rem, 2 * GROWTH_BATCH_MAX);
+
+        for (i, &region) in region_ids.iter().enumerate() {
+            // Quality signal: within-session gist primary (no drift); cross-session
+            // gist at c1 of any session (ws always None before first spill); MSE
+            // last resort when warm was empty (S1C1). Novelty mirrors the same
+            // three-way signal choice, feeding growth_batch_size (gaps.md §19)
+            // instead of the old flat GROWTH_BATCH.
+            let (quality_poor, novelty) = match (within_session_gist_rate, gist_recall_rate) {
+                (Some(ws), _) => (
+                    ws < GIST_GROWTH_THRESHOLD,
+                    gist_novelty(ws, GIST_GROWTH_THRESHOLD),
+                ),
+                (None, Some(gr)) => (gist_poor, gist_novelty(gr, GIST_GROWTH_THRESHOLD)),
+                (None, None) => (
+                    per_region_mse[i] > GROWTH_THRESHOLD,
+                    mse_novelty(per_region_mse[i], GROWTH_THRESHOLD),
+                ),
+            };
+            if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor {
+                let batch = growth_batch_size(novelty);
+                tracing::info!(
+                    region = ?region,
+                    mse = per_region_mse[i],
+                    gist_recall_rate = ?gist_recall_rate,
+                    novelty,
+                    batch,
+                    seeds = cc_seeds[i].len(),
+                    "growing region (cascade-correlation)"
+                );
+                somnus_metrics::counted_core!(somnus_metrics::Metric::GrowthBatchSize, batch as u64);
+                perception.grow_region_seeded(region, batch, &cc_seeds[i]);
+                regions_grown.push(region);
+            }
+        }
+    }
+    regions_grown
+}
+
 /// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
 /// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
 /// Plain data so a cycle can be driven from a test without building the CLI `Args`.
@@ -1203,9 +1335,6 @@ pub fn run_sleep_cycle(
     let t_rem = Instant::now();
     // Run BEFORE spill so warm only contains prior-cycle entries. Querying after
     // spill would find exact matches (L2=0) from the just-inserted current records.
-    let mut per_region_mse = [0.0f32; 5];
-    let mut per_region_count = [0usize; 5];
-    let mut regions_grown: Vec<RegionId> = Vec::new();
     let mut regions_pruned: Vec<RegionId> = Vec::new();
     let mut total_units_pruned: usize = 0;
     let mut warm_recall_l2: Option<f32> = None;
@@ -1486,98 +1615,28 @@ pub fn run_sleep_cycle(
 
     // ── REM-like: measure MSE + trigger growth ────────────────────────────────
     let t_rem2 = Instant::now();
-    if !was_interrupted {
-        // Measure SAE reconstruction quality without updating weights.
-        for (_, regional, _, _) in &traces_for_rem {
-            match perception.measure_mse(regional) {
-                Ok(mse) => {
-                    for i in 0..5 {
-                        if !regional[i].is_empty() {
-                            per_region_mse[i] += mse[i];
-                            per_region_count[i] += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(?e, "measure_mse error");
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
-                }
-            }
-        }
-
-        for i in 0..5 {
-            if per_region_count[i] > 0 {
-                per_region_mse[i] /= per_region_count[i] as f32;
-            }
-        }
-
-        // Growth trigger: within-session gist is the primary signal (no cross-session drift).
-        // Falls back to cross-session gist at c1 of each session (within_session always None
-        // before the first spill). Last resort: SAE MSE when no warm existed at all (S1C1).
-        // warm_recall_poor is logged but no longer gates growth (too noisy).
-        //
-        // Cooldown: suppresses growth for `growth_cooldown` cycles after any event.
-        // c1 cross-session gist is still noisy; cooldown backstops spurious c1 growth.
-        let _warm_recall_poor = warm_recall_l2.is_none_or(|l2| l2 > WARM_RECALL_GROWTH_THRESHOLD);
-        let gist_poor = gist_recall_rate.is_none_or(|r| r < GIST_GROWTH_THRESHOLD);
-        let growth_blocked = cooldown_remaining > 0;
-        if growth_blocked {
-            tracing::info!(
+    let (per_region_mse, per_region_count) = if !was_interrupted {
+        measure_region_mse(perception, &traces_for_rem)
+    } else {
+        ([0.0f32; 5], [0usize; 5])
+    };
+    let regions_grown: Vec<RegionId> = if !was_interrupted {
+        grow_poor_regions(
+            perception,
+            &traces_for_rem,
+            &GrowthSignals {
+                per_region_mse,
+                per_region_count,
+                gist_recall_rate,
+                within_session_gist_rate,
+                warm_recall_l2,
                 cooldown_remaining,
-                gist_recall_rate = ?gist_recall_rate,
-                "growth suppressed by cooldown"
-            );
-        }
-        let region_ids = [
-            RegionId::AudioSpeech,
-            RegionId::AudioEnv,
-            RegionId::Visual,
-            RegionId::Symbolic,
-            RegionId::Language,
-        ];
-        if !growth_blocked {
-            // Cascade-correlation init (ADR 0007, P2b): collect high-residual inputs once
-            // before the growth loop so that any regions that trigger growth can use them.
-            // Cap at 2 × GROWTH_BATCH_MAX seeds per region to bound memory (worst case: every
-            // triggered region gets the largest possible batch).
-            let cc_seeds =
-                perception.collect_high_residual_inputs(&traces_for_rem, 2 * GROWTH_BATCH_MAX);
-
-            for (i, &region) in region_ids.iter().enumerate() {
-                // Quality signal: within-session gist primary (no drift); cross-session
-                // gist at c1 of any session (ws always None before first spill); MSE
-                // last resort when warm was empty (S1C1). Novelty mirrors the same
-                // three-way signal choice, feeding growth_batch_size (gaps.md §19)
-                // instead of the old flat GROWTH_BATCH.
-                let (quality_poor, novelty) = match (within_session_gist_rate, gist_recall_rate) {
-                    (Some(ws), _) => (
-                        ws < GIST_GROWTH_THRESHOLD,
-                        gist_novelty(ws, GIST_GROWTH_THRESHOLD),
-                    ),
-                    (None, Some(gr)) => (gist_poor, gist_novelty(gr, GIST_GROWTH_THRESHOLD)),
-                    (None, None) => (
-                        per_region_mse[i] > GROWTH_THRESHOLD,
-                        mse_novelty(per_region_mse[i], GROWTH_THRESHOLD),
-                    ),
-                };
-                if per_region_count[i] >= GROWTH_MIN_SAMPLES && quality_poor {
-                    let batch = growth_batch_size(novelty);
-                    tracing::info!(
-                        region = ?region,
-                        mse = per_region_mse[i],
-                        gist_recall_rate = ?gist_recall_rate,
-                        novelty,
-                        batch,
-                        seeds = cc_seeds[i].len(),
-                        "growing region (cascade-correlation)"
-                    );
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::GrowthBatchSize, batch as u64);
-                    perception.grow_region_seeded(region, batch, &cc_seeds[i]);
-                    regions_grown.push(region);
-                }
-            }
-        }
-
+            },
+        )
+    } else {
+        Vec::new()
+    };
+    if !was_interrupted {
         tracing::info!(
             speech_mse = per_region_mse[0],
             env_mse = per_region_mse[1],
