@@ -4,6 +4,30 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
+> **✅ CHECKPOINT (clean), 2026-10-17 (latest, end of day) — resume here.**
+> - **State:** all work committed on `main`, nothing pushed, working tree clean. Gates green (fmt, clippy default +
+>   fine-metrics, `cargo test --workspace`). Branches `tooling/convert-weights-pre0048` and `tooling/golden-021`
+>   hold the burn-migration tooling (see ADR 0049).
+> - **Done today (details in `ai-docs/gaps.md` §48/§49, ADRs 0049/0050):** burn 0.22 + flex + safetensors; atomic
+>   snapshot writes; ORT built once post-restore (+ the restore bug); thread budgets (wake wall 448 -> 336 s);
+>   `run_sleep_cycle` 1205 -> 260 lines and `run()` 2006 -> 405 (loop ~285) with `startup.rs`/`pipeline.rs`/
+>   `wake_state.rs`/`wake.rs`; KV-cache generation fixed for Qwen3 (R19, verified token-identical to the reference).
+> - **Decision waiting on the user — R1:** `measure_mse` and `collect_high_residual_inputs` (REM scoring passes) call
+>   `KWtaLayer::forward`, which advances k-WTA duty cycles (~16k spurious steps/cycle at 3.3k traces, several time
+>   constants at alpha=1/1000). History: `measure_mse` is from 2026-05-10; `forward_no_dc` came 2026-05-11 (ADR 0011,
+>   settling only); nothing documents the REM side effect, so it reads as accidental. Options: (a) switch both to
+>   `forward_no_dc`, run a 2-arm A/B on a campaign snapshot (fine-metrics on; compare mean_output_mse, per-region MSE,
+>   growth events, gist rates, duty-cycle stats; record deviations); (b) keep it, document as intended in an ADR note.
+>   **R4** (batch the REM scoring matmul: ~11.6 s + ~12 s/cycle) is queued behind it.
+> - **Still queued (user said keep):** ADR 0048 4-arm pilot (now runnable on a build with the restore fixes; use `--seed`,
+>   `SEED` defaults to 42 in `ab_*.sh`), R8 (k-WTA alloc/dedupe), R10 (cold append batch, not worthwhile today),
+>   moving the video encoder off MIGraphX (CPU EP measured 23 ms vs 54 ms isolated), other `ab_*` snapshot dirs still
+>   need conversion to safetensors (tool on `tooling/convert-weights-pre0048`).
+> - Habits to keep: run `cargo test` before committing (hook only runs fmt+clippy); after mechanical renames, diff the
+>   string-literal sets (two silent regressions were caught that way this session).
+>
+> ---
+>
 > **✅ CHECKPOINT (clean), 2026-10-17 (latest) — codebase review fix pass (gaps.md §49), ADR 0050.**
 > - Done: atomic snapshot writes (R2), single ORT build post-restore (R3), `ingest_region` + accessors (R11),
 >   `TensorF32Ext` (R12), `run_sleep_cycle` 1205 -> 260 lines with `SleepParams`/`SleepSignals` and an end-to-end
@@ -37,13 +61,6 @@
 >   not migrated (ffmpeg-next 9.0.0 is current). CI now also installs `ffmpeg` (media_file_it needs the CLI) -
 >   not yet confirmed green on the runner. Nothing pushed.
 > - **Still open:** ADR 0048 4-arm pilot, now worth running on this build (restore bug fixed).
->
-> ---
->
-> **✅ CHECKPOINT (clean), 2026-10-16 — repo sweep done, queue = `gaps.md` §48, most items fixed.**
-> - Sweep → `gaps.md` §48 (13 items); fix pass committed (`170aa76`, `b3b0136`, `badb099`, `9be497f`): `--seed` + `SEED` in A/B scripts, CI/hook run `cargo test --workspace` and fine-metrics clippy, `model_ref()` accessor, `cli.rs` split, new Core metric `nrem_stale_trace_skipped` (fired 2032× in a 2-cycle pilot — worth a look vs §33), scripts README/requirements.
-> - Not done on purpose: `run_sleep_cycle` split (needs golden-output test under fixed seed), pedantic lint churn. Open decision: burn 0.22/burn-flex and ffmpeg-the-third 6 migrations.
-> - **Still open:** ADR 0048 4-arm pilot not launched (use `--seed` now; SEED defaults to 42 in `ab_*.sh`).
 
 >
 > ---

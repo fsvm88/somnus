@@ -242,6 +242,16 @@ needs a measurement before acting.
 | R17 | Cleanup | Left: `status.py` (live process status) and `campaign_status.py` (campaign report) are different tools; KV-export scripts are model-specific copies. |
 | R18 | - | Left (upstream-driven). |
 
+**R1 in full (for resuming):** the question is whether the REM scoring passes should advance k-WTA duty cycles. Today
+`measure_mse` ("inference, no weight update") and `collect_high_residual_inputs` use `KWtaLayer::forward`, which updates
+`duty_cycle`; `forward_no_dc(&self)` exists for exactly this. One REM pass = ~1 duty-cycle step per trace per region (~16k
+per cycle at 3.3k traces; alpha = 1/1000, so several time constants), i.e. the REM traces' activation frequencies
+overwrite the wake-built duty cycles before the next wake phase. History: probe written 2026-05-10 (`69d1971`),
+`forward_no_dc` introduced 2026-05-11 for ADR 0011 settling; ADR 0011 states the ingest/settle rule but never the REM
+probes. Judged accidental, not proven. Decision needed: (a) switch to `forward_no_dc` + 2-arm A/B (current vs fixed; fine-metrics on;
+compare mean_output_mse, per-region MSE, growth events, gist rates, duty-cycle stats; record deviations), then R4 batches on
+top; or (b) keep and document as intended (R4 then batches while preserving the side effect, which is awkward).
+
 **Suggested order:** R1 (decide intent) and R2 (small, protects 250 MB state), R3, then R4+R7 together (measure R7 first), R14 -> R11/R13, R9 as a quick experiment, the rest opportunistically.
 
 ---
