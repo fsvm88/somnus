@@ -463,6 +463,29 @@ pub async fn run() -> Result<()> {
             .init();
     }
 
+    if args.convert_weights_to_safetensors {
+        let snap = args.memory_dir.join("snapshot");
+        let sizes = load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
+        let mut p = PerceptionProcessor::new(NdArrayDevice::Cpu);
+        p.convert_weights_to_safetensors(
+            &weights_path(&args.memory_dir),
+            sizes,
+            &snap.join("weights.safetensors"),
+        )?;
+        info!(?sizes, "perception weights converted");
+        let dec = snap.join("decoder_weights");
+        if dec.with_extension("bin").exists() {
+            action::convert_proj_weights_to_safetensors(
+                &dec,
+                &snap.join("decoder_weights.safetensors"),
+                args.linear_proj,
+                &NdArrayDevice::Cpu,
+            )?;
+            info!("decoder weights converted");
+        }
+        return Ok(());
+    }
+
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
 
     if let Some(seed) = args.seed {

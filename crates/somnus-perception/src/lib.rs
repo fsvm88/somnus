@@ -3314,6 +3314,67 @@ impl PerceptionProcessor {
         (ep.0, gru_h)
     }
 
+    /// Pre-grow regions to `sizes`, then load a safetensors weights file written by
+    /// `convert_weights_to_safetensors` (or `save_weights_safetensors`). Tensors missing from
+    /// the file (e.g. `wake_binding.*` in pre-ADR-0048 snapshots) keep their current values;
+    /// `wake_binding` is then synced from the loaded `binding`.
+    pub fn load_weights_safetensors_with_sizes(
+        &mut self,
+        path: &std::path::Path,
+        sizes: [usize; 5],
+    ) -> PerceptionResult<()> {
+        use burn_store::{ModuleSnapshot, SafetensorsStore};
+        let regions = [
+            RegionId::AudioSpeech,
+            RegionId::AudioEnv,
+            RegionId::Visual,
+            RegionId::Symbolic,
+            RegionId::Language,
+        ];
+        let current = self.region_sizes();
+        for (i, &region) in regions.iter().enumerate() {
+            if sizes[i] > current[i] {
+                self.grow_region(region, sizes[i] - current[i]);
+            }
+        }
+        let mut store = SafetensorsStore::from_file(path).allow_partial(true);
+        let result = self
+            .model_mut()
+            .load_from(&mut store)
+            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))?;
+        if !result.errors.is_empty() {
+            return Err(PerceptionError::Burn(format!("{:?}", result.errors)));
+        }
+        let m = self.model_mut();
+        m.binding.region_n = [
+            m.binding.region_0.weight.val().inner().dims()[0],
+            m.binding.region_1.weight.val().inner().dims()[0],
+            m.binding.region_2.weight.val().inner().dims()[0],
+            m.binding.region_3.weight.val().inner().dims()[0],
+            m.binding.region_4.weight.val().inner().dims()[0],
+        ];
+        m.wake_binding.region_n = m.binding.region_n;
+        self.sync_wake_binding();
+        self.ema_heads = EmaOutputHeads::from_model(self.model_ref());
+        Ok(())
+    }
+
+    /// One-shot migration helper (burn 0.21 only): load a legacy BinFile weights record
+    /// (pre-grown to `sizes`) and re-save it as safetensors for the burn 0.22 port.
+    pub fn convert_weights_to_safetensors(
+        &mut self,
+        src: &std::path::Path,
+        sizes: [usize; 5],
+        dst: &std::path::Path,
+    ) -> PerceptionResult<()> {
+        use burn_store::{ModuleSnapshot, SafetensorsStore};
+        self.load_weights_with_sizes(src, sizes)?;
+        let mut store = SafetensorsStore::from_file(dst);
+        self.model_ref()
+            .save_into(&mut store)
+            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))
+    }
+
     /// Pre-grow regions to `sizes`, then load weights.
     pub fn load_weights_with_sizes(
         &mut self,

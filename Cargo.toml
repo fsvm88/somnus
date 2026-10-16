@@ -28,6 +28,7 @@ burn               = { version = "0.21", default-features = false, features = ["
 # build-graph instance — dropping it (e.g. because no crate imports `burn_ndarray`
 # directly; NdArray/NdArrayDevice come from burn::backend instead) would silently lose
 # CPU threading. See [package.metadata.cargo-machete] in somnus/somnus-perception's Cargo.toml.
+burn-store         = { version = "0.21", default-features = false, features = ["std", "safetensors"] }
 burn-ndarray       = { version = "0.21", default-features = false, features = ["std", "multi-threads", "simd"] }
 safetensors        = "0.8"
 hnsw_rs            = "0.3"

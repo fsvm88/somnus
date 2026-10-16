@@ -225,6 +225,48 @@ struct ProjModel<B: burn::tensor::backend::Backend> {
     fc2: Linear<B>, // [PROJ_HIDDEN, N_REGIONS * LM_HIDDEN]
 }
 
+/// One-shot migration helper (burn 0.21 only): load a legacy BinFile projection record and
+/// re-save it as safetensors for the burn 0.22 port. Needs no ONNX sessions.
+pub(crate) fn convert_proj_weights_to_safetensors(
+    src_stem: &std::path::Path,
+    dst: &std::path::Path,
+    linear_proj: bool,
+    device: &NdArrayDevice,
+) -> Result<()> {
+    use burn_store::{ModuleSnapshot, SafetensorsStore};
+    let (fc1, fc2) = if linear_proj {
+        (
+            LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
+                .with_bias(false)
+                .init::<TrainB>(device),
+            LinearConfig::new(1, 1)
+                .with_bias(false)
+                .init::<TrainB>(device),
+        )
+    } else {
+        (
+            LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
+                .with_bias(false)
+                .init::<TrainB>(device),
+            LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
+                .with_bias(false)
+                .init::<TrainB>(device),
+        )
+    };
+    let model = ProjModel { fc1, fc2 };
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let src = src_stem
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 path"))?;
+    let loaded = model
+        .load_file(src, &recorder, device)
+        .map_err(|e| anyhow::anyhow!("load failed: {e}"))?;
+    let mut store = SafetensorsStore::from_file(dst);
+    loaded
+        .save_into(&mut store)
+        .map_err(|e| anyhow::anyhow!("safetensors save failed: {e:?}"))
+}
+
 pub struct ActionDecoder {
     model: Option<ProjModel<TrainB>>,
     optimizer: ProjOptim,

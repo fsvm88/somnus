@@ -23,6 +23,7 @@ ignored = ["burn-ndarray"]
 [dependencies]
 burn         = { workspace = true }
 burn-ndarray = { workspace = true }
+burn-store   = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
 serde_json   = { workspace = true }
