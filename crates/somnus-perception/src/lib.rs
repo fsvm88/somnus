@@ -234,6 +234,41 @@ pub struct PerceptionModel {
 }
 
 impl PerceptionModel {
+    /// k-WTA layer for region index `idx` (0 speech, 1 env, 2 visual, 3 symbolic, 4 language).
+    pub fn layer(&self, idx: usize) -> &KWtaLayer {
+        match idx {
+            0 => &self.speech_layer,
+            1 => &self.env_layer,
+            2 => &self.visual_layer,
+            3 => &self.symbolic_layer,
+            4 => &self.language_layer,
+            _ => unreachable!("region index {idx}"),
+        }
+    }
+
+    pub fn layer_mut(&mut self, idx: usize) -> &mut KWtaLayer {
+        match idx {
+            0 => &mut self.speech_layer,
+            1 => &mut self.env_layer,
+            2 => &mut self.visual_layer,
+            3 => &mut self.symbolic_layer,
+            4 => &mut self.language_layer,
+            _ => unreachable!("region index {idx}"),
+        }
+    }
+
+    /// SAE decoder for region index `idx`.
+    pub fn decoder(&self, idx: usize) -> &SaeDecoder {
+        match idx {
+            0 => &self.speech_decoder,
+            1 => &self.env_decoder,
+            2 => &self.visual_decoder,
+            3 => &self.symbolic_decoder,
+            4 => &self.language_decoder,
+            _ => unreachable!("region index {idx}"),
+        }
+    }
+
     pub fn new(device: &Device) -> Self {
         // wake_binding must start byte-identical to binding (ADR 0048). A plain
         // `binding.clone()` does NOT achieve this: burn's derived `Module` Clone
@@ -461,267 +496,87 @@ impl PerceptionProcessor {
     /// Ingest a 384-dim Whisper speech embedding.
     /// Updates AudioSpeech region, then recomputes Symbolic from all available cross-modal inputs.
     pub fn ingest_speech(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device.clone();
-        let gained_speech = apply_gain(values, self.region_gain[0]);
-        let (speech_input, speech_cos) = self.blend_with_prior(&gained_speech, 0);
-        if let Some(c) = speech_cos {
-            tracing::info!(region = "speech", prior_cosine = c, "top-down prior");
-        }
-
-        let (speech_err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
-            if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-                // ORT encoder recomputes all 5 regions in try_bind; skip burn forward.
-                // Bootstrap latest[0] if needed so try_bind gate can fire.
-                if self.latest[RegionId::AudioSpeech.as_index()].is_none() {
-                    let n = self.model_ref().speech_layer.n_units;
-                    self.latest[RegionId::AudioSpeech.as_index()] =
-                        Some(bootstrap_placeholder(RegionId::AudioSpeech, n));
-                }
-                0.0
-            } else {
-                let act = self
-                    .model
-                    .as_mut()
-                    .unwrap()
-                    .speech_layer
-                    .forward(&speech_input, &device);
-                let err = self
-                    .model
-                    .as_ref()
-                    .unwrap()
-                    .speech_decoder
-                    .reconstruction_error(values, &act, &device);
-                self.latest[RegionId::AudioSpeech.as_index()] = Some(act);
-                err
-            }
-        });
-        self.perf_kwta_us += d0.as_micros() as u64;
-        self.latest_inputs[RegionId::AudioSpeech.as_index()] = Some(values.to_vec());
-
-        let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestSymbolic,
-            self.compute_symbolic_cross_modal()
-        );
-        self.refresh_language_cache();
-        self.perf_symbolic_us += d1.as_micros() as u64;
-
-        let latest_ep = self.working_memory.back().cloned();
-        let ((episode, regional_inputs), d2) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestBind,
-            self.try_bind(latest_ep.as_ref())
-        );
-        self.perf_bind_us += d2.as_micros() as u64;
-
-        let ((episode, settle_iters, settle_delta), d3) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestPrior,
-            self.maybe_settle_and_update(episode, speech_cos)
-        );
-        self.perf_prior_us += d3.as_micros() as u64;
-
-        self.push_to_wm(&episode);
-
-        let mut prior_cosines = [None; 5];
-        prior_cosines[0] = speech_cos;
-        prior_cosines[3] = symbolic_cos;
-        Ok(PerceptionOutput {
-            recon_errors: vec![
-                (RegionId::AudioSpeech, speech_err),
-                (RegionId::Symbolic, symbolic_err),
-            ],
-            episode,
-            regional_inputs,
-            settle_iters,
-            settle_delta,
-            prior_cosines,
-        })
+        self.ingest_region(RegionId::AudioSpeech, values)
     }
 
     /// Ingest an ENV_DIM-dim env embedding (CLAP or mn10 depending on feature).
     pub fn ingest_env(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device.clone();
-        let gained = apply_gain(values, self.region_gain[1]);
-        let (input, cosine) = self.blend_with_prior(&gained, 1);
-        if let Some(c) = cosine {
-            tracing::info!(region = "env", prior_cosine = c, "top-down prior");
-        }
-
-        let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
-            if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-                if self.latest[RegionId::AudioEnv.as_index()].is_none() {
-                    let n = self.model_ref().env_layer.n_units;
-                    self.latest[RegionId::AudioEnv.as_index()] =
-                        Some(bootstrap_placeholder(RegionId::AudioEnv, n));
-                }
-                0.0
-            } else {
-                let act = self
-                    .model
-                    .as_mut()
-                    .unwrap()
-                    .env_layer
-                    .forward(&input, &device);
-                let e = self
-                    .model
-                    .as_ref()
-                    .unwrap()
-                    .env_decoder
-                    .reconstruction_error(values, &act, &device);
-                self.latest[RegionId::AudioEnv.as_index()] = Some(act);
-                e
-            }
-        });
-        self.perf_kwta_us += d0.as_micros() as u64;
-        self.latest_inputs[RegionId::AudioEnv.as_index()] = Some(values.to_vec());
-
-        let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestSymbolic,
-            self.compute_symbolic_cross_modal()
-        );
-        self.refresh_language_cache();
-        self.perf_symbolic_us += d1.as_micros() as u64;
-
-        let latest_ep = self.working_memory.back().cloned();
-        let ((episode, regional_inputs), d2) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestBind,
-            self.try_bind(latest_ep.as_ref())
-        );
-        self.perf_bind_us += d2.as_micros() as u64;
-
-        let ((episode, settle_iters, settle_delta), d3) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestPrior,
-            self.maybe_settle_and_update(episode, cosine)
-        );
-        self.perf_prior_us += d3.as_micros() as u64;
-
-        self.push_to_wm(&episode);
-
-        let mut prior_cosines = [None; 5];
-        prior_cosines[1] = cosine;
-        prior_cosines[3] = symbolic_cos;
-        Ok(PerceptionOutput {
-            recon_errors: vec![
-                (RegionId::AudioEnv, err),
-                (RegionId::Symbolic, symbolic_err),
-            ],
-            episode,
-            regional_inputs,
-            settle_iters,
-            settle_delta,
-            prior_cosines,
-        })
+        self.ingest_region(RegionId::AudioEnv, values)
     }
 
     /// Ingest a 384-dim DINOv2 visual embedding.
     pub fn ingest_visual(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device.clone();
-        let gained = apply_gain(values, self.region_gain[2]);
-        let (input, cosine) = self.blend_with_prior(&gained, 2);
-        if let Some(c) = cosine {
-            tracing::info!(region = "visual", prior_cosine = c, "top-down prior");
-        }
-
-        let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
-            if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-                if self.latest[RegionId::Visual.as_index()].is_none() {
-                    let n = self.model_ref().visual_layer.n_units;
-                    self.latest[RegionId::Visual.as_index()] =
-                        Some(bootstrap_placeholder(RegionId::Visual, n));
-                }
-                0.0
-            } else {
-                let act = self
-                    .model
-                    .as_mut()
-                    .unwrap()
-                    .visual_layer
-                    .forward(&input, &device);
-                let e = self
-                    .model
-                    .as_ref()
-                    .unwrap()
-                    .visual_decoder
-                    .reconstruction_error(values, &act, &device);
-                self.latest[RegionId::Visual.as_index()] = Some(act);
-                e
-            }
-        });
-        self.perf_kwta_us += d0.as_micros() as u64;
-        self.latest_inputs[RegionId::Visual.as_index()] = Some(values.to_vec());
-
-        let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestSymbolic,
-            self.compute_symbolic_cross_modal()
-        );
-        self.refresh_language_cache();
-        self.perf_symbolic_us += d1.as_micros() as u64;
-
-        let latest_ep = self.working_memory.back().cloned();
-        let ((episode, regional_inputs), d2) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestBind,
-            self.try_bind(latest_ep.as_ref())
-        );
-        self.perf_bind_us += d2.as_micros() as u64;
-
-        let ((episode, settle_iters, settle_delta), d3) = somnus_metrics::timed_core!(
-            somnus_metrics::Metric::IngestPrior,
-            self.maybe_settle_and_update(episode, cosine)
-        );
-        self.perf_prior_us += d3.as_micros() as u64;
-
-        self.push_to_wm(&episode);
-
-        let mut prior_cosines = [None; 5];
-        prior_cosines[2] = cosine;
-        prior_cosines[3] = symbolic_cos;
-        Ok(PerceptionOutput {
-            recon_errors: vec![(RegionId::Visual, err), (RegionId::Symbolic, symbolic_err)],
-            episode,
-            regional_inputs,
-            prior_cosines,
-            settle_iters,
-            settle_delta,
-        })
+        self.ingest_region(RegionId::Visual, values)
     }
 
     /// Ingest a LANG_HIDDEN-dim language embedding (mean-pooled LM hidden states / token embeddings).
     pub fn ingest_language(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
+        self.ingest_region(RegionId::Language, values)
+    }
+
+    /// Shared ingest pipeline for the four external modalities: gain -> top-down prior blend ->
+    /// k-WTA + reconstruction error (burn path, or a bootstrap placeholder when the ORT encoder
+    /// owns the forward) -> cross-modal symbolic -> bind -> settle/prior update -> working memory.
+    fn ingest_region(
+        &mut self,
+        region: RegionId,
+        values: &[f32],
+    ) -> PerceptionResult<PerceptionOutput> {
+        debug_assert_ne!(
+            region,
+            RegionId::Symbolic,
+            "symbolic is derived, never ingested"
+        );
         let device = self.device.clone();
-        self.last_language_input = Some(values.to_vec());
-        let gained = apply_gain(values, self.region_gain[4]);
-        let (input, cosine) = self.blend_with_prior(&gained, 4);
+        let idx = region.as_index();
+        let is_language = region == RegionId::Language;
+        if is_language {
+            self.last_language_input = Some(values.to_vec());
+        }
+        let gained = apply_gain(values, self.region_gain[idx]);
+        let (input, cosine) = self.blend_with_prior(&gained, idx);
         if let Some(c) = cosine {
-            tracing::info!(region = "language", prior_cosine = c, "top-down prior");
+            let label = match region {
+                RegionId::AudioSpeech => "speech",
+                RegionId::AudioEnv => "env",
+                RegionId::Visual => "visual",
+                RegionId::Symbolic => "symbolic",
+                RegionId::Language => "language",
+            };
+            tracing::info!(region = label, prior_cosine = c, "top-down prior");
         }
 
         let (err, d0) = somnus_metrics::timed_core!(somnus_metrics::Metric::IngestKwta, {
             if self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
-                // Language is not checked in the try_bind gate (indices 0-3 only),
-                // so no bootstrap needed; try_bind updates latest[4] via topk_from_z.
+                // ORT encoder recomputes all 5 regions in try_bind; skip burn forward.
+                // Bootstrap latest[idx] if needed so the try_bind gate can fire. Language is
+                // not checked in that gate (indices 0-3 only) and try_bind updates latest[4]
+                // via topk_from_z, so it needs no bootstrap.
+                if !is_language && self.latest[idx].is_none() {
+                    let n = self.model_ref().layer(idx).n_units;
+                    self.latest[idx] = Some(bootstrap_placeholder(region, n));
+                }
                 0.0
             } else {
-                let act = self
-                    .model
-                    .as_mut()
-                    .unwrap()
-                    .language_layer
-                    .forward(&input, &device);
+                let act = self.model_mut().layer_mut(idx).forward(&input, &device);
                 let e = self
-                    .model
-                    .as_ref()
-                    .unwrap()
-                    .language_decoder
+                    .model_ref()
+                    .decoder(idx)
                     .reconstruction_error(values, &act, &device);
-                self.latest[RegionId::Language.as_index()] = Some(act);
+                self.latest[idx] = Some(act);
                 e
             }
         });
         self.perf_kwta_us += d0.as_micros() as u64;
-        self.latest_inputs[RegionId::Language.as_index()] = Some(values.to_vec());
+        self.latest_inputs[idx] = Some(values.to_vec());
 
         let ((symbolic_cos, symbolic_err), d1) = somnus_metrics::timed_core!(
             somnus_metrics::Metric::IngestSymbolic,
             self.compute_symbolic_cross_modal()
         );
+        if !is_language {
+            self.refresh_language_cache();
+        }
         self.perf_symbolic_us += d1.as_micros() as u64;
 
         let latest_ep = self.working_memory.back().cloned();
@@ -740,18 +595,15 @@ impl PerceptionProcessor {
         self.push_to_wm(&episode);
 
         let mut prior_cosines = [None; 5];
-        prior_cosines[3] = symbolic_cos;
-        prior_cosines[4] = cosine;
+        prior_cosines[idx] = cosine;
+        prior_cosines[RegionId::Symbolic.as_index()] = symbolic_cos;
         Ok(PerceptionOutput {
-            recon_errors: vec![
-                (RegionId::Language, err),
-                (RegionId::Symbolic, symbolic_err),
-            ],
+            recon_errors: vec![(region, err), (RegionId::Symbolic, symbolic_err)],
             episode,
             regional_inputs,
-            prior_cosines,
             settle_iters,
             settle_delta,
+            prior_cosines,
         })
     }
 
@@ -1050,14 +902,7 @@ impl PerceptionProcessor {
                 if input.is_empty() {
                     continue;
                 }
-                let (act, z) = match region_idx {
-                    0 => model.speech_layer.forward_tracked(input, &device),
-                    1 => model.env_layer.forward_tracked(input, &device),
-                    2 => model.visual_layer.forward_tracked(input, &device),
-                    3 => model.symbolic_layer.forward_tracked(input, &device),
-                    4 => model.language_layer.forward_tracked(input, &device),
-                    _ => unreachable!(),
-                };
+                let (act, z) = model.layer_mut(region_idx).forward_tracked(input, &device);
 
                 let n = act.n_units;
                 let mut mask_vec = vec![0.0f32; n];
@@ -1072,14 +917,7 @@ impl PerceptionProcessor {
                 let target: Tensor<2> =
                     Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
 
-                let loss = match region_idx {
-                    0 => model.speech_decoder.mse_loss_batch(target, sparse_z),
-                    1 => model.env_decoder.mse_loss_batch(target, sparse_z),
-                    2 => model.visual_decoder.mse_loss_batch(target, sparse_z),
-                    3 => model.symbolic_decoder.mse_loss_batch(target, sparse_z),
-                    4 => model.language_decoder.mse_loss_batch(target, sparse_z),
-                    _ => unreachable!(),
-                };
+                let loss = model.decoder(region_idx).mse_loss_batch(target, sparse_z);
 
                 total_loss = Some(match total_loss {
                     None => loss,
@@ -1175,14 +1013,7 @@ impl PerceptionProcessor {
                 let target: Tensor<2> =
                     Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
 
-                let region_loss = match region_idx {
-                    0 => model.speech_decoder.mse_loss_batch(target, sparse_z),
-                    1 => model.env_decoder.mse_loss_batch(target, sparse_z),
-                    2 => model.visual_decoder.mse_loss_batch(target, sparse_z),
-                    3 => model.symbolic_decoder.mse_loss_batch(target, sparse_z),
-                    4 => model.language_decoder.mse_loss_batch(target, sparse_z),
-                    _ => unreachable!(),
-                };
+                let region_loss = model.decoder(region_idx).mse_loss_batch(target, sparse_z);
 
                 total_loss = Some(match total_loss {
                     None => region_loss,
@@ -1348,24 +1179,10 @@ impl PerceptionProcessor {
                 let flat: Vec<f32> = valid.iter().flat_map(|(_, v)| v.iter().copied()).collect();
                 let input_batch: Tensor<2> =
                     Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
-                let (z_batch, flat_masks) = match region_idx {
-                    0 => model
-                        .speech_layer
-                        .forward_tracked_batch(input_batch, b, batch_topk),
-                    1 => model
-                        .env_layer
-                        .forward_tracked_batch(input_batch, b, batch_topk),
-                    2 => model
-                        .visual_layer
-                        .forward_tracked_batch(input_batch, b, batch_topk),
-                    3 => model
-                        .symbolic_layer
-                        .forward_tracked_batch(input_batch, b, batch_topk),
-                    4 => model
-                        .language_layer
-                        .forward_tracked_batch(input_batch, b, batch_topk),
-                    _ => unreachable!(),
-                };
+                let (z_batch, flat_masks) =
+                    model
+                        .layer_mut(region_idx)
+                        .forward_tracked_batch(input_batch, b, batch_topk);
                 let n_units = flat_masks.len() / b;
                 let z_flat: Vec<f32> = z_batch.to_f32_vec();
                 for (j, &(sample_i, _)) in valid.iter().enumerate() {
@@ -1644,34 +1461,9 @@ impl PerceptionProcessor {
                         let input_batch: Tensor<2> =
                             Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
 
-                        let (z_batch, flat_masks) = match region_idx {
-                            0 => model.speech_layer.forward_tracked_batch(
-                                input_batch.clone(),
-                                b,
-                                batch_topk,
-                            ),
-                            1 => model.env_layer.forward_tracked_batch(
-                                input_batch.clone(),
-                                b,
-                                batch_topk,
-                            ),
-                            2 => model.visual_layer.forward_tracked_batch(
-                                input_batch.clone(),
-                                b,
-                                batch_topk,
-                            ),
-                            3 => model.symbolic_layer.forward_tracked_batch(
-                                input_batch.clone(),
-                                b,
-                                batch_topk,
-                            ),
-                            4 => model.language_layer.forward_tracked_batch(
-                                input_batch.clone(),
-                                b,
-                                batch_topk,
-                            ),
-                            _ => unreachable!(),
-                        };
+                        let (z_batch, flat_masks) = model
+                            .layer_mut(region_idx)
+                            .forward_tracked_batch(input_batch.clone(), b, batch_topk);
 
                         let n_units = flat_masks.len() / b;
                         let mask_inner: Tensor<2> =
@@ -1686,14 +1478,7 @@ impl PerceptionProcessor {
                         let target: Tensor<2> =
                             Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
 
-                        let mse_loss = match region_idx {
-                            0 => model.speech_decoder.mse_loss_batch(target, sparse_z),
-                            1 => model.env_decoder.mse_loss_batch(target, sparse_z),
-                            2 => model.visual_decoder.mse_loss_batch(target, sparse_z),
-                            3 => model.symbolic_decoder.mse_loss_batch(target, sparse_z),
-                            4 => model.language_decoder.mse_loss_batch(target, sparse_z),
-                            _ => unreachable!(),
-                        };
+                        let mse_loss = model.decoder(region_idx).mse_loss_batch(target, sparse_z);
                         let region_loss = match l1_term {
                             Some(l1) => mse_loss + l1.mul_scalar(sae_l1_coeff),
                             None => mse_loss,
@@ -1986,33 +1771,13 @@ impl PerceptionProcessor {
                 }
                 let act = {
                     let model = self.model_mut();
-                    match idx {
-                        0 => model.speech_layer.forward(input, &device),
-                        1 => model.env_layer.forward(input, &device),
-                        2 => model.visual_layer.forward(input, &device),
-                        3 => model.symbolic_layer.forward(input, &device),
-                        4 => model.language_layer.forward(input, &device),
-                        _ => unreachable!(),
-                    }
+                    model.layer_mut(idx).forward(input, &device)
                 };
                 let err = {
                     let model = self.model_ref();
-                    match idx {
-                        0 => model
-                            .speech_decoder
-                            .reconstruction_error(input, &act, &device),
-                        1 => model.env_decoder.reconstruction_error(input, &act, &device),
-                        2 => model
-                            .visual_decoder
-                            .reconstruction_error(input, &act, &device),
-                        3 => model
-                            .symbolic_decoder
-                            .reconstruction_error(input, &act, &device),
-                        4 => model
-                            .language_decoder
-                            .reconstruction_error(input, &act, &device),
-                        _ => unreachable!(),
-                    }
+                    model
+                        .decoder(idx)
+                        .reconstruction_error(input, &act, &device)
                 };
                 result[idx] = err;
             }
@@ -2062,14 +1827,7 @@ impl PerceptionProcessor {
                 .map(|(&x, &y)| alpha * x + (1.0 - alpha) * y)
                 .collect();
             let model = self.model_ref();
-            acts[i] = Some(match i {
-                0 => model.speech_layer.forward_no_dc(&blended, &device),
-                1 => model.env_layer.forward_no_dc(&blended, &device),
-                2 => model.visual_layer.forward_no_dc(&blended, &device),
-                3 => model.symbolic_layer.forward_no_dc(&blended, &device),
-                4 => model.language_layer.forward_no_dc(&blended, &device),
-                _ => unreachable!(),
-            });
+            acts[i] = Some(model.layer(i).forward_no_dc(&blended, &device));
         }
         let (a0, a1, a2, a3) = match (&acts[0], &acts[1], &acts[2], &acts[3]) {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
@@ -2425,22 +2183,8 @@ impl PerceptionProcessor {
                         }
                         let (act, recon) = {
                             let model = self.model_mut();
-                            let act = match idx {
-                                0 => model.speech_layer.forward(input, &device),
-                                1 => model.env_layer.forward(input, &device),
-                                2 => model.visual_layer.forward(input, &device),
-                                3 => model.symbolic_layer.forward(input, &device),
-                                4 => model.language_layer.forward(input, &device),
-                                _ => unreachable!(),
-                            };
-                            let recon = match idx {
-                                0 => model.speech_decoder.reconstruct(&act, &device),
-                                1 => model.env_decoder.reconstruct(&act, &device),
-                                2 => model.visual_decoder.reconstruct(&act, &device),
-                                3 => model.symbolic_decoder.reconstruct(&act, &device),
-                                4 => model.language_decoder.reconstruct(&act, &device),
-                                _ => unreachable!(),
-                            };
+                            let act = model.layer_mut(idx).forward(input, &device);
+                            let recon = model.decoder(idx).reconstruct(&act, &device);
                             (act, recon)
                         };
                         let _ = act;
@@ -3352,14 +3096,7 @@ impl PerceptionProcessor {
                                     (1.0 - self.settle_beta) * r + self.settle_beta * p * amp
                                 })
                                 .collect();
-                            acts[i] = Some(match i {
-                                0 => model.speech_layer.forward_no_dc(&blended, &device),
-                                1 => model.env_layer.forward_no_dc(&blended, &device),
-                                2 => model.visual_layer.forward_no_dc(&blended, &device),
-                                3 => model.symbolic_layer.forward_no_dc(&blended, &device),
-                                4 => model.language_layer.forward_no_dc(&blended, &device),
-                                _ => unreachable!(),
-                            });
+                            acts[i] = Some(model.layer(i).forward_no_dc(&blended, &device));
                         }
                     }
                 } // model borrow dropped
