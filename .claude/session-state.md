@@ -4,7 +4,26 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **✅ CHECKPOINT (clean), 2026-10-16 (latest) — repo sweep done, queue = `gaps.md` §48, most items fixed.**
+> **✅ CHECKPOINT (clean), 2026-10-16 (latest, later) — Q11 done: burn 0.22 + burn-flex + safetensors (ADR 0049).**
+> - Merged to `main` from branch `burn-0.22`. Device-based API, flex with rayon requested via a direct
+>   `burn-flex` dep, weights now `*.safetensors` (burn-store). Parity vs 0.21 on real converted weights:
+>   0 diffs at rtol 1e-3 (`scripts/compare_golden.py`, `ai-docs/research/burn-021-golden.json`).
+> - **Three pre-existing bugs found and fixed on the way:** (1) every pre-ADR-0048 snapshot was
+>   unloadable on `main`; (2) `wake_binding` GRU/temporal_proj never synced from `binding`; (3) the ORT
+>   binding session was exported from random weights BEFORE the snapshot restore, so every restored
+>   run's first wake phase inferred on random weights (cycle-1 per_region_mse .075 -> .002 after the fix).
+>   All earlier restored §33 pilots are affected by (3).
+> - Converted snapshots written next to the originals: `/data/somnus/memory/snapshot/` and
+>   `ab_binding_replay_freeze_heads_cpu/control/snapshot/` only; other `ab_*` dirs still need
+>   `tooling/convert-weights-pre0048` (branch). Originals untouched.
+> - Queue: gaps §48 Q14 (size rayon's pool vs ORT; `encode_video` +28%/call observed). ffmpeg-the-third
+>   not migrated (ffmpeg-next 9.0.0 is current). CI now also installs `ffmpeg` (media_file_it needs the CLI) -
+>   not yet confirmed green on the runner. Nothing pushed.
+> - **Still open:** ADR 0048 4-arm pilot, now worth running on this build (restore bug fixed).
+>
+> ---
+>
+> **✅ CHECKPOINT (clean), 2026-10-16 — repo sweep done, queue = `gaps.md` §48, most items fixed.**
 > - Sweep → `gaps.md` §48 (13 items); fix pass committed (`170aa76`, `b3b0136`, `badb099`, `9be497f`): `--seed` + `SEED` in A/B scripts, CI/hook run `cargo test --workspace` and fine-metrics clippy, `model_ref()` accessor, `cli.rs` split, new Core metric `nrem_stale_trace_skipped` (fired 2032× in a 2-cycle pilot — worth a look vs §33), scripts README/requirements.
 > - Not done on purpose: `run_sleep_cycle` split (needs golden-output test under fixed seed), pedantic lint churn. Open decision: burn 0.22/burn-flex and ffmpeg-the-third 6 migrations.
 > - **Still open:** ADR 0048 4-arm pilot not launched (use `--seed` now; SEED defaults to 42 in `ab_*.sh`).
@@ -49,45 +68,6 @@
 > - **Still open, unchanged from last checkpoint:** ADR 0048's 4-arm binding-wake-lag validation
 >   pilot has not been launched — needs a decision from the user on when to run it.
 > - **All work committed and pushed** as of this checkpoint (`db4b5b3` is HEAD).
->
-> ---
->
-> **✅ CHECKPOINT (clean), 2026-09-13 — §33 candidate (e) implemented: decoupled
-> wake-time binding snapshot (ADR 0048). Not yet piloted.**
-> - **Scoped, reviewed, then implemented directly** (not delegated to opencode/Lemonade — its
->   first real attempt on this file was destructive, deleted an existing struct field, then blew
->   its 65280-token context window on the very next step; reverted via `git checkout` and built by
->   hand per the director-mode escape valve).
-> - **What changed:** `PerceptionModel` gains `wake_binding: BindingArea<TrainB>`. New
->   `sync_wake_binding()` hard-copies the 8 live-trained tensors (region_0..4, w_q/w_k/w_v) from
->   `binding` into `wake_binding`. All wake-time call sites (`try_bind`/`settle_episode`/
->   `binding_only`, plus `export_weights_for_onnx`) now read `wake_binding`, never `binding`
->   directly. `grow_region`/`grow_region_seeded`/`prune_region` reshape both copies in lockstep
->   (shape never lags, only trained values do). New CLI flag `--binding-wake-lag-cycles` (default
->   1 = today's always-immediate behavior). 2 new unit tests (`wake_binding_stays_frozen_until_synced`,
->   `growth_and_prune_keep_binding_and_wake_binding_in_lockstep`) plus a regression pin for a real
->   burn quirk found during the build.
-> - **Two implementation-time findings, not caught by review** (both fixed, documented in ADR
->   0048's "Implementation findings"): (1) `binding.clone()` does NOT preserve materialized weight
->   values — burn's derived `Linear`/`Module` `Clone` re-runs each `Param`'s lazy random
->   initializer independently per clone (confirmed empirically, now a regression test); fixed by
->   explicitly copying each trained tensor's `.val()` at construction, same pattern as
->   `sync_wake_binding`. (2) The sync gate must NOT be conditioned on `--binding-replay`:
->   `homeostatic_decay` (`sleep.rs:896`) mutates the trained binding tensors every cycle
->   unconditionally, so gating on the flag would leave `wake_binding` frozen forever on the
->   default/production path (binding-replay off). Also caught: `binding_only`'s `gru_hidden`
->   readback needed to switch to `wake_binding` too (missed in the original scoping pass, found by
->   re-grepping every `.gru_hidden` site after the call-site swap).
-> - **Verified:** `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, and the full test
->   suite all clean in both feature configs (default and `fine-metrics`) across `somnus-perception`
->   and `somnus`. Live smoke run (`--binding-replay --binding-wake-lag-cycles 2`, small clip set)
->   completed 2 full sleep cycles with no errors.
-> - **Not done: the actual validation pilot.** ADR 0048's plan (4-arm sweep: control, lag=1
->   baseline, lag=10, lag=30, over 30-50 cycles, `mean_output_mse` reported as a cycle-range trend
->   rather than one aggregate mean) has not been run — needs a decision from the user on when to
->   launch it, since it's a real campaign-affecting pilot.
-> - **All work committed** — `gaps.md` §33, ADR 0048, and this checkpoint updated in the same
->   session; code changes committed separately per the usual code/docs split.
 
 >
 > ---

@@ -1,9 +1,9 @@
 /// Export somnus's own growable region/binding weight matrices from a trained checkpoint,
 /// as raw f32 files + a manifest, for an offline SVD effective-rank check (numpy side).
 ///
-/// Loads `<memory_dir>/snapshot/{region_sizes.bin,weights.bin}` (pre-growing regions to
+/// Loads `<memory_dir>/snapshot/{region_sizes.bin,weights.safetensors}` (pre-growing regions to
 /// match the saved sizes, same as the live system does on restore), then dumps via
-/// `export_weights_for_onnx`. Does not touch decoder_weights.bin (ActionDecoder) — this
+/// `export_weights_for_onnx`. Does not touch decoder_weights.safetensors (ActionDecoder) — this
 /// checks somnus's own region/binding weights, not the LM-side projection.
 ///
 /// Run: cargo run --release -p somnus-perception --bin svd_rank_check -- <memory_dir> <out_dir>

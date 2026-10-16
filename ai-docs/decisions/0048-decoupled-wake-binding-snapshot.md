@@ -16,7 +16,11 @@
   equal; they did not). A restored session therefore ran its wake path on fresh random temporal
   weights, differing from the saved `binding` and from run to run. Fixed by
   `BindingArea::copy_temporal_from` (construction + every `sync_wake_binding`). Any ADR 0048 pilot
-  must run on a build with this fix.
+  must run on a build with this fix. **Second correction (same day):** every restored run's first
+  wake phase used an ORT binding session exported from random weights (built before the snapshot
+  restore; fixed in ADR 0049), which also affects all earlier §33 pilots that restored a snapshot.
+  And the lag counter restarts at 0 on every process start, while a 0.22 snapshot now persists the
+  lagged `wake_binding` itself.
 
 ## Implementation findings (2026-09-13, during the build — corrections to the plan above)
 

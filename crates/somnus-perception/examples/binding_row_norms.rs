@@ -6,14 +6,14 @@
 //! control arm stays exactly zero (ADR 0041 "Validation plan" / "What would
 //! invalidate this").
 //!
-//! Usage: cargo run -p somnus-perception --release --example binding_row_norms -- <weights.bin>
+//! Usage: cargo run -p somnus-perception --release --example binding_row_norms -- <weights.safetensors>
 use burn::tensor::Device;
 use somnus_perception::{PerceptionProcessor, RegionId, N_UNITS};
 
 fn main() {
     let weights = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| panic!("usage: binding_row_norms <weights.bin>"));
+        .unwrap_or_else(|| panic!("usage: binding_row_norms <weights.safetensors>"));
     let weights_path = std::path::Path::new(&weights);
     let sizes_str =
         std::fs::read_to_string(weights_path.with_extension("sizes")).expect("read .sizes sidecar");
