@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{Gru, GruConfig, Linear, LinearConfig},
-    tensor::{activation, backend::Backend, Int, Tensor, TensorData},
+    tensor::{activation, Device, Int, Tensor, TensorData},
 };
 
 use crate::region::{SparseActivation, N_UNITS};
@@ -40,22 +40,22 @@ pub struct EpisodeVector(pub Vec<f32>);
 /// Order: [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
 /// The Language slot is zero-padded when no text embedding is available.
 #[derive(Module, Debug)]
-pub struct BindingArea<B: Backend> {
+pub struct BindingArea {
     /// Per-region input projections: N_UNITS → D_PROJ (5 separate fields for derive compat).
-    pub(crate) region_0: Linear<B>,
-    pub(crate) region_1: Linear<B>,
-    pub(crate) region_2: Linear<B>,
-    pub(crate) region_3: Linear<B>,
-    pub(crate) region_4: Linear<B>,
-    pub(crate) w_q: Linear<B>,
-    pub(crate) w_k: Linear<B>,
-    pub(crate) w_v: Linear<B>,
+    pub(crate) region_0: Linear,
+    pub(crate) region_1: Linear,
+    pub(crate) region_2: Linear,
+    pub(crate) region_3: Linear,
+    pub(crate) region_4: Linear,
+    pub(crate) w_q: Linear,
+    pub(crate) w_k: Linear,
+    pub(crate) w_v: Linear,
     /// GRU over recent episode sequence → temporal context token for K/V.
     /// Replaces the old WM mean-vector approach with a learned recurrence.
-    pub(crate) temporal_gru: Gru<B>,
+    pub(crate) temporal_gru: Gru,
     /// Projects GRU final hidden state [GRU_HIDDEN] → [EPISODE_DIM] so it can
     /// be reshaped to [5, D_PROJ] and appended to K and V.
-    pub(crate) temporal_proj: Linear<B>,
+    pub(crate) temporal_proj: Linear,
     /// Cached GRU hidden state from the previous forward pass (Vec<f32>, [1 × GRU_HIDDEN]).
     /// Fed as the initial state when a new episode arrives, so the GRU only processes one
     /// step per ingest instead of re-running the full WM window each time.
@@ -67,8 +67,37 @@ pub struct BindingArea<B: Backend> {
     pub(crate) region_n: [usize; 5],
 }
 
-impl<B: Backend> BindingArea<B> {
-    pub fn new(device: &B::Device) -> Self {
+impl BindingArea {
+    /// Hard-copy the GRU gates and `temporal_proj` from `src` (plain value copy; fresh `ParamId`s,
+    /// no autodiff link). Neither `BindingArea` copy trains these, but they are *randomly
+    /// initialised per instance*, so without this copy `wake_binding`'s temporal path would
+    /// differ from the (saved/restored) `binding` one — and change on every process start.
+    pub(crate) fn copy_temporal_from(&mut self, src: &Self) {
+        use burn::module::{Param, ParamId};
+        fn copy_linear(dst: &mut Linear, src: &Linear) {
+            dst.weight = Param::initialized(ParamId::new(), src.weight.val());
+            if let (Some(d), Some(s)) = (dst.bias.as_mut(), src.bias.as_ref()) {
+                *d = Param::initialized(ParamId::new(), s.val());
+            }
+        }
+        for (d, s) in [
+            (
+                &mut self.temporal_gru.update_gate,
+                &src.temporal_gru.update_gate,
+            ),
+            (
+                &mut self.temporal_gru.reset_gate,
+                &src.temporal_gru.reset_gate,
+            ),
+            (&mut self.temporal_gru.new_gate, &src.temporal_gru.new_gate),
+        ] {
+            copy_linear(&mut d.input_transform, &s.input_transform);
+            copy_linear(&mut d.hidden_transform, &s.hidden_transform);
+        }
+        copy_linear(&mut self.temporal_proj, &src.temporal_proj);
+    }
+
+    pub fn new(device: &Device) -> Self {
         let proj = || {
             LinearConfig::new(N_UNITS, D_PROJ)
                 .with_bias(false)
@@ -109,7 +138,7 @@ impl<B: Backend> BindingArea<B> {
         &mut self,
         acts: &[&SparseActivation; 5],
         new_episode: Option<&Vec<f32>>,
-        device: &B::Device,
+        device: &Device,
     ) -> EpisodeVector {
         let (ep, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::BindingForward, {
             self.forward_inner(acts, new_episode, device)
@@ -121,51 +150,51 @@ impl<B: Backend> BindingArea<B> {
         &mut self,
         acts: &[&SparseActivation; 5],
         new_episode: Option<&Vec<f32>>,
-        device: &B::Device,
+        device: &Device,
     ) -> EpisodeVector {
         // Stack current region tokens: [5, D_PROJ]
-        let x: Tensor<B, 2> = self.project_regions(acts, device);
+        let x: Tensor<2> = self.project_regions(acts, device);
 
         // Q from current regions only: [5, D_PROJ]
-        let q: Tensor<B, 2> = self.w_q.forward(x.clone());
+        let q: Tensor<2> = self.w_q.forward(x.clone());
 
         // K and V: current regions + optional GRU temporal context token.
         // One GRU step with cached hidden state — O(1) instead of O(wm_size).
         let (k, v) = if let Some(ep) = new_episode {
-            let seq_t: Tensor<B, 3> =
+            let seq_t: Tensor<3> =
                 Tensor::from_data(TensorData::new(ep.clone(), [1, 1, EPISODE_DIM]), device);
-            let init_hidden: Option<Tensor<B, 2>> = self
+            let init_hidden: Option<Tensor<2>> = self
                 .gru_hidden
                 .as_ref()
                 .map(|h| Tensor::from_data(TensorData::new(h.clone(), [1, GRU_HIDDEN]), device));
-            let gru_out: Tensor<B, 3> = self.temporal_gru.forward(seq_t, init_hidden);
-            let hidden: Tensor<B, 2> = gru_out.narrow(1, 0, 1).squeeze_dim::<2>(1);
+            let gru_out: Tensor<3> = self.temporal_gru.forward(seq_t, init_hidden);
+            let hidden: Tensor<2> = gru_out.narrow(1, 0, 1).squeeze_dim::<2>(1);
             // Cache hidden state for the next call.
             self.gru_hidden = Some(
                 hidden
                     .clone()
                     .into_data()
                     .convert::<f32>()
-                    .to_vec()
+                    .try_to_vec::<f32>()
                     .unwrap(),
             );
             // Project → [1, EPISODE_DIM] → reshape → [5, D_PROJ]
-            let ctx: Tensor<B, 2> = self.temporal_proj.forward(hidden);
-            let ctx_tokens: Tensor<B, 2> = ctx.reshape([5, D_PROJ]);
-            let x_ext: Tensor<B, 2> = Tensor::cat(vec![x, ctx_tokens], 0); // [10, D_PROJ]
+            let ctx: Tensor<2> = self.temporal_proj.forward(hidden);
+            let ctx_tokens: Tensor<2> = ctx.reshape([5, D_PROJ]);
+            let x_ext: Tensor<2> = Tensor::cat(vec![x, ctx_tokens], 0); // [10, D_PROJ]
             (self.w_k.forward(x_ext.clone()), self.w_v.forward(x_ext))
         } else {
             (self.w_k.forward(x.clone()), self.w_v.forward(x))
         };
 
-        let out: Tensor<B, 2> = self.attend(q, k, v);
+        let out: Tensor<2> = self.attend(q, k, v);
 
         // Flatten [5, D_PROJ] → [EPISODE_DIM]
         let flat: Vec<f32> = out
             .flatten::<1>(0, 1)
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         EpisodeVector(flat)
     }
@@ -183,23 +212,19 @@ impl<B: Backend> BindingArea<B> {
     /// Deliberately NOT wrapped in `BindingForward`: that metric tracks wake-path binding
     /// cost, and mixing training calls into it would pollute the A/B comparison ADR 0041
     /// is gated on. The enclosing training step has its own metric (`NremBindingReplay`).
-    pub fn forward_tracked(
-        &mut self,
-        acts: &[&SparseActivation; 5],
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
-        let x: Tensor<B, 2> = self.project_regions(acts, device);
-        let q: Tensor<B, 2> = self.w_q.forward(x.clone());
-        let k: Tensor<B, 2> = self.w_k.forward(x.clone());
-        let v: Tensor<B, 2> = self.w_v.forward(x);
-        let out: Tensor<B, 2> = self.attend(q, k, v);
+    pub fn forward_tracked(&mut self, acts: &[&SparseActivation; 5], device: &Device) -> Tensor<2> {
+        let x: Tensor<2> = self.project_regions(acts, device);
+        let q: Tensor<2> = self.w_q.forward(x.clone());
+        let k: Tensor<2> = self.w_k.forward(x.clone());
+        let v: Tensor<2> = self.w_v.forward(x);
+        let out: Tensor<2> = self.attend(q, k, v);
         out.flatten::<1>(0, 1).reshape([1, EPISODE_DIM])
     }
 
     /// Project each region's sparse activation to a D_PROJ token and stack them to
     /// `[5, D_PROJ]`. Shared by the inference (`forward_inner`) and training
     /// (`forward_tracked`) paths.
-    fn project_regions(&self, acts: &[&SparseActivation; 5], device: &B::Device) -> Tensor<B, 2> {
+    fn project_regions(&self, acts: &[&SparseActivation; 5], device: &Device) -> Tensor<2> {
         let region_projs = [
             &self.region_0,
             &self.region_1,
@@ -215,19 +240,19 @@ impl<B: Backend> BindingArea<B> {
         // values. Same result (region_projs have no bias, see `new()`), ~n/k_active fewer
         // FLOPs, and `select` is autodiff-tracked so gradients still flow to just the
         // active weight rows (gaps.md §25).
-        let projected: Vec<Tensor<B, 2>> = acts
+        let projected: Vec<Tensor<2>> = acts
             .iter()
             .zip(region_projs.iter())
             .map(|(act, proj)| {
                 if act.indices.is_empty() {
-                    return Tensor::<B, 2>::zeros([1, D_PROJ], device);
+                    return Tensor::<2>::zeros([1, D_PROJ], device);
                 }
                 let idx_data: Vec<i64> = act.indices.iter().map(|&i| i as i64).collect();
                 let k = idx_data.len();
-                let idx_t: Tensor<B, 1, Int> =
+                let idx_t: Tensor<1, Int> =
                     Tensor::from_data(TensorData::new(idx_data, [k]), device);
                 let gathered = proj.weight.val().select(0, idx_t); // [k, D_PROJ]
-                let vals_t: Tensor<B, 2> =
+                let vals_t: Tensor<2> =
                     Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), device);
                 vals_t.matmul(gathered) // [1, D_PROJ]
             })
@@ -239,21 +264,21 @@ impl<B: Backend> BindingArea<B> {
     /// Multi-head scaled dot-product attention over the region tokens. Q is always the
     /// 5 current-region tokens; K/V may be extended with the GRU temporal context token
     /// on the inference path. Returns `[5, D_PROJ]`.
-    fn attend(&self, q: Tensor<B, 2>, k: Tensor<B, 2>, v: Tensor<B, 2>) -> Tensor<B, 2> {
+    fn attend(&self, q: Tensor<2>, k: Tensor<2>, v: Tensor<2>) -> Tensor<2> {
         // Reshape: [seq, D_PROJ] → [seq, N_HEADS, D_HEAD] → [N_HEADS, seq, D_HEAD].
         // The feature axis is split contiguously: head h sees features [h*D_HEAD..(h+1)*D_HEAD]
         // of every token. Reshape order must be [seq, N_HEADS, D_HEAD] first (not
         // [N_HEADS, seq, D_HEAD]) to avoid interleaving tokens across heads.
         let seq_k = k.dims()[0]; // 5 without temporal context, 10 with
-        let q3: Tensor<B, 3> = q.reshape([5, N_HEADS, D_HEAD]).swap_dims(0, 1);
-        let k3: Tensor<B, 3> = k.reshape([seq_k, N_HEADS, D_HEAD]).swap_dims(0, 1);
-        let v3: Tensor<B, 3> = v.reshape([seq_k, N_HEADS, D_HEAD]).swap_dims(0, 1);
+        let q3: Tensor<3> = q.reshape([5, N_HEADS, D_HEAD]).swap_dims(0, 1);
+        let k3: Tensor<3> = k.reshape([seq_k, N_HEADS, D_HEAD]).swap_dims(0, 1);
+        let v3: Tensor<3> = v.reshape([seq_k, N_HEADS, D_HEAD]).swap_dims(0, 1);
         let scale = (D_HEAD as f32).sqrt().recip();
         // scores: [N_HEADS, 5, seq_k]
-        let scores3: Tensor<B, 3> = q3.matmul(k3.swap_dims(1, 2)).mul_scalar(scale);
-        let attn3: Tensor<B, 3> = activation::softmax(scores3, 2);
-        let out3: Tensor<B, 3> = attn3.matmul(v3); // [N_HEADS, 5, D_HEAD]
-                                                   // Merge: [N_HEADS, 5, D_HEAD] → [5, N_HEADS, D_HEAD] → [5, D_PROJ]
+        let scores3: Tensor<3> = q3.matmul(k3.swap_dims(1, 2)).mul_scalar(scale);
+        let attn3: Tensor<3> = activation::softmax(scores3, 2);
+        let out3: Tensor<3> = attn3.matmul(v3); // [N_HEADS, 5, D_HEAD]
+                                                // Merge: [N_HEADS, 5, D_HEAD] → [5, N_HEADS, D_HEAD] → [5, D_PROJ]
         out3.swap_dims(0, 1).reshape([5, D_PROJ])
     }
 }
@@ -262,11 +287,10 @@ impl<B: Backend> BindingArea<B> {
 mod tests {
     use super::*;
     use crate::region::RegionId;
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::NdArray;
+    use burn::tensor::Device;
 
-    fn make_area() -> BindingArea<NdArray> {
-        let device = NdArrayDevice::Cpu;
+    fn make_area() -> BindingArea {
+        let device = Device::flex();
         BindingArea::new(&device)
     }
 
@@ -290,7 +314,7 @@ mod tests {
 
     #[test]
     fn output_is_episode_dim() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut area = make_area();
         let acts = [
             &dummy_act(RegionId::AudioSpeech),
@@ -306,7 +330,7 @@ mod tests {
 
     #[test]
     fn zero_language_slot_is_finite() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut area = make_area();
         let ep = area.forward(
             &[
@@ -327,7 +351,7 @@ mod tests {
     /// cache produces a finite, distinct output from the no-context case.
     #[test]
     fn output_with_temporal_context_is_finite_and_differs() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut area = make_area();
         let acts = [
             &dummy_act(RegionId::AudioSpeech),
@@ -359,7 +383,7 @@ mod tests {
     /// interleaved across heads instead of contiguously partitioned.
     #[test]
     fn different_head_slices_produce_different_outputs() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut area = make_area();
 
         // Build two activations that differ only in which D_HEAD feature block is active.
@@ -397,7 +421,7 @@ mod tests {
     /// hand-rolled dense reference computed independently of `BindingArea::forward`.
     #[test]
     fn sparse_projection_matches_dense_reference() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let area = make_area();
         let act = SparseActivation {
             region: RegionId::AudioSpeech,
@@ -408,17 +432,15 @@ mod tests {
 
         // Reference: old dense path (to_dense_n + full Linear::forward).
         let dense = act.to_dense_n(N_UNITS);
-        let dense_t: Tensor<NdArray, 2> =
-            Tensor::from_data(TensorData::new(dense, [1, N_UNITS]), &device);
+        let dense_t: Tensor<2> = Tensor::from_data(TensorData::new(dense, [1, N_UNITS]), &device);
         let dense_out = area.region_0.forward(dense_t);
 
         // Sparse path: gather only the active rows and contract against the nonzero values.
         let idx_data: Vec<i64> = act.indices.iter().map(|&i| i as i64).collect();
         let k = idx_data.len();
-        let idx_t: Tensor<NdArray, 1, Int> =
-            Tensor::from_data(TensorData::new(idx_data, [k]), &device);
+        let idx_t: Tensor<1, Int> = Tensor::from_data(TensorData::new(idx_data, [k]), &device);
         let gathered = area.region_0.weight.val().select(0, idx_t);
-        let vals_t: Tensor<NdArray, 2> =
+        let vals_t: Tensor<2> =
             Tensor::from_data(TensorData::new(act.values.clone(), [1, k]), &device);
         let sparse_out = vals_t.matmul(gathered);
 
@@ -429,7 +451,7 @@ mod tests {
 
     #[test]
     fn output_differs_with_different_inputs() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut area = make_area();
         let zero = zero_act(RegionId::Visual);
         let active = dummy_act(RegionId::Visual);
@@ -468,7 +490,7 @@ mod tests {
     /// path relies on, since NREM replay traces are temporally unordered.
     #[test]
     fn forward_tracked_matches_forward_none_and_is_stateless() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut area = make_area();
         let acts = [
             dummy_act(RegionId::AudioSpeech),
@@ -495,7 +517,7 @@ mod tests {
             .flatten::<1>(0, 1)
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(ep_t_vec.len(), EPISODE_DIM);
         assert_eq!(
@@ -505,47 +527,41 @@ mod tests {
     }
 }
 
-/// Regression pin for a non-obvious burn quirk found while implementing ADR 0048
-/// (gaps.md §33): `Linear::clone()` does NOT preserve a materialized weight
-/// value — it re-runs `Param`'s lazy random initializer independently per clone,
-/// even though bare `Tensor::clone()` does preserve values correctly. This is why
-/// `PerceptionModel::new()` seeds `wake_binding` by explicitly copying each
-/// trained tensor's `.val()` into a fresh `Param::initialized(...)` rather than
-/// `binding.clone()` — if this test ever starts passing on `assert_ne`, burn's
-/// `Param`/`Module` clone semantics have changed and `PerceptionModel::new()`'s
-/// explicit-copy workaround may have become unnecessary (or, if it flips the
-/// other direction, insufficient).
+/// Regression pin for burn's `Linear::clone()` semantics (found while implementing ADR 0048,
+/// gaps.md §33). In burn 0.21 `Linear::clone()` did NOT preserve a materialized weight value (it
+/// re-ran `Param`'s lazy random initializer per clone), which is why `PerceptionModel::new()`
+/// seeds `wake_binding` by explicitly copying each trained tensor's `.val()` into a fresh
+/// `Param::initialized(...)`. burn 0.22 fixed this: clones preserve values, and this test pins
+/// that. The explicit copy stays (it is harmless and does not depend on clone semantics); if this
+/// test ever flips back, that copy is required again.
 #[cfg(test)]
 mod burn_linear_clone_quirk {
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::NdArray;
     use burn::nn::LinearConfig;
+    use burn::tensor::Device;
 
     #[test]
-    fn linear_clone_does_not_preserve_materialized_values() {
-        let device = NdArrayDevice::Cpu;
-        let lin = LinearConfig::new(10, 10)
-            .with_bias(false)
-            .init::<NdArray>(&device);
+    fn linear_clone_preserves_materialized_values() {
+        let device = Device::flex();
+        let lin = LinearConfig::new(10, 10).with_bias(false).init(&device);
         let cloned = lin.clone();
         let a: Vec<f32> = lin
             .weight
             .val()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         let b: Vec<f32> = cloned
             .weight
             .val()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             a, b,
-            "burn's Linear::clone() now preserves values — re-check PerceptionModel::new()'s \
-             explicit wake_binding seeding workaround (ADR 0048), it may no longer be needed"
+            "burn's Linear::clone() no longer preserves values (the 0.21 behavior) — \
+             PerceptionModel::new()'s explicit wake_binding seeding is required again (ADR 0048)"
         );
     }
 }

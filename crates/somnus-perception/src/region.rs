@@ -1,10 +1,7 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{
-        backend::{AutodiffBackend, Backend},
-        Tensor, TensorData,
-    },
+    tensor::{Device, Tensor, TensorData},
 };
 
 pub const N_UNITS: usize = 1024;
@@ -97,8 +94,8 @@ impl SparseActivation {
 /// Generic over backend B. The training-path methods (forward_tracked,
 /// forward_tracked_batch) are in a separate impl block requiring AutodiffBackend.
 #[derive(Module, Debug)]
-pub struct KWtaLayer<B: Backend> {
-    pub linear: Linear<B>,
+pub struct KWtaLayer {
+    pub linear: Linear,
     #[module(skip)]
     pub region: RegionId,
     #[module(skip)]
@@ -112,8 +109,8 @@ pub struct KWtaLayer<B: Backend> {
     pub duty_cycle: Vec<f32>,
 }
 
-impl<B: Backend> KWtaLayer<B> {
-    pub fn new(region: RegionId, n_in: usize, device: &B::Device) -> Self {
+impl KWtaLayer {
+    pub fn new(region: RegionId, n_in: usize, device: &Device) -> Self {
         let linear = LinearConfig::new(n_in, N_UNITS)
             .with_bias(false)
             .init(device);
@@ -126,12 +123,12 @@ impl<B: Backend> KWtaLayer<B> {
         }
     }
 
-    pub fn forward(&mut self, input: &[f32], device: &B::Device) -> SparseActivation {
+    pub fn forward(&mut self, input: &[f32], device: &Device) -> SparseActivation {
         let data = TensorData::new(input.to_vec(), [1, input.len()]);
-        let t = Tensor::<B, 2>::from_data(data, device);
-        let z: Tensor<B, 2> =
+        let t = Tensor::<2>::from_data(data, device);
+        let z: Tensor<2> =
             somnus_metrics::timed!(somnus_metrics::Metric::KwtaScoreMatmul, self.linear.forward(t));
-        let z_vec: Vec<f32> = z.into_data().convert::<f32>().to_vec().unwrap();
+        let z_vec: Vec<f32> = z.into_data().convert::<f32>().try_to_vec::<f32>().unwrap();
         self.select_top_k(z_vec)
     }
 
@@ -139,11 +136,11 @@ impl<B: Backend> KWtaLayer<B> {
     ///
     /// Use during settling iterations so multiple passes per encoder input
     /// do not inflate the effective duty-cycle learning rate (ADR 0011).
-    pub fn forward_no_dc(&self, input: &[f32], device: &B::Device) -> SparseActivation {
+    pub fn forward_no_dc(&self, input: &[f32], device: &Device) -> SparseActivation {
         let data = TensorData::new(input.to_vec(), [1, input.len()]);
-        let t = Tensor::<B, 2>::from_data(data, device);
-        let z: Tensor<B, 2> = self.linear.forward(t);
-        let z_vec: Vec<f32> = z.into_data().convert::<f32>().to_vec().unwrap();
+        let t = Tensor::<2>::from_data(data, device);
+        let z: Tensor<2> = self.linear.forward(t);
+        let z_vec: Vec<f32> = z.into_data().convert::<f32>().try_to_vec::<f32>().unwrap();
         self.select_top_k_no_dc(z_vec)
     }
 
@@ -229,7 +226,7 @@ impl<B: Backend> KWtaLayer<B> {
 }
 
 /// Training-path methods: require AutodiffBackend so `.detach()` is available.
-impl<B: AutodiffBackend> KWtaLayer<B> {
+impl KWtaLayer {
     /// Forward pass that returns the tracked z tensor for backprop.
     ///
     /// Returns `(activation, z_tensor)` where z_tensor has shape `[1, n_units]`.
@@ -238,18 +235,18 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
     pub fn forward_tracked(
         &mut self,
         input: &[f32],
-        device: &B::Device,
-    ) -> (SparseActivation, Tensor<B, 2>) {
+        device: &Device,
+    ) -> (SparseActivation, Tensor<2>) {
         let data = TensorData::new(input.to_vec(), [1, input.len()]);
-        let t = Tensor::<B, 2>::from_data(data, device);
-        let z: Tensor<B, 2> = self.linear.forward(t); // [1, n_units], tracked
+        let t = Tensor::<2>::from_data(data, device);
+        let z: Tensor<2> = self.linear.forward(t); // [1, n_units], tracked
 
         let z_vec: Vec<f32> = z
             .clone()
             .detach()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let act = self.select_top_k(z_vec);
@@ -265,18 +262,18 @@ impl<B: AutodiffBackend> KWtaLayer<B> {
     /// Duty cycles are updated per-sample in batch order.
     pub fn forward_tracked_batch(
         &mut self,
-        input_batch: Tensor<B, 2>,
+        input_batch: Tensor<2>,
         b: usize,
         batch_topk: bool,
-    ) -> (Tensor<B, 2>, Vec<f32>) {
-        let z_batch: Tensor<B, 2> = self.linear.forward(input_batch); // [B, n_units]
+    ) -> (Tensor<2>, Vec<f32>) {
+        let z_batch: Tensor<2> = self.linear.forward(input_batch); // [B, n_units]
 
         let z_vals: Vec<f32> = z_batch
             .clone()
             .detach()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let n = self.n_units;
@@ -540,17 +537,16 @@ pub mod hierarchical_validation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::NdArray;
+    use burn::tensor::Device;
 
-    fn make_layer(region: RegionId, n_in: usize) -> KWtaLayer<NdArray> {
-        let device = NdArrayDevice::Cpu;
+    fn make_layer(region: RegionId, n_in: usize) -> KWtaLayer {
+        let device = Device::flex();
         KWtaLayer::new(region, n_in, &device)
     }
 
     #[test]
     fn kwta_produces_exactly_k_active() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut layer = make_layer(RegionId::Visual, 384);
         let input = vec![0.5f32; 384];
         let act = layer.forward(&input, &device);
@@ -582,7 +578,7 @@ mod tests {
 
     #[test]
     fn kwta_indices_sorted_and_in_range() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut layer = make_layer(RegionId::AudioEnv, 512);
         let input: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
         let act = layer.forward(&input, &device);
@@ -596,7 +592,7 @@ mod tests {
 
     #[test]
     fn to_dense_has_correct_nonzero_count() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let mut layer = make_layer(RegionId::AudioSpeech, 384);
         let input = vec![1.0f32; 384];
         let act = layer.forward(&input, &device);

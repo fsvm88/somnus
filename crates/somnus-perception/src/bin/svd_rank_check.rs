@@ -8,7 +8,7 @@
 ///
 /// Run: cargo run --release -p somnus-perception --bin svd_rank_check -- <memory_dir> <out_dir>
 /// Then: scripts/.venv/bin/python3 scripts/svd_rank_check.py <out_dir>
-use burn::backend::ndarray::NdArrayDevice;
+use burn::tensor::Device;
 use somnus_perception::PerceptionProcessor;
 use std::path::PathBuf;
 
@@ -39,8 +39,8 @@ fn main() {
     let sizes = load_region_sizes(&memory_dir);
     println!("Region sizes from checkpoint: {sizes:?}");
 
-    let device = NdArrayDevice::Cpu;
-    let mut proc = PerceptionProcessor::new(device);
+    let device = Device::flex();
+    let mut proc = PerceptionProcessor::new(device.clone());
 
     let weights_path = memory_dir.join("snapshot").join("weights");
     proc.load_weights_with_sizes(&weights_path, sizes)

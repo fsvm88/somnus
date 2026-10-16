@@ -12,11 +12,11 @@
 ///   travelling via the data (the §24 drift bug class)
 #[cfg(test)]
 mod tests {
-    use burn::backend::ndarray::NdArrayDevice;
+    use burn::tensor::Device;
     use somnus_perception::{PerceptionProcessor, RegionId, EPISODE_DIM, N_UNITS, REGION_DIMS};
 
     fn make_proc() -> PerceptionProcessor {
-        PerceptionProcessor::new(NdArrayDevice::Cpu)
+        PerceptionProcessor::new(Device::flex())
     }
 
     fn regional_inputs() -> [Vec<f32>; 5] {

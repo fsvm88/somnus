@@ -7,7 +7,7 @@
 //! invalidate this").
 //!
 //! Usage: cargo run -p somnus-perception --release --example binding_row_norms -- <weights.bin>
-use burn::backend::ndarray::NdArrayDevice;
+use burn::tensor::Device;
 use somnus_perception::{PerceptionProcessor, RegionId, N_UNITS};
 
 fn main() {
@@ -24,7 +24,7 @@ fn main() {
         .try_into()
         .expect("5 region sizes");
 
-    let mut proc = PerceptionProcessor::new(NdArrayDevice::Cpu);
+    let mut proc = PerceptionProcessor::new(Device::flex());
     proc.load_weights_with_sizes(weights_path, sizes)
         .expect("load weights");
 

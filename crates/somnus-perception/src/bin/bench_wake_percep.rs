@@ -4,7 +4,7 @@
 /// wake_reconstruct_step individually to characterise the real bottleneck.
 ///
 /// Run: cargo run --release -p somnus-perception --bin bench_wake_percep
-use burn::backend::ndarray::NdArrayDevice;
+use burn::tensor::Device;
 use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
 use std::time::Instant;
 
@@ -23,8 +23,8 @@ fn rand_vec(len: usize, seed: &mut u64) -> Vec<f32> {
 }
 
 fn main() {
-    let device = NdArrayDevice::Cpu;
-    let mut proc = PerceptionProcessor::new(device);
+    let device = Device::flex();
+    let mut proc = PerceptionProcessor::new(device.clone());
     proc.set_settle_steps(1);
     proc.set_settle_beta(0.5);
 

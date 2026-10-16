@@ -9,16 +9,10 @@
 /// mean(text_target_embeddings) from text-bypass queries.
 use anyhow::{bail, Result};
 use burn::{
-    backend::{
-        ndarray::{NdArray, NdArrayDevice},
-        Autodiff,
-    },
     module::Module,
     nn::{Linear, LinearConfig},
-    optim::adaptor::OptimizerAdaptor,
-    optim::{AdamW, AdamWConfig, GradientsParams, Optimizer},
-    record::{BinFileRecorder, FullPrecisionSettings},
-    tensor::{activation, Tensor, TensorData},
+    optim::{AdamWConfig, GradientsParams, ModuleOptimizer},
+    tensor::{activation, Device, Tensor, TensorData},
 };
 use ndarray::{Array2, Array3, ArrayView4};
 use ort::{
@@ -213,62 +207,56 @@ struct ConvTurn {
     response_ids: Vec<u32>,
 }
 
-type TrainB = Autodiff<NdArray>;
-type ProjOptim = OptimizerAdaptor<AdamW, ProjModel<TrainB>, TrainB>;
+type ProjOptim = ModuleOptimizer;
 
 /// MLP hidden dimension for the 2-layer episode projection (ADR 0032).
 const PROJ_HIDDEN: usize = 1024;
 
 #[derive(Module, Debug)]
-struct ProjModel<B: burn::tensor::backend::Backend> {
-    fc1: Linear<B>, // [EPISODE_DIM, PROJ_HIDDEN]
-    fc2: Linear<B>, // [PROJ_HIDDEN, N_REGIONS * LM_HIDDEN]
+struct ProjModel {
+    fc1: Linear, // [EPISODE_DIM, PROJ_HIDDEN]
+    fc2: Linear, // [PROJ_HIDDEN, N_REGIONS * LM_HIDDEN]
 }
 
-/// One-shot migration helper (burn 0.21 only): load a legacy BinFile projection record and
-/// re-save it as safetensors for the burn 0.22 port. Needs no ONNX sessions.
-pub(crate) fn convert_proj_weights_to_safetensors(
-    src_stem: &std::path::Path,
-    dst: &std::path::Path,
-    linear_proj: bool,
-    device: &NdArrayDevice,
-) -> Result<()> {
-    use burn_store::{ModuleSnapshot, SafetensorsStore};
-    let (fc1, fc2) = if linear_proj {
-        (
-            LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
+impl ProjModel {
+    fn new(device: &Device, linear_proj: bool) -> Self {
+        let (fc1, fc2) = if linear_proj {
+            // Control arm: single linear layer EPISODE_DIM → N_REGIONS*LM_HIDDEN, fc2 unused (1→1 dummy).
+            let fc1 = LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
                 .with_bias(false)
-                .init::<TrainB>(device),
-            LinearConfig::new(1, 1)
+                .init(device);
+            let fc2 = LinearConfig::new(1, 1).with_bias(false).init(device);
+            (fc1, fc2)
+        } else {
+            let fc1 = LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
                 .with_bias(false)
-                .init::<TrainB>(device),
-        )
-    } else {
-        (
-            LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
+                .init(device);
+            let fc2 = LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
                 .with_bias(false)
-                .init::<TrainB>(device),
-            LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
-                .with_bias(false)
-                .init::<TrainB>(device),
-        )
-    };
-    let model = ProjModel { fc1, fc2 };
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let src = src_stem
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF8 path"))?;
-    let loaded = model
-        .load_file(src, &recorder, device)
-        .map_err(|e| anyhow::anyhow!("load failed: {e}"))?;
-    let mut store = SafetensorsStore::from_file(dst);
-    loaded
-        .save_into(&mut store)
-        .map_err(|e| anyhow::anyhow!("safetensors save failed: {e:?}"))
+                .init(device);
+            (fc1, fc2)
+        };
+        Self { fc1, fc2 }
+    }
+}
+
+/// Re-wraps every parameter as a fresh autodiff leaf (used after loading weights, whose tensors
+/// carry no autodiff association).
+struct Retrack;
+
+impl burn::module::ModuleMapper for Retrack {
+    fn map_float<const D: usize>(
+        &mut self,
+        param: burn::module::Param<Tensor<D>>,
+    ) -> burn::module::Param<Tensor<D>> {
+        let (id, tensor, mapper) = param.consume();
+        let fresh = tensor.inner().autodiff().require_grad();
+        burn::module::Param::from_mapped_value(id, fresh, mapper)
+    }
 }
 
 pub struct ActionDecoder {
-    model: Option<ProjModel<TrainB>>,
+    model: Option<ProjModel>,
     optimizer: ProjOptim,
     /// Frozen embedding table: flat [vocab_size * LM_HIDDEN], row-major f32.
     embed_table: Vec<f32>,
@@ -301,7 +289,7 @@ pub struct ActionDecoder {
     /// 2-layer MLP. A/B control arm for ADR 0032 validation (--linear-proj flag).
     linear_proj: bool,
     tokenizer: Tokenizer,
-    device: NdArrayDevice,
+    device: Device,
     /// Cross-cycle LM hidden-state cache. Clips loop so token sequences repeat; after the first
     /// cycle each unique text pays the ORT cost exactly once for the lifetime of the session.
     lm_hidden_cache: std::collections::HashMap<Vec<u32>, Vec<f32>>,
@@ -316,7 +304,7 @@ impl ActionDecoder {
     /// The model is `None` only while moved into an optimizer step (`take()` / put-back);
     /// any access in that window is a logic bug, so fail with a message that says so.
     #[inline]
-    fn model_ref(&self) -> &ProjModel<TrainB> {
+    fn model_ref(&self) -> &ProjModel {
         self.model
             .as_ref()
             .expect("ActionDecoder.model accessed while taken for an optimizer step")
@@ -334,7 +322,7 @@ impl ActionDecoder {
     /// (see ai-docs/a_b_qwen3_findings.md).
     pub fn new(
         models_dir: &std::path::Path,
-        device: NdArrayDevice,
+        device: Device,
         ort_profile_dir: Option<&std::path::Path>,
         gpu_generation: bool,
         linear_proj: bool,
@@ -356,12 +344,14 @@ impl ActionDecoder {
 
     fn new_inner(
         models_dir: &std::path::Path,
-        device: NdArrayDevice,
+        device: Device,
         ort_profile_dir: Option<&std::path::Path>,
         gpu_generation: bool,
         linear_proj: bool,
         model_prefix: &str,
     ) -> Result<Self> {
+        // Training state lives on the autodiff-enabled device (autodiff is a device property in burn 0.22).
+        let device = device.autodiff();
         let gain_path = models_dir.join(format!("{model_prefix}_gain.onnx"));
         let lm_path = models_dir.join(format!("{model_prefix}_lm.onnx"));
         let embed_path = models_dir.join(format!("{model_prefix}_embed_table.safetensors"));
@@ -446,26 +436,8 @@ impl ActionDecoder {
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
 
-        let (fc1, fc2) = if linear_proj {
-            // Control arm: single linear layer EPISODE_DIM → N_REGIONS*LM_HIDDEN, fc2 unused (1→1 dummy).
-            let fc1 = LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
-                .with_bias(false)
-                .init::<TrainB>(&device);
-            let fc2 = LinearConfig::new(1, 1)
-                .with_bias(false)
-                .init::<TrainB>(&device);
-            (fc1, fc2)
-        } else {
-            let fc1 = LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
-                .with_bias(false)
-                .init::<TrainB>(&device);
-            let fc2 = LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
-                .with_bias(false)
-                .init::<TrainB>(&device);
-            (fc1, fc2)
-        };
-        let model = ProjModel { fc1, fc2 };
-        let optimizer: ProjOptim = AdamWConfig::new().init::<TrainB, ProjModel<TrainB>>();
+        let model = ProjModel::new(&device, linear_proj);
+        let optimizer: ProjOptim = AdamWConfig::new().init();
         let kv_cache = {
             let vocab_size = embed_table.len() / LM_HIDDEN;
             let mut kv = KvCache::new();
@@ -724,7 +696,7 @@ impl ActionDecoder {
 
         // Burn forward pass (with grad tracking).
         let ep_data = TensorData::new(episode.to_vec(), [1, EPISODE_DIM]);
-        let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
+        let ep_t: Tensor<2> = Tensor::from_data(ep_data, &self.device);
 
         let model = self.model_ref();
         let proj_out = if self.linear_proj {
@@ -741,10 +713,10 @@ impl ActionDecoder {
 
         // Detached text target tensor.
         let text_data = TensorData::new(text_mean, [1, LM_HIDDEN]);
-        let text_unit: Tensor<TrainB, 2> = Tensor::from_data(text_data, &self.device);
+        let text_unit: Tensor<2> = Tensor::from_data(text_data, &self.device);
 
         let loss = (proj_unit - text_unit).powf_scalar(2.0).mean();
-        let loss_val: f32 = loss.clone().into_scalar();
+        let loss_val: f32 = loss.clone().into_scalar::<f32>();
 
         // Take/replace pattern for the optimizer step.
         let model = self.model.take().unwrap();
@@ -859,7 +831,7 @@ impl ActionDecoder {
             .iter()
             .flat_map(|(ep, _)| ep.iter().copied())
             .collect();
-        let ep_t: Tensor<TrainB, 2> =
+        let ep_t: Tensor<2> =
             Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
 
         let model = self.model_ref();
@@ -876,10 +848,10 @@ impl ActionDecoder {
         let proj_unit = proj_sum / norm; // [N, LM_HIDDEN]
 
         let text_data = TensorData::new(text_targets, [n, LM_HIDDEN]);
-        let text_unit: Tensor<TrainB, 2> = Tensor::from_data(text_data, &self.device);
+        let text_unit: Tensor<2> = Tensor::from_data(text_data, &self.device);
 
         let loss = (proj_unit - text_unit).powf_scalar(2.0).mean();
-        let loss_val: f32 = loss.clone().into_scalar();
+        let loss_val: f32 = loss.clone().into_scalar::<f32>();
 
         let model = self.model.take().unwrap();
         let grads = loss.backward();
@@ -911,7 +883,7 @@ impl ActionDecoder {
             .iter()
             .flat_map(|(ep, _)| ep.iter().copied())
             .collect();
-        let ep_t: Tensor<TrainB, 2> =
+        let ep_t: Tensor<2> =
             Tensor::from_data(TensorData::new(flat_eps, [n, EPISODE_DIM]), &self.device);
 
         let model = self.model_ref();
@@ -928,11 +900,11 @@ impl ActionDecoder {
         let proj_unit = proj_sum / norm; // [N, LM_HIDDEN], L2-normalised
 
         // Targets are already normalised; load as detached tensor.
-        let target_t: Tensor<TrainB, 2> =
+        let target_t: Tensor<2> =
             Tensor::from_data(TensorData::new(flat_hidden, [n, LM_HIDDEN]), &self.device);
 
         let loss = (proj_unit - target_t).powf_scalar(2.0).mean();
-        let loss_val: f32 = loss.clone().into_scalar();
+        let loss_val: f32 = loss.clone().into_scalar::<f32>();
 
         let model = self.model.take().unwrap();
         let grads = loss.backward();
@@ -978,7 +950,7 @@ impl ActionDecoder {
             .val()
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let norm_sq: f32 = if self.linear_proj {
             w1.iter().map(|x| x * x).sum()
@@ -989,7 +961,7 @@ impl ActionDecoder {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             w1.iter().chain(w2.iter()).map(|x| x * x).sum()
         };
@@ -1023,7 +995,7 @@ impl ActionDecoder {
             .detach()
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         if self.linear_proj {
             return w1;
@@ -1035,7 +1007,7 @@ impl ActionDecoder {
             .detach()
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let mut out = Vec::with_capacity(w1.len() + w2.len());
         out.extend(w1);
@@ -1043,54 +1015,46 @@ impl ActionDecoder {
         out
     }
 
-    /// Save projection weights to a burn binary file.
+    /// Save projection weights as safetensors (`<path>.safetensors`).
     pub fn save_weights(&self, path: &std::path::Path) -> Result<()> {
-        let model_clone = self.model_ref().clone();
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-UTF8 path"))?;
-        model_clone
-            .save_file(path_str, &recorder)
-            .map_err(|e| anyhow::anyhow!("save_weights failed: {e}"))
+        use burn_store::{ModuleSnapshot, SafetensorsStore};
+        let mut store = SafetensorsStore::from_file(path.with_extension("safetensors"));
+        self.model_ref()
+            .save_into(&mut store)
+            .map_err(|e| anyhow::anyhow!("save_weights failed: {e:?}"))
     }
 
-    /// Load projection weights from a burn binary file.
+    /// Load projection weights from `<path>.safetensors`. On failure the model is replaced by
+    /// a fresh one so callers remain functional (cold-starting the projection).
     pub fn load_weights(&mut self, path: &std::path::Path) -> Result<()> {
-        // Extract path string before taking the model so a bad-path error
-        // doesn't leave self.model = None.
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-UTF8 path"))?;
-        let model = self.model.take().unwrap();
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        match model.load_file(path_str, &recorder, &self.device) {
-            Ok(loaded) => {
-                self.model = Some(loaded);
+        use burn_store::{ModuleSnapshot, SafetensorsStore};
+        let mut store = SafetensorsStore::from_file(path.with_extension("safetensors"));
+        let result = self
+            .model
+            .as_mut()
+            .expect("ActionDecoder.model accessed while taken for an optimizer step")
+            .load_from(&mut store)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
+            .and_then(|r| {
+                if r.errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("{:?}", r.errors))
+                }
+            });
+        match result {
+            Ok(()) => {
+                // Loaded tensors carry no autodiff association: re-wrap every parameter as a
+                // fresh tracked leaf, and reset the optimizer state to match.
+                let model = self.model.take().expect("model present");
+                self.model = Some(model.map(&mut Retrack));
+                self.optimizer = AdamWConfig::new().init();
                 Ok(())
             }
             Err(e) => {
-                // load_file consumes the model; restore a fresh one so callers remain
-                // functional after a failed weight restore.
                 tracing::warn!("decoder weight restore failed (cold-starting projection): {e}");
-                let (fc1, fc2) = if self.linear_proj {
-                    let fc1 = LinearConfig::new(EPISODE_DIM, N_REGIONS * LM_HIDDEN)
-                        .with_bias(false)
-                        .init::<TrainB>(&self.device);
-                    let fc2 = LinearConfig::new(1, 1)
-                        .with_bias(false)
-                        .init::<TrainB>(&self.device);
-                    (fc1, fc2)
-                } else {
-                    let fc1 = LinearConfig::new(EPISODE_DIM, PROJ_HIDDEN)
-                        .with_bias(false)
-                        .init::<TrainB>(&self.device);
-                    let fc2 = LinearConfig::new(PROJ_HIDDEN, N_REGIONS * LM_HIDDEN)
-                        .with_bias(false)
-                        .init::<TrainB>(&self.device);
-                    (fc1, fc2)
-                };
-                self.model = Some(ProjModel { fc1, fc2 });
+                self.model = Some(ProjModel::new(&self.device, self.linear_proj));
+                self.optimizer = AdamWConfig::new().init();
                 Err(anyhow::anyhow!("load_weights failed: {e}"))
             }
         }
@@ -1314,14 +1278,18 @@ impl ActionDecoder {
     fn project_flat(&self, episode: &[f32]) -> Result<Vec<f32>> {
         let model = self.model_ref();
         let ep_data = TensorData::new(episode.to_vec(), [1, EPISODE_DIM]);
-        let ep_t: Tensor<TrainB, 2> = Tensor::from_data(ep_data, &self.device);
+        let ep_t: Tensor<2> = Tensor::from_data(ep_data, &self.device);
         let proj = if self.linear_proj {
             model.fc1.forward(ep_t) // [1, N_REGIONS * LM_HIDDEN]
         } else {
             let h = activation::relu(model.fc1.forward(ep_t)); // [1, PROJ_HIDDEN]
             model.fc2.forward(h) // [1, N_REGIONS * LM_HIDDEN]
         };
-        let flat = proj.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let flat = proj
+            .into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .unwrap();
         Ok(flat)
     }
 
@@ -1507,6 +1475,59 @@ fn argmax(logits: &[f32]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ProjModel safetensors round trip: tensor names are the on-disk contract with snapshots
+    /// converted from burn 0.21 (`fc1.weight`, `fc2.weight`), values survive, and the reloaded
+    /// params are fresh autodiff leaves (a gradient reaches them).
+    #[test]
+    fn proj_model_safetensors_round_trip_and_retrack() {
+        use burn_store::{ModuleSnapshot, SafetensorsStore};
+        let device = Device::flex().autodiff();
+        let src = ProjModel::new(&device, true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.safetensors");
+        src.clone()
+            .save_into(&mut SafetensorsStore::from_file(&path))
+            .unwrap();
+        let header_len = u64::from_le_bytes(std::fs::read(&path).unwrap()[..8].try_into().unwrap());
+        let header =
+            String::from_utf8(std::fs::read(&path).unwrap()[8..8 + header_len as usize].to_vec())
+                .unwrap();
+        assert!(header.contains("\"fc1.weight\"") && header.contains("\"fc2.weight\""));
+
+        let mut dst = ProjModel::new(&device, true);
+        let r = dst
+            .load_from(&mut SafetensorsStore::from_file(&path))
+            .unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let dst = dst.map(&mut Retrack);
+        let a = src
+            .fc1
+            .weight
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let b = dst
+            .fc1
+            .weight
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert_eq!(a, b);
+
+        let x: Tensor<2> = Tensor::from_data(
+            TensorData::new(vec![0.5f32; EPISODE_DIM], [1, EPISODE_DIM]),
+            &device,
+        );
+        let loss = dst.fc1.forward(x).powf_scalar(2.0).mean();
+        let grads = loss.backward();
+        assert!(
+            dst.fc1.weight.val().grad(&grads).is_some(),
+            "no gradient reached reloaded param"
+        );
+    }
 
     #[test]
     fn argmax_basic() {

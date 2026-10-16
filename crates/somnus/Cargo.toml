@@ -21,11 +21,11 @@ fine-metrics = [
     "somnus-encoding/fine-metrics",
 ]
 
-# burn-ndarray is never directly imported here — see the same note in
-# somnus-perception/Cargo.toml. Kept as a direct dependency purely to request
-# "multi-threads"/"simd" on the shared build-graph instance.
+
+# burn-flex is never imported directly; it is a direct dependency purely to request "rayon" on
+# the shared instance (see the workspace Cargo.toml comment).
 [package.metadata.cargo-machete]
-ignored = ["burn-ndarray"]
+ignored = ["burn-flex"]
 
 [dependencies]
 somnus-sensory        = { path = "../somnus-sensory" }
@@ -42,7 +42,7 @@ serde_json         = { workspace = true }
 somnus-perception     = { path = "../somnus-perception" }
 somnus-memory         = { path = "../somnus-memory" }
 burn               = { workspace = true }
-burn-ndarray       = { workspace = true }
+burn-flex  = { workspace = true }
 burn-store   = { workspace = true }
 safetensors        = { workspace = true }
 ndarray            = { workspace = true }

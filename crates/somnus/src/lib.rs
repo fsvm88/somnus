@@ -62,7 +62,7 @@ pub(crate) fn cpu_session(
 
 /// Compute (intra_op, inter_op) thread counts for ONNX sessions.
 ///
-/// Reserves roughly half the logical cores for burn-ndarray's rayon thread pool.
+/// Reserves roughly half the logical cores for burn-flex's rayon thread pool.
 /// Both pools compete for the same hardware threads during NREM replay, so this
 /// cap prevents ONNX from starving burn's matmul workers.
 fn onnx_thread_budget() -> (usize, usize) {
@@ -78,7 +78,7 @@ use action::{ActionDecoder, GainWorker};
 use whisper_asr::WhisperDecoder;
 
 use anyhow::{Context as _, Result};
-use burn::backend::ndarray::NdArrayDevice;
+use burn::tensor::Device;
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use somnus_encoding::{
@@ -463,34 +463,10 @@ pub async fn run() -> Result<()> {
             .init();
     }
 
-    if args.convert_weights_to_safetensors {
-        let snap = args.memory_dir.join("snapshot");
-        let sizes = load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
-        let mut p = PerceptionProcessor::new(NdArrayDevice::Cpu);
-        p.convert_weights_to_safetensors(
-            &weights_path(&args.memory_dir),
-            sizes,
-            &snap.join("weights.safetensors"),
-        )?;
-        info!(?sizes, "perception weights converted");
-        let dec = snap.join("decoder_weights");
-        if dec.with_extension("bin").exists() {
-            action::convert_proj_weights_to_safetensors(
-                &dec,
-                &snap.join("decoder_weights.safetensors"),
-                args.linear_proj,
-                &NdArrayDevice::Cpu,
-            )?;
-            info!("decoder weights converted");
-        }
-        return Ok(());
-    }
-
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
 
     if let Some(seed) = args.seed {
-        use burn::tensor::backend::Backend;
-        <burn::backend::NdArray as Backend>::seed(&NdArrayDevice::Cpu, seed);
+        Device::flex().seed(seed);
         info!(seed, "burn RNG seeded");
     }
 
@@ -537,7 +513,7 @@ pub async fn run() -> Result<()> {
     };
 
     // ── perception processor ──────────────────────────────────────────────────
-    let mut perception = PerceptionProcessor::new(NdArrayDevice::Cpu);
+    let mut perception = PerceptionProcessor::new(Device::flex());
     let prior_beta_regions_static: Option<[f32; 5]> = if let Some(ref s) = args.prior_beta_regions {
         let betas = parse_prior_beta_regions(s)?;
         perception.set_prior_beta(0.0); // clear base first
@@ -676,10 +652,9 @@ pub async fn run() -> Result<()> {
                     "restored from snapshot"
                 );
                 // Restore perception weights; pre-grow regions if they grew last session.
-                // Burn's BinFileRecorder appends ".bin" via set_extension, so the actual
-                // file is weights.bin — check that, not the stem path itself.
+                // save_weights writes `<stem>.safetensors`; check that, not the stem path itself.
                 let w_path = weights_path(&args.memory_dir);
-                if w_path.with_extension("bin").exists() {
+                if w_path.with_extension("safetensors").exists() {
                     let sizes =
                         load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
                     if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
@@ -757,16 +732,16 @@ pub async fn run() -> Result<()> {
     let mut decoder: Option<ActionDecoder> = if args.action {
         match ActionDecoder::new(
             &args.models_dir,
-            NdArrayDevice::Cpu,
+            Device::flex(),
             args.ort_profile_dir.as_deref(),
             args.gpu_generation,
             args.linear_proj,
             &args.action_model_prefix,
         ) {
             Ok(mut d) => {
-                // Burn's BinFileRecorder sets extension to ".bin"; pass stem path.
+                // save_weights/load_weights take the stem path and add ".safetensors".
                 let dec_w = args.memory_dir.join("snapshot").join("decoder_weights");
-                if dec_w.with_extension("bin").exists() {
+                if dec_w.with_extension("safetensors").exists() {
                     if let Err(e) = d.load_weights(&dec_w) {
                         tracing::warn!(?e, "decoder weight restore failed — starting fresh");
                         somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
@@ -775,7 +750,7 @@ pub async fn run() -> Result<()> {
                     }
                 } else if snapshot_found {
                     tracing::warn!(
-                        "snapshot found but no decoder_weights.bin — \
+                        "snapshot found but no decoder_weights.safetensors — \
                          projection starts fresh; generation incoherent until trained"
                     );
                     somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);

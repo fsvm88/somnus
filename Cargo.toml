@@ -21,15 +21,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde_json         = "1"
 # "wgpu" deliberately dropped (ADR 0023): tried once (commit 5dbf9c9), abandoned — wgpu
 # can't claim the AMD device once MIGraphX/ORT already owns it. All GPU inference goes
-# through ORT/MIGraphX instead; burn now only runs its CPU (ndarray) backend.
-burn               = { version = "0.21", default-features = false, features = ["std", "autodiff", "ndarray", "simd"] }
-# burn's own dependency on burn-ndarray sets default-features=false, so this direct
-# workspace dependency is what actually requests "multi-threads"/"simd" onto the shared
-# build-graph instance — dropping it (e.g. because no crate imports `burn_ndarray`
-# directly; NdArray/NdArrayDevice come from burn::backend instead) would silently lose
-# CPU threading. See [package.metadata.cargo-machete] in somnus/somnus-perception's Cargo.toml.
-burn-store         = { version = "0.21", default-features = false, features = ["std", "safetensors"] }
-burn-ndarray       = { version = "0.21", default-features = false, features = ["std", "multi-threads", "simd"] }
+# through ORT/MIGraphX instead; burn only runs its pure-Rust CPU backend (burn-flex since 0.22;
+# burn-ndarray is deprecated there). Autodiff is a device property in 0.22 (Device::autodiff()).
+burn               = { version = "0.22", default-features = false, features = ["std", "autodiff", "optim", "flex", "simd"] }
+# burn's own dependency on burn-flex does not request "rayon": this direct workspace dependency
+# is what actually turns on flex's rayon threading (and gemm/rayon) on the shared build-graph
+# instance. Dropping it (no crate imports `burn_flex` directly) silently single-threads the CPU
+# backend. See [package.metadata.cargo-machete] in somnus/somnus-perception's Cargo.toml.
+burn-flex          = { version = "0.22", default-features = false, features = ["std", "simd", "rayon"] }
+burn-store         = { version = "0.22", default-features = false, features = ["std", "safetensors"] }
 safetensors        = "0.8"
 hnsw_rs            = "0.3"
 memmap2            = "0.9"

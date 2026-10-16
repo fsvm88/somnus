@@ -7,7 +7,7 @@
 ///
 /// Run: cargo run --release -p somnus-perception --bin onnx_validate_prepare -- <out_dir>
 /// Then: python3 experiments/onnx-validate/validate.py --data-dir <out_dir>
-use burn::backend::ndarray::NdArrayDevice;
+use burn::tensor::Device;
 use somnus_perception::{PerceptionProcessor, EPISODE_DIM, K_ACTIVE, N_UNITS};
 use std::path::PathBuf;
 
@@ -22,8 +22,8 @@ fn main() {
 
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    let device = NdArrayDevice::Cpu;
-    let mut proc = PerceptionProcessor::new(device);
+    let device = Device::flex();
+    let mut proc = PerceptionProcessor::new(device.clone());
 
     // ── Step 1: export burn weights ───────────────────────────────────────────
     let weights_dir = out_dir.join("weights");

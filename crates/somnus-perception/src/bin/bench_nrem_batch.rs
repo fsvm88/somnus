@@ -6,7 +6,7 @@
 ///   fused        — fused_replay_wake_step_batch (current production code)
 ///
 /// Run: cargo run --release -p somnus-perception --bin bench_nrem_batch
-use burn::backend::ndarray::NdArrayDevice;
+use burn::tensor::Device;
 use somnus_perception::PerceptionProcessor;
 use std::time::Instant;
 
@@ -100,21 +100,21 @@ fn print_table(header: &str, results: &[(usize, f64, f64)]) {
 }
 
 fn main() {
-    let device = NdArrayDevice::Cpu;
+    let device = Device::flex();
     println!("Generating {N_TRACES} synthetic traces…");
     let traces: Vec<[Vec<f32>; 5]> = (0..N_TRACES).map(random_regional).collect();
     let episodes: Vec<Vec<f32>> = (0..N_TRACES).map(random_episode).collect();
 
     println!("Warming up (1 sequential pass, not timed)…");
     {
-        let mut proc = PerceptionProcessor::new(device);
+        let mut proc = PerceptionProcessor::new(device.clone());
         let _ = run_sequential(&mut proc, &traces[..32]);
     }
 
     // ── replay-only (backward reference) ──────────────────────────────────────
     let mut replay_results = Vec::new();
     for &bs in BATCH_SIZES {
-        let mut proc = PerceptionProcessor::new(device);
+        let mut proc = PerceptionProcessor::new(device.clone());
         let t0 = Instant::now();
         if bs == 1 {
             run_sequential(&mut proc, &traces);
@@ -132,7 +132,7 @@ fn main() {
     // ── fused replay+wake ──────────────────────────────────────────────────────
     let mut fused_results = Vec::new();
     for &bs in BATCH_SIZES {
-        let mut proc = PerceptionProcessor::new(device);
+        let mut proc = PerceptionProcessor::new(device.clone());
         let t0 = Instant::now();
         if bs == 1 {
             // sequential fused as baseline

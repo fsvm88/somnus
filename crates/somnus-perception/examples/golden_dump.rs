@@ -4,7 +4,7 @@
 //! `scripts/compare_golden.py`.
 //!
 //! Usage: cargo run -p somnus-perception --release --example golden_dump -- <weights.safetensors> > golden.json
-use burn::backend::ndarray::NdArrayDevice;
+use burn::tensor::Device;
 use somnus_perception::{PerceptionProcessor, RegionId, EPISODE_DIM, REGION_DIMS};
 
 /// Deterministic pseudo-random vector in [-1, 1] (LCG; independent of any burn RNG).
@@ -43,10 +43,14 @@ fn main() {
         .try_into()
         .expect("5 region sizes");
 
-    let mut proc = PerceptionProcessor::new(NdArrayDevice::Cpu);
-    proc.load_weights_safetensors_with_sizes(path, sizes)
+    let mut proc = PerceptionProcessor::new(Device::flex());
+    proc.load_weights_with_sizes(path, sizes)
         .expect("load weights");
-    proc.set_learning_rate(1e-4);
+    // Production calls this before the NREM loop; the training steps below need it too.
+    proc.refresh_autodiff_state();
+    if let Ok(lr) = std::env::var("GOLDEN_LR") {
+        proc.set_learning_rate(lr.parse().expect("GOLDEN_LR"));
+    }
 
     let mut out = serde_json::Map::new();
     out.insert("sizes".into(), serde_json::json!(proc.region_sizes()));
@@ -94,11 +98,17 @@ fn main() {
         outs.iter().map(|v| stats(v)).collect::<Vec<_>>().into(),
     );
 
-    // Two training steps: loss must be finite and weights must move.
+    // Five training steps: record each loss and the MSE trajectory (weights must move, loss must
+    // fall; the *rate* of movement is the optimizer-semantics check across burn versions).
     let heads_before = proc.head_weights_flat();
-    let l1 = proc.replay_step(&regional).expect("replay_step 1");
-    let l2 = proc.replay_step(&regional).expect("replay_step 2");
-    out.insert("replay_loss".into(), serde_json::json!([l1, l2]));
+    let mut losses = Vec::new();
+    let mut mses = Vec::new();
+    for _ in 0..5 {
+        losses.push(proc.replay_step(&regional).expect("replay_step"));
+        mses.push(proc.measure_mse(&regional).expect("measure_mse"));
+    }
+    out.insert("replay_loss".into(), serde_json::json!(losses));
+    out.insert("measure_mse_trajectory".into(), serde_json::json!(mses));
     let heads_after = proc.head_weights_flat();
     out.insert(
         "heads_after".into(),
@@ -120,10 +130,6 @@ fn main() {
         .collect();
     out.insert("heads_abs_delta".into(), serde_json::json!(moved));
     out.insert(
-        "measure_mse_after".into(),
-        serde_json::json!(proc.measure_mse(&regional).expect("measure_mse")),
-    );
-    out.insert(
         "binding_row_norms".into(),
         serde_json::json!([RegionId::AudioSpeech, RegionId::Language]
             .iter()
@@ -133,5 +139,10 @@ fn main() {
             ))
             .collect::<Vec<_>>()),
     );
+    if let Ok(dir) = std::env::var("GOLDEN_EXPORT_DIR") {
+        // After training: ORT sessions are built from these files, so they must agree across versions.
+        proc.export_weights_for_onnx(std::path::Path::new(&dir))
+            .expect("export_weights_for_onnx");
+    }
     println!("{}", serde_json::Value::Object(out));
 }

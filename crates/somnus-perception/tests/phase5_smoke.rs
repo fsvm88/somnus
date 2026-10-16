@@ -4,11 +4,11 @@
 /// k-WTA sparsity, binding area output shape, and replay gradient flow.
 #[cfg(test)]
 mod tests {
-    use burn::backend::ndarray::NdArrayDevice;
+    use burn::tensor::Device;
     use somnus_perception::{PerceptionProcessor, EPISODE_DIM, REGION_DIMS};
 
     fn make_proc() -> PerceptionProcessor {
-        PerceptionProcessor::new(NdArrayDevice::Cpu)
+        PerceptionProcessor::new(Device::flex())
     }
 
     fn speech_input() -> Vec<f32> {

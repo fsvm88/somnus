@@ -29,11 +29,6 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) seed: Option<u64>,
 
-    /// Temporary (burn 0.21 only): convert `<memory-dir>/snapshot/{weights,decoder_weights}.bin`
-    /// to `.safetensors` next to them, then exit. Used once to carry trained weights to burn 0.22.
-    #[arg(long, hide = true)]
-    pub(crate) convert_weights_to_safetensors: bool,
-
     #[arg(long)]
     pub(crate) embeddings_out: Option<PathBuf>,
 

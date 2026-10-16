@@ -20,48 +20,41 @@
 use std::sync::mpsc;
 
 use burn::{
-    backend::ndarray::NdArrayDevice,
     module::{Module, Param},
     nn::{Linear, LinearConfig},
-    optim::adaptor::OptimizerAdaptor,
-    optim::{AdamW, AdamWConfig, GradientsParams, Optimizer},
-    tensor::{Tensor, TensorData},
+    optim::{AdamWConfig, GradientsParams, ModuleOptimizer},
+    tensor::{Device, Tensor, TensorData},
 };
 
-use crate::{EmaOutputHeads, TrainB, EPISODE_DIM, REGION_DIMS};
+use crate::{EmaOutputHeads, EPISODE_DIM, REGION_DIMS};
 
 /// Standalone copy of the 5 output heads. Field order mirrors REGION_DIMS:
 /// [AudioSpeech, AudioEnv, Visual, Symbolic, Language].
 #[derive(Module, Debug)]
-pub(crate) struct WakeHeadsModel<B: burn::tensor::backend::Backend> {
-    speech: Linear<B>,
-    env: Linear<B>,
-    visual: Linear<B>,
-    symbolic: Linear<B>,
-    language: Linear<B>,
+pub(crate) struct WakeHeadsModel {
+    speech: Linear,
+    env: Linear,
+    visual: Linear,
+    symbolic: Linear,
+    language: Linear,
 }
 
-type WakeOptim = OptimizerAdaptor<AdamW, WakeHeadsModel<TrainB>, TrainB>;
+type WakeOptim = ModuleOptimizer;
 
 /// Overwrite a head's weight from a flat [EPISODE_DIM × d_out] vec, preserving
 /// the ParamId so the worker's AdamW moments stay attached.
-fn set_linear_weight(
-    linear: &mut Linear<TrainB>,
-    flat: &[f32],
-    d_out: usize,
-    device: &NdArrayDevice,
-) {
+fn set_linear_weight(linear: &mut Linear, flat: &[f32], d_out: usize, device: &Device) {
     let id = linear.weight.id;
     // require_grad is mandatory: Param::initialized inherits the tensor's flag,
     // and from_data tensors don't track gradients — without it the head is
     // silently frozen (no grads → AdamW no-op).
-    let t: Tensor<TrainB, 2> =
+    let t: Tensor<2> =
         Tensor::from_data(TensorData::new(flat.to_vec(), [EPISODE_DIM, d_out]), device)
             .require_grad();
     linear.weight = Param::initialized(id, t);
 }
 
-fn heads_from_flat(weights: &[Vec<f32>; 5], device: &NdArrayDevice) -> WakeHeadsModel<TrainB> {
+fn heads_from_flat(weights: &[Vec<f32>; 5], device: &Device) -> WakeHeadsModel {
     let mk = |flat: &Vec<f32>, d_out: usize| {
         let mut l = LinearConfig::new(EPISODE_DIM, d_out)
             .with_bias(false)
@@ -81,29 +74,29 @@ fn heads_from_flat(weights: &[Vec<f32>; 5], device: &NdArrayDevice) -> WakeHeads
 /// One training step: per-region MSE → single backward → AdamW → EMA update.
 /// Mirrors `PerceptionProcessor::wake_reconstruct_step`.
 fn train_step(
-    model: WakeHeadsModel<TrainB>,
+    model: WakeHeadsModel,
     optim: &mut WakeOptim,
     ema: &mut EmaOutputHeads,
     episode: &[f32],
     regional: &[Vec<f32>; 5],
     lr: f64,
-    device: &NdArrayDevice,
-) -> (WakeHeadsModel<TrainB>, Option<f32>) {
+    device: &Device,
+) -> (WakeHeadsModel, Option<f32>) {
     // Runs on this module's dedicated background OS thread — somnus_metrics::METRICS.record()
     // (invoked inside timed_core!) is a plain atomic fetch_add, safe to call from any thread.
     let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::WakeWorkerTrainStep, {
-        let ep_t: Tensor<TrainB, 2> = Tensor::from_data(
+        let ep_t: Tensor<2> = Tensor::from_data(
             TensorData::new(episode.to_vec(), [1, episode.len()]),
             device,
         );
-        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+        let mut total_loss: Option<Tensor<1>> = None;
         let mut n = 0usize;
 
         for (head_idx, input) in regional.iter().enumerate() {
             if input.is_empty() {
                 continue;
             }
-            let target: Tensor<TrainB, 2> =
+            let target: Tensor<2> =
                 Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), device);
             let pred = match head_idx {
                 0 => model.speech.forward(ep_t.clone()),
@@ -113,7 +106,7 @@ fn train_step(
                 4 => model.language.forward(ep_t.clone()),
                 _ => unreachable!(),
             };
-            let loss: Tensor<TrainB, 1> = (pred - target).powi_scalar(2).mean();
+            let loss: Tensor<1> = (pred - target).powi_scalar(2).mean();
             total_loss = Some(match total_loss {
                 None => loss,
                 Some(acc) => acc + loss,
@@ -122,7 +115,7 @@ fn train_step(
         }
 
         if let Some(loss) = total_loss {
-            let loss_val: f32 = loss.clone().into_scalar();
+            let loss_val: f32 = loss.clone().into_scalar::<f32>();
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
             let model = optim.step(lr, model, grads_p);
@@ -141,7 +134,7 @@ fn train_step(
     result
 }
 
-fn weights_flat(model: &WakeHeadsModel<TrainB>) -> [Vec<f32>; 5] {
+fn weights_flat(model: &WakeHeadsModel) -> [Vec<f32>; 5] {
     [
         &model.speech,
         &model.env,
@@ -155,7 +148,7 @@ fn weights_flat(model: &WakeHeadsModel<TrainB>) -> [Vec<f32>; 5] {
             .inner()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap()
     })
 }
@@ -194,9 +187,9 @@ impl WakeReconWorker {
         std::thread::Builder::new()
             .name("wake-recon-worker".into())
             .spawn(move || {
-                let device = NdArrayDevice::Cpu;
+                let device = Device::flex().autodiff();
                 let mut model = Some(heads_from_flat(&weights, &device));
-                let mut optim = AdamWConfig::new().init::<TrainB, WakeHeadsModel<TrainB>>();
+                let mut optim = AdamWConfig::new().init();
                 while let Ok(msg) = req_rx.recv() {
                     match msg {
                         Msg::Train {
@@ -304,7 +297,7 @@ mod tests {
     /// makes the EMA-before-Weights sequence deterministic.
     #[test]
     fn round_trip_train_and_weight_sync() {
-        let p = PerceptionProcessor::new(NdArrayDevice::Cpu);
+        let p = PerceptionProcessor::new(Device::flex());
         let initial = p.head_weights_flat();
         let worker = p.create_wake_recon_worker();
 

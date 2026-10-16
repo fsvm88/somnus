@@ -13,21 +13,14 @@ pub use sae::SaeDecoder;
 pub use wake_worker::WakeReconWorker;
 
 use burn::{
-    backend::{
-        ndarray::{NdArray, NdArrayDevice},
-        Autodiff,
-    },
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    optim::adaptor::OptimizerAdaptor,
-    optim::{AdamW, AdamWConfig, GradientsParams, Optimizer},
-    record::{BinFileRecorder, FullPrecisionSettings},
-    tensor::{Distribution, Int, Tensor, TensorData},
+    optim::{AdamWConfig, GradientsParams, ModuleOptimizer},
+    tensor::{Device, Distribution, Int, Tensor, TensorData},
 };
 use std::collections::VecDeque;
 
-pub type TrainB = Autodiff<NdArray>;
-type PercOptim = OptimizerAdaptor<AdamW, PerceptionModel<TrainB>, TrainB>;
+type PercOptim = ModuleOptimizer;
 
 /// EMA (exponential moving average) copies of the 5 output heads, used for all
 /// inference paths (top-down prior generation, settling).  Updated after every
@@ -38,7 +31,7 @@ const EMA_ALPHA: f32 = 0.99;
 #[derive(Clone)]
 pub(crate) struct EmaOutputHeads {
     /// EMA tensors for the weight update step (NdArray, no autodiff).
-    heads: [burn::tensor::Tensor<NdArray, 2>; 5],
+    heads: [burn::tensor::Tensor<2>; 5],
     /// Flat row-major copies of the EMA weights for allocation-free inference.
     /// Layout: [d_in × d_out] (burn stores weight as [d_in, d_out]).
     /// Updated by `sync_flat` after every EMA weight update.
@@ -48,7 +41,7 @@ pub(crate) struct EmaOutputHeads {
 }
 
 impl EmaOutputHeads {
-    fn from_model(model: &PerceptionModel<TrainB>) -> Self {
+    fn from_model(model: &PerceptionModel) -> Self {
         let heads = [
             model.speech_head.weight.val().inner(),
             model.env_head.weight.val().inner(),
@@ -65,7 +58,7 @@ impl EmaOutputHeads {
         s
     }
 
-    fn update(&mut self, model: &PerceptionModel<TrainB>) {
+    fn update(&mut self, model: &PerceptionModel) {
         self.update_from_weights([
             model.speech_head.weight.val().inner(),
             model.env_head.weight.val().inner(),
@@ -77,7 +70,7 @@ impl EmaOutputHeads {
 
     /// EMA-blend a fresh set of live head weights (NdArray inner tensors).
     /// Shared by the in-thread `update` path and the async WakeReconWorker.
-    pub(crate) fn update_from_weights(&mut self, live: [burn::tensor::Tensor<NdArray, 2>; 5]) {
+    pub(crate) fn update_from_weights(&mut self, live: [burn::tensor::Tensor<2>; 5]) {
         somnus_metrics::timed_core!(somnus_metrics::Metric::EmaUpdateFromWeights, {
             for (ema, w) in self.heads.iter_mut().zip(live) {
                 *ema = ema.clone() * EMA_ALPHA + w * (1.0 - EMA_ALPHA);
@@ -105,7 +98,12 @@ impl EmaOutputHeads {
             for (i, h) in self.heads.iter().enumerate() {
                 let dims = h.dims();
                 self.d_out[i] = dims[1];
-                self.flat[i] = h.clone().into_data().convert::<f32>().to_vec().unwrap();
+                self.flat[i] = h
+                    .clone()
+                    .into_data()
+                    .convert::<f32>()
+                    .try_to_vec::<f32>()
+                    .unwrap();
             }
         });
     }
@@ -206,18 +204,18 @@ pub struct PerceptionOutput {
 
 /// All trainable parameters for the cognitive layer.
 #[derive(Module, Debug)]
-pub struct PerceptionModel<B: burn::tensor::backend::Backend> {
-    pub speech_layer: KWtaLayer<B>,
-    pub env_layer: KWtaLayer<B>,
-    pub visual_layer: KWtaLayer<B>,
-    pub symbolic_layer: KWtaLayer<B>,
-    pub language_layer: KWtaLayer<B>,
-    pub speech_decoder: SaeDecoder<B>,
-    pub env_decoder: SaeDecoder<B>,
-    pub visual_decoder: SaeDecoder<B>,
-    pub symbolic_decoder: SaeDecoder<B>,
-    pub language_decoder: SaeDecoder<B>,
-    pub binding: BindingArea<B>,
+pub struct PerceptionModel {
+    pub speech_layer: KWtaLayer,
+    pub env_layer: KWtaLayer,
+    pub visual_layer: KWtaLayer,
+    pub symbolic_layer: KWtaLayer,
+    pub language_layer: KWtaLayer,
+    pub speech_decoder: SaeDecoder,
+    pub env_decoder: SaeDecoder,
+    pub visual_decoder: SaeDecoder,
+    pub symbolic_decoder: SaeDecoder,
+    pub language_decoder: SaeDecoder,
+    pub binding: BindingArea,
     /// Lagged snapshot of `binding`'s trained tensors (region_0..4, w_q/w_k/w_v),
     /// hard-copied from `binding` only every `--binding-wake-lag-cycles` sleep
     /// cycles (ADR 0048). All wake-time inference (`try_bind`/`settle_episode`/
@@ -226,20 +224,20 @@ pub struct PerceptionModel<B: burn::tensor::backend::Backend> {
     /// writes to. Decouples "how often the binder trains" from "how often wake
     /// sees a new binder generation", the confirmed root cause of gaps.md §33's
     /// mean_output_mse regression (engineering-log.md §47).
-    pub wake_binding: BindingArea<B>,
-    pub speech_head: Linear<B>,
-    pub env_head: Linear<B>,
-    pub visual_head: Linear<B>,
-    pub symbolic_head: Linear<B>,
-    pub language_head: Linear<B>,
+    pub wake_binding: BindingArea,
+    pub speech_head: Linear,
+    pub env_head: Linear,
+    pub visual_head: Linear,
+    pub symbolic_head: Linear,
+    pub language_head: Linear,
     /// Projects concatenated cross-modal encoder inputs → 384-dim symbolic input.
     /// Input: [speech(384) | env(ENV_DIM) | visual(384) | language(LANG_HIDDEN)] = CROSS_MODAL_DIM,
     /// zero-padded for any missing modality.
-    pub cross_modal_proj: Linear<B>,
+    pub cross_modal_proj: Linear,
 }
 
-impl PerceptionModel<TrainB> {
-    pub fn new(device: &NdArrayDevice) -> Self {
+impl PerceptionModel {
+    pub fn new(device: &Device) -> Self {
         // wake_binding must start byte-identical to binding (ADR 0048). A plain
         // `binding.clone()` does NOT achieve this: burn's derived `Module` Clone
         // re-runs each `Param`'s lazy random initializer independently per clone
@@ -264,6 +262,7 @@ impl PerceptionModel<TrainB> {
         seed_wake_binding_field!(w_q);
         seed_wake_binding_field!(w_k);
         seed_wake_binding_field!(w_v);
+        wake_binding.copy_temporal_from(&binding);
         Self {
             speech_layer: KWtaLayer::new(RegionId::AudioSpeech, 384, device),
             env_layer: KWtaLayer::new(RegionId::AudioEnv, ENV_DIM, device),
@@ -319,10 +318,10 @@ pub struct IngestPerfBreakdown {
 }
 
 pub struct PerceptionProcessor {
-    model: Option<PerceptionModel<TrainB>>,
+    model: Option<PerceptionModel>,
     optimizer: PercOptim,
     current_lr: f64,
-    device: NdArrayDevice,
+    device: Device,
 
     /// EMA copies of the output heads used for all inference paths (prior, settle).
     /// Decoupled from the autodiff training heads so gradient noise doesn't
@@ -378,23 +377,26 @@ impl PerceptionProcessor {
     /// The model is `None` only while moved into an optimizer step (`take()` / put-back);
     /// any access in that window is a logic bug, so fail with a message that says so.
     #[inline]
-    fn model_ref(&self) -> &PerceptionModel<TrainB> {
+    fn model_ref(&self) -> &PerceptionModel {
         self.model
             .as_ref()
             .expect("PerceptionProcessor.model accessed while taken for an optimizer step")
     }
 
     #[inline]
-    fn model_mut(&mut self) -> &mut PerceptionModel<TrainB> {
+    fn model_mut(&mut self) -> &mut PerceptionModel {
         self.model
             .as_mut()
             .expect("PerceptionProcessor.model accessed while taken for an optimizer step")
     }
 
-    pub fn new(device: NdArrayDevice) -> Self {
+    /// `device` is the plain execution device (e.g. `Device::flex()`); training state lives on
+    /// its autodiff-enabled counterpart (autodiff is a device property in burn 0.22).
+    pub fn new(device: Device) -> Self {
+        let device = device.autodiff();
         let model = PerceptionModel::new(&device);
         let ema_heads = EmaOutputHeads::from_model(&model);
-        let optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+        let optimizer = AdamWConfig::new().init();
         Self {
             model: Some(model),
             optimizer,
@@ -439,7 +441,7 @@ impl PerceptionProcessor {
             .val()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         // burn stores Linear weight as [n_in, n_out] — already row-major [i][j].
         self.cross_modal_proj_flat = Some(w);
@@ -469,7 +471,7 @@ impl PerceptionProcessor {
     /// Ingest a 384-dim Whisper speech embedding.
     /// Updates AudioSpeech region, then recomputes Symbolic from all available cross-modal inputs.
     pub fn ingest_speech(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device;
+        let device = self.device.clone();
         let gained_speech = apply_gain(values, self.region_gain[0]);
         let (speech_input, speech_cos) = self.blend_with_prior(&gained_speech, 0);
         if let Some(c) = speech_cos {
@@ -546,7 +548,7 @@ impl PerceptionProcessor {
 
     /// Ingest an ENV_DIM-dim env embedding (CLAP or mn10 depending on feature).
     pub fn ingest_env(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device;
+        let device = self.device.clone();
         let gained = apply_gain(values, self.region_gain[1]);
         let (input, cosine) = self.blend_with_prior(&gained, 1);
         if let Some(c) = cosine {
@@ -621,7 +623,7 @@ impl PerceptionProcessor {
 
     /// Ingest a 384-dim DINOv2 visual embedding.
     pub fn ingest_visual(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device;
+        let device = self.device.clone();
         let gained = apply_gain(values, self.region_gain[2]);
         let (input, cosine) = self.blend_with_prior(&gained, 2);
         if let Some(c) = cosine {
@@ -693,7 +695,7 @@ impl PerceptionProcessor {
 
     /// Ingest a LANG_HIDDEN-dim language embedding (mean-pooled LM hidden states / token embeddings).
     pub fn ingest_language(&mut self, values: &[f32]) -> PerceptionResult<PerceptionOutput> {
-        let device = self.device;
+        let device = self.device.clone();
         self.last_language_input = Some(values.to_vec());
         let gained = apply_gain(values, self.region_gain[4]);
         let (input, cosine) = self.blend_with_prior(&gained, 4);
@@ -805,7 +807,7 @@ impl PerceptionProcessor {
     ///
     /// Returns (symbolic_prior_cosine, symbolic_reconstruction_err).
     fn compute_symbolic_cross_modal(&mut self) -> (Option<f32>, f32) {
-        let device = self.device;
+        let device = self.device.clone();
 
         // Build CROSS_MODAL_DIM-dim concat: [speech(384) | env(ENV_DIM) | visual(384) | language(LANG_HIDDEN)]
         let mut concat = vec![0.0f32; CROSS_MODAL_DIM];
@@ -843,7 +845,7 @@ impl PerceptionProcessor {
                 out
             } else {
                 // Flat weights not yet synced (first call before first NREM); use burn path.
-                let concat_t: Tensor<TrainB, 2> =
+                let concat_t: Tensor<2> =
                     Tensor::from_data(TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device);
                 self.model
                     .as_ref()
@@ -852,11 +854,11 @@ impl PerceptionProcessor {
                     .forward(concat_t)
                     .into_data()
                     .convert::<f32>()
-                    .to_vec()
+                    .try_to_vec::<f32>()
                     .unwrap()
             }
         } else {
-            let concat_t: Tensor<TrainB, 2> =
+            let concat_t: Tensor<2> =
                 Tensor::from_data(TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device);
             self.model
                 .as_ref()
@@ -865,7 +867,7 @@ impl PerceptionProcessor {
                 .forward(concat_t)
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap()
         };
 
@@ -916,7 +918,7 @@ impl PerceptionProcessor {
             // run_encoder in try_bind, which uses latest_inputs[Language] directly.
             if !self.ort_session.as_ref().is_some_and(|s| s.has_encoder()) {
                 somnus_metrics::counted_core!(somnus_metrics::Metric::RefreshLanguageCacheRun, 1);
-                let device = self.device;
+                let device = self.device.clone();
                 if let Some(emb) = self.last_language_input.clone() {
                     let act = self
                         .model
@@ -1019,7 +1021,7 @@ impl PerceptionProcessor {
                 Err(e) => {
                     tracing::warn!(?e, "ORT binding failed; falling back to burn");
                     somnus_metrics::counted_core!(somnus_metrics::Metric::OrtBindingFallback, 1);
-                    let device = self.device;
+                    let device = self.device.clone();
                     self.model
                         .as_mut()
                         .expect(
@@ -1031,7 +1033,7 @@ impl PerceptionProcessor {
             }
         } else {
             // Burn path (original)
-            let device = self.device;
+            let device = self.device.clone();
             self.model
                 .as_mut()
                 .expect("PerceptionProcessor.model accessed while taken for an optimizer step")
@@ -1053,8 +1055,8 @@ impl PerceptionProcessor {
 
     /// Run one training step on a stored episode trace (SAE reconstruction loss).
     pub fn replay_step(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<f32> {
-        let device = self.device;
-        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+        let device = self.device.clone();
+        let mut total_loss: Option<Tensor<1>> = None;
         let mut n_terms = 0usize;
 
         // Phase 1: forward passes (duty-cycle updates happen here).
@@ -1078,12 +1080,12 @@ impl PerceptionProcessor {
                 for &i in &act.indices {
                     mask_vec[i as usize] = 1.0;
                 }
-                let mask_inner: Tensor<NdArray, 2> =
+                let mask_inner: Tensor<2> =
                     Tensor::from_data(TensorData::new(mask_vec, [1, n]), &device);
-                let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
+                let mask: Tensor<2> = Tensor::from_inner(mask_inner);
                 let sparse_z = z * mask;
 
-                let target: Tensor<TrainB, 2> =
+                let target: Tensor<2> =
                     Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
 
                 let loss = match region_idx {
@@ -1105,7 +1107,7 @@ impl PerceptionProcessor {
 
         // Phase 2: backward + optimizer step.
         if let Some(loss) = total_loss {
-            let loss_val: f32 = loss.clone().into_scalar();
+            let loss_val: f32 = loss.clone().into_scalar::<f32>();
             let model = self.model.take().unwrap();
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
@@ -1122,9 +1124,9 @@ impl PerceptionProcessor {
         if batch.is_empty() {
             return Ok(0.0);
         }
-        let device = self.device;
+        let device = self.device.clone();
         let batch_topk = self.batch_topk;
-        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+        let mut total_loss: Option<Tensor<1>> = None;
         let mut n_terms = 0usize;
 
         {
@@ -1150,7 +1152,7 @@ impl PerceptionProcessor {
                 let n_in = valid[0].len();
                 let flat: Vec<f32> = valid.iter().flat_map(|v| v.iter().copied()).collect();
 
-                let input_batch: Tensor<TrainB, 2> =
+                let input_batch: Tensor<2> =
                     Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
 
                 let (z_batch, flat_masks) = match region_idx {
@@ -1181,12 +1183,12 @@ impl PerceptionProcessor {
                 };
 
                 let n_units = flat_masks.len() / b;
-                let mask_inner: Tensor<NdArray, 2> =
+                let mask_inner: Tensor<2> =
                     Tensor::from_data(TensorData::new(flat_masks, [b, n_units]), &device);
-                let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
+                let mask: Tensor<2> = Tensor::from_inner(mask_inner);
                 let sparse_z = z_batch * mask;
 
-                let target: Tensor<TrainB, 2> =
+                let target: Tensor<2> =
                     Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
 
                 let region_loss = match region_idx {
@@ -1207,7 +1209,7 @@ impl PerceptionProcessor {
         }
 
         if let Some(loss) = total_loss {
-            let loss_val: f32 = loss.clone().into_scalar();
+            let loss_val: f32 = loss.clone().into_scalar::<f32>();
             let model = self.model.take().unwrap();
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
@@ -1238,7 +1240,8 @@ impl PerceptionProcessor {
     /// Hard-copy `binding`'s currently-trained tensors (region_0..4, w_q, w_k, w_v)
     /// into `wake_binding` (ADR 0048). Plain value copy — the target gets a fresh
     /// `ParamId` and no autodiff graph link back to `binding`; GRU/temporal_proj are
-    /// untouched (neither copy trains them; see `BindingArea`'s doc comment).
+    /// copied too (`copy_temporal_from`) — neither copy trains them, but they are random per
+    /// instance, so they must be aligned with `binding` explicitly.
     /// Called by the sleep-cycle driver loop on a `--binding-wake-lag-cycles` cadence,
     /// not every cycle — that's the whole point of this ADR.
     pub fn sync_wake_binding(&mut self) {
@@ -1262,7 +1265,7 @@ impl PerceptionProcessor {
                             .val()
                             .into_data()
                             .convert::<f32>()
-                            .to_vec()
+                            .try_to_vec::<f32>()
                             .unwrap();
                         let wake: Vec<f32> = model
                             .wake_binding
@@ -1271,7 +1274,7 @@ impl PerceptionProcessor {
                             .val()
                             .into_data()
                             .convert::<f32>()
-                            .to_vec()
+                            .try_to_vec::<f32>()
                             .unwrap();
                         for (a, b) in live.iter().zip(wake.iter()) {
                             let d = (*a - *b) as f64;
@@ -1308,6 +1311,9 @@ impl PerceptionProcessor {
             copy_linear!(w_q);
             copy_linear!(w_k);
             copy_linear!(w_v);
+            // GRU gates + temporal_proj are not trained but are per-instance random: keep the
+            // wake copy identical to `binding` (and to what a snapshot restored into it).
+            model.wake_binding.copy_temporal_from(&model.binding);
         });
     }
 
@@ -1332,7 +1338,7 @@ impl PerceptionProcessor {
         if batch.is_empty() {
             return Ok(0.0);
         }
-        let device = self.device;
+        let device = self.device.clone();
         let batch_topk = self.batch_topk;
         let region_ids = [
             RegionId::AudioSpeech,
@@ -1341,7 +1347,7 @@ impl PerceptionProcessor {
             RegionId::Symbolic,
             RegionId::Language,
         ];
-        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+        let mut total_loss: Option<Tensor<1>> = None;
         let mut n_terms = 0usize;
 
         {
@@ -1372,7 +1378,7 @@ impl PerceptionProcessor {
                 let b = valid.len();
                 let n_in = valid[0].1.len();
                 let flat: Vec<f32> = valid.iter().flat_map(|(_, v)| v.iter().copied()).collect();
-                let input_batch: Tensor<TrainB, 2> =
+                let input_batch: Tensor<2> =
                     Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
                 let (z_batch, flat_masks) = match region_idx {
                     0 => model
@@ -1393,7 +1399,11 @@ impl PerceptionProcessor {
                     _ => unreachable!(),
                 };
                 let n_units = flat_masks.len() / b;
-                let z_flat: Vec<f32> = z_batch.into_data().convert::<f32>().to_vec().unwrap();
+                let z_flat: Vec<f32> = z_batch
+                    .into_data()
+                    .convert::<f32>()
+                    .try_to_vec::<f32>()
+                    .unwrap();
                 for (j, &(sample_i, _)) in valid.iter().enumerate() {
                     let mask_row = &flat_masks[j * n_units..(j + 1) * n_units];
                     let z_row = &z_flat[j * n_units..(j + 1) * n_units];
@@ -1417,7 +1427,7 @@ impl PerceptionProcessor {
             // Phase 2: live episodes through the binding area (graph-preserving), one
             // per sample with at least one non-empty region. Empty regions become
             // zero-token placeholders, same as the wake path's lang_zero sites.
-            let mut episodes: Vec<Tensor<TrainB, 2>> = Vec::new();
+            let mut episodes: Vec<Tensor<2>> = Vec::new();
             let mut episode_sample: Vec<usize> = Vec::new();
             for (sample_i, sample_acts) in acts.iter().enumerate() {
                 if sample_acts.iter().all(|a| a.is_none()) {
@@ -1432,14 +1442,14 @@ impl PerceptionProcessor {
                     });
                 let refs: [&SparseActivation; 5] =
                     std::array::from_fn(|i| sample_acts[i].as_ref().unwrap_or(&placeholders[i]));
-                let ep: Tensor<TrainB, 2> = model.binding.forward_tracked(&refs, &device);
+                let ep: Tensor<2> = model.binding.forward_tracked(&refs, &device);
                 episodes.push(ep);
                 episode_sample.push(sample_i);
             }
             if episodes.is_empty() {
                 return Ok(0.0);
             }
-            let ep_batch: Tensor<TrainB, 2> = Tensor::cat(episodes, 0); // [B', EPISODE_DIM]
+            let ep_batch: Tensor<2> = Tensor::cat(episodes, 0); // [B', EPISODE_DIM]
 
             // Phase 3: output-head loss against the regional targets — same semantics
             // as wake_reconstruct_step_batch, with live episodes instead of stored.
@@ -1467,10 +1477,9 @@ impl PerceptionProcessor {
                     .iter()
                     .flat_map(|(_, inp)| inp.iter().copied())
                     .collect();
-                let idx_t: Tensor<TrainB, 1, Int> =
-                    Tensor::from_data(TensorData::new(rows, [b]), &device);
-                let ep_sub: Tensor<TrainB, 2> = ep_batch.clone().select(0, idx_t);
-                let target_batch: Tensor<TrainB, 2> =
+                let idx_t: Tensor<1, Int> = Tensor::from_data(TensorData::new(rows, [b]), &device);
+                let ep_sub: Tensor<2> = ep_batch.clone().select(0, idx_t);
+                let target_batch: Tensor<2> =
                     Tensor::from_data(TensorData::new(flat_targets, [b, n_out]), &device);
                 let pred = match head_idx {
                     0 => model.speech_head.forward(ep_sub),
@@ -1480,7 +1489,7 @@ impl PerceptionProcessor {
                     4 => model.language_head.forward(ep_sub),
                     _ => unreachable!(),
                 };
-                let loss: Tensor<TrainB, 1> = (pred - target_batch).powi_scalar(2).mean();
+                let loss: Tensor<1> = (pred - target_batch).powi_scalar(2).mean();
                 total_loss = Some(match total_loss {
                     None => loss,
                     Some(acc) => acc + loss,
@@ -1496,7 +1505,7 @@ impl PerceptionProcessor {
             // tensor before backward() cancels out almost entirely — candidate (a)'s original
             // "loss-scale" pilot was a no-op by construction, not a real dosage test. Scaling
             // the step size actually changes the update magnitude.
-            let loss_val: f32 = loss.clone().into_scalar();
+            let loss_val: f32 = loss.clone().into_scalar::<f32>();
             let model = self.model.take().unwrap();
             let grads = loss.backward();
             let mut grads_p = GradientsParams::from_grads(grads, &model);
@@ -1518,12 +1527,9 @@ impl PerceptionProcessor {
                     &model_ref.symbolic_head,
                     &model_ref.language_head,
                 ] {
-                    // GradientsParams stores gradients keyed on the *inner* (non-autodiff)
-                    // backend — TrainB::InnerBackend, i.e. NdArray, not TrainB itself; using
-                    // TrainB here silently fails the downcast inside TensorContainer::remove.
-                    grads_p.remove::<NdArray, 2>(head.weight.id);
+                    grads_p.remove::<2>(head.weight.id);
                     if let Some(b) = &head.bias {
-                        grads_p.remove::<NdArray, 1>(b.id);
+                        grads_p.remove::<1>(b.id);
                     }
                 }
             }
@@ -1552,9 +1558,9 @@ impl PerceptionProcessor {
         if episodes.is_empty() {
             return Ok(0.0);
         }
-        let device = self.device;
+        let device = self.device.clone();
         let ep_dim = EPISODE_DIM;
-        let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+        let mut total_loss: Option<Tensor<1>> = None;
         let mut n = 0usize;
 
         for head_idx in 0..5usize {
@@ -1585,9 +1591,9 @@ impl PerceptionProcessor {
                 .flat_map(|(_, inp)| inp.iter().copied())
                 .collect();
 
-            let ep_batch: Tensor<TrainB, 2> =
+            let ep_batch: Tensor<2> =
                 Tensor::from_data(TensorData::new(flat_eps, [b, ep_dim]), &device);
-            let target_batch: Tensor<TrainB, 2> =
+            let target_batch: Tensor<2> =
                 Tensor::from_data(TensorData::new(flat_targets, [b, n_out]), &device);
 
             let pred = {
@@ -1602,7 +1608,7 @@ impl PerceptionProcessor {
                 }
             };
 
-            let loss: Tensor<TrainB, 1> = (pred - target_batch).powi_scalar(2).mean();
+            let loss: Tensor<1> = (pred - target_batch).powi_scalar(2).mean();
             total_loss = Some(match total_loss {
                 None => loss,
                 Some(acc) => acc + loss,
@@ -1611,7 +1617,7 @@ impl PerceptionProcessor {
         }
 
         if let Some(loss) = total_loss {
-            let loss_val: f32 = loss.clone().into_scalar();
+            let loss_val: f32 = loss.clone().into_scalar::<f32>();
             let model = self.model.take().unwrap();
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
@@ -1641,14 +1647,14 @@ impl PerceptionProcessor {
         if batch.is_empty() {
             return Ok((0.0, 0.0));
         }
-        let device = self.device;
+        let device = self.device.clone();
 
         // ── Phase 1: SAE replay losses (needs &mut model for duty-cycle updates) ──
         let sae_l1_coeff = self.sae_l1_coeff;
         let batch_topk = self.batch_topk;
         let ((sae_loss, sae_n_terms), _) =
             somnus_metrics::timed_core!(somnus_metrics::Metric::FusedReplaySaePhase, {
-                let mut sae_loss: Option<Tensor<TrainB, 1>> = None;
+                let mut sae_loss: Option<Tensor<1>> = None;
                 let mut sae_n_terms = 0usize;
                 {
                     let model = self.model_mut();
@@ -1671,7 +1677,7 @@ impl PerceptionProcessor {
                         let n_in = valid[0].len();
                         let flat: Vec<f32> = valid.iter().flat_map(|v| v.iter().copied()).collect();
 
-                        let input_batch: Tensor<TrainB, 2> =
+                        let input_batch: Tensor<2> =
                             Tensor::from_data(TensorData::new(flat.clone(), [b, n_in]), &device);
 
                         let (z_batch, flat_masks) = match region_idx {
@@ -1704,16 +1710,16 @@ impl PerceptionProcessor {
                         };
 
                         let n_units = flat_masks.len() / b;
-                        let mask_inner: Tensor<NdArray, 2> =
+                        let mask_inner: Tensor<2> =
                             Tensor::from_data(TensorData::new(flat_masks, [b, n_units]), &device);
-                        let mask: Tensor<TrainB, 2> = Tensor::from_inner(mask_inner);
+                        let mask: Tensor<2> = Tensor::from_inner(mask_inner);
                         let sparse_z = z_batch * mask;
-                        let l1_term: Option<Tensor<TrainB, 1>> = if sae_l1_coeff > 0.0 {
+                        let l1_term: Option<Tensor<1>> = if sae_l1_coeff > 0.0 {
                             Some(sparse_z.clone().abs().mean())
                         } else {
                             None
                         };
-                        let target: Tensor<TrainB, 2> =
+                        let target: Tensor<2> =
                             Tensor::from_data(TensorData::new(flat, [b, n_in]), &device);
 
                         let mse_loss = match region_idx {
@@ -1742,7 +1748,7 @@ impl PerceptionProcessor {
         let ep_dim = EPISODE_DIM;
         let ((wake_loss, wake_n_terms), _) =
             somnus_metrics::timed_core!(somnus_metrics::Metric::FusedReplayHeadPhase, {
-                let mut wake_loss: Option<Tensor<TrainB, 1>> = None;
+                let mut wake_loss: Option<Tensor<1>> = None;
                 let mut wake_n_terms = 0usize;
                 if !episodes.is_empty() {
                     for head_idx in 0..5usize {
@@ -1772,9 +1778,9 @@ impl PerceptionProcessor {
                             .flat_map(|(_, inp)| inp.iter().copied())
                             .collect();
 
-                        let ep_batch: Tensor<TrainB, 2> =
+                        let ep_batch: Tensor<2> =
                             Tensor::from_data(TensorData::new(flat_eps, [b, ep_dim]), &device);
-                        let target_batch: Tensor<TrainB, 2> =
+                        let target_batch: Tensor<2> =
                             Tensor::from_data(TensorData::new(flat_tgt, [b, n_out]), &device);
 
                         let pred = {
@@ -1788,7 +1794,7 @@ impl PerceptionProcessor {
                                 _ => unreachable!(),
                             }
                         };
-                        let h_loss: Tensor<TrainB, 1> = (pred - target_batch).powi_scalar(2).mean();
+                        let h_loss: Tensor<1> = (pred - target_batch).powi_scalar(2).mean();
                         wake_loss = Some(match wake_loss {
                             None => h_loss,
                             Some(a) => a + h_loss,
@@ -1802,11 +1808,11 @@ impl PerceptionProcessor {
         // ── Single combined backward + optimizer step ────────────────────────────
         let sae_val = sae_loss
             .as_ref()
-            .map(|l| l.clone().into_scalar() / sae_n_terms.max(1) as f32)
+            .map(|l| l.clone().into_scalar::<f32>() / sae_n_terms.max(1) as f32)
             .unwrap_or(0.0);
         let wake_val = wake_loss
             .as_ref()
-            .map(|l| l.clone().into_scalar() / wake_n_terms.max(1) as f32)
+            .map(|l| l.clone().into_scalar::<f32>() / wake_n_terms.max(1) as f32)
             .unwrap_or(0.0);
 
         // DER++ Phase 3: auto-λ. Weight wake_loss (MSE against stale stored outputs) by the
@@ -1852,19 +1858,19 @@ impl PerceptionProcessor {
         regional: &[Vec<f32>; 5],
     ) -> PerceptionResult<f32> {
         let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::WakeReconstructStep, {
-            let device = self.device;
-            let ep_t: Tensor<TrainB, 2> = Tensor::from_data(
+            let device = self.device.clone();
+            let ep_t: Tensor<2> = Tensor::from_data(
                 TensorData::new(episode.to_vec(), [1, episode.len()]),
                 &device,
             );
-            let mut total_loss: Option<Tensor<TrainB, 1>> = None;
+            let mut total_loss: Option<Tensor<1>> = None;
             let mut n = 0usize;
 
             for (head_idx, input) in regional.iter().enumerate() {
                 if input.is_empty() {
                     continue;
                 }
-                let target: Tensor<TrainB, 2> =
+                let target: Tensor<2> =
                     Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
 
                 let pred = {
@@ -1879,7 +1885,7 @@ impl PerceptionProcessor {
                     }
                 };
 
-                let loss: Tensor<TrainB, 1> = (pred - target).powi_scalar(2).mean();
+                let loss: Tensor<1> = (pred - target).powi_scalar(2).mean();
                 total_loss = Some(match total_loss {
                     None => loss,
                     Some(acc) => acc + loss,
@@ -1888,7 +1894,7 @@ impl PerceptionProcessor {
             }
 
             if let Some(loss) = total_loss {
-                let loss_val: f32 = loss.clone().into_scalar();
+                let loss_val: f32 = loss.clone().into_scalar::<f32>();
                 let model = self.model.take().unwrap();
                 let grads = loss.backward();
                 let grads_p = GradientsParams::from_grads(grads, &model);
@@ -1928,7 +1934,7 @@ impl PerceptionProcessor {
                 .inner()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap()
         })
     }
@@ -1936,7 +1942,7 @@ impl PerceptionProcessor {
     /// Write worker-trained head weights back into the model (sleep-entry merge).
     /// ParamIds are preserved so the main optimizer's AdamW moments stay attached.
     pub fn set_head_weights_flat(&mut self, weights: [Vec<f32>; 5]) {
-        let device = self.device;
+        let device = self.device.clone();
         let m = self.model_mut();
         let heads = [
             &mut m.speech_head,
@@ -1950,7 +1956,7 @@ impl PerceptionProcessor {
             // require_grad is mandatory: Param::initialized inherits the tensor's
             // flag, and from_data tensors don't track gradients — without it the
             // merged heads would be silently frozen for NREM training.
-            let t: Tensor<TrainB, 2> =
+            let t: Tensor<2> =
                 Tensor::from_data(TensorData::new(flat, [EPISODE_DIM, d_out]), &device)
                     .require_grad();
             h.weight = Param::initialized(id, t);
@@ -1977,7 +1983,7 @@ impl PerceptionProcessor {
             .inner()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         let dims = proj.weight.val().inner().dims();
         let (n, d) = (dims[0], dims[1]);
@@ -2008,7 +2014,7 @@ impl PerceptionProcessor {
             .inner()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         let dims = proj.weight.val().inner().dims();
         let (n, d) = (dims[0], dims[1]);
@@ -2030,7 +2036,7 @@ impl PerceptionProcessor {
     /// Measure SAE reconstruction MSE per region (inference, no weight update).
     pub fn measure_mse(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<[f32; 5]> {
         let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::MeasureMse, {
-            let device = self.device;
+            let device = self.device.clone();
             let mut result = [0.0f32; 5];
             for (idx, input) in regional.iter().enumerate() {
                 if input.is_empty() {
@@ -2094,7 +2100,7 @@ impl PerceptionProcessor {
         regional_b: &[Vec<f32>; 5],
         alpha: f32,
     ) -> PerceptionResult<Vec<f32>> {
-        let device = self.device;
+        let device = self.device.clone();
         let lang_zero = SparseActivation {
             region: RegionId::Language,
             indices: vec![],
@@ -2145,8 +2151,8 @@ impl PerceptionProcessor {
     ) -> PerceptionResult<f32> {
         let (result, _) =
             somnus_metrics::timed_core!(somnus_metrics::Metric::MeasureOutputMseInference, {
-                let device = self.device;
-                let ep_t: Tensor<TrainB, 2> =
+                let device = self.device.clone();
+                let ep_t: Tensor<2> =
                     Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
                 let model = self.model_ref();
                 let mut total = 0.0f32;
@@ -2163,11 +2169,11 @@ impl PerceptionProcessor {
                         4 => model.language_head.forward(ep_t.clone()),
                         _ => unreachable!(),
                     };
-                    let target: Tensor<TrainB, 2> = Tensor::from_data(
+                    let target: Tensor<2> = Tensor::from_data(
                         TensorData::new(input.clone(), [1, input.len()]),
                         &device,
                     );
-                    let mse: f32 = (pred - target).powi_scalar(2).mean().into_scalar();
+                    let mse: f32 = (pred - target).powi_scalar(2).mean().into_scalar::<f32>();
                     total += mse;
                     n += 1;
                 }
@@ -2185,13 +2191,13 @@ impl PerceptionProcessor {
     /// Used to detect staleness: compare predicted vs stored outputs via cosine similarity.
     pub fn infer_episode_outputs(&self, episode: &[f32]) -> PerceptionResult<[Vec<f32>; 5]> {
         let (outputs, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::InferEpisodeOutputs, {
-            let device = self.device;
-            let ep_t: Tensor<TrainB, 2> =
+            let device = self.device.clone();
+            let ep_t: Tensor<2> =
                 Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
             let model = self.model_ref();
 
             let mut outputs: [Vec<f32>; 5] = Default::default();
-            let heads: [&Linear<TrainB>; 5] = [
+            let heads: [&Linear; 5] = [
                 &model.speech_head,
                 &model.env_head,
                 &model.visual_head,
@@ -2200,11 +2206,11 @@ impl PerceptionProcessor {
             ];
 
             for (i, head) in heads.iter().enumerate() {
-                let pred: Tensor<TrainB, 2> = head.forward(ep_t.clone());
+                let pred: Tensor<2> = head.forward(ep_t.clone());
                 let pred_vec: Vec<f32> = pred
                     .into_data()
                     .convert::<f32>()
-                    .to_vec()
+                    .try_to_vec::<f32>()
                     .map_err(|e| PerceptionError::Burn(format!("tensor extraction: {}", e)))?;
                 outputs[i] = pred_vec;
             }
@@ -2254,7 +2260,7 @@ impl PerceptionProcessor {
     }
 
     fn grow_region_inner(&mut self, region: RegionId, n_new: usize) {
-        let device = self.device;
+        let device = self.device.clone();
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model_mut();
 
@@ -2264,11 +2270,10 @@ impl PerceptionProcessor {
             let new_n = old_n + n_new;
 
             // Encoder weight shape: [n_in, n_units] — grow by appending new columns (dim 1).
-            let old_w: Tensor<NdArray, 2> = layer.linear.weight.val().inner();
-            let new_cols: Tensor<NdArray, 2> =
+            let old_w: Tensor<2> = layer.linear.weight.val().inner();
+            let new_cols: Tensor<2> =
                 Tensor::random([n_in, n_new], Distribution::Normal(0.0, 0.01), &device);
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_cols], 1));
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, new_cols], 1));
             layer.linear.weight = Param::initialized(ParamId::new(), new_w);
             layer.n_units = new_n;
             // Rescale k so sparsity ratio (k/n) stays roughly constant as the region
@@ -2281,10 +2286,9 @@ impl PerceptionProcessor {
         {
             // Decoder weight shape: [n_units, n_in] — grow by appending new rows (dim 0).
             let decoder = Self::decoder_mut(model, region);
-            let old_w: Tensor<NdArray, 2> = decoder.decoder.weight.val().inner();
-            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, n_in], &device);
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            let old_w: Tensor<2> = decoder.decoder.weight.val().inner();
+            let new_rows: Tensor<2> = Tensor::zeros([n_new, n_in], &device);
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_w);
             decoder.n_units = new_n;
         }
@@ -2299,11 +2303,10 @@ impl PerceptionProcessor {
                 RegionId::Symbolic => &mut model.binding.region_3,
                 RegionId::Language => &mut model.binding.region_4,
             };
-            let old_w: Tensor<NdArray, 2> = binding_proj.weight.val().inner();
+            let old_w: Tensor<2> = binding_proj.weight.val().inner();
             let d_proj = old_w.dims()[1];
-            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            let new_rows: Tensor<2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             binding_proj.weight = Param::initialized(ParamId::new(), new_w);
             model.binding.region_n[region.as_index()] = new_n;
         }
@@ -2319,11 +2322,10 @@ impl PerceptionProcessor {
                 RegionId::Symbolic => &mut model.wake_binding.region_3,
                 RegionId::Language => &mut model.wake_binding.region_4,
             };
-            let old_w: Tensor<NdArray, 2> = wake_binding_proj.weight.val().inner();
+            let old_w: Tensor<2> = wake_binding_proj.weight.val().inner();
             let d_proj = old_w.dims()[1];
-            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            let new_rows: Tensor<2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             wake_binding_proj.weight = Param::initialized(ParamId::new(), new_w);
             model.wake_binding.region_n[region.as_index()] = new_n;
         }
@@ -2371,7 +2373,7 @@ impl PerceptionProcessor {
         n_new: usize,
         sorted_inputs: &[Vec<f32>],
     ) {
-        let device = self.device;
+        let device = self.device.clone();
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model_mut();
 
@@ -2390,14 +2392,13 @@ impl PerceptionProcessor {
                     cols.push(x / norm * 0.01);
                 }
             }
-            let cols_t: Tensor<TrainB, 2> = Tensor::from_inner(Tensor::<NdArray, 2>::from_data(
+            let cols_t: Tensor<2> = Tensor::from_inner(Tensor::<2>::from_data(
                 burn::tensor::TensorData::new(cols, [n_in, n_new]),
                 &device,
             ));
 
-            let old_w: Tensor<NdArray, 2> = layer.linear.weight.val().inner();
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, cols_t.inner()], 1));
+            let old_w: Tensor<2> = layer.linear.weight.val().inner();
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, cols_t.inner()], 1));
             layer.linear.weight = Param::initialized(ParamId::new(), new_w);
             layer.n_units = new_n;
             layer.k_active = region::scaled_k(new_n);
@@ -2407,10 +2408,9 @@ impl PerceptionProcessor {
 
         {
             let decoder = Self::decoder_mut(model, region);
-            let old_w: Tensor<NdArray, 2> = decoder.decoder.weight.val().inner();
-            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, n_in], &device);
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            let old_w: Tensor<2> = decoder.decoder.weight.val().inner();
+            let new_rows: Tensor<2> = Tensor::zeros([n_new, n_in], &device);
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_w);
             decoder.n_units = new_n;
         }
@@ -2423,11 +2423,10 @@ impl PerceptionProcessor {
                 RegionId::Symbolic => &mut model.binding.region_3,
                 RegionId::Language => &mut model.binding.region_4,
             };
-            let old_w: Tensor<NdArray, 2> = binding_proj.weight.val().inner();
+            let old_w: Tensor<2> = binding_proj.weight.val().inner();
             let d_proj = old_w.dims()[1];
-            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            let new_rows: Tensor<2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             binding_proj.weight = Param::initialized(ParamId::new(), new_w);
             model.binding.region_n[region.as_index()] = new_n;
         }
@@ -2442,11 +2441,10 @@ impl PerceptionProcessor {
                 RegionId::Symbolic => &mut model.wake_binding.region_3,
                 RegionId::Language => &mut model.wake_binding.region_4,
             };
-            let old_w: Tensor<NdArray, 2> = wake_binding_proj.weight.val().inner();
+            let old_w: Tensor<2> = wake_binding_proj.weight.val().inner();
             let d_proj = old_w.dims()[1];
-            let new_rows: Tensor<NdArray, 2> = Tensor::zeros([n_new, d_proj], &device);
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
+            let new_rows: Tensor<2> = Tensor::zeros([n_new, d_proj], &device);
+            let new_w: Tensor<2> = Tensor::from_inner(Tensor::cat(vec![old_w, new_rows], 0));
             wake_binding_proj.weight = Param::initialized(ParamId::new(), new_w);
             model.wake_binding.region_n[region.as_index()] = new_n;
         }
@@ -2474,7 +2472,7 @@ impl PerceptionProcessor {
     ) -> [Vec<Vec<f32>>; 5] {
         let (result, _) =
             somnus_metrics::timed_core!(somnus_metrics::Metric::CollectHighResidualInputs, {
-                let device = self.device;
+                let device = self.device.clone();
                 // Per-region: (residual_mse, input_vec)
                 let mut scored: [Vec<(f32, Vec<f32>)>; 5] = Default::default();
 
@@ -2536,7 +2534,7 @@ impl PerceptionProcessor {
     }
 
     fn prune_region_inner(&mut self, region: RegionId, prune_fraction: f32) -> usize {
-        let device = self.device;
+        let device = self.device.clone();
         let n_in = REGION_DIMS[region.as_index()];
         let model = self.model_mut();
 
@@ -2557,7 +2555,7 @@ impl PerceptionProcessor {
             .val()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // L1 norm of unit i = sum over rows j of abs(enc_flat[j * current_n + i]).
@@ -2591,7 +2589,7 @@ impl PerceptionProcessor {
             .val()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
         // Keep rows `keep` from [current_n, n_in] → [new_n, n_in].
         let new_dec_flat: Vec<f32> = keep
@@ -2601,7 +2599,7 @@ impl PerceptionProcessor {
 
         {
             let layer = Self::layer_mut(model, region);
-            let new_enc: Tensor<TrainB, 2> =
+            let new_enc: Tensor<2> =
                 Tensor::from_data(TensorData::new(new_enc_flat, [n_in, new_n]), &device);
             layer.linear.weight = Param::initialized(ParamId::new(), new_enc);
             let old_dc = layer.duty_cycle.clone();
@@ -2612,7 +2610,7 @@ impl PerceptionProcessor {
 
         {
             let decoder = Self::decoder_mut(model, region);
-            let new_dec: Tensor<TrainB, 2> =
+            let new_dec: Tensor<2> =
                 Tensor::from_data(TensorData::new(new_dec_flat, [new_n, n_in]), &device);
             decoder.decoder.weight = Param::initialized(ParamId::new(), new_dec);
             decoder.n_units = new_n;
@@ -2632,14 +2630,14 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             let d_proj = bind_flat.len() / current_n;
             let new_bind_flat: Vec<f32> = keep
                 .iter()
                 .flat_map(|&i| bind_flat[i * d_proj..(i + 1) * d_proj].iter().copied())
                 .collect();
-            let new_bind: Tensor<TrainB, 2> =
+            let new_bind: Tensor<2> =
                 Tensor::from_data(TensorData::new(new_bind_flat, [new_n, d_proj]), &device);
             binding_proj.weight = Param::initialized(ParamId::new(), new_bind);
             model.binding.region_n[region.as_index()] = new_n;
@@ -2660,14 +2658,14 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             let d_proj = bind_flat.len() / current_n;
             let new_bind_flat: Vec<f32> = keep
                 .iter()
                 .flat_map(|&i| bind_flat[i * d_proj..(i + 1) * d_proj].iter().copied())
                 .collect();
-            let new_bind: Tensor<TrainB, 2> =
+            let new_bind: Tensor<2> =
                 Tensor::from_data(TensorData::new(new_bind_flat, [new_n, d_proj]), &device);
             wake_binding_proj.weight = Param::initialized(ParamId::new(), new_bind);
             model.wake_binding.region_n[region.as_index()] = new_n;
@@ -2849,19 +2847,19 @@ impl PerceptionProcessor {
         somnus_metrics::timed_core!(somnus_metrics::Metric::RefreshAutodiffState, {
             use burn::module::ModuleMapper;
             struct GraphDetacher;
-            impl ModuleMapper<TrainB> for GraphDetacher {
+            impl ModuleMapper for GraphDetacher {
                 fn map_float<const D: usize>(
                     &mut self,
-                    param: Param<Tensor<TrainB, D>>,
-                ) -> Param<Tensor<TrainB, D>> {
+                    param: Param<Tensor<D>>,
+                ) -> Param<Tensor<D>> {
                     let (_, tensor, mapper) = param.consume();
-                    let fresh = Tensor::from_inner(tensor.inner()).require_grad();
+                    let fresh = tensor.inner().autodiff().require_grad();
                     Param::from_mapped_value(ParamId::new(), fresh, mapper)
                 }
             }
             let model = self.model.take().unwrap();
             self.model = Some(model.map(&mut GraphDetacher));
-            self.optimizer = AdamWConfig::new().init::<TrainB, PerceptionModel<TrainB>>();
+            self.optimizer = AdamWConfig::new().init();
         });
     }
 
@@ -2898,9 +2896,10 @@ impl PerceptionProcessor {
 
     // ── Save / Load ──────────────────────────────────────────────────────────
 
-    /// Save weights to a binary file (burn BinFileRecorder).
+    /// Save weights as safetensors (`<path>.safetensors`; any extension on `path` is replaced).
     /// Also writes a `<path>.sizes` sidecar with grown region sizes.
     pub fn save_weights(&mut self, path: &std::path::Path) -> PerceptionResult<()> {
+        use burn_store::{ModuleSnapshot, SafetensorsStore};
         let sizes = self.region_sizes();
         let sizes_str = sizes
             .iter()
@@ -2910,57 +2909,57 @@ impl PerceptionProcessor {
         std::fs::write(path.with_extension("sizes"), &sizes_str)
             .map_err(|e| PerceptionError::Burn(e.to_string()))?;
 
-        // Clone is cheap (Arc-backed tensors); saves clone, keeps original in self.model.
-        let model_clone = self.model_ref().clone();
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| PerceptionError::Burn("invalid path".into()))?;
-        model_clone
-            .save_file(path_str, &recorder)
-            .map_err(|e| PerceptionError::Burn(e.to_string()))
+        let mut store = SafetensorsStore::from_file(path.with_extension("safetensors"));
+        self.model_ref()
+            .save_into(&mut store)
+            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))
     }
 
-    /// Load weights from a binary file written by `save_weights`.
+    /// Load weights written by `save_weights` (`<path>.safetensors`). Regions must already be
+    /// grown to the saved sizes (see `load_weights_with_sizes`). Tensors missing from the file
+    /// (e.g. `wake_binding.*` in snapshots that predate ADR 0048) keep their current values;
+    /// `wake_binding` is then synced from the loaded `binding`.
+    ///
+    /// On failure the model is replaced by a fresh one grown to the same sizes, so callers stay
+    /// functional after a failed restore.
     pub fn load_weights(&mut self, path: &std::path::Path) -> PerceptionResult<()> {
-        let device = self.device;
-        // Extract path string before taking the model so an invalid-path error
-        // doesn't leave self.model = None.
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| PerceptionError::Burn("invalid path".into()))?;
+        use burn_store::{ModuleSnapshot, SafetensorsStore};
         let saved_sizes = self.region_sizes();
-        let model = self.model.take().unwrap();
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        match model.load_file(path_str, &recorder, &device) {
-            Ok(mut loaded) => {
-                // Reconstruct region_n from projection weight shapes — the skip field is
-                // not serialised by burn's recorder, so it resets to usize default (0).
-                loaded.binding.region_n = [
-                    loaded.binding.region_0.weight.val().inner().dims()[0],
-                    loaded.binding.region_1.weight.val().inner().dims()[0],
-                    loaded.binding.region_2.weight.val().inner().dims()[0],
-                    loaded.binding.region_3.weight.val().inner().dims()[0],
-                    loaded.binding.region_4.weight.val().inner().dims()[0],
+        let mut store =
+            SafetensorsStore::from_file(path.with_extension("safetensors")).allow_partial(true);
+        let applied = self
+            .model_mut()
+            .load_from(&mut store)
+            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))
+            .and_then(|r| {
+                if r.errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(PerceptionError::Burn(format!("{:?}", r.errors)))
+                }
+            });
+        match applied {
+            Ok(()) => {
+                // `region_n` is #[module(skip)], so it is not serialised; rebuild it from the
+                // loaded projection shapes (binding and wake_binding independently, ADR 0048).
+                let m = self.model_mut();
+                m.binding.region_n = [
+                    m.binding.region_0.weight.val().inner().dims()[0],
+                    m.binding.region_1.weight.val().inner().dims()[0],
+                    m.binding.region_2.weight.val().inner().dims()[0],
+                    m.binding.region_3.weight.val().inner().dims()[0],
+                    m.binding.region_4.weight.val().inner().dims()[0],
                 ];
-                // ADR 0048: wake_binding.region_n is equally #[module(skip)] and equally
-                // unserialized — same reconstruction, from wake_binding's own shapes (not
-                // binding's; growth/prune keep both in lockstep but this stays explicit).
-                loaded.wake_binding.region_n = [
-                    loaded.wake_binding.region_0.weight.val().inner().dims()[0],
-                    loaded.wake_binding.region_1.weight.val().inner().dims()[0],
-                    loaded.wake_binding.region_2.weight.val().inner().dims()[0],
-                    loaded.wake_binding.region_3.weight.val().inner().dims()[0],
-                    loaded.wake_binding.region_4.weight.val().inner().dims()[0],
-                ];
-                self.ema_heads = EmaOutputHeads::from_model(&loaded);
-                self.model = Some(loaded);
+                m.wake_binding.region_n = m.binding.region_n;
+                // Loaded tensors carry no autodiff association: re-wrap every parameter as a
+                // fresh tracked leaf (and reset the optimizer) before any training step.
+                self.refresh_autodiff_state();
+                self.sync_wake_binding();
+                self.ema_heads = EmaOutputHeads::from_model(self.model_ref());
                 Ok(())
             }
             Err(e) => {
-                // load_file consumes the model whether it succeeds or not.
-                // Restore a fresh model grown to the same sizes so all callers
-                // remain functional after a failed weight restore.
+                let device = self.device.clone();
                 self.model = Some(PerceptionModel::new(&device));
                 for (i, &region) in [
                     RegionId::AudioSpeech,
@@ -2977,7 +2976,7 @@ impl PerceptionProcessor {
                         self.grow_region(region, n_new);
                     }
                 }
-                Err(PerceptionError::Burn(e.to_string()))
+                Err(e)
             }
         }
     }
@@ -3038,7 +3037,7 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             write(&format!("W_enc_{i}"), w, vec![*n_in, n_units])?;
         }
@@ -3052,12 +3051,17 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             write("W_cross", w, vec![dims[0], dims[1]])?;
             // cross_modal_proj has bias=true; bias shape [384]
             if let Some(bias) = m.cross_modal_proj.bias.as_ref() {
-                let b: Vec<f32> = bias.val().into_data().convert::<f32>().to_vec().unwrap();
+                let b: Vec<f32> = bias
+                    .val()
+                    .into_data()
+                    .convert::<f32>()
+                    .try_to_vec::<f32>()
+                    .unwrap();
                 write("W_cross_bias", b, vec![dims[1]])?;
             }
         }
@@ -3077,7 +3081,7 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             write(&format!("W_region_{i}"), w, vec![dims[0], dims[1]])?;
         }
@@ -3094,7 +3098,7 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             write(name, w, vec![dims[0], dims[1]])?;
         }
@@ -3113,7 +3117,7 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             write(
                 &format!("gru_{gate_name}_input_W"),
@@ -3128,7 +3132,7 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             write(
                 &format!("gru_{gate_name}_hidden_W"),
@@ -3147,7 +3151,7 @@ impl PerceptionProcessor {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             write("W_temporal_proj", w, vec![dims[0], dims[1]])?;
         }
@@ -3205,7 +3209,7 @@ impl PerceptionProcessor {
         visual: &[f32],
         language: Option<&[f32]>,
     ) -> [Vec<f32>; 5] {
-        let device = self.device;
+        let device = self.device.clone();
         let m = self.model_ref();
 
         let lang_zeros: Vec<f32>;
@@ -3230,15 +3234,15 @@ impl PerceptionProcessor {
             let len = src.len().min(*dim);
             concat[*off..*off + len].copy_from_slice(&src[..len]);
         }
-        let cross_t: Tensor<NdArray, 2> =
+        let cross_t: Tensor<2> =
             Tensor::from_data(TensorData::new(concat, [1, CROSS_MODAL_DIM]), &device);
         let symbolic_enc: Vec<f32> = m
             .cross_modal_proj
-            .forward(Tensor::<TrainB, 2>::from_inner(cross_t))
+            .forward(Tensor::<2>::from_inner(cross_t))
             .inner()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let enc_inputs: [&[f32]; 5] = [speech, env, visual, &symbolic_enc, lang];
@@ -3251,16 +3255,16 @@ impl PerceptionProcessor {
         ];
 
         std::array::from_fn(|i| {
-            let t: Tensor<NdArray, 2> = Tensor::from_data(
+            let t: Tensor<2> = Tensor::from_data(
                 TensorData::new(enc_inputs[i].to_vec(), [1, enc_inputs[i].len()]),
                 &device,
             );
             layers[i]
-                .forward(Tensor::<TrainB, 2>::from_inner(t))
+                .forward(Tensor::<2>::from_inner(t))
                 .inner()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap()
         })
     }
@@ -3273,7 +3277,7 @@ impl PerceptionProcessor {
         sparse_z: &[Vec<f32>; 5],
         prev_ep: Option<&[f32]>,
     ) -> (Vec<f32>, Vec<f32>) {
-        let device = self.device;
+        let device = self.device.clone();
         let acts: [SparseActivation; 5] = std::array::from_fn(|i| {
             let dense = &sparse_z[i];
             let mut indices = Vec::with_capacity(K_ACTIVE);
@@ -3314,67 +3318,6 @@ impl PerceptionProcessor {
         (ep.0, gru_h)
     }
 
-    /// Pre-grow regions to `sizes`, then load a safetensors weights file written by
-    /// `convert_weights_to_safetensors` (or `save_weights_safetensors`). Tensors missing from
-    /// the file (e.g. `wake_binding.*` in pre-ADR-0048 snapshots) keep their current values;
-    /// `wake_binding` is then synced from the loaded `binding`.
-    pub fn load_weights_safetensors_with_sizes(
-        &mut self,
-        path: &std::path::Path,
-        sizes: [usize; 5],
-    ) -> PerceptionResult<()> {
-        use burn_store::{ModuleSnapshot, SafetensorsStore};
-        let regions = [
-            RegionId::AudioSpeech,
-            RegionId::AudioEnv,
-            RegionId::Visual,
-            RegionId::Symbolic,
-            RegionId::Language,
-        ];
-        let current = self.region_sizes();
-        for (i, &region) in regions.iter().enumerate() {
-            if sizes[i] > current[i] {
-                self.grow_region(region, sizes[i] - current[i]);
-            }
-        }
-        let mut store = SafetensorsStore::from_file(path).allow_partial(true);
-        let result = self
-            .model_mut()
-            .load_from(&mut store)
-            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))?;
-        if !result.errors.is_empty() {
-            return Err(PerceptionError::Burn(format!("{:?}", result.errors)));
-        }
-        let m = self.model_mut();
-        m.binding.region_n = [
-            m.binding.region_0.weight.val().inner().dims()[0],
-            m.binding.region_1.weight.val().inner().dims()[0],
-            m.binding.region_2.weight.val().inner().dims()[0],
-            m.binding.region_3.weight.val().inner().dims()[0],
-            m.binding.region_4.weight.val().inner().dims()[0],
-        ];
-        m.wake_binding.region_n = m.binding.region_n;
-        self.sync_wake_binding();
-        self.ema_heads = EmaOutputHeads::from_model(self.model_ref());
-        Ok(())
-    }
-
-    /// One-shot migration helper (burn 0.21 only): load a legacy BinFile weights record
-    /// (pre-grown to `sizes`) and re-save it as safetensors for the burn 0.22 port.
-    pub fn convert_weights_to_safetensors(
-        &mut self,
-        src: &std::path::Path,
-        sizes: [usize; 5],
-        dst: &std::path::Path,
-    ) -> PerceptionResult<()> {
-        use burn_store::{ModuleSnapshot, SafetensorsStore};
-        self.load_weights_with_sizes(src, sizes)?;
-        let mut store = SafetensorsStore::from_file(dst);
-        self.model_ref()
-            .save_into(&mut store)
-            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))
-    }
-
     /// Pre-grow regions to `sizes`, then load weights.
     pub fn load_weights_with_sizes(
         &mut self,
@@ -3409,7 +3352,7 @@ impl PerceptionProcessor {
     /// In all ORT paths the live GRU hidden state is saved before the loop and restored
     /// after each binding call so settle iterations don't advance cross-episode state.
     fn settle_episode(&mut self, ep: &EpisodeVector) -> (EpisodeVector, usize, f32) {
-        let device = self.device;
+        let device = self.device.clone();
         let use_ort = self.ort_session.is_some();
         let use_encoder = use_ort && self.ort_session.as_ref().is_some_and(|s| s.has_encoder());
         let saved_hidden = if use_ort {
@@ -3669,7 +3612,7 @@ impl PerceptionProcessor {
         }
     }
 
-    fn layer_mut(model: &mut PerceptionModel<TrainB>, region: RegionId) -> &mut KWtaLayer<TrainB> {
+    fn layer_mut(model: &mut PerceptionModel, region: RegionId) -> &mut KWtaLayer {
         match region {
             RegionId::AudioSpeech => &mut model.speech_layer,
             RegionId::AudioEnv => &mut model.env_layer,
@@ -3679,10 +3622,7 @@ impl PerceptionProcessor {
         }
     }
 
-    fn decoder_mut(
-        model: &mut PerceptionModel<TrainB>,
-        region: RegionId,
-    ) -> &mut SaeDecoder<TrainB> {
+    fn decoder_mut(model: &mut PerceptionModel, region: RegionId) -> &mut SaeDecoder {
         match region {
             RegionId::AudioSpeech => &mut model.speech_decoder,
             RegionId::AudioEnv => &mut model.env_decoder,
@@ -3694,7 +3634,7 @@ impl PerceptionProcessor {
 }
 
 /// Scale a Linear weight tensor in-place, preserving its ParamId for optimizer compat.
-fn scale_weight(linear: &mut Linear<TrainB>, scale: f32) {
+fn scale_weight(linear: &mut Linear, scale: f32) {
     let id = linear.weight.id;
     let new_w = linear.weight.val().mul_scalar(scale);
     linear.weight = Param::initialized(id, new_w);
@@ -3756,8 +3696,8 @@ mod binding_replay_tests {
     /// from the first step.
     #[test]
     fn binding_replay_trains_grown_binding_rows_when_active() {
-        let device = NdArrayDevice::Cpu;
-        let mut proc = PerceptionProcessor::new(device);
+        let device = Device::flex();
+        let mut proc = PerceptionProcessor::new(device.clone());
         const N_GROWN: usize = 8;
         proc.grow_region(RegionId::AudioSpeech, N_GROWN);
 
@@ -3780,7 +3720,7 @@ mod binding_replay_tests {
                 .inner()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             let norm: f32 = regional[0].iter().map(|x| x * x).sum::<f32>().sqrt();
             for c in N_UNITS..n {
@@ -3788,8 +3728,7 @@ mod binding_replay_tests {
                     flat[r * n + c] = x / norm;
                 }
             }
-            let new_w: Tensor<TrainB, 2> =
-                Tensor::from_data(TensorData::new(flat, [n_in, n]), &device);
+            let new_w: Tensor<2> = Tensor::from_data(TensorData::new(flat, [n_in, n]), &device);
             layer.linear.weight = Param::initialized(ParamId::new(), new_w);
         }
         // Mirror the production sequence: growth in REM, then the next NREM
@@ -3810,7 +3749,7 @@ mod binding_replay_tests {
                 .inner()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap();
             flat.iter().map(|v| v * v).sum::<f32>()
         };
@@ -3861,8 +3800,8 @@ mod binding_replay_tests {
     /// the mechanism before piloting it — same discipline as the other `binding_replay_tests`.
     #[test]
     fn binding_replay_freeze_heads_trains_binding_not_heads() {
-        let device = NdArrayDevice::Cpu;
-        let mut proc = PerceptionProcessor::new(device);
+        let device = Device::flex();
+        let mut proc = PerceptionProcessor::new(device.clone());
 
         let regional: [Vec<f32>; 5] = std::array::from_fn(|i| {
             (0..REGION_DIMS[i])
@@ -3879,7 +3818,7 @@ mod binding_replay_tests {
                 .val()
                 .into_data()
                 .convert::<f32>()
-                .to_vec()
+                .try_to_vec::<f32>()
                 .unwrap()
         };
         let binding_norm = |p: &PerceptionProcessor| -> f32 {
