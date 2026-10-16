@@ -717,6 +717,283 @@ fn grow_poor_regions(
     regions_grown
 }
 
+/// Outputs of the pre-spill warm recall + gist probe (10c, Gap 8).
+#[derive(Default)]
+struct WarmProbe {
+    /// Mean L2 distance from each trace to its nearest warm neighbour.
+    warm_recall_l2: Option<f32>,
+    /// Fraction of traces whose nearest warm neighbour is in the same k-means gist cluster.
+    gist_recall_rate: Option<f32>,
+    /// Mean Shannon entropy (bits) of the regional-weight histogram per occupied gist cluster.
+    cross_modal_gist_entropy: Option<f32>,
+}
+
+/// REM pre-spill warm recall probe. Runs BEFORE the spill so warm only holds prior-cycle
+/// entries (querying after would find exact L2=0 matches from the just-inserted records).
+fn warm_recall_probe(
+    recall: &RecollectionLayer,
+    traces_for_rem: &[RemTrace],
+    pre_spill_warm_len: usize,
+) -> WarmProbe {
+    let mut warm_recall_l2: Option<f32> = None;
+    let mut gist_recall_rate: Option<f32> = None;
+    let mut cross_modal_gist_entropy: Option<f32> = None;
+    // ── Gist clustering (10c) ─────────────────────────────────────────────
+    // Build k-means centroids from a sample of the warm store, then use them
+    // during the warm probe to compute per-episode gist-recall.
+    let gist_centroids: Vec<Vec<f32>> = if pre_spill_warm_len >= GIST_MIN_WARM {
+        let sample = recall.warm.sample_values(GIST_SAMPLE);
+        tracing::debug!(sample_n = sample.len(), k = GIST_K, "gist: running k-means");
+        let (centroids, d_kmeans) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::SleepGistKmeans,
+            kmeans(&sample, GIST_K, GIST_MAX_ITER)
+        );
+        tracing::debug!(elapsed_ms = d_kmeans.as_millis(), "gist: k-means complete");
+        centroids
+    } else {
+        Vec::new()
+    };
+    let gist_available = !gist_centroids.is_empty();
+
+    let mut total_l2 = 0.0f32;
+    let mut n_probed = 0usize;
+    let mut gist_matches = 0usize;
+    // Per-cluster regional weight histogram for cross-modal entropy (Gap 8, ADR 0021).
+    // Slots 0–4 map to the 5 perception regions; each episode distributes its
+    // salience weight proportionally via regional_weights() (L2-norm attribution).
+    let mut cluster_sources: Vec<[f32; 6]> = vec![[0.0f32; 6]; GIST_K];
+
+    for (ep_vec, _, _src, salience) in traces_for_rem {
+        if let Some((dist, neighbor)) = recall.warm.query_with_dist(ep_vec, 1).into_iter().next() {
+            total_l2 += dist;
+            n_probed += 1;
+            if gist_available {
+                let probe_cluster = nearest_centroid(&gist_centroids, ep_vec);
+                let neighbor_cluster = nearest_centroid(&gist_centroids, &neighbor.values);
+                if probe_cluster == neighbor_cluster {
+                    gist_matches += 1;
+                }
+                // Salience weight: unknown (f32::MAX) → 1.0; otherwise clamp [0.01, 2.0].
+                let weight = if *salience >= f32::MAX / 2.0 {
+                    1.0f32
+                } else {
+                    salience.clamp(0.01, 2.0)
+                };
+                // Distribute weight proportionally across the 5 regional slots
+                // using L2 norms of the episode vector's per-region slices.
+                // This gives meaningful entropy even for Mixed-tagged episodes.
+                let rw = regional_weights(ep_vec);
+                for (slot, &rw_i) in rw.iter().enumerate() {
+                    cluster_sources[probe_cluster][slot] += weight * rw_i;
+                }
+            }
+        }
+    }
+
+    // Extend the cluster histogram with a bounded warm sample so that
+    // prior-session episodes (cold→warm) contribute to cross_modal_gist_entropy.
+    if gist_available {
+        for rec in recall.warm.sample_records(GIST_SAMPLE) {
+            let probe_cluster = nearest_centroid(&gist_centroids, &rec.values);
+            let weight = if rec.salience >= f32::MAX / 2.0 {
+                1.0f32
+            } else {
+                rec.salience.clamp(0.01, 2.0)
+            };
+            let rw = regional_weights(&rec.values);
+            for (slot, &rw_i) in rw.iter().enumerate() {
+                cluster_sources[probe_cluster][slot] += weight * rw_i;
+            }
+        }
+    }
+
+    if n_probed > 0 {
+        let mean_l2 = total_l2 / n_probed as f32;
+        warm_recall_l2 = Some(mean_l2);
+        if gist_available {
+            let rate = gist_matches as f32 / n_probed as f32;
+            gist_recall_rate = Some(rate);
+
+            // Shannon entropy per cluster (bits), averaged over occupied clusters.
+            // Slots 0–4 map to the 5 perception regions; slot 5 is unused now that
+            // the histogram uses proportional regional weights instead of IngestSource.
+            // Counts are salience-weighted so novel episodes contribute more.
+            let entropy_sum: f32 = cluster_sources
+                .iter()
+                .filter_map(|counts| {
+                    let total: f32 = counts[0..5].iter().sum();
+                    if total < 2.0 {
+                        return None; // need ≥2 weight to compute entropy
+                    }
+                    let h: f32 = counts[0..5]
+                        .iter()
+                        .filter(|&&c| c > 0.0)
+                        .map(|&c| {
+                            let p = c / total;
+                            // Guard p=1.0: log2(1.0)=0.0 exactly, so -p*log2(p)=-0.0
+                            // in IEEE 754. Return 0.0 explicitly for the pure-cluster case.
+                            if p >= 1.0 {
+                                0.0
+                            } else {
+                                -p * p.log2()
+                            }
+                        })
+                        .sum();
+                    Some(h)
+                })
+                .sum();
+            let n_occupied = cluster_sources
+                .iter()
+                .filter(|counts| counts[0..5].iter().sum::<f32>() >= 2.0)
+                .count();
+            if n_occupied > 0 {
+                cross_modal_gist_entropy = Some((entropy_sum / n_occupied as f32).max(0.0));
+            }
+
+            tracing::info!(
+                mean_l2,
+                pre_spill_warm_len,
+                gist_recall_rate = rate,
+                gist_matches,
+                n_probed,
+                cross_modal_gist_entropy = ?cross_modal_gist_entropy,
+                "warm recall + gist probe"
+            );
+        } else {
+            tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
+        }
+    }
+    WarmProbe {
+        warm_recall_l2,
+        gist_recall_rate,
+        cross_modal_gist_entropy,
+    }
+}
+
+/// Within-session gist probe: re-runs the gist match against only the warm records written
+/// since `session_start_secs`, excluding prior-session embeddings whose nearest-neighbour matches
+/// are unreliable after NREM weight drift. The clean signal for the growth controller (ADR 0024).
+fn within_session_gist(
+    recall: &RecollectionLayer,
+    traces_for_rem: &[RemTrace],
+    session_start_secs: f64,
+) -> Option<f32> {
+    let mut within_session_gist_rate: Option<f32> = None;
+    let ws_records = recall.warm.records_since(session_start_secs);
+    if ws_records.len() >= GIST_MIN_WARM {
+        let ws_vecs: Vec<Vec<f32>> = ws_records.iter().map(|r| r.values.clone()).collect();
+        tracing::debug!(
+            ws_warm_len = ws_records.len(),
+            k = GIST_K,
+            "within-session gist: running k-means"
+        );
+        let ws_centroids = kmeans(&ws_vecs, GIST_K, GIST_MAX_ITER);
+        let mut ws_matches = 0usize;
+        let mut ws_probed = 0usize;
+        for (ep_vec, _, _, _) in traces_for_rem {
+            // Brute-force nearest within-session neighbor (no HNSW for this subset).
+            let nearest = ws_records.iter().min_by(|a, b| {
+                let da: f32 = a
+                    .values
+                    .iter()
+                    .zip(ep_vec.iter())
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
+                let db: f32 = b
+                    .values
+                    .iter()
+                    .zip(ep_vec.iter())
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if let Some(neighbor) = nearest {
+                let probe_cluster = nearest_centroid(&ws_centroids, ep_vec);
+                let neighbor_cluster = nearest_centroid(&ws_centroids, &neighbor.values);
+                if probe_cluster == neighbor_cluster {
+                    ws_matches += 1;
+                }
+                ws_probed += 1;
+            }
+        }
+        if ws_probed > 0 {
+            let rate = ws_matches as f32 / ws_probed as f32;
+            within_session_gist_rate = Some(rate);
+            tracing::info!(
+                ws_warm_len = ws_records.len(),
+                rate,
+                ws_matches,
+                ws_probed,
+                "within-session gist probe"
+            );
+        }
+    }
+    within_session_gist_rate
+}
+
+/// Compression: spill the hot buffer to the cold archive and consolidate into warm, then keep
+/// warm and cold within their caps (warm rebuild from recent cold; lowest-salience cold eviction,
+/// ADR 0020).
+fn spill_hot_buffer(
+    episodic: &EpisodicBuffer,
+    recall: &mut RecollectionLayer,
+    max_warm_records: usize,
+    max_cold_records: usize,
+) {
+    let mut spilled = 0usize;
+    for record in episodic.iter_records() {
+        if let Err(e) = recall.cold.append(record) {
+            tracing::warn!(?e, "cold archive append error");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
+            break;
+        }
+        recall.warm.insert(record.clone());
+        spilled += 1;
+    }
+    somnus_metrics::counted_core!(
+        somnus_metrics::Metric::ColdArchiveSpillBytesWritten,
+        spilled as u64 * somnus_memory::cold::RECORD_BYTES as u64
+    );
+    tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
+
+    // Warm HNSW size management: rebuild whenever cold has grown past warm.
+    // The previous condition (warm.len() > max_warm_records) silently broke after the
+    // first rebuild: SemanticStore.insert() drops records once max_records is reached,
+    // so warm.len() never exceeds max_warm_records again and the index permanently
+    // diverges from cold. cold.len() > warm.len() fires every cycle once the cap is
+    // hit, keeping warm synchronised with the latest cold records.
+    if max_warm_records > 0 && recall.cold.len() > recall.warm.len() {
+        let (loaded, d_rebuild) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::SleepWarmRebuild, {
+                recall
+                    .warm
+                    .rebuild_from_recent(&recall.cold, max_warm_records)
+            });
+        tracing::info!(
+            loaded,
+            max_warm_records,
+            elapsed_ms = d_rebuild.as_millis(),
+            "warm HNSW rebuilt from recent cold records"
+        );
+    }
+
+    // Cold archive size management: evict lowest-salience records (ADR 0020).
+    if max_cold_records > 0 && recall.cold.len() > max_cold_records {
+        let before = recall.cold.len();
+        match recall.cold.evict_lowest_salience(max_cold_records) {
+            Ok(()) => tracing::info!(
+                before,
+                after = max_cold_records,
+                "cold archive: evicted lowest-salience records"
+            ),
+            Err(e) => {
+                tracing::warn!(?e, "cold archive eviction failed");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
+            }
+        }
+    }
+}
+
 /// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
 /// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
 /// Plain data so a cycle can be driven from a test without building the CLI `Args`.
@@ -1337,10 +1614,6 @@ pub fn run_sleep_cycle(
     // spill would find exact matches (L2=0) from the just-inserted current records.
     let mut regions_pruned: Vec<RegionId> = Vec::new();
     let mut total_units_pruned: usize = 0;
-    let mut warm_recall_l2: Option<f32> = None;
-    let mut gist_recall_rate: Option<f32> = None;
-    let mut cross_modal_gist_entropy: Option<f32> = None;
-    let mut within_session_gist_rate: Option<f32> = None;
 
     // Collect traces once for reuse in both warm probe and MSE measurement.
     let traces_for_rem: Vec<RemTrace> = if !was_interrupted {
@@ -1359,192 +1632,26 @@ pub fn run_sleep_cycle(
         vec![]
     };
 
-    if !was_interrupted && pre_spill_warm_len > 0 {
-        // ── Gist clustering (10c) ─────────────────────────────────────────────
-        // Build k-means centroids from a sample of the warm store, then use them
-        // during the warm probe to compute per-episode gist-recall.
-        let gist_centroids: Vec<Vec<f32>> = if pre_spill_warm_len >= GIST_MIN_WARM {
-            let sample = recall.warm.sample_values(GIST_SAMPLE);
-            tracing::debug!(sample_n = sample.len(), k = GIST_K, "gist: running k-means");
-            let (centroids, d_kmeans) = somnus_metrics::timed_core!(
-                somnus_metrics::Metric::SleepGistKmeans,
-                kmeans(&sample, GIST_K, GIST_MAX_ITER)
-            );
-            tracing::debug!(elapsed_ms = d_kmeans.as_millis(), "gist: k-means complete");
-            centroids
-        } else {
-            Vec::new()
-        };
-        let gist_available = !gist_centroids.is_empty();
-
-        let mut total_l2 = 0.0f32;
-        let mut n_probed = 0usize;
-        let mut gist_matches = 0usize;
-        // Per-cluster regional weight histogram for cross-modal entropy (Gap 8, ADR 0021).
-        // Slots 0–4 map to the 5 perception regions; each episode distributes its
-        // salience weight proportionally via regional_weights() (L2-norm attribution).
-        let mut cluster_sources: Vec<[f32; 6]> = vec![[0.0f32; 6]; GIST_K];
-
-        for (ep_vec, _, _src, salience) in &traces_for_rem {
-            if let Some((dist, neighbor)) =
-                recall.warm.query_with_dist(ep_vec, 1).into_iter().next()
-            {
-                total_l2 += dist;
-                n_probed += 1;
-                if gist_available {
-                    let probe_cluster = nearest_centroid(&gist_centroids, ep_vec);
-                    let neighbor_cluster = nearest_centroid(&gist_centroids, &neighbor.values);
-                    if probe_cluster == neighbor_cluster {
-                        gist_matches += 1;
-                    }
-                    // Salience weight: unknown (f32::MAX) → 1.0; otherwise clamp [0.01, 2.0].
-                    let weight = if *salience >= f32::MAX / 2.0 {
-                        1.0f32
-                    } else {
-                        salience.clamp(0.01, 2.0)
-                    };
-                    // Distribute weight proportionally across the 5 regional slots
-                    // using L2 norms of the episode vector's per-region slices.
-                    // This gives meaningful entropy even for Mixed-tagged episodes.
-                    let rw = regional_weights(ep_vec);
-                    for (slot, &rw_i) in rw.iter().enumerate() {
-                        cluster_sources[probe_cluster][slot] += weight * rw_i;
-                    }
-                }
-            }
-        }
-
-        // Extend the cluster histogram with a bounded warm sample so that
-        // prior-session episodes (cold→warm) contribute to cross_modal_gist_entropy.
-        if gist_available {
-            for rec in recall.warm.sample_records(GIST_SAMPLE) {
-                let probe_cluster = nearest_centroid(&gist_centroids, &rec.values);
-                let weight = if rec.salience >= f32::MAX / 2.0 {
-                    1.0f32
-                } else {
-                    rec.salience.clamp(0.01, 2.0)
-                };
-                let rw = regional_weights(&rec.values);
-                for (slot, &rw_i) in rw.iter().enumerate() {
-                    cluster_sources[probe_cluster][slot] += weight * rw_i;
-                }
-            }
-        }
-
-        if n_probed > 0 {
-            let mean_l2 = total_l2 / n_probed as f32;
-            warm_recall_l2 = Some(mean_l2);
-            if gist_available {
-                let rate = gist_matches as f32 / n_probed as f32;
-                gist_recall_rate = Some(rate);
-
-                // Shannon entropy per cluster (bits), averaged over occupied clusters.
-                // Slots 0–4 map to the 5 perception regions; slot 5 is unused now that
-                // the histogram uses proportional regional weights instead of IngestSource.
-                // Counts are salience-weighted so novel episodes contribute more.
-                let entropy_sum: f32 = cluster_sources
-                    .iter()
-                    .filter_map(|counts| {
-                        let total: f32 = counts[0..5].iter().sum();
-                        if total < 2.0 {
-                            return None; // need ≥2 weight to compute entropy
-                        }
-                        let h: f32 = counts[0..5]
-                            .iter()
-                            .filter(|&&c| c > 0.0)
-                            .map(|&c| {
-                                let p = c / total;
-                                // Guard p=1.0: log2(1.0)=0.0 exactly, so -p*log2(p)=-0.0
-                                // in IEEE 754. Return 0.0 explicitly for the pure-cluster case.
-                                if p >= 1.0 {
-                                    0.0
-                                } else {
-                                    -p * p.log2()
-                                }
-                            })
-                            .sum();
-                        Some(h)
-                    })
-                    .sum();
-                let n_occupied = cluster_sources
-                    .iter()
-                    .filter(|counts| counts[0..5].iter().sum::<f32>() >= 2.0)
-                    .count();
-                if n_occupied > 0 {
-                    cross_modal_gist_entropy = Some((entropy_sum / n_occupied as f32).max(0.0));
-                }
-
-                tracing::info!(
-                    mean_l2,
-                    pre_spill_warm_len,
-                    gist_recall_rate = rate,
-                    gist_matches,
-                    n_probed,
-                    cross_modal_gist_entropy = ?cross_modal_gist_entropy,
-                    "warm recall + gist probe"
-                );
-            } else {
-                tracing::info!(mean_l2, pre_spill_warm_len, "warm recall probe");
-            }
-        }
-    }
+    let WarmProbe {
+        warm_recall_l2,
+        gist_recall_rate,
+        cross_modal_gist_entropy,
+    } = if !was_interrupted && pre_spill_warm_len > 0 {
+        warm_recall_probe(recall, &traces_for_rem, pre_spill_warm_len)
+    } else {
+        WarmProbe::default()
+    };
 
     // ── Within-session gist probe ─────────────────────────────────────────────
     // Re-runs gist with a within-session warm subset (timestamp_secs >= session_start_secs).
     // Prior-session embeddings are excluded because NREM weight updates cause embedding
     // drift, making cross-session nearest-neighbor matches semantically unreliable.
     // This is the clean signal for the growth controller (ADR 0024).
-    if !was_interrupted {
-        let ws_records = recall.warm.records_since(session_start_secs);
-        if ws_records.len() >= GIST_MIN_WARM {
-            let ws_vecs: Vec<Vec<f32>> = ws_records.iter().map(|r| r.values.clone()).collect();
-            tracing::debug!(
-                ws_warm_len = ws_records.len(),
-                k = GIST_K,
-                "within-session gist: running k-means"
-            );
-            let ws_centroids = kmeans(&ws_vecs, GIST_K, GIST_MAX_ITER);
-            let mut ws_matches = 0usize;
-            let mut ws_probed = 0usize;
-            for (ep_vec, _, _, _) in &traces_for_rem {
-                // Brute-force nearest within-session neighbor (no HNSW for this subset).
-                let nearest = ws_records.iter().min_by(|a, b| {
-                    let da: f32 = a
-                        .values
-                        .iter()
-                        .zip(ep_vec.iter())
-                        .map(|(x, y)| (x - y) * (x - y))
-                        .sum();
-                    let db: f32 = b
-                        .values
-                        .iter()
-                        .zip(ep_vec.iter())
-                        .map(|(x, y)| (x - y) * (x - y))
-                        .sum();
-                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                if let Some(neighbor) = nearest {
-                    let probe_cluster = nearest_centroid(&ws_centroids, ep_vec);
-                    let neighbor_cluster = nearest_centroid(&ws_centroids, &neighbor.values);
-                    if probe_cluster == neighbor_cluster {
-                        ws_matches += 1;
-                    }
-                    ws_probed += 1;
-                }
-            }
-            if ws_probed > 0 {
-                let rate = ws_matches as f32 / ws_probed as f32;
-                within_session_gist_rate = Some(rate);
-                tracing::info!(
-                    ws_warm_len = ws_records.len(),
-                    rate,
-                    ws_matches,
-                    ws_probed,
-                    "within-session gist probe"
-                );
-            }
-        }
-    }
+    let within_session_gist_rate = if !was_interrupted {
+        within_session_gist(recall, &traces_for_rem, session_start_secs)
+    } else {
+        None
+    };
 
     // ── Compression: spill hot → cold; consolidate into warm ─────────────────
     // t_rem/t_rem2 (below) are two non-contiguous REM sub-sections accumulated into one
@@ -1555,58 +1662,7 @@ pub fn run_sleep_cycle(
     rem_wall_ms += d_rem1.as_millis() as u64;
     let (_, d_spill) = somnus_metrics::timed_core!(somnus_metrics::Metric::SleepSpill, {
         if !was_interrupted {
-            let mut spilled = 0usize;
-            for record in episodic.iter_records() {
-                if let Err(e) = recall.cold.append(record) {
-                    tracing::warn!(?e, "cold archive append error");
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
-                    break;
-                }
-                recall.warm.insert(record.clone());
-                spilled += 1;
-            }
-            somnus_metrics::counted_core!(
-                somnus_metrics::Metric::ColdArchiveSpillBytesWritten,
-                spilled as u64 * somnus_memory::cold::RECORD_BYTES as u64
-            );
-            tracing::info!(spilled, "hot→cold spill + warm consolidation complete");
-
-            // Warm HNSW size management: rebuild whenever cold has grown past warm.
-            // The previous condition (warm.len() > max_warm_records) silently broke after the
-            // first rebuild: SemanticStore.insert() drops records once max_records is reached,
-            // so warm.len() never exceeds max_warm_records again and the index permanently
-            // diverges from cold. cold.len() > warm.len() fires every cycle once the cap is
-            // hit, keeping warm synchronised with the latest cold records.
-            if max_warm_records > 0 && recall.cold.len() > recall.warm.len() {
-                let (loaded, d_rebuild) =
-                    somnus_metrics::timed_core!(somnus_metrics::Metric::SleepWarmRebuild, {
-                        recall
-                            .warm
-                            .rebuild_from_recent(&recall.cold, max_warm_records)
-                    });
-                tracing::info!(
-                    loaded,
-                    max_warm_records,
-                    elapsed_ms = d_rebuild.as_millis(),
-                    "warm HNSW rebuilt from recent cold records"
-                );
-            }
-
-            // Cold archive size management: evict lowest-salience records (ADR 0020).
-            if max_cold_records > 0 && recall.cold.len() > max_cold_records {
-                let before = recall.cold.len();
-                match recall.cold.evict_lowest_salience(max_cold_records) {
-                    Ok(()) => tracing::info!(
-                        before,
-                        after = max_cold_records,
-                        "cold archive: evicted lowest-salience records"
-                    ),
-                    Err(e) => {
-                        tracing::warn!(?e, "cold archive eviction failed");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
-                    }
-                }
-            }
+            spill_hot_buffer(episodic, recall, max_warm_records, max_cold_records);
         }
     });
 
