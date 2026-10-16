@@ -12,7 +12,9 @@
 > - **Awaiting user:** R1 (do REM scoring passes `measure_mse`/`collect_high_residual_inputs` mutate k-WTA duty
 >   cycles on purpose? history says accidental; switching to `forward_no_dc` changes REM numerics, needs an A/B).
 >   R4 (batch REM scoring) is queued behind it.
-> - Not done: the ~1000-line wake main loop of `run()` (no end-to-end test, ~100 mutable locals).
+> - Wake main loop of `run()` split (~1000 -> ~290 lines): `WakeState`, `wake.rs`, `startup.rs`; metrics line key set pinned by a test.
+>   Two mechanical-rename bugs were caught by review (st.* prefixes leaked into tracing field names and into the metrics JSON keys);
+>   string-literal sets verified equal to the pre-refactor tree. Remaining ~950 lines of `run()` are linear setup.
 > - Always run `cargo test` before committing (the pre-commit hook only runs fmt + clippy; one commit this session
 >   landed with failing startup tests and was fixed in the next).
 > - **Still open:** ADR 0048 4-arm pilot. Nothing pushed.
