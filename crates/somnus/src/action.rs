@@ -220,6 +220,104 @@ struct ProjModel {
     fc2: Linear, // [PROJ_HIDDEN, N_REGIONS * LM_HIDDEN]
 }
 
+/// The MIGraphX-backed sessions (gain always; text-hidden and fixed-length LM when their ONNX
+/// files exist). Built sequentially so GPU compiles don't contend.
+struct GpuSessions {
+    gain: Option<Session>,
+    text_hidden: Option<Session>,
+    lm_fixed: Option<Session>,
+}
+
+fn load_gpu_sessions(
+    models_dir: &std::path::Path,
+    model_prefix: &str,
+    gain_path: &std::path::Path,
+    gpu_generation: bool,
+) -> Result<GpuSessions> {
+    let gain = Some(crate::migraphx_session(gain_path)?);
+    let text_hidden_path = models_dir.join(format!("{model_prefix}_text_hidden.onnx"));
+    let text_hidden_session = if text_hidden_path.exists() {
+        tracing::info!(
+            "loading {model_prefix}_text_hidden.onnx — GPU path active for distillation targets"
+        );
+        Some(crate::migraphx_session(&text_hidden_path)?)
+    } else {
+        tracing::info!(
+            "{model_prefix}_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session"
+        );
+        None
+    };
+    let lm_fixed_path = models_dir.join(format!("{model_prefix}_lm_fixed.onnx"));
+    let lm_fixed_session = if gpu_generation && lm_fixed_path.exists() {
+        tracing::info!(
+            "loading {model_prefix}_lm_fixed.onnx — GPU generation path active (--gpu-generation)"
+        );
+        Some(crate::migraphx_session(&lm_fixed_path)?)
+    } else if gpu_generation {
+        tracing::info!(
+            "{model_prefix}_lm_fixed.onnx absent — --gpu-generation ignored, using CPU lm_session"
+        );
+        None
+    } else {
+        tracing::info!("generate() using CPU lm_session (pass --gpu-generation to use {model_prefix}_lm_fixed.onnx)");
+        None
+    };
+    Ok(GpuSessions {
+        gain,
+        text_hidden: text_hidden_session,
+        lm_fixed: lm_fixed_session,
+    })
+}
+
+/// KV-cache generation sessions (prefill, decode): INT8 when present, else FP32, else none.
+fn load_kv_sessions(
+    models_dir: &std::path::Path,
+    model_prefix: &str,
+) -> Result<(Option<Session>, Option<Session>)> {
+    let prefill_kv_int8 = models_dir.join(format!("{model_prefix}_lm_prefill_kv_int8.onnx"));
+    let decode_kv_int8 = models_dir.join(format!("{model_prefix}_lm_decode_kv_int8.onnx"));
+    let prefill_kv_fp32 = models_dir.join(format!("{model_prefix}_lm_prefill_kv.onnx"));
+    let decode_kv_fp32 = models_dir.join(format!("{model_prefix}_lm_decode_kv.onnx"));
+    let (prefill_kv_session, decode_kv_session) =
+        if prefill_kv_int8.exists() && decode_kv_int8.exists() {
+            tracing::info!("loading KV-cache INT8 models — fast generate() path active (Q-B)");
+            (
+                Some(crate::cpu_session(&prefill_kv_int8, None)?),
+                Some(crate::cpu_session(&decode_kv_int8, None)?),
+            )
+        } else if prefill_kv_fp32.exists() && decode_kv_fp32.exists() {
+            tracing::info!("loading KV-cache FP32 models — fast generate() path active (ADR 0034)");
+            (
+                Some(crate::cpu_session(&prefill_kv_fp32, None)?),
+                Some(crate::cpu_session(&decode_kv_fp32, None)?),
+            )
+        } else {
+            tracing::info!("KV-cache models absent — generate() using slow lm_session path");
+            (None, None)
+        };
+    Ok((prefill_kv_session, decode_kv_session))
+}
+
+/// The frozen token-embedding table as a flat row-major `f32` vector.
+fn load_embed_table(embed_path: &std::path::Path) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(embed_path)?;
+    let st = SafeTensors::deserialize(&bytes)
+        .map_err(|e| anyhow::anyhow!("safetensors load failed: {e}"))?;
+    let tv = st.tensor("embed_tokens.weight").map_err(|e| {
+        anyhow::anyhow!(
+            "embed_tokens.weight missing in {}: {e}",
+            embed_path.display()
+        )
+    })?;
+    Ok(tv
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect())
+}
+
 impl ProjModel {
     fn new(device: &Device, linear_proj: bool) -> Self {
         let (fc1, fc2) = if linear_proj {
@@ -364,79 +462,35 @@ impl ActionDecoder {
             }
         }
 
-        let gain_session = Some(crate::migraphx_session(&gain_path)?);
+        // Everything below is independent file I/O + ONNX session construction (~30 s serially:
+        // measured 2026-10-16). Build it concurrently; the GPU (MIGraphX) sessions stay on one
+        // thread so their compiles don't contend with each other.
         let lm_profile_prefix = ort_profile_dir.map(|d| d.join(format!("{model_prefix}_lm")));
-        let lm_session = crate::cpu_session(&lm_path, lm_profile_prefix.as_deref())?;
-        let text_hidden_path = models_dir.join(format!("{model_prefix}_text_hidden.onnx"));
-        let text_hidden_session = if text_hidden_path.exists() {
-            tracing::info!(
-                "loading {model_prefix}_text_hidden.onnx — GPU path active for distillation targets"
-            );
-            Some(crate::migraphx_session(&text_hidden_path)?)
-        } else {
-            tracing::info!(
-                "{model_prefix}_text_hidden.onnx absent — text_hidden_states() uses CPU lm_session"
-            );
-            None
-        };
-        let lm_fixed_path = models_dir.join(format!("{model_prefix}_lm_fixed.onnx"));
-        let lm_fixed_session = if gpu_generation && lm_fixed_path.exists() {
-            tracing::info!(
-                "loading {model_prefix}_lm_fixed.onnx — GPU generation path active (--gpu-generation)"
-            );
-            Some(crate::migraphx_session(&lm_fixed_path)?)
-        } else if gpu_generation {
-            tracing::info!(
-                "{model_prefix}_lm_fixed.onnx absent — --gpu-generation ignored, using CPU lm_session"
-            );
-            None
-        } else {
-            tracing::info!("generate() using CPU lm_session (pass --gpu-generation to use {model_prefix}_lm_fixed.onnx)");
-            None
-        };
-
-        let prefill_kv_int8 = models_dir.join(format!("{model_prefix}_lm_prefill_kv_int8.onnx"));
-        let decode_kv_int8 = models_dir.join(format!("{model_prefix}_lm_decode_kv_int8.onnx"));
-        let prefill_kv_fp32 = models_dir.join(format!("{model_prefix}_lm_prefill_kv.onnx"));
-        let decode_kv_fp32 = models_dir.join(format!("{model_prefix}_lm_decode_kv.onnx"));
-        let (prefill_kv_session, decode_kv_session) = if prefill_kv_int8.exists()
-            && decode_kv_int8.exists()
-        {
-            tracing::info!("loading KV-cache INT8 models — fast generate() path active (Q-B)");
-            (
-                Some(crate::cpu_session(&prefill_kv_int8, None)?),
-                Some(crate::cpu_session(&decode_kv_int8, None)?),
-            )
-        } else if prefill_kv_fp32.exists() && decode_kv_fp32.exists() {
-            tracing::info!("loading KV-cache FP32 models — fast generate() path active (ADR 0034)");
-            (
-                Some(crate::cpu_session(&prefill_kv_fp32, None)?),
-                Some(crate::cpu_session(&decode_kv_fp32, None)?),
-            )
-        } else {
-            tracing::info!("KV-cache models absent — generate() using slow lm_session path");
-            (None, None)
-        };
-
-        let bytes = std::fs::read(&embed_path)?;
-        let st = SafeTensors::deserialize(&bytes)
-            .map_err(|e| anyhow::anyhow!("safetensors load failed: {e}"))?;
-        let tv = st.tensor("embed_tokens.weight").map_err(|e| {
-            anyhow::anyhow!(
-                "embed_tokens.weight missing in {}: {e}",
-                embed_path.display()
-            )
+        let (gpu, lm_session, kv, embed_table, tokenizer) = std::thread::scope(|sc| {
+            let h_gpu = sc
+                .spawn(|| load_gpu_sessions(models_dir, model_prefix, &gain_path, gpu_generation));
+            let h_lm = sc.spawn(|| crate::cpu_session(&lm_path, lm_profile_prefix.as_deref()));
+            let h_kv = sc.spawn(|| load_kv_sessions(models_dir, model_prefix));
+            let h_embed = sc.spawn(|| load_embed_table(&embed_path));
+            let h_tok = sc.spawn(|| {
+                Tokenizer::from_file(&tok_path)
+                    .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))
+            });
+            let join = |what: &str| anyhow::anyhow!("{what} loader thread panicked");
+            Ok::<_, anyhow::Error>((
+                h_gpu.join().map_err(|_| join("gpu session"))??,
+                h_lm.join().map_err(|_| join("lm session"))??,
+                h_kv.join().map_err(|_| join("kv session"))??,
+                h_embed.join().map_err(|_| join("embed table"))??,
+                h_tok.join().map_err(|_| join("tokenizer"))??,
+            ))
         })?;
-        let embed_table: Vec<f32> = tv
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect();
-
-        let tokenizer = Tokenizer::from_file(&tok_path)
-            .map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
+        let GpuSessions {
+            gain: gain_session,
+            text_hidden: text_hidden_session,
+            lm_fixed: lm_fixed_session,
+        } = gpu;
+        let (prefill_kv_session, decode_kv_session) = kv;
 
         let model = ProjModel::new(&device, linear_proj);
         let optimizer: ProjOptim = AdamWConfig::new().init();
