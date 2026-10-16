@@ -1170,106 +1170,78 @@ fn prepare_replay_traces(
     }
 }
 
-/// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
-/// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
-/// Plain data so a cycle can be driven from a test without building the CLI `Args`.
-#[derive(Debug, Clone)]
-pub struct SleepParams {
-    pub sleep_loss_target: f32,
-    pub sleep_max_secs: u64,
-    pub prune_fraction: f32,
-    pub prune_min_grown: usize,
-    pub replay_batch_size: usize,
-    pub nrem_min_traces: usize,
-    pub nrem_salience_threshold: usize,
-    pub lang_oversample: usize,
-    pub replay_epochs: usize,
-    pub binding_replay: bool,
-    pub binding_replay_steps: usize,
-    pub binding_replay_lr_scale: f32,
-    pub binding_replay_freeze_heads: bool,
-    pub max_warm_records: usize,
-    pub max_cold_records: usize,
-    pub growth_cooldown: usize,
-    pub cooldown_remaining: usize,
-    pub session_start_secs: f64,
-    /// Where to export replay traces as training data (`--export-training-data`), if anywhere.
-    pub training_data_path: Option<PathBuf>,
-}
-
-/// Cross-thread signals observed during a sleep cycle.
-pub struct SleepSignals {
-    /// Set by the main loop to cut the cycle short.
-    pub interrupt: Arc<AtomicBool>,
-    /// Embeddings produced by encoder tasks but not yet consumed by the main loop.
-    pub pending_embs: Arc<AtomicUsize>,
-}
-
-impl Default for SleepParams {
-    /// The CLI defaults (`cli.rs`).
-    fn default() -> Self {
-        Self {
-            sleep_loss_target: 0.0,
-            sleep_max_secs: 0,
-            prune_fraction: 0.0,
-            prune_min_grown: 64,
-            replay_batch_size: 128,
-            nrem_min_traces: 0,
-            nrem_salience_threshold: 0,
-            lang_oversample: 0,
-            replay_epochs: 4,
-            binding_replay: false,
-            binding_replay_steps: 1,
-            binding_replay_lr_scale: 1.0,
-            binding_replay_freeze_heads: false,
-            max_warm_records: 200_000,
-            max_cold_records: 0,
-            growth_cooldown: 3,
-            cooldown_remaining: 0,
-            session_start_secs: 0.0,
-            training_data_path: None,
+/// Mean cosine similarity between the regional outputs stored with a trace and the current
+/// model's predictions for its episode, over regions where both are non-empty (DER++ staleness
+/// check). `1.0` when there is nothing to compare; a zero-norm vector counts as similarity 1.0.
+fn staleness_cosine(stored: &[Vec<f32>; 5], predicted: &[Vec<f32>; 5]) -> f32 {
+    let mut cosines = Vec::new();
+    for (stored, predicted) in stored.iter().zip(predicted.iter()) {
+        if stored.is_empty() || predicted.is_empty() {
+            continue;
         }
+        let dot: f32 = stored
+            .iter()
+            .zip(predicted.iter())
+            .map(|(x, y)| x * y)
+            .sum();
+        let norm_stored: f32 = stored.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_pred: f32 = predicted.iter().map(|x| x * x).sum::<f32>().sqrt();
+        cosines.push(if norm_stored < 1e-9 || norm_pred < 1e-9 {
+            1.0
+        } else {
+            (dot / (norm_stored * norm_pred)).clamp(-1.0, 1.0)
+        });
+    }
+    if cosines.is_empty() {
+        1.0 // No stored outputs to check
+    } else {
+        cosines.iter().sum::<f32>() / cosines.len() as f32
     }
 }
 
-pub fn run_sleep_cycle(
+/// What the NREM replay loop reports back to the cycle driver.
+struct NremOutcome {
+    traces_replayed: usize,
+    mean_train_loss: f32,
+    mean_output_mse: f32,
+    mean_proj_loss: Option<f32>,
+    proj_loss_max_opt: Option<f32>,
+    was_interrupted: bool,
+    /// Why the loop exited: "traces_exhausted", "loss_target_met", "time_budget" or "salience".
+    nrem_exit_reason: &'static str,
+    nrem_wall_ms: u64,
+    decoder_trainable_records: usize,
+}
+
+/// NREM: replay the prepared traces for `replay_epochs` passes, training the SAE + output heads
+/// (fused single backward), optionally the live-episode binding (ADR 0041) and the projection
+/// distillation (Gap 6). Honours the interrupt flag, the salience threshold, the loss target and
+/// the wall-clock budget; stale traces (stored outputs drifted from current inference, DER++) are
+/// skipped.
+fn run_nrem(
     perception: &mut PerceptionProcessor,
     episodic: &mut EpisodicBuffer,
-    recall: &mut RecollectionLayer,
-    memory_dir: &Path,
     decoder: &mut Option<ActionDecoder>,
-    signals: SleepSignals,
+    traces: &[TraceSnapshot],
+    signals: &SleepSignals,
     params: &SleepParams,
-) -> Result<SleepStats> {
-    let SleepSignals {
-        interrupt,
-        pending_embs,
-    } = signals;
-    let training_data_path = params.training_data_path.as_deref();
-    let sleep_loss_target = params.sleep_loss_target;
-    let sleep_max_secs = params.sleep_max_secs;
-    let prune_fraction = params.prune_fraction;
-    let prune_min_grown = params.prune_min_grown;
-    let replay_batch_size = params.replay_batch_size;
-    let nrem_min_traces = params.nrem_min_traces;
-    let nrem_salience_threshold = params.nrem_salience_threshold;
-    let lang_oversample = params.lang_oversample;
-    let replay_epochs = params.replay_epochs;
-    let binding_replay = params.binding_replay;
-    let binding_replay_steps = params.binding_replay_steps;
-    let binding_replay_lr_scale = params.binding_replay_lr_scale;
-    let binding_replay_freeze_heads = params.binding_replay_freeze_heads;
-    let max_warm_records = params.max_warm_records;
-    let max_cold_records = params.max_cold_records;
-    let growth_cooldown = params.growth_cooldown;
-    let cooldown_remaining = params.cooldown_remaining;
-    let session_start_secs = params.session_start_secs;
-
-    let sleep_start = Instant::now();
-    tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
-    // rem_wall_ms is accumulated across two REM sub-sections; the others are one-shot.
-    let mut rem_wall_ms = 0u64;
-
+    sleep_start: Instant,
+) -> NremOutcome {
+    let interrupt = &signals.interrupt;
+    let pending_embs = &signals.pending_embs;
+    let SleepParams {
+        sleep_loss_target,
+        sleep_max_secs,
+        replay_batch_size,
+        nrem_min_traces,
+        nrem_salience_threshold,
+        replay_epochs,
+        binding_replay,
+        binding_replay_steps,
+        binding_replay_lr_scale,
+        binding_replay_freeze_heads,
+        ..
+    } = *params;
     let mut traces_replayed = 0usize;
     let mut total_train_loss = 0.0f32;
     let mut total_output_mse = 0.0f32;
@@ -1279,18 +1251,6 @@ pub fn run_sleep_cycle(
     let mut total_proj_loss = 0.0f32;
     let mut proj_loss_n = 0usize;
     let mut proj_loss_max = 0.0f32;
-
-    // Snapshot warm size before spill so REM can detect cross-cycle entries.
-    let pre_spill_warm_len = recall.warm.len();
-
-    // ── NREM-like: replay + train ─────────────────────────────────────────────
-    let PreparedTraces {
-        traces,
-        lm_hidden_computed,
-        lm_hidden_unique,
-        distill_precompute_ms,
-        nrem_unique_traces,
-    } = prepare_replay_traces(episodic, decoder, lang_oversample, training_data_path);
     let n_traces = traces.len();
     let mut loss_ewma = 0.0f32;
     const EWMA_ALPHA: f32 = 0.3;
@@ -1362,35 +1322,7 @@ pub fn run_sleep_cycle(
                 // Infer current model's predictions for this episode
                 match perception.infer_episode_outputs(ep) {
                     Ok(predicted_regionals) => {
-                        // Check staleness: mean cosine sim across regions
-                        let mut cosines = Vec::new();
-                        for region_idx in 0..5 {
-                            let stored = &stored_regionals[region_idx];
-                            let predicted = &predicted_regionals[region_idx];
-                            if !stored.is_empty() && !predicted.is_empty() {
-                                // cosine_sim is a static helper — call it via the method
-                                let dot: f32 = stored
-                                    .iter()
-                                    .zip(predicted.iter())
-                                    .map(|(x, y)| x * y)
-                                    .sum();
-                                let norm_stored: f32 =
-                                    stored.iter().map(|x| x * x).sum::<f32>().sqrt();
-                                let norm_pred: f32 =
-                                    predicted.iter().map(|x| x * x).sum::<f32>().sqrt();
-                                let sim = if norm_stored < 1e-9 || norm_pred < 1e-9 {
-                                    1.0
-                                } else {
-                                    (dot / (norm_stored * norm_pred)).clamp(-1.0, 1.0)
-                                };
-                                cosines.push(sim);
-                            }
-                        }
-                        let mean_cosine = if cosines.is_empty() {
-                            1.0 // No stored outputs to check
-                        } else {
-                            cosines.iter().sum::<f32>() / cosines.len() as f32
-                        };
+                        let mean_cosine = staleness_cosine(stored_regionals, &predicted_regionals);
 
                         // Keep sample if not stale (cosine above threshold)
                         if mean_cosine >= STALE_COSINE_THRESHOLD {
@@ -1643,6 +1575,137 @@ pub fn run_sleep_cycle(
         "NREM replay complete"
     );
 
+    NremOutcome {
+        traces_replayed,
+        mean_train_loss,
+        mean_output_mse,
+        mean_proj_loss,
+        proj_loss_max_opt,
+        was_interrupted,
+        nrem_exit_reason,
+        nrem_wall_ms,
+        decoder_trainable_records,
+    }
+}
+
+/// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
+/// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
+/// Plain data so a cycle can be driven from a test without building the CLI `Args`.
+#[derive(Debug, Clone)]
+pub struct SleepParams {
+    pub sleep_loss_target: f32,
+    pub sleep_max_secs: u64,
+    pub prune_fraction: f32,
+    pub prune_min_grown: usize,
+    pub replay_batch_size: usize,
+    pub nrem_min_traces: usize,
+    pub nrem_salience_threshold: usize,
+    pub lang_oversample: usize,
+    pub replay_epochs: usize,
+    pub binding_replay: bool,
+    pub binding_replay_steps: usize,
+    pub binding_replay_lr_scale: f32,
+    pub binding_replay_freeze_heads: bool,
+    pub max_warm_records: usize,
+    pub max_cold_records: usize,
+    pub growth_cooldown: usize,
+    pub cooldown_remaining: usize,
+    pub session_start_secs: f64,
+    /// Where to export replay traces as training data (`--export-training-data`), if anywhere.
+    pub training_data_path: Option<PathBuf>,
+}
+
+/// Cross-thread signals observed during a sleep cycle.
+pub struct SleepSignals {
+    /// Set by the main loop to cut the cycle short.
+    pub interrupt: Arc<AtomicBool>,
+    /// Embeddings produced by encoder tasks but not yet consumed by the main loop.
+    pub pending_embs: Arc<AtomicUsize>,
+}
+
+impl Default for SleepParams {
+    /// The CLI defaults (`cli.rs`).
+    fn default() -> Self {
+        Self {
+            sleep_loss_target: 0.0,
+            sleep_max_secs: 0,
+            prune_fraction: 0.0,
+            prune_min_grown: 64,
+            replay_batch_size: 128,
+            nrem_min_traces: 0,
+            nrem_salience_threshold: 0,
+            lang_oversample: 0,
+            replay_epochs: 4,
+            binding_replay: false,
+            binding_replay_steps: 1,
+            binding_replay_lr_scale: 1.0,
+            binding_replay_freeze_heads: false,
+            max_warm_records: 200_000,
+            max_cold_records: 0,
+            growth_cooldown: 3,
+            cooldown_remaining: 0,
+            session_start_secs: 0.0,
+            training_data_path: None,
+        }
+    }
+}
+
+pub fn run_sleep_cycle(
+    perception: &mut PerceptionProcessor,
+    episodic: &mut EpisodicBuffer,
+    recall: &mut RecollectionLayer,
+    memory_dir: &Path,
+    decoder: &mut Option<ActionDecoder>,
+    signals: SleepSignals,
+    params: &SleepParams,
+) -> Result<SleepStats> {
+    let training_data_path = params.training_data_path.as_deref();
+    let prune_fraction = params.prune_fraction;
+    let prune_min_grown = params.prune_min_grown;
+    let lang_oversample = params.lang_oversample;
+    let max_warm_records = params.max_warm_records;
+    let max_cold_records = params.max_cold_records;
+    let growth_cooldown = params.growth_cooldown;
+    let cooldown_remaining = params.cooldown_remaining;
+    let session_start_secs = params.session_start_secs;
+
+    let sleep_start = Instant::now();
+    tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
+    // rem_wall_ms is accumulated across two REM sub-sections; the others are one-shot.
+    let mut rem_wall_ms = 0u64;
+
+    // Snapshot warm size before spill so REM can detect cross-cycle entries.
+    let pre_spill_warm_len = recall.warm.len();
+
+    // ── NREM-like: replay + train ─────────────────────────────────────────────
+    let PreparedTraces {
+        traces,
+        lm_hidden_computed,
+        lm_hidden_unique,
+        distill_precompute_ms,
+        nrem_unique_traces,
+    } = prepare_replay_traces(episodic, decoder, lang_oversample, training_data_path);
+    let n_traces = traces.len();
+    let NremOutcome {
+        traces_replayed,
+        mean_train_loss,
+        mean_output_mse,
+        mean_proj_loss,
+        proj_loss_max_opt,
+        was_interrupted,
+        nrem_exit_reason,
+        nrem_wall_ms,
+        decoder_trainable_records,
+    } = run_nrem(
+        perception,
+        episodic,
+        decoder,
+        &traces,
+        &signals,
+        params,
+        sleep_start,
+    );
+
     // ── Homeostatic downscaling ───────────────────────────────────────────────
     if !was_interrupted {
         perception.homeostatic_decay(DECAY_RATE);
@@ -1851,6 +1914,37 @@ pub fn run_sleep_cycle(
 
 #[cfg(test)]
 mod tests {
+    // ── staleness_cosine ───────────────────────────────────────────────────────
+
+    fn regs(a: &[f32], b: &[f32]) -> [Vec<f32>; 5] {
+        [a.to_vec(), vec![], b.to_vec(), vec![], vec![]]
+    }
+
+    #[test]
+    fn staleness_cosine_identical_is_one_and_opposite_is_minus_one() {
+        let x = regs(&[1.0, 2.0], &[3.0, 4.0]);
+        assert!((staleness_cosine(&x, &x) - 1.0).abs() < 1e-6);
+        let neg = regs(&[-1.0, -2.0], &[-3.0, -4.0]);
+        assert!((staleness_cosine(&x, &neg) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn staleness_cosine_averages_only_regions_present_on_both_sides() {
+        // Region 0 identical (1.0), region 2 orthogonal (0.0); regions 1/3/4 empty -> mean 0.5.
+        let stored = regs(&[1.0, 0.0], &[1.0, 0.0]);
+        let predicted = regs(&[2.0, 0.0], &[0.0, 5.0]);
+        assert!((staleness_cosine(&stored, &predicted) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn staleness_cosine_with_nothing_to_compare_or_zero_norm_is_one() {
+        let empty: [Vec<f32>; 5] = Default::default();
+        assert_eq!(staleness_cosine(&empty, &empty), 1.0);
+        let zero = regs(&[0.0, 0.0], &[]);
+        let x = regs(&[1.0, 2.0], &[]);
+        assert_eq!(staleness_cosine(&zero, &x), 1.0);
+    }
+
     // ── whole-cycle characterization ─────────────────────────────────────────
     // `run_sleep_cycle` had no end-to-end test. These pin its externally visible behaviour (stats,
     // persisted files, buffer/memory side effects, run-to-run determinism) so the function can be
