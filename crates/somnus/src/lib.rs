@@ -5,6 +5,7 @@ mod cli;
 mod sleep;
 mod startup;
 mod util;
+mod wake;
 mod wake_state;
 mod whisper_asr;
 
@@ -1423,70 +1424,14 @@ pub async fn run() -> Result<()> {
         // ── drain any pending queries before potentially sleeping ─────────────
         // This ensures queries are never blocked behind a sleep cycle.
         while let Ok(query) = query_rx.try_recv() {
-            tracing::info!(query = %query, "query received (pre-sleep drain)");
-            let raw_targets = if is_introspective_query(&query) {
-                episodic.recent_text_targets(8)
-            } else {
-                vec![]
-            };
-            let last_trace = episodic.iter_traces().last();
-            let ep_info = last_trace.map(|t| (t.record.id, t.record.values.clone()));
-            match ep_info {
-                None => {
-                    println!(
-                        "{}",
-                        serde_json::json!({"type":"action_response","error":"no episode yet"})
-                    );
-                }
-                Some((last_id, ep)) => {
-                    if let Some(ref mut dec) = decoder {
-                        if let Ok(ids) = dec.tokenize(&query) {
-                            episodic.set_last_text_target(ids);
-                        }
-                        let effective_query = build_query_with_history(&query, raw_targets, dec);
-                        let recalled =
-                            query_recalled_episodes(&recall, &ep, Some(last_id), args.recall_k);
-                        tracing::info!(
-                            recall_n = recalled.len(),
-                            introspective = effective_query.len() != query.len(),
-                            "starting generation (pre-sleep)"
-                        );
-                        let ep_clone = ep.clone();
-                        let max_tokens = args.action_max_tokens;
-                        let result = tokio::task::block_in_place(|| {
-                            dec.generate(&ep_clone, &recalled, &effective_query, max_tokens)
-                        });
-                        match result {
-                            Ok(response) => {
-                                let ts_ms = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_millis())
-                                    .unwrap_or(0);
-                                tracing::info!(
-                                    tokens = response.split_whitespace().count(),
-                                    "generation complete"
-                                );
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "type": "action_response",
-                                        "ts": ts_ms,
-                                        "query": query,
-                                        "response": response,
-                                    })
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(?e, "generation failed");
-                                somnus_metrics::counted_core!(
-                                    somnus_metrics::Metric::ActionGenerationError,
-                                    1
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            wake::answer_query(
+                &query,
+                "pre-sleep",
+                &mut episodic,
+                &mut decoder,
+                &recall,
+                &args,
+            );
         }
 
         // ── poll gain worker result (non-blocking) ────────────────────────────
@@ -1526,79 +1471,14 @@ pub async fn run() -> Result<()> {
                         &mut st.wake_recon_dropped,
                         sal_gate(st.sal_mu, st.sal_sigma, st.sal_n),
                     ) {
-                        st.lang_ingest_count += 1;
-                        if r.episode_produced {
-                            st.wake_episodes += 1;
-                            if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
-                                update_perf_ewma(
-                                    m,
-                                    &mut st.cosine_ewma,
-                                    &mut st.cosine_baseline,
-                                    &mut st.cosine_baseline_accum,
-                                    &mut st.cosine_baseline_n,
-                                    &mut st.perf_sleep_flag,
-                                    args.perf_sleep_threshold,
-                                );
-                                update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
-                                perception.set_settle_gate(settle_gate_val(
-                                    st.settle_mu,
-                                    st.settle_n,
-                                    args.settle_gate,
-                                ));
-                            }
-                        }
-                        if let Some(m) = r.reconstruct_mse {
-                            st.wake_output_mse_sum += m as f64;
-                            st.wake_output_mse_n += 1;
-                        }
-                        if r.throttle_passed {
-                            st.wake_reconstruct_throttle_passed += 1;
-                        }
-                        if r.settle_iters > 0 {
-                            st.settle_trigger_count += 1;
-                            st.settle_iters_sum += r.settle_iters;
-                            st.settle_delta_sum += r.settle_delta as f64;
-                        }
-                        if let Some(ref es) = r.ep_stats {
-                            let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
-                            accumulate_salience(
-                                es,
-                                sal_thresh,
-                                &mut st.salience_sum,
-                                &mut st.salience_n,
-                                &mut st.salience_min,
-                                &mut st.high_salience_episodes,
-                                &mut st.blend_count,
-                                &mut st.episodes_speech,
-                                &mut st.episodes_env,
-                                &mut st.episodes_visual,
-                                &mut st.episodes_language,
-                                &mut st.episodes_mixed,
-                            );
-                            update_sal_ewma(
-                                es.salience,
-                                &mut st.sal_mu,
-                                &mut st.sal_sigma,
-                                &mut st.sal_n,
-                            );
-                            accumulate_wakefulness_pressure(
-                                es.salience,
-                                sal_thresh,
-                                &mut st.wakefulness_pressure,
-                            );
-                        }
-                        accumulate_cosines(
-                            &r.prior_cosines,
-                            &mut st.prior_cosine_sums,
-                            &mut st.prior_cosine_counts,
+                        wake::record_language_result(
+                            &mut st,
+                            &mut perception,
+                            gain_worker.as_ref(),
+                            &args,
+                            &r,
+                            &text,
                         );
-                        // Inline training data export (ADR 0033): write (episode, text) pair
-                        // immediately at language ingest time, capturing every ASR/text event.
-                        if let (Some(ref export_path), Some(ref ep)) =
-                            (&args.export_training_data, &r.last_episode)
-                        {
-                            write_training_pair(export_path, ep, &text);
-                        }
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -2312,40 +2192,14 @@ pub async fn run() -> Result<()> {
                             &mut st.wake_recon_dropped,
                             sal_gate(st.sal_mu, st.sal_sigma, st.sal_n),
                         ) {
-                            st.lang_ingest_count += 1;
-                            st.perception_total_ms += r.perception_ms;
-                            if r.episode_produced {
-                                st.wake_episodes += 1;
-                                if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
-                                    update_perf_ewma(m, &mut st.cosine_ewma, &mut st.cosine_baseline, &mut st.cosine_baseline_accum, &mut st.cosine_baseline_n, &mut st.perf_sleep_flag, args.perf_sleep_threshold);
-                                    update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
-                                    perception.set_settle_gate(settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate));
-                                }
-                                if let Some(ref gw) = gain_worker {
-                                    if let Some(ref ep) = r.last_episode {
-                                        st.gain_episode_counter += 1;
-                                        if st.gain_episode_counter.is_multiple_of(args.gain_interval) {
-                                            gw.request_gain(ep.clone());
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(m) = r.reconstruct_mse { st.wake_output_mse_sum += m as f64; st.wake_output_mse_n += 1; }
-                            if r.throttle_passed { st.wake_reconstruct_throttle_passed += 1; }
-                            if let Some(ref es) = r.ep_stats {
-                                let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
-                                accumulate_salience(es, sal_thresh, &mut st.salience_sum, &mut st.salience_n, &mut st.salience_min, &mut st.high_salience_episodes, &mut st.blend_count, &mut st.episodes_speech, &mut st.episodes_env, &mut st.episodes_visual, &mut st.episodes_language, &mut st.episodes_mixed);
-                                update_sal_ewma(es.salience, &mut st.sal_mu, &mut st.sal_sigma, &mut st.sal_n);
-                                accumulate_wakefulness_pressure(es.salience, sal_thresh, &mut st.wakefulness_pressure);
-                                st.hnsw_query_us_sum += es.hnsw_query_us;
-                                st.hnsw_query_n += 1;
-                            }
-                            accumulate_cosines(&r.prior_cosines, &mut st.prior_cosine_sums, &mut st.prior_cosine_counts);
-                            if let (Some(ref export_path), Some(ref ep)) =
-                                (&args.export_training_data, &r.last_episode)
-                            {
-                                write_training_pair(export_path, ep, &text);
-                            }
+                            wake::record_language_result(
+                                &mut st,
+                                &mut perception,
+                                gain_worker.as_ref(),
+                                &args,
+                                &r,
+                                &text,
+                            );
                         }
                     }
                     None => { lang_closed = true; }
@@ -2375,65 +2229,7 @@ pub async fn run() -> Result<()> {
                 );
             }
             Some(query) = query_rx.recv() => {
-                // Query: generate a response using the current episode as context (ADR 0012, R1).
-                // The query text is also stored as text_target on the latest episode for NREM training.
-                tracing::info!(query = %query, "query received");
-                // Collect recent text history before borrowing decoder (R3 Phase 1).
-                let raw_targets = if is_introspective_query(&query) {
-                    episodic.recent_text_targets(8)
-                } else {
-                    vec![]
-                };
-                let last_trace = episodic.iter_traces().last();
-                let ep_info = last_trace.map(|t| (t.record.id, t.record.values.clone()));
-                match ep_info {
-                    None => {
-                        println!("{}", serde_json::json!({"type":"action_response","error":"no episode yet"}));
-                    }
-                    Some((last_id, ep)) => {
-                        if let Some(ref mut dec) = decoder {
-                            // Store query as text_target before generation so it's available for NREM.
-                            if let Ok(ids) = dec.tokenize(&query) {
-                                episodic.set_last_text_target(ids);
-                            }
-                            let effective_query = build_query_with_history(&query, raw_targets, dec);
-                            let recalled = query_recalled_episodes(
-                                &recall, &ep, Some(last_id), args.recall_k,
-                            );
-                            tracing::info!(recall_n = recalled.len(), introspective = effective_query.len() != query.len(), "starting generation");
-                            // Run generation in a blocking thread so we don't stall the async runtime.
-                            let ep_clone = ep.clone();
-                            let max_tokens = args.action_max_tokens;
-                            // SAFETY: ActionDecoder is not Send. We run generation synchronously
-                            // here (blocking the current async task via block_in_place).
-                            let result = tokio::task::block_in_place(|| {
-                                dec.generate(&ep_clone, &recalled, &effective_query, max_tokens)
-                            });
-                            match result {
-                                Ok(response) => {
-                                    let ts_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .map(|d| d.as_millis())
-                                        .unwrap_or(0);
-                                    tracing::info!(tokens = response.split_whitespace().count(), "generation complete");
-                                    println!("{}", serde_json::json!({
-                                        "type": "action_response",
-                                        "ts": ts_ms,
-                                        "query": query,
-                                        "response": response,
-                                    }));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(?e, "generation failed");
-                                    somnus_metrics::counted_core!(
-                                        somnus_metrics::Metric::ActionGenerationError,
-                                        1
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+                wake::answer_query(&query, "live", &mut episodic, &mut decoder, &recall, &args);
             }
             _ = tokio::signal::ctrl_c() => {
                 interrupt.store(true, Ordering::Relaxed);
