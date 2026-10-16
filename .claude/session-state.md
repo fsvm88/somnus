@@ -4,6 +4,13 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
+> **✅ CHECKPOINT (clean), 2026-10-16 (latest) — repo sweep done, queue = `gaps.md` §48, most items fixed.**
+> - Sweep → `gaps.md` §48 (13 items); fix pass committed (`170aa76`, `b3b0136`, `badb099`, `9be497f`): `--seed` + `SEED` in A/B scripts, CI/hook run `cargo test --workspace` and fine-metrics clippy, `model_ref()` accessor, `cli.rs` split, new Core metric `nrem_stale_trace_skipped` (fired 2032× in a 2-cycle pilot — worth a look vs §33), scripts README/requirements.
+> - Not done on purpose: `run_sleep_cycle` split (needs golden-output test under fixed seed), pedantic lint churn. Open decision: burn 0.22/burn-flex and ffmpeg-the-third 6 migrations.
+> - **Still open:** ADR 0048 4-arm pilot not launched (use `--seed` now; SEED defaults to 42 in `ab_*.sh`).
+>
+> ---
+>
 > **✅ CHECKPOINT (clean), 2026-09-14 (latest) — CI green again; deps refreshed; ai-docs audited;
 > dead code pruned. §33/ADR 0048 pilot still not launched — unchanged from last checkpoint.**
 > - **Pipeline fixes:** CI broke twice on `clippy::chunks_exact_to_as_chunks`, a lint CI's rustc
@@ -81,35 +88,6 @@
 >   launch it, since it's a real campaign-affecting pilot.
 > - **All work committed** — `gaps.md` §33, ADR 0048, and this checkpoint updated in the same
 >   session; code changes committed separately per the usual code/docs split.
->
-> ---
->
-> **✅ CHECKPOINT (clean), 2026-09-13 — §33: confirming diagnostic run, ORT re-export
-> hypothesis DISCONFIRMED; real root cause is backend-independent live-weight drift, now confirmed.**
-> - **Sixth pilot (`engineering-log.md` §47):** repeated the candidate-(d) freeze-heads pilot
->   (`scripts/ab_binding_replay_freeze_heads_cpu.sh`, new script) with `--force-cpu-inference` added
->   to both arms, structurally removing ORT (`rebuild_ort_session` never runs; confirmed
->   `ort_binding_forward` fired 0 times in both arms). `mean_output_mse` still +462.0% — same
->   445-587% band as every prior pilot with ORT active. **ORT re-export is not the cause.** The
->   mechanism is backend-independent: whatever serves wake-time binding inference (ORT or burn) uses
->   live weights that changed during the immediately preceding NREM cycle; those episodes get
->   stored; later cycles train heads against the now-drifted stored-episode distribution. This is
->   §35's original "episode-space drift" finding, now positively confirmed rather than inferred from
->   head/gradient elimination.
-> - **New deviation:** treatment arm's salience/settle gate degenerates much harder than §46's
->   comparable pilot — `settle_gate_dynamic` collapses to exactly 0.0 by cycle 10, `sal_threshold`
->   exceeds its designed [0,1] range. Not explained; flagged per standing A/B deviation policy, not
->   investigated further.
-> - **Docs corrected same session:** `gaps.md` §33 (verdict + priority table), `engineering-log.md`
->   §47 (new entry), ADR 0041 (both the changelog and its stale "ORT inference picks up trained
->   weights" Consequences bullet) — the ORT-specific framing in all three was actively wrong, not
->   just unconfirmed, and is now corrected in place rather than left to accumulate as a stale lead.
-> - **Open — root cause confirmed, no path chosen.** (a) and (d) closed as failed leads. (b) and (c)
->   are no longer blocked by ORT-specific reasoning (there is no ORT-specific cadence), but neither
->   addresses the now-confirmed real constraint (live weight updates immediately consumed by the next
->   wake phase). A candidate that would: decouple wake-time binding inference from the NREM-training
->   copy of the weights (e.g. an EMA/lagged snapshot for episode formation, reconciled on a slower
->   cadence). **Not scoped or piloted — needs a decision from the user before more pilots run.**
-> - **All docs committed as of this checkpoint.**
+
 >
 > ---
