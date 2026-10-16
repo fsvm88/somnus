@@ -348,6 +348,118 @@ fn regional_weights(ep_vec: &[f32]) -> [f32; N_EPISODE_REGIONS] {
 /// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
 /// by the main loop. A high count means the world is active while the system sleeps;
 /// once it exceeds `SALIENCE_THRESHOLD` the current replay step is the last one.
+/// Write everything a restart needs: episodic snapshot, warm HNSW dump, perception weights,
+/// region sizes and the growth-cooldown counter. Each write is independent and crash-safe
+/// (atomic replace); a failure is logged and counted but never aborts the cycle.
+fn persist_snapshot(
+    perception: &mut PerceptionProcessor,
+    episodic: &EpisodicBuffer,
+    recall: &RecollectionLayer,
+    memory_dir: &Path,
+    growth_cooldown_remaining: usize,
+) {
+    let write_failed = || {
+        somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
+    };
+    if let Err(e) = save_snapshot(episodic, memory_dir) {
+        tracing::warn!(?e, "episodic snapshot write failed");
+        write_failed();
+    }
+    // Persist warm HNSW index so restart avoids cold-rebuild (~3 min at 100k records).
+    let warm_dir = memory_dir.join("warm");
+    match recall.warm.dump(&warm_dir) {
+        Ok(bytes_written) => {
+            somnus_metrics::counted_core!(somnus_metrics::Metric::SemanticStoreDumpBytes, bytes_written);
+        }
+        Err(e) => {
+            tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
+            write_failed();
+        }
+    }
+    // Perception weights (`weights.safetensors`) written to the snapshot dir.
+    if let Err(e) = perception.save_weights(&weights_path(memory_dir)) {
+        tracing::warn!(?e, "weight snapshot write failed");
+        write_failed();
+    }
+    // Region sizes written so restore can pre-grow before loading weights.
+    if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
+        tracing::warn!(?e, "region sizes write failed");
+        write_failed();
+    }
+    if let Err(e) = save_growth_cooldown_remaining(growth_cooldown_remaining, memory_dir) {
+        tracing::warn!(?e, "growth cooldown write failed");
+        write_failed();
+    }
+    tracing::info!("snapshot written");
+}
+
+/// Clear the hot buffer after spill + REM, then seed it with the REM synthetic traces so the
+/// next NREM cycle trains on the creative recombinations. Synthetics are L2-normalised for
+/// cosine-equivalent recall (matching how real episodes are stored by `record_episode`).
+fn reset_hot_buffer(
+    episodic: &mut EpisodicBuffer,
+    synth_traces: Vec<(Vec<f32>, [Vec<f32>; 5], f32)>,
+) {
+    episodic.clear();
+    tracing::info!("hot buffer cleared after spill");
+    if synth_traces.is_empty() {
+        return;
+    }
+    let synth_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let n_synth = synth_traces.len();
+    for (ep, regional, salience) in synth_traces {
+        let mag = ep.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
+        let ep_norm: Vec<f32> = ep.iter().map(|x| x / mag).collect();
+        episodic.push(synth_ts, ep_norm, regional, salience, IngestSource::Mixed);
+    }
+    tracing::info!(n_synth, "REM synthetics seeded into episodic buffer");
+}
+
+/// REM pruning (12c): drop the lowest-magnitude grown units of every region that has at least
+/// `prune_min_grown` grown units, but only when the best available gist-recall signal says the
+/// system is not struggling (None, e.g. cycle 1, means quality can't be assessed -> no pruning).
+/// Returns the regions pruned and the total units removed.
+fn prune_grown_units(
+    perception: &mut PerceptionProcessor,
+    prune_fraction: f32,
+    prune_min_grown: usize,
+    gist_signal: Option<f32>,
+) -> (Vec<RegionId>, usize) {
+    let mut regions_pruned = Vec::new();
+    let mut total_units_pruned = 0usize;
+    if !gist_signal.is_some_and(|r| r >= PRUNE_GIST_THRESHOLD) {
+        return (regions_pruned, total_units_pruned);
+    }
+    let region_ids = [
+        RegionId::AudioSpeech,
+        RegionId::AudioEnv,
+        RegionId::Visual,
+        RegionId::Symbolic,
+        RegionId::Language,
+    ];
+    for (i, &region) in region_ids.iter().enumerate() {
+        let n_grown = perception.region_sizes()[i].saturating_sub(N_UNITS);
+        if n_grown >= prune_min_grown {
+            let n = perception.prune_region(region, prune_fraction);
+            if n > 0 {
+                regions_pruned.push(region);
+                total_units_pruned += n;
+            }
+        }
+    }
+    if !regions_pruned.is_empty() {
+        tracing::info!(
+            regions_pruned = ?regions_pruned,
+            total_units_pruned,
+            "REM pruning complete"
+        );
+    }
+    (regions_pruned, total_units_pruned)
+}
+
 /// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
 /// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
 /// Plain data so a cycle can be driven from a test without building the CLI `Args`.
@@ -1357,37 +1469,14 @@ pub fn run_sleep_cycle(
     // ── REM pruning of grown units (12c) ─────────────────────────────────────
     // Prune only when gist recall is high (system not struggling) and prune_fraction > 0.
     if !was_interrupted && prune_fraction > 0.0 {
-        // Prefer within-session gist for prune safety check; fall back to cross-session.
-        // None at c1 → no pruning (conservative when quality can't be assessed).
-        let prune_ok = within_session_gist_rate
-            .or(gist_recall_rate)
-            .is_some_and(|r| r >= PRUNE_GIST_THRESHOLD);
-        if prune_ok {
-            let region_ids = [
-                RegionId::AudioSpeech,
-                RegionId::AudioEnv,
-                RegionId::Visual,
-                RegionId::Symbolic,
-                RegionId::Language,
-            ];
-            for (i, &region) in region_ids.iter().enumerate() {
-                let n_grown = perception.region_sizes()[i].saturating_sub(N_UNITS);
-                if n_grown >= prune_min_grown {
-                    let n = perception.prune_region(region, prune_fraction);
-                    if n > 0 {
-                        regions_pruned.push(region);
-                        total_units_pruned += n;
-                    }
-                }
-            }
-        }
-        if !regions_pruned.is_empty() {
-            tracing::info!(
-                regions_pruned = ?regions_pruned,
-                total_units_pruned,
-                "REM pruning complete"
-            );
-        }
+        let pruned = prune_grown_units(
+            perception,
+            prune_fraction,
+            prune_min_grown,
+            within_session_gist_rate.or(gist_recall_rate),
+        );
+        regions_pruned = pruned.0;
+        total_units_pruned = pruned.1;
     }
 
     // ── REM creative recombination (11b) ─────────────────────────────────────
@@ -1499,25 +1588,7 @@ pub fn run_sleep_cycle(
 
     // ── Clear hot buffer after spill + REM ───────────────────────────────────
     if !was_interrupted {
-        episodic.clear();
-        tracing::info!("hot buffer cleared after spill");
-
-        // Seed REM synthetic traces into the hot buffer so the next NREM cycle
-        // trains on creative recombinations. L2-normalise for cosine-equivalent
-        // recall (matching how real episodes are stored by record_episode).
-        if !synth_traces.is_empty() {
-            let synth_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            let n_synth = synth_traces.len();
-            for (ep, regional, salience) in synth_traces {
-                let mag = ep.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-                let ep_norm: Vec<f32> = ep.iter().map(|x| x / mag).collect();
-                episodic.push(synth_ts, ep_norm, regional, salience, IngestSource::Mixed);
-            }
-            tracing::info!(n_synth, "REM synthetics seeded into episodic buffer");
-        }
+        reset_hot_buffer(episodic, synth_traces);
     }
 
     let d_rem2 = t_rem2.elapsed();
@@ -1526,57 +1597,24 @@ pub fn run_sleep_cycle(
     tracing::info!(rem_wall_ms, "REM complete");
 
     // ── Snapshot ──────────────────────────────────────────────────────────────
-    let (_, d_snapshot) = somnus_metrics::timed_core!(somnus_metrics::Metric::SleepSnapshot, {
-        if !was_interrupted {
-            if let Err(e) = save_snapshot(episodic, memory_dir) {
-                tracing::warn!(?e, "episodic snapshot write failed");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
-            }
-            // Persist warm HNSW index so restart avoids cold-rebuild (~3 min at 100k records).
-            let warm_dir = memory_dir.join("warm");
-            match recall.warm.dump(&warm_dir) {
-                Ok(bytes_written) => {
-                    somnus_metrics::counted_core!(
-                        somnus_metrics::Metric::SemanticStoreDumpBytes,
-                        bytes_written
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
-                }
-            }
-            // Perception weights (BinFileRecorder → weights.bin) written to snapshot dir.
-            let w_path = weights_path(memory_dir);
-            if let Err(e) = perception.save_weights(&w_path) {
-                tracing::warn!(?e, "weight snapshot write failed");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
-            }
-            // Region sizes written so restore can pre-grow before loading weights.
-            if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
-                tracing::warn!(?e, "region sizes write failed");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
-            }
-            // Growth cooldown counter: reset to growth_cooldown when something grew,
-            // otherwise decrement toward 0.
-            let new_cooldown = if !regions_grown.is_empty() {
-                growth_cooldown
-            } else {
-                cooldown_remaining.saturating_sub(1)
-            };
-            if let Err(e) = save_growth_cooldown_remaining(new_cooldown, memory_dir) {
-                tracing::warn!(?e, "growth cooldown write failed");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::SleepPersistenceWriteFailed, 1);
-            }
-            tracing::info!("snapshot written");
-        }
-    });
-    let snapshot_wall_ms = d_snapshot.as_millis() as u64;
+    // Cooldown counter: reset to growth_cooldown when something grew, otherwise decrement to 0.
     let growth_cooldown_remaining = if !regions_grown.is_empty() {
         growth_cooldown
     } else {
         cooldown_remaining.saturating_sub(1)
     };
+    let (_, d_snapshot) = somnus_metrics::timed_core!(somnus_metrics::Metric::SleepSnapshot, {
+        if !was_interrupted {
+            persist_snapshot(
+                perception,
+                episodic,
+                recall,
+                memory_dir,
+                growth_cooldown_remaining,
+            );
+        }
+    });
+    let snapshot_wall_ms = d_snapshot.as_millis() as u64;
     let d_total = sleep_start.elapsed();
     somnus_metrics::METRICS.record(somnus_metrics::Metric::SleepTotal, d_total);
     tracing::info!(
