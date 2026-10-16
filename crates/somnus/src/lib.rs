@@ -1492,7 +1492,7 @@ pub async fn run() -> Result<()> {
         let high_water_hit = episodic.len() >= high_water;
         let schedule_hit = st.wake_start.elapsed() >= st.max_wake;
         let perf_degradation_hit = st.perf_sleep_flag && args.perf_sleep_threshold > 0.0;
-        // S3: pressure trigger active once st.sal_n >= 500 and min-episode guard is satisfied.
+        // S3: pressure trigger active once sal_n >= 500 and min-episode guard is satisfied.
         // Capacity fill remains active during cold-start as the primary trigger.
         let pressure_hit = st.sal_n >= P_COLD_START_N
             && st.wake_episodes >= P_MIN_EPISODES
@@ -1601,7 +1601,7 @@ pub async fn run() -> Result<()> {
                         tracing::warn!(?e, "wake_ewma save failed");
                         somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
-                    // Recompute st.max_wake from updated EWMA (floor until n≥3).
+                    // Recompute max_wake from updated EWMA (floor until n≥3).
                     st.max_wake = Duration::from_secs(recompute_max_wake_secs(
                         st.wake_ewma_mu,
                         st.wake_ewma_n,
@@ -1696,7 +1696,7 @@ pub async fn run() -> Result<()> {
                     }
                     st.sleep_dur_secs_history.push_back(total_sleep_secs);
 
-                    // P2a / S7: adapt st.effective_wake_interval from cycle-level MSE trend.
+                    // P2a / S7: adapt effective_wake_interval from cycle-level MSE trend.
                     // Reduces interval when MSE improves < 1% for 3 consecutive cycles;
                     // restores toward user default when MSE starts improving again.
                     let mean_mse_wake = if st.wake_output_mse_n > 0 {
@@ -1793,24 +1793,24 @@ pub async fn run() -> Result<()> {
                             "grew":              grew,
                             "regions_grown":     stats.regions_grown.iter().map(|r| r.as_index()).collect::<Vec<_>>(),
                             "growth_cooldown_remaining": stats.growth_cooldown_remaining,
-                            "st.wake_episodes":     st.wake_episodes,
-                            "st.episodes_speech":   st.episodes_speech,
-                            "st.episodes_env":      st.episodes_env,
-                            "st.episodes_visual":   st.episodes_visual,
-                            "st.episodes_language": st.episodes_language,
-                            "st.episodes_mixed":    st.episodes_mixed,
+                            "wake_episodes":     st.wake_episodes,
+                            "episodes_speech":   st.episodes_speech,
+                            "episodes_env":      st.episodes_env,
+                            "episodes_visual":   st.episodes_visual,
+                            "episodes_language": st.episodes_language,
+                            "episodes_mixed":    st.episodes_mixed,
                             "asr_count":         cycle_asr,
-                            "st.lang_ingest_count": st.lang_ingest_count,
+                            "lang_ingest_count": st.lang_ingest_count,
                             "mean_salience_wake":       mean_salience_wake,
                             "min_salience_wake":        min_salience_wake,
-                            "st.high_salience_episodes":   st.high_salience_episodes,
-                            "st.blend_count":              st.blend_count,
+                            "high_salience_episodes":   st.high_salience_episodes,
+                            "blend_count":              st.blend_count,
                             "wake_reconstruct_attempts":       st.wake_reconstruct_counter,
-                            "st.wake_reconstruct_throttle_passed": st.wake_reconstruct_throttle_passed,
+                            "wake_reconstruct_throttle_passed": st.wake_reconstruct_throttle_passed,
                             "wake_reconstruct_fired":          st.wake_output_mse_n,
-                            "st.wake_recon_dropped":              st.wake_recon_dropped,
-                            "st.settle_trigger_count":  st.settle_trigger_count,
-                            "st.settle_iters_sum":      st.settle_iters_sum,
+                            "wake_recon_dropped":              st.wake_recon_dropped,
+                            "settle_trigger_count":  st.settle_trigger_count,
+                            "settle_iters_sum":      st.settle_iters_sum,
                             "settle_delta_mean": if st.settle_trigger_count > 0 { Some(st.settle_delta_sum / st.settle_trigger_count as f64) } else { None },
                             "mean_output_mse_wake": mean_mse_wake,
                             "prior_cosine_mean": prior_cosine_mean,
@@ -1829,11 +1829,11 @@ pub async fn run() -> Result<()> {
                             "snapshot_wall_ms":           stats.snapshot_wall_ms,
                             "lm_hidden_computed":         stats.lm_hidden_computed,
                             "lm_hidden_unique":           stats.lm_hidden_unique,
-                            "st.speech_encode_total_ms":     st.speech_encode_total_ms,
-                            "st.env_encode_total_ms":        st.env_encode_total_ms,
-                            "st.video_encode_total_ms":      st.video_encode_total_ms,
+                            "speech_encode_total_ms":     st.speech_encode_total_ms,
+                            "env_encode_total_ms":        st.env_encode_total_ms,
+                            "video_encode_total_ms":      st.video_encode_total_ms,
                             "gain_update_total_ms":       0u64,
-                            "st.perception_total_ms":        st.perception_total_ms,
+                            "perception_total_ms":        st.perception_total_ms,
                             "perc_kwta_us":         perf_breakdown.kwta_us,
                             "perc_symbolic_us":     perf_breakdown.symbolic_us,
                             "perc_bind_us":         perf_breakdown.bind_us,
@@ -1846,7 +1846,7 @@ pub async fn run() -> Result<()> {
                             "sal_threshold":  sal_gate(st.sal_mu, st.sal_sigma, st.sal_n) as f64,
                             "settle_ewma_mean":    st.settle_mu as f64,
                             "settle_gate_dynamic": settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate) as f64,
-                            "st.wakefulness_pressure": st.wakefulness_pressure as f64,
+                            "wakefulness_pressure": st.wakefulness_pressure as f64,
                             "prior_beta_effective": if st.s4_beta_active { 0.05f64 } else { args.prior_beta as f64 },
                             "prior_betas_effective": perception.prior_betas().map(|b| b as f64),
                             "wake_ewma_mean":       st.wake_ewma_mu as f64,
@@ -1854,7 +1854,7 @@ pub async fn run() -> Result<()> {
                             "max_cold_records_effective": effective_max_cold,
                             "sleep_max_secs_effective": effective_sleep_max_secs,
                             "wake_interval_effective": st.effective_wake_interval,
-                            "st.s7_mse_ewma":           if st.s7_ewma_n > 0 { Some(st.s7_mse_ewma) } else { None },
+                            "s7_mse_ewma":           if st.s7_ewma_n > 0 { Some(st.s7_mse_ewma) } else { None },
                             "fine_metrics":          fine_metrics,
                         })
                         .to_string();
