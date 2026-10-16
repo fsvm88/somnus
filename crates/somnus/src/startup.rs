@@ -103,33 +103,34 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    fn args(extra: &[&str]) -> Args {
+    /// `--language` is a default-on flag with no CLI off switch, so tests turn it off on the struct.
+    fn args(extra: &[&str], language: bool) -> Args {
         let mut v = vec!["somnus"];
         v.extend_from_slice(extra);
-        Args::try_parse_from(v).unwrap()
+        let mut a = Args::try_parse_from(v).unwrap();
+        a.language = language;
+        a
     }
 
     #[test]
     fn model_files_not_required_without_media_or_language() {
         let dir = tempfile::tempdir().unwrap();
-        let a = args(&[
-            "--models-dir",
-            dir.path().to_str().unwrap(),
-            "--language",
-            "false",
-        ]);
+        let a = args(&["--models-dir", dir.path().to_str().unwrap()], false);
         assert!(check_model_files(&a).is_ok());
     }
 
     #[test]
     fn missing_encoder_for_media_input_names_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        let a = args(&[
-            "--models-dir",
-            dir.path().to_str().unwrap(),
-            "--file",
-            "clip.mp4",
-        ]);
+        let a = args(
+            &[
+                "--models-dir",
+                dir.path().to_str().unwrap(),
+                "--file",
+                "clip.mp4",
+            ],
+            false,
+        );
         let err = check_model_files(&a).unwrap_err().to_string();
         assert!(err.contains("whisper_tiny_encoder.onnx"), "{err}");
     }
@@ -146,16 +147,8 @@ mod tests {
             std::fs::write(dir.path().join(f), b"x").unwrap();
         }
         let d = dir.path().to_str().unwrap();
-        assert!(check_model_files(&args(&[
-            "--models-dir",
-            d,
-            "--file",
-            "c.mp4",
-            "--language",
-            "false"
-        ]))
-        .is_ok());
-        let err = check_model_files(&args(&["--models-dir", d, "--language", "true"]))
+        assert!(check_model_files(&args(&["--models-dir", d, "--file", "c.mp4"], false)).is_ok());
+        let err = check_model_files(&args(&["--models-dir", d], true))
             .unwrap_err()
             .to_string();
         assert!(err.contains("language model file not found"), "{err}");
@@ -163,7 +156,7 @@ mod tests {
 
     #[test]
     fn build_perception_applies_cli_settings() {
-        let a = args(&["--settle-steps", "3", "--prior-beta", "0.25"]);
+        let a = args(&["--settle-steps", "3", "--prior-beta", "0.25"], false);
         let (p, regions) = build_perception(&a).unwrap();
         assert!(regions.is_none());
         assert_eq!(p.prior_betas(), [0.25; 5]);
