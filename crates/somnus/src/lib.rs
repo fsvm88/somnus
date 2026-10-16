@@ -1508,7 +1508,7 @@ pub async fn run() -> Result<()> {
             let this_wake_secs = st.wake_start.elapsed().as_secs_f32();
             info!(
                 trigger = sleep_trigger,
-                st.wakefulness_pressure,
+                wakefulness_pressure = st.wakefulness_pressure,
                 buffer_len = episodic.len(),
                 buffer_cap = args.episodic_capacity,
                 wake_secs = this_wake_secs as u64,
@@ -1635,7 +1635,7 @@ pub async fn run() -> Result<()> {
                         decoder_trainable = stats.decoder_trainable_records,
                         interrupted   = stats.was_interrupted,
                         nrem_exit     = stats.nrem_exit_reason,
-                        st.wake_episodes,
+                        wake_episodes = st.wake_episodes,
                         asr_count     = cycle_asr,
                         lang_ingest   = st.lang_ingest_count,
                         "sleep cycle complete"
@@ -1720,7 +1720,7 @@ pub async fn run() -> Result<()> {
                                     st.effective_wake_interval = (st.effective_wake_interval + 1)
                                         .min(args.wake_reconstruct_interval);
                                     tracing::info!(
-                                        st.effective_wake_interval,
+                                        effective_wake_interval = st.effective_wake_interval,
                                         "S7: restored wake_reconstruct_interval"
                                     );
                                 }
@@ -1733,8 +1733,8 @@ pub async fn run() -> Result<()> {
                             st.effective_wake_interval -= 1;
                             st.s7_stagnant = 0;
                             tracing::info!(
-                                st.effective_wake_interval,
-                                st.s7_mse_ewma,
+                                effective_wake_interval = st.effective_wake_interval,
+                                s7_mse_ewma = st.s7_mse_ewma,
                                 "S7: reduced wake_reconstruct_interval (stagnant MSE)"
                             );
                         }
