@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     path::Path,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -347,35 +348,101 @@ fn regional_weights(ep_vec: &[f32]) -> [f32; N_EPISODE_REGIONS] {
 /// `pending_embs` counts embeddings produced by encoder tasks but not yet consumed
 /// by the main loop. A high count means the world is active while the system sleeps;
 /// once it exceeds `SALIENCE_THRESHOLD` the current replay step is the last one.
-#[allow(clippy::too_many_arguments)]
+/// Tunables of one sleep cycle (the CLI's `--sleep-*` / `--nrem-*` / `--binding-replay-*` /
+/// growth and capacity settings, plus per-cycle state such as the remaining growth cooldown).
+/// Plain data so a cycle can be driven from a test without building the CLI `Args`.
+#[derive(Debug, Clone)]
+pub struct SleepParams {
+    pub sleep_loss_target: f32,
+    pub sleep_max_secs: u64,
+    pub prune_fraction: f32,
+    pub prune_min_grown: usize,
+    pub replay_batch_size: usize,
+    pub nrem_min_traces: usize,
+    pub nrem_salience_threshold: usize,
+    pub lang_oversample: usize,
+    pub replay_epochs: usize,
+    pub binding_replay: bool,
+    pub binding_replay_steps: usize,
+    pub binding_replay_lr_scale: f32,
+    pub binding_replay_freeze_heads: bool,
+    pub max_warm_records: usize,
+    pub max_cold_records: usize,
+    pub growth_cooldown: usize,
+    pub cooldown_remaining: usize,
+    pub session_start_secs: f64,
+    /// Where to export replay traces as training data (`--export-training-data`), if anywhere.
+    pub training_data_path: Option<PathBuf>,
+}
+
+/// Cross-thread signals observed during a sleep cycle.
+pub struct SleepSignals {
+    /// Set by the main loop to cut the cycle short.
+    pub interrupt: Arc<AtomicBool>,
+    /// Embeddings produced by encoder tasks but not yet consumed by the main loop.
+    pub pending_embs: Arc<AtomicUsize>,
+}
+
+impl Default for SleepParams {
+    /// The CLI defaults (`cli.rs`).
+    fn default() -> Self {
+        Self {
+            sleep_loss_target: 0.0,
+            sleep_max_secs: 0,
+            prune_fraction: 0.0,
+            prune_min_grown: 64,
+            replay_batch_size: 128,
+            nrem_min_traces: 0,
+            nrem_salience_threshold: 0,
+            lang_oversample: 0,
+            replay_epochs: 4,
+            binding_replay: false,
+            binding_replay_steps: 1,
+            binding_replay_lr_scale: 1.0,
+            binding_replay_freeze_heads: false,
+            max_warm_records: 200_000,
+            max_cold_records: 0,
+            growth_cooldown: 3,
+            cooldown_remaining: 0,
+            session_start_secs: 0.0,
+            training_data_path: None,
+        }
+    }
+}
+
 pub fn run_sleep_cycle(
     perception: &mut PerceptionProcessor,
     episodic: &mut EpisodicBuffer,
     recall: &mut RecollectionLayer,
     memory_dir: &Path,
-    interrupt: Arc<AtomicBool>,
-    pending_embs: Arc<AtomicUsize>,
     decoder: &mut Option<ActionDecoder>,
-    sleep_loss_target: f32,
-    sleep_max_secs: u64,
-    prune_fraction: f32,
-    prune_min_grown: usize,
-    replay_batch_size: usize,
-    nrem_min_traces: usize,
-    nrem_salience_threshold: usize,
-    lang_oversample: usize,
-    replay_epochs: usize,
-    binding_replay: bool,
-    binding_replay_steps: usize,
-    binding_replay_lr_scale: f32,
-    binding_replay_freeze_heads: bool,
-    max_warm_records: usize,
-    max_cold_records: usize,
-    growth_cooldown: usize,
-    cooldown_remaining: usize,
-    session_start_secs: f64,
-    training_data_path: Option<&Path>,
+    signals: SleepSignals,
+    params: &SleepParams,
 ) -> Result<SleepStats> {
+    let SleepSignals {
+        interrupt,
+        pending_embs,
+    } = signals;
+    let training_data_path = params.training_data_path.as_deref();
+    let sleep_loss_target = params.sleep_loss_target;
+    let sleep_max_secs = params.sleep_max_secs;
+    let prune_fraction = params.prune_fraction;
+    let prune_min_grown = params.prune_min_grown;
+    let replay_batch_size = params.replay_batch_size;
+    let nrem_min_traces = params.nrem_min_traces;
+    let nrem_salience_threshold = params.nrem_salience_threshold;
+    let lang_oversample = params.lang_oversample;
+    let replay_epochs = params.replay_epochs;
+    let binding_replay = params.binding_replay;
+    let binding_replay_steps = params.binding_replay_steps;
+    let binding_replay_lr_scale = params.binding_replay_lr_scale;
+    let binding_replay_freeze_heads = params.binding_replay_freeze_heads;
+    let max_warm_records = params.max_warm_records;
+    let max_cold_records = params.max_cold_records;
+    let growth_cooldown = params.growth_cooldown;
+    let cooldown_remaining = params.cooldown_remaining;
+    let session_start_secs = params.session_start_secs;
+
     let sleep_start = Instant::now();
     tracing::info!(episodic_len = episodic.len(), "sleep cycle started");
     // rem_wall_ms is accumulated across two REM sub-sections; the others are one-shot.
@@ -1557,6 +1624,222 @@ pub fn run_sleep_cycle(
 
 #[cfg(test)]
 mod tests {
+    // ── whole-cycle characterization ─────────────────────────────────────────
+    // `run_sleep_cycle` had no end-to-end test. These pin its externally visible behaviour (stats,
+    // persisted files, buffer/memory side effects, run-to-run determinism) so the function can be
+    // split into phases without silently changing what a cycle does.
+
+    use somnus_memory::{ColdArchive, IngestSource, RecollectionLayer, SemanticStore};
+    use std::sync::atomic::AtomicUsize;
+
+    fn lcg(seed: u64, len: usize) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// 24 deterministic episodes. The regional inputs are the model's own head outputs for the
+    /// episode, so the staleness filter (stored outputs vs current inference) keeps them and the
+    /// NREM training path actually runs; random regionals would all be dropped as stale.
+    fn fixture_buffer(perception: &PerceptionProcessor) -> EpisodicBuffer {
+        let mut buf = EpisodicBuffer::new(64);
+        for i in 0..24u64 {
+            let ep = lcg(i, 640);
+            let outs = perception.infer_episode_outputs(&ep).unwrap();
+            let mut regional: [Vec<f32>; 5] = Default::default();
+            regional[0] = outs[0].clone();
+            regional[2] = outs[2].clone();
+            if i % 3 == 0 {
+                regional[1] = outs[1].clone();
+            }
+            buf.push(
+                i as f64,
+                ep,
+                regional,
+                1.0,
+                if i % 2 == 0 {
+                    IngestSource::Speech
+                } else {
+                    IngestSource::Visual
+                },
+            );
+        }
+        buf
+    }
+
+    struct CycleOutcome {
+        stats: SleepStats,
+        episodic_len: usize,
+        warm_len: usize,
+        cold_len: usize,
+        files: Vec<String>,
+    }
+
+    /// Runs one cycle from `weights` (a safetensors stem path) on the fixture, in a fresh dir.
+    fn run_fixture_cycle(weights: &Path, params: &SleepParams) -> CycleOutcome {
+        let dir = tempfile::tempdir().unwrap();
+        let mut perception = PerceptionProcessor::new(burn::tensor::Device::flex());
+        perception.load_weights(weights).unwrap();
+        let mut episodic = fixture_buffer(&perception);
+        let mut recall = RecollectionLayer::new(
+            SemanticStore::new(640),
+            ColdArchive::open(dir.path()).unwrap(),
+        );
+        let stats = run_sleep_cycle(
+            &mut perception,
+            &mut episodic,
+            &mut recall,
+            dir.path(),
+            &mut None,
+            SleepSignals {
+                interrupt: Arc::new(AtomicBool::new(false)),
+                pending_embs: Arc::new(AtomicUsize::new(0)),
+            },
+            params,
+        )
+        .unwrap();
+        let mut files: Vec<String> = std::fs::read_dir(dir.path().join("snapshot"))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        CycleOutcome {
+            stats,
+            episodic_len: episodic.len(),
+            warm_len: recall.warm.len(),
+            cold_len: recall.cold.len(),
+            files,
+        }
+    }
+
+    fn fixture_params() -> SleepParams {
+        SleepParams {
+            replay_batch_size: 8,
+            replay_epochs: 1,
+            // Large enough that the wall-clock budget never decides the outcome.
+            sleep_max_secs: 600,
+            ..SleepParams::default()
+        }
+    }
+
+    #[test]
+    fn sleep_cycle_end_to_end_is_deterministic_and_persists_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("w");
+        // Same initial weights for both runs regardless of the global RNG state.
+        PerceptionProcessor::new(burn::tensor::Device::flex())
+            .save_weights(&weights)
+            .unwrap();
+        let params = fixture_params();
+
+        let a = run_fixture_cycle(&weights, &params);
+        let b = run_fixture_cycle(&weights, &params);
+
+        // Behavioural contract.
+        eprintln!(
+            "DEBUG exit={} replayed={} loss={} out_mse={} epi={} warm={} cold={}",
+            a.stats.nrem_exit_reason,
+            a.stats.traces_replayed,
+            a.stats.mean_train_loss,
+            a.stats.mean_output_mse,
+            a.episodic_len,
+            a.warm_len,
+            a.cold_len
+        );
+        assert_eq!(
+            a.stats.traces_replayed, 24,
+            "every fixture trace is replayed once"
+        );
+        assert!(a.stats.mean_train_loss.is_finite());
+        assert!(a.stats.mean_output_mse.is_finite());
+        assert!(a.stats.per_region_mse.iter().all(|v| v.is_finite()));
+        assert!(!a.stats.was_interrupted);
+        assert_eq!(a.stats.nrem_exit_reason, "traces_exhausted");
+        // The hot buffer is spilled and cleared; spilled episodes land in warm/cold.
+        assert_eq!(a.episodic_len, 0, "hot buffer cleared after spill");
+        assert!(
+            a.warm_len + a.cold_len > 0,
+            "spill must populate warm or cold"
+        );
+        // Persisted state (the crash-resume contract).
+        for f in [
+            "episodic.bin",
+            "next_id.bin",
+            "region_sizes.bin",
+            "weights.safetensors",
+            "weights.sizes",
+        ] {
+            assert!(
+                a.files.iter().any(|x| x == f),
+                "missing snapshot file {f}: {:?}",
+                a.files
+            );
+        }
+        assert!(
+            a.files.iter().all(|f| !f.ends_with(".tmp")),
+            "no temp files left: {:?}",
+            a.files
+        );
+
+        // Determinism: identical inputs give identical outcomes (wall-clock fields excluded).
+        assert_eq!(a.stats.traces_replayed, b.stats.traces_replayed);
+        assert_eq!(a.stats.mean_train_loss, b.stats.mean_train_loss);
+        assert_eq!(a.stats.mean_output_mse, b.stats.mean_output_mse);
+        assert_eq!(a.stats.per_region_mse, b.stats.per_region_mse);
+        assert_eq!(a.stats.regions_grown, b.stats.regions_grown);
+        assert_eq!(a.stats.nrem_exit_reason, b.stats.nrem_exit_reason);
+        assert_eq!((a.warm_len, a.cold_len), (b.warm_len, b.cold_len));
+        assert_eq!(a.files, b.files);
+    }
+
+    #[test]
+    fn sleep_cycle_interrupt_skips_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("w");
+        PerceptionProcessor::new(burn::tensor::Device::flex())
+            .save_weights(&weights)
+            .unwrap();
+        let mut perception = PerceptionProcessor::new(burn::tensor::Device::flex());
+        perception.load_weights(&weights).unwrap();
+        let mut episodic = fixture_buffer(&perception);
+        let mut recall = RecollectionLayer::new(
+            SemanticStore::new(640),
+            ColdArchive::open(dir.path()).unwrap(),
+        );
+        let stats = run_sleep_cycle(
+            &mut perception,
+            &mut episodic,
+            &mut recall,
+            dir.path(),
+            &mut None,
+            SleepSignals {
+                interrupt: Arc::new(AtomicBool::new(true)),
+                pending_embs: Arc::new(AtomicUsize::new(0)),
+            },
+            &fixture_params(),
+        )
+        .unwrap();
+        assert!(stats.was_interrupted);
+        assert!(
+            !dir.path()
+                .join("snapshot")
+                .join("weights.safetensors")
+                .exists(),
+            "an interrupted cycle must not write a snapshot"
+        );
+    }
+
     use super::*;
 
     // ── nrem_lr schedule tests ─────────────────────────────────────────────────

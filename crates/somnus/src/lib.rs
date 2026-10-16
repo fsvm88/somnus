@@ -1641,33 +1641,39 @@ pub async fn run() -> Result<()> {
             if let Some(ref mut dec) = decoder {
                 dec.clear_conversation();
             }
+            let sleep_params = sleep::SleepParams {
+                sleep_loss_target: args.sleep_loss_target,
+                sleep_max_secs: effective_sleep_max_secs,
+                prune_fraction: args.prune_fraction,
+                prune_min_grown: args.prune_min_grown,
+                replay_batch_size: args.replay_batch_size,
+                nrem_min_traces: args.nrem_min_traces,
+                nrem_salience_threshold: args.nrem_salience_threshold,
+                lang_oversample: args.lang_oversample,
+                replay_epochs: args.nrem_replay_epochs,
+                binding_replay: args.binding_replay,
+                binding_replay_steps: args.binding_replay_steps,
+                binding_replay_lr_scale: args.binding_replay_lr_scale,
+                binding_replay_freeze_heads: args.binding_replay_freeze_heads,
+                max_warm_records: args.max_warm_records,
+                max_cold_records: effective_max_cold,
+                growth_cooldown: args.growth_cooldown,
+                cooldown_remaining,
+                session_start_secs,
+                training_data_path: args.export_training_data.clone(),
+            };
+            let sleep_signals = sleep::SleepSignals {
+                interrupt: Arc::clone(&interrupt_sleep),
+                pending_embs: Arc::clone(&pending_embs),
+            };
             match sleep::run_sleep_cycle(
                 &mut perception,
                 &mut episodic,
                 &mut recall,
                 &args.memory_dir,
-                Arc::clone(&interrupt_sleep),
-                Arc::clone(&pending_embs),
                 &mut decoder,
-                args.sleep_loss_target,
-                effective_sleep_max_secs,
-                args.prune_fraction,
-                args.prune_min_grown,
-                args.replay_batch_size,
-                args.nrem_min_traces,
-                args.nrem_salience_threshold,
-                args.lang_oversample,
-                args.nrem_replay_epochs,
-                args.binding_replay,
-                args.binding_replay_steps,
-                args.binding_replay_lr_scale,
-                args.binding_replay_freeze_heads,
-                args.max_warm_records,
-                effective_max_cold,
-                args.growth_cooldown,
-                cooldown_remaining,
-                session_start_secs,
-                args.export_training_data.as_deref(),
+                sleep_signals,
+                &sleep_params,
             ) {
                 Ok(stats) => {
                     cooldown_remaining = stats.growth_cooldown_remaining;
