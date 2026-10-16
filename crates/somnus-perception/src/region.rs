@@ -1,3 +1,4 @@
+use crate::tensor_ext::TensorF32Ext;
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
@@ -128,7 +129,7 @@ impl KWtaLayer {
         let t = Tensor::<2>::from_data(data, device);
         let z: Tensor<2> =
             somnus_metrics::timed!(somnus_metrics::Metric::KwtaScoreMatmul, self.linear.forward(t));
-        let z_vec: Vec<f32> = z.into_data().convert::<f32>().try_to_vec::<f32>().unwrap();
+        let z_vec: Vec<f32> = z.to_f32_vec();
         self.select_top_k(z_vec)
     }
 
@@ -140,7 +141,7 @@ impl KWtaLayer {
         let data = TensorData::new(input.to_vec(), [1, input.len()]);
         let t = Tensor::<2>::from_data(data, device);
         let z: Tensor<2> = self.linear.forward(t);
-        let z_vec: Vec<f32> = z.into_data().convert::<f32>().try_to_vec::<f32>().unwrap();
+        let z_vec: Vec<f32> = z.to_f32_vec();
         self.select_top_k_no_dc(z_vec)
     }
 
@@ -241,13 +242,7 @@ impl KWtaLayer {
         let t = Tensor::<2>::from_data(data, device);
         let z: Tensor<2> = self.linear.forward(t); // [1, n_units], tracked
 
-        let z_vec: Vec<f32> = z
-            .clone()
-            .detach()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let z_vec: Vec<f32> = z.clone().detach().to_f32_vec();
 
         let act = self.select_top_k(z_vec);
         (act, z)
@@ -268,13 +263,7 @@ impl KWtaLayer {
     ) -> (Tensor<2>, Vec<f32>) {
         let z_batch: Tensor<2> = self.linear.forward(input_batch); // [B, n_units]
 
-        let z_vals: Vec<f32> = z_batch
-            .clone()
-            .detach()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let z_vals: Vec<f32> = z_batch.clone().detach().to_f32_vec();
 
         let n = self.n_units;
         let k = self.k_active;

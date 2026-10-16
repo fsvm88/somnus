@@ -5,6 +5,7 @@ use burn::{
 };
 
 use crate::region::{SparseActivation, N_UNITS};
+use crate::tensor_ext::TensorF32Ext;
 
 pub const EPISODE_DIM: usize = 640;
 
@@ -170,14 +171,7 @@ impl BindingArea {
             let gru_out: Tensor<3> = self.temporal_gru.forward(seq_t, init_hidden);
             let hidden: Tensor<2> = gru_out.narrow(1, 0, 1).squeeze_dim::<2>(1);
             // Cache hidden state for the next call.
-            self.gru_hidden = Some(
-                hidden
-                    .clone()
-                    .into_data()
-                    .convert::<f32>()
-                    .try_to_vec::<f32>()
-                    .unwrap(),
-            );
+            self.gru_hidden = Some(hidden.clone().to_f32_vec());
             // Project → [1, EPISODE_DIM] → reshape → [5, D_PROJ]
             let ctx: Tensor<2> = self.temporal_proj.forward(hidden);
             let ctx_tokens: Tensor<2> = ctx.reshape([5, D_PROJ]);
@@ -190,12 +184,7 @@ impl BindingArea {
         let out: Tensor<2> = self.attend(q, k, v);
 
         // Flatten [5, D_PROJ] → [EPISODE_DIM]
-        let flat: Vec<f32> = out
-            .flatten::<1>(0, 1)
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let flat: Vec<f32> = out.flatten::<1>(0, 1).to_f32_vec();
         EpisodeVector(flat)
     }
 
@@ -513,12 +502,7 @@ mod tests {
             "forward_tracked must not touch gru_hidden"
         );
         assert_eq!(ep_t.dims(), [1, EPISODE_DIM]);
-        let ep_t_vec: Vec<f32> = ep_t
-            .flatten::<1>(0, 1)
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let ep_t_vec: Vec<f32> = ep_t.flatten::<1>(0, 1).to_f32_vec();
         assert_eq!(ep_t_vec.len(), EPISODE_DIM);
         assert_eq!(
             ep_t_vec, ep_ref.0,
@@ -536,6 +520,7 @@ mod tests {
 /// test ever flips back, that copy is required again.
 #[cfg(test)]
 mod burn_linear_clone_quirk {
+    use crate::tensor_ext::TensorF32Ext;
     use burn::nn::LinearConfig;
     use burn::tensor::Device;
 
@@ -544,20 +529,8 @@ mod burn_linear_clone_quirk {
         let device = Device::flex();
         let lin = LinearConfig::new(10, 10).with_bias(false).init(&device);
         let cloned = lin.clone();
-        let a: Vec<f32> = lin
-            .weight
-            .val()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
-        let b: Vec<f32> = cloned
-            .weight
-            .val()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let a: Vec<f32> = lin.weight.val().to_f32_vec();
+        let b: Vec<f32> = cloned.weight.val().to_f32_vec();
         assert_eq!(
             a, b,
             "burn's Linear::clone() no longer preserves values (the 0.21 behavior) — \

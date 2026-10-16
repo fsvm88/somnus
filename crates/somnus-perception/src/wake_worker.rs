@@ -17,6 +17,7 @@
 //!   AdamW moments survive but refer to pre-sleep weights — stale by one
 //!   sleep cycle, acceptable here.
 
+use crate::tensor_ext::TensorF32Ext;
 use std::sync::mpsc;
 
 use burn::{
@@ -142,15 +143,7 @@ fn weights_flat(model: &WakeHeadsModel) -> [Vec<f32>; 5] {
         &model.symbolic,
         &model.language,
     ]
-    .map(|h| {
-        h.weight
-            .val()
-            .inner()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap()
-    })
+    .map(|h| h.weight.val().inner().to_f32_vec())
 }
 
 enum Msg {

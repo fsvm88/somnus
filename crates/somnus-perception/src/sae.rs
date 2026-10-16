@@ -1,3 +1,4 @@
+use crate::tensor_ext::TensorF32Ext;
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
@@ -46,11 +47,7 @@ impl SaeDecoder {
         let dense = act.to_dense_n(self.n_units);
         let dense_t = Tensor::<2>::from_data(TensorData::new(dense, [1, self.n_units]), device);
         let recon_t: Tensor<2> = self.decoder.forward(dense_t); // [1, n_in]
-        let recon_vec: Vec<f32> = recon_t
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let recon_vec: Vec<f32> = recon_t.to_f32_vec();
         input
             .iter()
             .zip(recon_vec.iter())
@@ -65,11 +62,7 @@ impl SaeDecoder {
         let dense = act.to_dense_n(self.n_units);
         let dense_t = Tensor::<2>::from_data(TensorData::new(dense, [1, self.n_units]), device);
         let recon_t: Tensor<2> = self.decoder.forward(dense_t);
-        recon_t
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap()
+        recon_t.to_f32_vec()
     }
 
     /// Batched MSE loss for NREM replay (B=1 for sequential, B>1 for batched).

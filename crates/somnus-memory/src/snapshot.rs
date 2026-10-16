@@ -239,72 +239,70 @@ pub fn load_growth_cooldown_remaining(memory_dir: &Path) -> usize {
     u64::from_le_bytes(bytes) as usize
 }
 
+/// Atomically write a small fixed-layout state file under `snapshot/`.
+fn save_state(memory_dir: &Path, name: &str, buf: &[u8]) -> MemoryResult<()> {
+    write_atomic(&memory_dir.join("snapshot").join(name), buf)?;
+    Ok(())
+}
+
+/// Read the first `N` bytes of a small state file under `snapshot/`; `None` if absent or short.
+fn load_state<const N: usize>(memory_dir: &Path, name: &str) -> Option<[u8; N]> {
+    let data = fs::read(memory_dir.join("snapshot").join(name)).ok()?;
+    data.get(..N)?.try_into().ok()
+}
+
+/// Encode `(μ: f32, n: u64)` (12 bytes LE), the layout shared by the settle and wake EWMAs.
+fn encode_mu_n(mu: f32, n: u64) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&mu.to_le_bytes());
+    buf[4..12].copy_from_slice(&n.to_le_bytes());
+    buf
+}
+
+fn decode_mu_n(b: [u8; 12]) -> (f32, u64) {
+    let mu = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let n = u64::from_le_bytes(b[4..12].try_into().expect("8 bytes"));
+    (mu, n)
+}
+
 /// Save the salience EWMA state (μ, σ as f32 LE; n as u64 LE = 16 bytes; ADR 0024 S1).
 pub fn save_sal_ewma(mu: f32, sigma: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> {
-    let path = memory_dir.join("snapshot").join("sal_ewma.bin");
     let mut buf = [0u8; 16];
     buf[0..4].copy_from_slice(&mu.to_le_bytes());
     buf[4..8].copy_from_slice(&sigma.to_le_bytes());
     buf[8..16].copy_from_slice(&n.to_le_bytes());
-    write_atomic(&path, buf)?;
-    Ok(())
+    save_state(memory_dir, "sal_ewma.bin", &buf)
 }
 
 /// Load the salience EWMA state. Returns (0.8, 0.2, 0) on absent/malformed file.
 pub fn load_sal_ewma(memory_dir: &Path) -> (f32, f32, u64) {
-    let path = memory_dir.join("snapshot").join("sal_ewma.bin");
-    let data = fs::read(path).ok().unwrap_or_default();
-    if data.len() < 16 {
+    let Some(d) = load_state::<16>(memory_dir, "sal_ewma.bin") else {
         return (0.8, 0.2, 0);
-    }
-    let mu = f32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
-    let sigma = f32::from_le_bytes(data[4..8].try_into().unwrap_or([0; 4]));
-    let n = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+    };
+    let mu = f32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+    let sigma = f32::from_le_bytes([d[4], d[5], d[6], d[7]]);
+    let n = u64::from_le_bytes(d[8..16].try_into().expect("8 bytes"));
     (mu, sigma, n)
 }
 
 /// Save the settle-cosine EWMA state (μ f32 LE + n u64 LE = 12 bytes; ADR 0024 S2).
 pub fn save_settle_ewma(mu: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> {
-    let path = memory_dir.join("snapshot").join("settle_ewma.bin");
-    let mut buf = [0u8; 12];
-    buf[0..4].copy_from_slice(&mu.to_le_bytes());
-    buf[4..12].copy_from_slice(&n.to_le_bytes());
-    write_atomic(&path, buf)?;
-    Ok(())
+    save_state(memory_dir, "settle_ewma.bin", &encode_mu_n(mu, n))
 }
 
 /// Load the settle-cosine EWMA state. Returns (0.85, 0) on absent/malformed file.
 pub fn load_settle_ewma(memory_dir: &Path) -> (f32, u64) {
-    let path = memory_dir.join("snapshot").join("settle_ewma.bin");
-    let data = fs::read(path).ok().unwrap_or_default();
-    if data.len() < 12 {
-        return (0.85, 0);
-    }
-    let mu = f32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
-    let n = u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]));
-    (mu, n)
+    load_state::<12>(memory_dir, "settle_ewma.bin").map_or((0.85, 0), decode_mu_n)
 }
 
 /// Save the wake-duration EWMA state (μ f32 LE + n u64 LE = 12 bytes; ADR 0024 S6).
 pub fn save_wake_ewma(mu: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> {
-    let path = memory_dir.join("snapshot").join("wake_ewma.bin");
-    let mut buf = [0u8; 12];
-    buf[0..4].copy_from_slice(&mu.to_le_bytes());
-    buf[4..12].copy_from_slice(&n.to_le_bytes());
-    write_atomic(&path, buf)?;
-    Ok(())
+    save_state(memory_dir, "wake_ewma.bin", &encode_mu_n(mu, n))
 }
 
 /// Load the wake-duration EWMA state. Returns (0.0, 0) on absent/malformed file.
 pub fn load_wake_ewma(memory_dir: &Path) -> (f32, u64) {
-    let path = memory_dir.join("snapshot").join("wake_ewma.bin");
-    let data = fs::read(path).ok().unwrap_or_default();
-    if data.len() < 12 {
-        return (0.0, 0);
-    }
-    let mu = f32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
-    let n = u64::from_le_bytes(data[4..12].try_into().unwrap_or([0; 8]));
-    (mu, n)
+    load_state::<12>(memory_dir, "wake_ewma.bin").map_or((0.0, 0), decode_mu_n)
 }
 
 /// Restore episodic buffer + rebuild SemanticStore from `memory_dir/snapshot/`.

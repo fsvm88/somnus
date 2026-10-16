@@ -1,3 +1,4 @@
+use crate::util::argmax;
 /// ActionDecoder: region-token projection + frozen Qwen3-0.6B (ADR 0012).
 ///
 /// Dual function:
@@ -14,6 +15,7 @@ use burn::{
     optim::{AdamWConfig, GradientsParams, ModuleOptimizer},
     tensor::{activation, Device, Tensor, TensorData},
 };
+use somnus_perception::TensorF32Ext;
 use ndarray::{Array2, Array3, ArrayView4};
 use ort::{
     session::Session,
@@ -944,25 +946,11 @@ impl ActionDecoder {
     /// Frobenius norm of the projection weight matrices (monitoring, Phase 8).
     pub fn proj_weight_norm(&self) -> Result<f32> {
         let model = self.model_ref();
-        let w1 = model
-            .fc1
-            .weight
-            .val()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let w1 = model.fc1.weight.val().to_f32_vec();
         let norm_sq: f32 = if self.linear_proj {
             w1.iter().map(|x| x * x).sum()
         } else {
-            let w2 = model
-                .fc2
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let w2 = model.fc2.weight.val().to_f32_vec();
             w1.iter().chain(w2.iter()).map(|x| x * x).sum()
         };
         Ok(norm_sq.sqrt())
@@ -988,27 +976,11 @@ impl ActionDecoder {
     /// gain_from_episode() receives `linear_proj` separately to interpret the layout.
     pub fn proj_weights_flat(&self) -> Vec<f32> {
         let model = self.model_ref();
-        let w1 = model
-            .fc1
-            .weight
-            .val()
-            .detach()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let w1 = model.fc1.weight.val().detach().to_f32_vec();
         if self.linear_proj {
             return w1;
         }
-        let w2 = model
-            .fc2
-            .weight
-            .val()
-            .detach()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let w2 = model.fc2.weight.val().detach().to_f32_vec();
         let mut out = Vec::with_capacity(w1.len() + w2.len());
         out.extend(w1);
         out.extend(w2);
@@ -1290,11 +1262,7 @@ impl ActionDecoder {
             let h = activation::relu(model.fc1.forward(ep_t)); // [1, PROJ_HIDDEN]
             model.fc2.forward(h) // [1, N_REGIONS * LM_HIDDEN]
         };
-        let flat = proj
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let flat = proj.to_f32_vec();
         Ok(flat)
     }
 
@@ -1468,15 +1436,6 @@ fn gain_from_episode_inner(
     Ok(attn.map(|a| (a * 5.0).clamp(0.5, 2.0)))
 }
 
-fn argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1506,20 +1465,8 @@ mod tests {
             .unwrap();
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         let dst = dst.map(&mut Retrack);
-        let a = src
-            .fc1
-            .weight
-            .val()
-            .into_data()
-            .try_to_vec::<f32>()
-            .unwrap();
-        let b = dst
-            .fc1
-            .weight
-            .val()
-            .into_data()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let a = src.fc1.weight.val().to_f32_vec();
+        let b = dst.fc1.weight.val().to_f32_vec();
         assert_eq!(a, b);
 
         let x: Tensor<2> = Tensor::from_data(
@@ -1532,12 +1479,6 @@ mod tests {
             dst.fc1.weight.val().grad(&grads).is_some(),
             "no gradient reached reloaded param"
         );
-    }
-
-    #[test]
-    fn argmax_basic() {
-        assert_eq!(argmax(&[0.1, 0.5, 0.3, 0.9, 0.2]), 3);
-        assert_eq!(argmax(&[1.0]), 0);
     }
 
     #[test]

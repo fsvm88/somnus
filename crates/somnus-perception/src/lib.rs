@@ -3,7 +3,9 @@ pub mod error;
 pub mod onnx_session;
 pub mod region;
 pub mod sae;
+mod tensor_ext;
 pub mod wake_worker;
+pub use tensor_ext::TensorF32Ext;
 
 pub use binding::{BindingArea, EpisodeVector, EPISODE_DIM};
 pub use error::{PerceptionError, PerceptionResult};
@@ -98,12 +100,7 @@ impl EmaOutputHeads {
             for (i, h) in self.heads.iter().enumerate() {
                 let dims = h.dims();
                 self.d_out[i] = dims[1];
-                self.flat[i] = h
-                    .clone()
-                    .into_data()
-                    .convert::<f32>()
-                    .try_to_vec::<f32>()
-                    .unwrap();
+                self.flat[i] = h.clone().to_f32_vec();
             }
         });
     }
@@ -435,14 +432,7 @@ impl PerceptionProcessor {
     /// Called whenever ORT sessions are rebuilt so the inference copy stays in sync.
     pub fn sync_cross_modal_flat(&mut self) {
         let model = self.model_ref();
-        let w: Vec<f32> = model
-            .cross_modal_proj
-            .weight
-            .val()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let w: Vec<f32> = model.cross_modal_proj.weight.val().to_f32_vec();
         // burn stores Linear weight as [n_in, n_out] — already row-major [i][j].
         self.cross_modal_proj_flat = Some(w);
     }
@@ -852,10 +842,7 @@ impl PerceptionProcessor {
                     .unwrap()
                     .cross_modal_proj
                     .forward(concat_t)
-                    .into_data()
-                    .convert::<f32>()
-                    .try_to_vec::<f32>()
-                    .unwrap()
+                    .to_f32_vec()
             }
         } else {
             let concat_t: Tensor<2> =
@@ -865,10 +852,7 @@ impl PerceptionProcessor {
                 .unwrap()
                 .cross_modal_proj
                 .forward(concat_t)
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap()
+                .to_f32_vec()
         };
 
         // Store projected embedding: NREM synthesize_episode uses latest_inputs[3] as
@@ -1258,24 +1242,8 @@ impl PerceptionProcessor {
                 let mut divergence_l2_sq = 0.0f64;
                 macro_rules! accumulate_divergence {
                     ($field:ident) => {{
-                        let live: Vec<f32> = model
-                            .binding
-                            .$field
-                            .weight
-                            .val()
-                            .into_data()
-                            .convert::<f32>()
-                            .try_to_vec::<f32>()
-                            .unwrap();
-                        let wake: Vec<f32> = model
-                            .wake_binding
-                            .$field
-                            .weight
-                            .val()
-                            .into_data()
-                            .convert::<f32>()
-                            .try_to_vec::<f32>()
-                            .unwrap();
+                        let live: Vec<f32> = model.binding.$field.weight.val().to_f32_vec();
+                        let wake: Vec<f32> = model.wake_binding.$field.weight.val().to_f32_vec();
                         for (a, b) in live.iter().zip(wake.iter()) {
                             let d = (*a - *b) as f64;
                             divergence_l2_sq += d * d;
@@ -1399,11 +1367,7 @@ impl PerceptionProcessor {
                     _ => unreachable!(),
                 };
                 let n_units = flat_masks.len() / b;
-                let z_flat: Vec<f32> = z_batch
-                    .into_data()
-                    .convert::<f32>()
-                    .try_to_vec::<f32>()
-                    .unwrap();
+                let z_flat: Vec<f32> = z_batch.to_f32_vec();
                 for (j, &(sample_i, _)) in valid.iter().enumerate() {
                     let mask_row = &flat_masks[j * n_units..(j + 1) * n_units];
                     let z_row = &z_flat[j * n_units..(j + 1) * n_units];
@@ -1928,15 +1892,7 @@ impl PerceptionProcessor {
             &m.symbolic_head,
             &m.language_head,
         ]
-        .map(|h| {
-            h.weight
-                .val()
-                .inner()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap()
-        })
+        .map(|h| h.weight.val().inner().to_f32_vec())
     }
 
     /// Write worker-trained head weights back into the model (sleep-entry merge).
@@ -1977,14 +1933,7 @@ impl PerceptionProcessor {
             RegionId::Symbolic => &m.binding.region_3,
             RegionId::Language => &m.binding.region_4,
         };
-        let flat: Vec<f32> = proj
-            .weight
-            .val()
-            .inner()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let flat: Vec<f32> = proj.weight.val().inner().to_f32_vec();
         let dims = proj.weight.val().inner().dims();
         let (n, d) = (dims[0], dims[1]);
         (0..n)
@@ -2008,14 +1957,7 @@ impl PerceptionProcessor {
             RegionId::Symbolic => &m.wake_binding.region_3,
             RegionId::Language => &m.wake_binding.region_4,
         };
-        let flat: Vec<f32> = proj
-            .weight
-            .val()
-            .inner()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+        let flat: Vec<f32> = proj.weight.val().inner().to_f32_vec();
         let dims = proj.weight.val().inner().dims();
         let (n, d) = (dims[0], dims[1]);
         (0..n)
@@ -2553,10 +2495,7 @@ impl PerceptionProcessor {
             .linear
             .weight
             .val()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+            .to_f32_vec();
 
         // L1 norm of unit i = sum over rows j of abs(enc_flat[j * current_n + i]).
         let mut grown_norms: Vec<(usize, f32)> = (N_UNITS..current_n)
@@ -2587,10 +2526,7 @@ impl PerceptionProcessor {
             .decoder
             .weight
             .val()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+            .to_f32_vec();
         // Keep rows `keep` from [current_n, n_in] → [new_n, n_in].
         let new_dec_flat: Vec<f32> = keep
             .iter()
@@ -2625,13 +2561,7 @@ impl PerceptionProcessor {
                 RegionId::Symbolic => &mut model.binding.region_3,
                 RegionId::Language => &mut model.binding.region_4,
             };
-            let bind_flat: Vec<f32> = binding_proj
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let bind_flat: Vec<f32> = binding_proj.weight.val().to_f32_vec();
             let d_proj = bind_flat.len() / current_n;
             let new_bind_flat: Vec<f32> = keep
                 .iter()
@@ -2653,13 +2583,7 @@ impl PerceptionProcessor {
                 RegionId::Symbolic => &mut model.wake_binding.region_3,
                 RegionId::Language => &mut model.wake_binding.region_4,
             };
-            let bind_flat: Vec<f32> = wake_binding_proj
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let bind_flat: Vec<f32> = wake_binding_proj.weight.val().to_f32_vec();
             let d_proj = bind_flat.len() / current_n;
             let new_bind_flat: Vec<f32> = keep
                 .iter()
@@ -3050,36 +2974,18 @@ impl PerceptionProcessor {
         ];
         for (i, (layer, n_in)) in enc_layers.iter().enumerate() {
             let n_units = layer.weight.val().dims()[1];
-            let w: Vec<f32> = layer
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let w: Vec<f32> = layer.weight.val().to_f32_vec();
             write(&format!("W_enc_{i}"), w, vec![*n_in, n_units])?;
         }
 
         // ── Cross-modal projection [CROSS_MODAL_DIM, 384] + bias [384] ──────
         {
             let dims = m.cross_modal_proj.weight.val().dims();
-            let w: Vec<f32> = m
-                .cross_modal_proj
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let w: Vec<f32> = m.cross_modal_proj.weight.val().to_f32_vec();
             write("W_cross", w, vec![dims[0], dims[1]])?;
             // cross_modal_proj has bias=true; bias shape [384]
             if let Some(bias) = m.cross_modal_proj.bias.as_ref() {
-                let b: Vec<f32> = bias
-                    .val()
-                    .into_data()
-                    .convert::<f32>()
-                    .try_to_vec::<f32>()
-                    .unwrap();
+                let b: Vec<f32> = bias.val().to_f32_vec();
                 write("W_cross_bias", b, vec![dims[1]])?;
             }
         }
@@ -3094,13 +3000,7 @@ impl PerceptionProcessor {
         ];
         for (i, proj) in region_projs.iter().enumerate() {
             let dims = proj.weight.val().dims();
-            let w: Vec<f32> = proj
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let w: Vec<f32> = proj.weight.val().to_f32_vec();
             write(&format!("W_region_{i}"), w, vec![dims[0], dims[1]])?;
         }
 
@@ -3111,13 +3011,7 @@ impl PerceptionProcessor {
             ("W_v", &m.wake_binding.w_v),
         ] {
             let dims = param.weight.val().dims();
-            let w: Vec<f32> = param
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let w: Vec<f32> = param.weight.val().to_f32_vec();
             write(name, w, vec![dims[0], dims[1]])?;
         }
 
@@ -3129,14 +3023,7 @@ impl PerceptionProcessor {
             ("new", &gru.new_gate),
         ] {
             let wi_dims = gate.input_transform.weight.val().dims();
-            let wi: Vec<f32> = gate
-                .input_transform
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let wi: Vec<f32> = gate.input_transform.weight.val().to_f32_vec();
             write(
                 &format!("gru_{gate_name}_input_W"),
                 wi,
@@ -3144,14 +3031,7 @@ impl PerceptionProcessor {
             )?;
 
             let wh_dims = gate.hidden_transform.weight.val().dims();
-            let wh: Vec<f32> = gate
-                .hidden_transform
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let wh: Vec<f32> = gate.hidden_transform.weight.val().to_f32_vec();
             write(
                 &format!("gru_{gate_name}_hidden_W"),
                 wh,
@@ -3162,15 +3042,7 @@ impl PerceptionProcessor {
         // ── temporal_proj [GRU_HIDDEN, EPISODE_DIM] ──────────────────────────
         {
             let dims = m.wake_binding.temporal_proj.weight.val().dims();
-            let w: Vec<f32> = m
-                .wake_binding
-                .temporal_proj
-                .weight
-                .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let w: Vec<f32> = m.wake_binding.temporal_proj.weight.val().to_f32_vec();
             write("W_temporal_proj", w, vec![dims[0], dims[1]])?;
         }
 
@@ -3258,10 +3130,7 @@ impl PerceptionProcessor {
             .cross_modal_proj
             .forward(Tensor::<2>::from_inner(cross_t))
             .inner()
-            .into_data()
-            .convert::<f32>()
-            .try_to_vec::<f32>()
-            .unwrap();
+            .to_f32_vec();
 
         let enc_inputs: [&[f32]; 5] = [speech, env, visual, &symbolic_enc, lang];
         let layers = [
@@ -3280,10 +3149,7 @@ impl PerceptionProcessor {
             layers[i]
                 .forward(Tensor::<2>::from_inner(t))
                 .inner()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap()
+                .to_f32_vec()
         })
     }
 
@@ -3731,15 +3597,7 @@ mod binding_replay_tests {
             let n = layer.n_units;
             assert_eq!(n, N_UNITS + N_GROWN);
             let n_in = REGION_DIMS[RegionId::AudioSpeech.as_index()];
-            let mut flat: Vec<f32> = layer
-                .linear
-                .weight
-                .val()
-                .inner()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let mut flat: Vec<f32> = layer.linear.weight.val().inner().to_f32_vec();
             let norm: f32 = regional[0].iter().map(|x| x * x).sum::<f32>().sqrt();
             for c in N_UNITS..n {
                 for (r, &x) in regional[0].iter().enumerate() {
@@ -3759,16 +3617,7 @@ mod binding_replay_tests {
         // optimizer never touches them.
         let temporal_norm = |p: &PerceptionProcessor| {
             let m = p.model.as_ref().unwrap();
-            let flat: Vec<f32> = m
-                .binding
-                .temporal_proj
-                .weight
-                .val()
-                .inner()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap();
+            let flat: Vec<f32> = m.binding.temporal_proj.weight.val().inner().to_f32_vec();
             flat.iter().map(|v| v * v).sum::<f32>()
         };
         let temporal_before = temporal_norm(&proc);
@@ -3834,10 +3683,7 @@ mod binding_replay_tests {
                 .speech_head
                 .weight
                 .val()
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .unwrap()
+                .to_f32_vec()
         };
         let binding_norm = |p: &PerceptionProcessor| -> f32 {
             p.binding_proj_row_norms(RegionId::AudioSpeech).iter().sum()

@@ -3,6 +3,7 @@
 mod action;
 mod cli;
 mod sleep;
+mod util;
 mod whisper_asr;
 
 /// Register MIGraphX EP using the generic key-value ORT API, then build the session.
@@ -558,9 +559,9 @@ pub async fn run() -> Result<()> {
     let (mut wake_ewma_mu, mut wake_ewma_n) = load_wake_ewma(&args.memory_dir);
 
     // ── Pre-grow perception to match last session's region sizes ─────────────
-    // Must happen before ORT build so the ONNX is exported from the correct
-    // (possibly grown) model *shape*. The ONNX graph carries frozen weights though, so the
-    // snapshot restore below rebuilds the ORT session once the real weights are loaded.
+    // Must happen before the weight restore (which needs the grown shape) and the ORT build
+    // (the ONNX is exported from the correct, possibly grown, model). The ORT session itself is
+    // built after the restore: its graph carries frozen weights.
     {
         let sizes = load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
         let regions = [
@@ -612,6 +613,61 @@ pub async fn run() -> Result<()> {
     // unavailable, ...), don't retry every sleep cycle — log once and stay on burn
     // CPU for the rest of the process. The environment problem won't fix itself.
     let mut onnx_failed = false;
+    // ── memory hierarchy ──────────────────────────────────────────────────────
+    std::fs::create_dir_all(&args.memory_dir)?;
+    let cold = match ColdArchive::open(&args.memory_dir) {
+        Ok(c) => c,
+        Err(e) => anyhow::bail!("cold archive init failed: {e}"),
+    };
+
+    // Restore from snapshot if available; otherwise start fresh.
+    let mut snapshot_found = false;
+    let (mut episodic, mut semantic) =
+        match load_snapshot(&args.memory_dir, args.episodic_capacity, EPISODE_DIM) {
+            Ok(Some((ep, sem))) => {
+                snapshot_found = true;
+                info!(
+                    episodic_len = ep.len(),
+                    semantic_len = sem.len(),
+                    "restored from snapshot"
+                );
+                // Restore perception weights; pre-grow regions if they grew last session.
+                // save_weights writes `<stem>.safetensors`; check that, not the stem path itself.
+                let w_path = weights_path(&args.memory_dir);
+                if w_path.with_extension("safetensors").exists() {
+                    let sizes =
+                        load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
+                    if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
+                        tracing::warn!(?e, "weight restore failed — starting with fresh weights");
+                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
+                    } else {
+                        info!(sizes = ?sizes, "perception weights restored");
+                    }
+                }
+                (ep, sem)
+            }
+            Ok(None) => {
+                info!("no snapshot found — starting fresh");
+                (
+                    EpisodicBuffer::new(args.episodic_capacity),
+                    SemanticStore::new(EPISODE_DIM),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(?e, "snapshot load failed — starting fresh");
+                somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
+                (
+                    EpisodicBuffer::new(args.episodic_capacity),
+                    SemanticStore::new(EPISODE_DIM),
+                )
+            }
+        };
+
+    // ── ORT binding session (Phase 1 GPU unification, ADR 0023/0037) ──────────
+    // Built *after* the snapshot restore: an ONNX graph carries frozen weights, so building it
+    // from the pre-grown but still random-init model (as this used to) inferred on random
+    // weights for the whole first wake phase, and the fix of rebuilding after the restore cost a
+    // second ~10 s session export on every restored start (ADR 0049).
     if let (Some(ref dir), Some(ref script)) = (&onnx_dir, &onnx_script_path) {
         if should_use_ort_inference(&perception.region_sizes(), args.onnx_crossover_units) {
             std::fs::create_dir_all(dir)?;
@@ -632,79 +688,6 @@ pub async fn run() -> Result<()> {
             }
         }
     }
-
-    // ── memory hierarchy ──────────────────────────────────────────────────────
-    std::fs::create_dir_all(&args.memory_dir)?;
-    let cold = match ColdArchive::open(&args.memory_dir) {
-        Ok(c) => c,
-        Err(e) => anyhow::bail!("cold archive init failed: {e}"),
-    };
-
-    // Restore from snapshot if available; otherwise start fresh.
-    let mut snapshot_found = false;
-    let (mut episodic, mut semantic) = match load_snapshot(
-        &args.memory_dir,
-        args.episodic_capacity,
-        EPISODE_DIM,
-    ) {
-        Ok(Some((ep, sem))) => {
-            snapshot_found = true;
-            info!(
-                episodic_len = ep.len(),
-                semantic_len = sem.len(),
-                "restored from snapshot"
-            );
-            // Restore perception weights; pre-grow regions if they grew last session.
-            // save_weights writes `<stem>.safetensors`; check that, not the stem path itself.
-            let w_path = weights_path(&args.memory_dir);
-            if w_path.with_extension("safetensors").exists() {
-                let sizes =
-                    load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
-                if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
-                    tracing::warn!(?e, "weight restore failed — starting with fresh weights");
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-                } else {
-                    info!(sizes = ?sizes, "perception weights restored");
-                    // The ORT binding session above was exported from the pre-grown but
-                    // still randomly-initialised model; its graph carries frozen weights, so
-                    // without a rebuild the whole first wake phase would infer on them.
-                    if perception.ort_active() {
-                        if let (Some(ref dir), Some(ref script)) = (&onnx_dir, &onnx_script_path) {
-                            match perception.rebuild_ort_session(script, dir, args.onnx_migraphx) {
-                                Ok(()) => {
-                                    info!("ORT binding session rebuilt from restored weights")
-                                }
-                                Err(e) => {
-                                    tracing::warn!(?e, "ORT rebuild after restore failed — running with burn inference");
-                                    somnus_metrics::counted_core!(
-                                        somnus_metrics::Metric::OrtSessionRebuildFailed,
-                                        1
-                                    );
-                                    onnx_failed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            (ep, sem)
-        }
-        Ok(None) => {
-            info!("no snapshot found — starting fresh");
-            (
-                EpisodicBuffer::new(args.episodic_capacity),
-                SemanticStore::new(EPISODE_DIM),
-            )
-        }
-        Err(e) => {
-            tracing::warn!(?e, "snapshot load failed — starting fresh");
-            somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
-            (
-                EpisodicBuffer::new(args.episodic_capacity),
-                SemanticStore::new(EPISODE_DIM),
-            )
-        }
-    };
 
     // S5: auto-seed max_warm_records from available RAM when not set (ADR 0024).
     // Warm HNSW is ~2500 bytes/record (640-dim f32 + graph edges); target 35% of free RAM.
