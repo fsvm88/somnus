@@ -5,6 +5,7 @@ mod cli;
 mod sleep;
 mod startup;
 mod util;
+mod wake_state;
 mod whisper_asr;
 
 /// Register MIGraphX EP using the generic key-value ORT API, then build the session.
@@ -511,13 +512,13 @@ pub async fn run() -> Result<()> {
     let session_start_secs = wall_secs(&SystemTime::now());
 
     // Load growth cooldown remaining from last session (0 if absent).
-    let mut cooldown_remaining = load_growth_cooldown_remaining(&args.memory_dir);
+    let cooldown_remaining = load_growth_cooldown_remaining(&args.memory_dir);
     // Load salience EWMA state (ADR 0024 S1). Cold-start: μ=0.8, σ=0.2, n=0.
-    let (mut sal_mu, mut sal_sigma, mut sal_n) = load_sal_ewma(&args.memory_dir);
+    let (sal_mu, sal_sigma, sal_n) = load_sal_ewma(&args.memory_dir);
     // Load settle-cosine EWMA state (ADR 0024 S2). Cold-start: μ=0.85, n=0.
-    let (mut settle_mu, mut settle_n) = load_settle_ewma(&args.memory_dir);
+    let (settle_mu, settle_n) = load_settle_ewma(&args.memory_dir);
     // Load wake-duration EWMA state (ADR 0024 S6). Cold-start: μ=0.0, n=0.
-    let (mut wake_ewma_mu, mut wake_ewma_n) = load_wake_ewma(&args.memory_dir);
+    let (wake_ewma_mu, wake_ewma_n) = load_wake_ewma(&args.memory_dir);
 
     // ── Pre-grow perception to match last session's region sizes ─────────────
     // Must happen before the weight restore (which needs the grown shape) and the ORT build
@@ -803,7 +804,7 @@ pub async fn run() -> Result<()> {
     } else {
         None
     };
-    let mut wake_recon_dropped: u64 = 0;
+    let wake_recon_dropped: u64 = 0;
 
     // ── language embedder ─────────────────────────────────────────────────────
     let lang_embedder: Option<LangEmbedder> = if args.language {
@@ -835,8 +836,8 @@ pub async fn run() -> Result<()> {
     } else {
         wake_ewma_floor
     };
-    let mut max_wake = Duration::from_secs(effective_max_wake_secs);
-    let mut wake_start = std::time::Instant::now();
+    let max_wake = Duration::from_secs(effective_max_wake_secs);
+    let wake_start = std::time::Instant::now();
 
     let interrupt = Arc::new(AtomicBool::new(false));
     let interrupt_sleep = Arc::clone(&interrupt);
@@ -856,65 +857,65 @@ pub async fn run() -> Result<()> {
     } else {
         None
     };
-    let mut sleep_cycle_count: usize = 0;
+    let sleep_cycle_count: usize = 0;
     // Tracks whether the --query one-shot generation has already fired.
-    let mut startup_query_fired = false;
+    let startup_query_fired = false;
     // Per-wake-cycle counters — reset after each sleep cycle.
-    let mut wake_episodes: usize = 0;
-    let mut wake_output_mse_sum: f64 = 0.0;
-    let mut wake_output_mse_n: usize = 0;
-    let mut prior_cosine_sums: [f64; 5] = [0.0; 5];
-    let mut prior_cosine_counts: [usize; 5] = [0; 5];
-    let mut lang_ingest_count: usize = 0;
-    let mut gain_episode_counter: usize = 0;
-    let mut wake_reconstruct_counter: usize = 0;
+    let wake_episodes: usize = 0;
+    let wake_output_mse_sum: f64 = 0.0;
+    let wake_output_mse_n: usize = 0;
+    let prior_cosine_sums: [f64; 5] = [0.0; 5];
+    let prior_cosine_counts: [usize; 5] = [0; 5];
+    let lang_ingest_count: usize = 0;
+    let gain_episode_counter: usize = 0;
+    let wake_reconstruct_counter: usize = 0;
     // ADR 0022 instrumentation additions.
-    let mut salience_sum: f64 = 0.0;
-    let mut salience_n: usize = 0;
-    let mut salience_min: f32 = f32::MAX;
-    let mut high_salience_episodes: usize = 0;
-    let mut blend_count: usize = 0;
-    let mut hnsw_query_us_sum: u64 = 0;
-    let mut hnsw_query_n: u64 = 0;
-    let mut wake_reconstruct_throttle_passed: usize = 0;
-    let mut episodes_speech: usize = 0;
-    let mut episodes_env: usize = 0;
-    let mut episodes_visual: usize = 0;
-    let mut episodes_language: usize = 0;
-    let mut episodes_mixed: usize = 0;
-    let mut settle_trigger_count: usize = 0;
-    let mut settle_iters_sum: usize = 0;
-    let mut settle_delta_sum: f64 = 0.0;
+    let salience_sum: f64 = 0.0;
+    let salience_n: usize = 0;
+    let salience_min: f32 = f32::MAX;
+    let high_salience_episodes: usize = 0;
+    let blend_count: usize = 0;
+    let hnsw_query_us_sum: u64 = 0;
+    let hnsw_query_n: u64 = 0;
+    let wake_reconstruct_throttle_passed: usize = 0;
+    let episodes_speech: usize = 0;
+    let episodes_env: usize = 0;
+    let episodes_visual: usize = 0;
+    let episodes_language: usize = 0;
+    let episodes_mixed: usize = 0;
+    let settle_trigger_count: usize = 0;
+    let settle_iters_sum: usize = 0;
+    let settle_delta_sum: f64 = 0.0;
     // Per-cycle encode/perception timing (ms) — reset after each sleep cycle.
-    let mut speech_encode_total_ms: u64 = 0;
-    let mut env_encode_total_ms: u64 = 0;
-    let mut video_encode_total_ms: u64 = 0;
-    let mut perception_total_ms: u64 = 0;
+    let speech_encode_total_ms: u64 = 0;
+    let env_encode_total_ms: u64 = 0;
+    let video_encode_total_ms: u64 = 0;
+    let perception_total_ms: u64 = 0;
     // Per-wake-cycle EWMA state for the perf-degradation sleep trigger (10a).
     // cosine_baseline: mean prior_cosine of the first COSINE_BASELINE_N episodes.
     // cosine_ewma: exponentially weighted moving average (α = COSINE_EWMA_ALPHA).
     // perf_sleep_flag: set when EWMA drops > perf_sleep_threshold below baseline.
-    let mut cosine_ewma: Option<f64> = None;
-    let mut cosine_baseline: Option<f64> = None;
-    let mut cosine_baseline_accum: f64 = 0.0;
-    let mut cosine_baseline_n: usize = 0;
-    let mut perf_sleep_flag = false;
+    let cosine_ewma: Option<f64> = None;
+    let cosine_baseline: Option<f64> = None;
+    let cosine_baseline_accum: f64 = 0.0;
+    let cosine_baseline_n: usize = 0;
+    let perf_sleep_flag = false;
     // Wakefulness pressure accumulator P (ADR 0024 S3). Starts fresh each session;
     // dissipated by NREM consolidation quality; fires sleep when P >= P_THRESHOLD.
-    let mut wakefulness_pressure: f32 = 0.0;
+    let wakefulness_pressure: f32 = 0.0;
     // S4: prior-beta auto-enable ring buffer (3 cycles) and active flag (ADR 0024).
-    let mut s4_ring: [Option<f64>; 3] = [None; 3];
-    let mut s4_ring_pos: usize = 0;
-    let mut s4_beta_active: bool = false;
+    let s4_ring: [Option<f64>; 3] = [None; 3];
+    let s4_ring_pos: usize = 0;
+    let s4_beta_active: bool = false;
     // P1b: rolling sleep-duration history for auto --sleep-max-secs (ADR 0024 ops table).
     // Cap activates after the first completed cycle; floor = 300s prevents over-tightening.
-    let mut sleep_dur_secs_history: std::collections::VecDeque<f64> =
+    let sleep_dur_secs_history: std::collections::VecDeque<f64> =
         std::collections::VecDeque::with_capacity(5);
     // P2a / S7: wake-reconstruct-interval adaptation from cycle-level MSE trend (ADR 0024).
-    let mut s7_mse_ewma: f64 = 0.0;
-    let mut s7_ewma_n: usize = 0;
-    let mut s7_stagnant: u32 = 0;
-    let mut effective_wake_interval: usize = args.wake_reconstruct_interval;
+    let s7_mse_ewma: f64 = 0.0;
+    let s7_ewma_n: usize = 0;
+    let s7_stagnant: u32 = 0;
+    let effective_wake_interval: usize = args.wake_reconstruct_interval;
     // ASR count shared with the audio encoder task.
     let asr_count = Arc::new(AtomicUsize::new(0));
 
@@ -1347,6 +1348,65 @@ pub async fn run() -> Result<()> {
         });
     }
 
+    let mut st = wake_state::WakeState {
+        cooldown_remaining,
+        sal_mu,
+        sal_sigma,
+        sal_n,
+        settle_mu,
+        settle_n,
+        wake_ewma_mu,
+        wake_ewma_n,
+        onnx_failed,
+        wake_recon_dropped,
+        max_wake,
+        wake_start,
+        sleep_cycle_count,
+        startup_query_fired,
+        wake_episodes,
+        wake_output_mse_sum,
+        wake_output_mse_n,
+        prior_cosine_sums,
+        prior_cosine_counts,
+        lang_ingest_count,
+        gain_episode_counter,
+        wake_reconstruct_counter,
+        salience_sum,
+        salience_n,
+        salience_min,
+        high_salience_episodes,
+        blend_count,
+        hnsw_query_us_sum,
+        hnsw_query_n,
+        wake_reconstruct_throttle_passed,
+        episodes_speech,
+        episodes_env,
+        episodes_visual,
+        episodes_language,
+        episodes_mixed,
+        settle_trigger_count,
+        settle_iters_sum,
+        settle_delta_sum,
+        speech_encode_total_ms,
+        env_encode_total_ms,
+        video_encode_total_ms,
+        perception_total_ms,
+        cosine_ewma,
+        cosine_baseline,
+        cosine_baseline_accum,
+        cosine_baseline_n,
+        perf_sleep_flag,
+        wakefulness_pressure,
+        s4_ring,
+        s4_ring_pos,
+        s4_beta_active,
+        sleep_dur_secs_history,
+        s7_mse_ewma,
+        s7_ewma_n,
+        s7_stagnant,
+        effective_wake_interval,
+    };
+
     // ── main loop ─────────────────────────────────────────────────────────────
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(10));
     // In file (non-loop) mode the embedding channels close when the file is
@@ -1440,8 +1500,8 @@ pub async fn run() -> Result<()> {
         if let Some(ref w) = wake_recon_worker {
             while let Some((flat, loss)) = w.try_recv_ema() {
                 perception.apply_ema_flat(flat);
-                wake_output_mse_sum += loss as f64;
-                wake_output_mse_n += 1;
+                st.wake_output_mse_sum += loss as f64;
+                st.wake_output_mse_n += 1;
                 tracing::info!(output_mse = loss, "wake reconstruction (async)");
             }
         }
@@ -1460,72 +1520,77 @@ pub async fn run() -> Result<()> {
                         args.top_k,
                         &recall,
                         &mut decoder,
-                        &mut wake_reconstruct_counter,
-                        effective_wake_interval,
+                        &mut st.wake_reconstruct_counter,
+                        st.effective_wake_interval,
                         wake_recon_worker.as_ref(),
-                        &mut wake_recon_dropped,
-                        sal_gate(sal_mu, sal_sigma, sal_n),
+                        &mut st.wake_recon_dropped,
+                        sal_gate(st.sal_mu, st.sal_sigma, st.sal_n),
                     ) {
-                        lang_ingest_count += 1;
+                        st.lang_ingest_count += 1;
                         if r.episode_produced {
-                            wake_episodes += 1;
+                            st.wake_episodes += 1;
                             if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
                                 update_perf_ewma(
                                     m,
-                                    &mut cosine_ewma,
-                                    &mut cosine_baseline,
-                                    &mut cosine_baseline_accum,
-                                    &mut cosine_baseline_n,
-                                    &mut perf_sleep_flag,
+                                    &mut st.cosine_ewma,
+                                    &mut st.cosine_baseline,
+                                    &mut st.cosine_baseline_accum,
+                                    &mut st.cosine_baseline_n,
+                                    &mut st.perf_sleep_flag,
                                     args.perf_sleep_threshold,
                                 );
-                                update_settle_ewma(m, &mut settle_mu, &mut settle_n);
+                                update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
                                 perception.set_settle_gate(settle_gate_val(
-                                    settle_mu,
-                                    settle_n,
+                                    st.settle_mu,
+                                    st.settle_n,
                                     args.settle_gate,
                                 ));
                             }
                         }
                         if let Some(m) = r.reconstruct_mse {
-                            wake_output_mse_sum += m as f64;
-                            wake_output_mse_n += 1;
+                            st.wake_output_mse_sum += m as f64;
+                            st.wake_output_mse_n += 1;
                         }
                         if r.throttle_passed {
-                            wake_reconstruct_throttle_passed += 1;
+                            st.wake_reconstruct_throttle_passed += 1;
                         }
                         if r.settle_iters > 0 {
-                            settle_trigger_count += 1;
-                            settle_iters_sum += r.settle_iters;
-                            settle_delta_sum += r.settle_delta as f64;
+                            st.settle_trigger_count += 1;
+                            st.settle_iters_sum += r.settle_iters;
+                            st.settle_delta_sum += r.settle_delta as f64;
                         }
                         if let Some(ref es) = r.ep_stats {
-                            let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
+                            let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
                             accumulate_salience(
                                 es,
                                 sal_thresh,
-                                &mut salience_sum,
-                                &mut salience_n,
-                                &mut salience_min,
-                                &mut high_salience_episodes,
-                                &mut blend_count,
-                                &mut episodes_speech,
-                                &mut episodes_env,
-                                &mut episodes_visual,
-                                &mut episodes_language,
-                                &mut episodes_mixed,
+                                &mut st.salience_sum,
+                                &mut st.salience_n,
+                                &mut st.salience_min,
+                                &mut st.high_salience_episodes,
+                                &mut st.blend_count,
+                                &mut st.episodes_speech,
+                                &mut st.episodes_env,
+                                &mut st.episodes_visual,
+                                &mut st.episodes_language,
+                                &mut st.episodes_mixed,
                             );
-                            update_sal_ewma(es.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
+                            update_sal_ewma(
+                                es.salience,
+                                &mut st.sal_mu,
+                                &mut st.sal_sigma,
+                                &mut st.sal_n,
+                            );
                             accumulate_wakefulness_pressure(
                                 es.salience,
                                 sal_thresh,
-                                &mut wakefulness_pressure,
+                                &mut st.wakefulness_pressure,
                             );
                         }
                         accumulate_cosines(
                             &r.prior_cosines,
-                            &mut prior_cosine_sums,
-                            &mut prior_cosine_counts,
+                            &mut st.prior_cosine_sums,
+                            &mut st.prior_cosine_counts,
                         );
                         // Inline training data export (ADR 0033): write (episode, text) pair
                         // immediately at language ingest time, capturing every ASR/text event.
@@ -1545,13 +1610,13 @@ pub async fn run() -> Result<()> {
 
         // ── sleep trigger check ───────────────────────────────────────────────
         let high_water_hit = episodic.len() >= high_water;
-        let schedule_hit = wake_start.elapsed() >= max_wake;
-        let perf_degradation_hit = perf_sleep_flag && args.perf_sleep_threshold > 0.0;
-        // S3: pressure trigger active once sal_n >= 500 and min-episode guard is satisfied.
+        let schedule_hit = st.wake_start.elapsed() >= st.max_wake;
+        let perf_degradation_hit = st.perf_sleep_flag && args.perf_sleep_threshold > 0.0;
+        // S3: pressure trigger active once st.sal_n >= 500 and min-episode guard is satisfied.
         // Capacity fill remains active during cold-start as the primary trigger.
-        let pressure_hit = sal_n >= P_COLD_START_N
-            && wake_episodes >= P_MIN_EPISODES
-            && wakefulness_pressure >= P_THRESHOLD;
+        let pressure_hit = st.sal_n >= P_COLD_START_N
+            && st.wake_episodes >= P_MIN_EPISODES
+            && st.wakefulness_pressure >= P_THRESHOLD;
         let (should_sleep, sleep_trigger) = decide_should_sleep(
             high_water_hit,
             schedule_hit,
@@ -1560,10 +1625,10 @@ pub async fn run() -> Result<()> {
         );
 
         if should_sleep && !episodic.is_empty() {
-            let this_wake_secs = wake_start.elapsed().as_secs_f32();
+            let this_wake_secs = st.wake_start.elapsed().as_secs_f32();
             info!(
                 trigger = sleep_trigger,
-                wakefulness_pressure,
+                st.wakefulness_pressure,
                 buffer_len = episodic.len(),
                 buffer_cap = args.episodic_capacity,
                 wake_secs = this_wake_secs as u64,
@@ -1579,8 +1644,8 @@ pub async fn run() -> Result<()> {
             if let Some(ref w) = wake_recon_worker {
                 let mut pending_ema: Option<[Vec<f32>; 5]> = None;
                 match w.fetch_weights(|flat, loss| {
-                    wake_output_mse_sum += loss as f64;
-                    wake_output_mse_n += 1;
+                    st.wake_output_mse_sum += loss as f64;
+                    st.wake_output_mse_n += 1;
                     pending_ema = Some(flat);
                 }) {
                     Some(weights) => {
@@ -1597,7 +1662,7 @@ pub async fn run() -> Result<()> {
             }
             // P1b: auto --sleep-max-secs: cap = max(300, 3 × mean_sleep_secs) after first cycle.
             let effective_sleep_max_secs: u64 =
-                compute_effective_sleep_max_secs(args.sleep_max_secs, &sleep_dur_secs_history);
+                compute_effective_sleep_max_secs(args.sleep_max_secs, &st.sleep_dur_secs_history);
             // Clear conversation history at sleep entry (R2 — wake-local by design).
             if let Some(ref mut dec) = decoder {
                 dec.clear_conversation();
@@ -1619,7 +1684,7 @@ pub async fn run() -> Result<()> {
                 max_warm_records: args.max_warm_records,
                 max_cold_records: effective_max_cold,
                 growth_cooldown: args.growth_cooldown,
-                cooldown_remaining,
+                cooldown_remaining: st.cooldown_remaining,
                 session_start_secs,
                 training_data_path: args.export_training_data.clone(),
             };
@@ -1637,35 +1702,39 @@ pub async fn run() -> Result<()> {
                 &sleep_params,
             ) {
                 Ok(stats) => {
-                    cooldown_remaining = stats.growth_cooldown_remaining;
-                    if let Err(e) = save_sal_ewma(sal_mu, sal_sigma, sal_n, &args.memory_dir) {
+                    st.cooldown_remaining = stats.growth_cooldown_remaining;
+                    if let Err(e) =
+                        save_sal_ewma(st.sal_mu, st.sal_sigma, st.sal_n, &args.memory_dir)
+                    {
                         tracing::warn!(?e, "sal_ewma save failed");
                         somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
-                    if let Err(e) = save_settle_ewma(settle_mu, settle_n, &args.memory_dir) {
+                    if let Err(e) = save_settle_ewma(st.settle_mu, st.settle_n, &args.memory_dir) {
                         tracing::warn!(?e, "settle_ewma save failed");
                         somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
                     // S6: update wake-duration EWMA (per-cycle α=0.3; ADR 0024).
-                    update_wake_ewma(this_wake_secs, &mut wake_ewma_mu, &mut wake_ewma_n);
-                    if let Err(e) = save_wake_ewma(wake_ewma_mu, wake_ewma_n, &args.memory_dir) {
+                    update_wake_ewma(this_wake_secs, &mut st.wake_ewma_mu, &mut st.wake_ewma_n);
+                    if let Err(e) =
+                        save_wake_ewma(st.wake_ewma_mu, st.wake_ewma_n, &args.memory_dir)
+                    {
                         tracing::warn!(?e, "wake_ewma save failed");
                         somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                     }
-                    // Recompute max_wake from updated EWMA (floor until n≥3).
-                    max_wake = Duration::from_secs(recompute_max_wake_secs(
-                        wake_ewma_mu,
-                        wake_ewma_n,
+                    // Recompute st.max_wake from updated EWMA (floor until n≥3).
+                    st.max_wake = Duration::from_secs(recompute_max_wake_secs(
+                        st.wake_ewma_mu,
+                        st.wake_ewma_n,
                         wake_ewma_floor,
                     ));
                     // Dissipate wakefulness pressure by NREM consolidation quality (ADR 0024 S3).
                     // Prefer within-session gist (clean signal); fall back to cross-session at c1.
-                    wakefulness_pressure = dissipate_wakefulness_pressure(
-                        wakefulness_pressure,
+                    st.wakefulness_pressure = dissipate_wakefulness_pressure(
+                        st.wakefulness_pressure,
                         stats.within_session_gist_rate,
                         stats.gist_recall_rate,
                     );
-                    sleep_cycle_count += 1;
+                    st.sleep_cycle_count += 1;
                     somnus_metrics::counted_core!(
                         somnus_metrics::Metric::ProcessRssBytes,
                         current_process_rss_bytes()
@@ -1676,7 +1745,7 @@ pub async fn run() -> Result<()> {
                     );
                     let cycle_asr = asr_count.swap(0, Ordering::Relaxed);
                     info!(
-                        cycle         = sleep_cycle_count,
+                        cycle         = st.sleep_cycle_count,
                         traces_replayed = stats.traces_replayed,
                         mean_loss     = stats.mean_train_loss,
                         mean_output_mse = stats.mean_output_mse,
@@ -1686,9 +1755,9 @@ pub async fn run() -> Result<()> {
                         decoder_trainable = stats.decoder_trainable_records,
                         interrupted   = stats.was_interrupted,
                         nrem_exit     = stats.nrem_exit_reason,
-                        wake_episodes,
+                        st.wake_episodes,
                         asr_count     = cycle_asr,
-                        lang_ingest   = lang_ingest_count,
+                        lang_ingest   = st.lang_ingest_count,
                         "sleep cycle complete"
                     );
                     // Save decoder projection weights alongside perception weights.
@@ -1712,21 +1781,21 @@ pub async fn run() -> Result<()> {
                     // Disabled in static per-region mode (--prior-beta-regions).
                     if prior_beta_regions_static.is_none() && args.prior_beta < 0.05 {
                         let global_cosine: Option<f64> =
-                            global_prior_cosine(&prior_cosine_sums, &prior_cosine_counts);
-                        s4_ring[s4_ring_pos % 3] = global_cosine;
-                        s4_ring_pos += 1;
+                            global_prior_cosine(&st.prior_cosine_sums, &st.prior_cosine_counts);
+                        st.s4_ring[st.s4_ring_pos % 3] = global_cosine;
+                        st.s4_ring_pos += 1;
                         if let Some(c) = global_cosine {
-                            if c < 0.40 && s4_beta_active {
-                                s4_beta_active = false;
+                            if c < 0.40 && st.s4_beta_active {
+                                st.s4_beta_active = false;
                                 perception.set_prior_beta(args.prior_beta);
                                 tracing::info!(
                                     prior_cosine = c,
                                     "S4: prior-beta scaled down to base (< 0.40)"
                                 );
-                            } else if !s4_beta_active && s4_ring_pos >= 3 {
-                                let all_high = s4_ring_all_high(&s4_ring);
+                            } else if !st.s4_beta_active && st.s4_ring_pos >= 3 {
+                                let all_high = s4_ring_all_high(&st.s4_ring);
                                 if all_high {
-                                    s4_beta_active = true;
+                                    st.s4_beta_active = true;
                                     perception.set_prior_beta(0.05);
                                     tracing::info!(
                                         prior_cosine = c,
@@ -1742,16 +1811,16 @@ pub async fn run() -> Result<()> {
                         + stats.spill_wall_ms
                         + stats.snapshot_wall_ms) as f64
                         / 1000.0;
-                    if sleep_dur_secs_history.len() >= 5 {
-                        sleep_dur_secs_history.pop_front();
+                    if st.sleep_dur_secs_history.len() >= 5 {
+                        st.sleep_dur_secs_history.pop_front();
                     }
-                    sleep_dur_secs_history.push_back(total_sleep_secs);
+                    st.sleep_dur_secs_history.push_back(total_sleep_secs);
 
-                    // P2a / S7: adapt effective_wake_interval from cycle-level MSE trend.
+                    // P2a / S7: adapt st.effective_wake_interval from cycle-level MSE trend.
                     // Reduces interval when MSE improves < 1% for 3 consecutive cycles;
                     // restores toward user default when MSE starts improving again.
-                    let mean_mse_wake = if wake_output_mse_n > 0 {
-                        Some(wake_output_mse_sum / wake_output_mse_n as f64)
+                    let mean_mse_wake = if st.wake_output_mse_n > 0 {
+                        Some(st.wake_output_mse_sum / st.wake_output_mse_n as f64)
                     } else {
                         None
                     };
@@ -1759,32 +1828,33 @@ pub async fn run() -> Result<()> {
                     const S7_STAGNANT_CYCLES: u32 = 3;
                     const S7_MSE_ALPHA: f64 = 0.3;
                     if let Some(mse) = mean_mse_wake {
-                        if s7_ewma_n == 0 {
-                            s7_mse_ewma = mse;
+                        if st.s7_ewma_n == 0 {
+                            st.s7_mse_ewma = mse;
                         } else {
-                            let improvement = (s7_mse_ewma - mse) / s7_mse_ewma.max(1e-9);
+                            let improvement = (st.s7_mse_ewma - mse) / st.s7_mse_ewma.max(1e-9);
                             if improvement < S7_STAGNANT_THRESHOLD {
-                                s7_stagnant += 1;
+                                st.s7_stagnant += 1;
                             } else {
-                                s7_stagnant = 0;
-                                if effective_wake_interval < args.wake_reconstruct_interval {
-                                    effective_wake_interval = (effective_wake_interval + 1)
+                                st.s7_stagnant = 0;
+                                if st.effective_wake_interval < args.wake_reconstruct_interval {
+                                    st.effective_wake_interval = (st.effective_wake_interval + 1)
                                         .min(args.wake_reconstruct_interval);
                                     tracing::info!(
-                                        effective_wake_interval,
+                                        st.effective_wake_interval,
                                         "S7: restored wake_reconstruct_interval"
                                     );
                                 }
                             }
-                            s7_mse_ewma = S7_MSE_ALPHA * mse + (1.0 - S7_MSE_ALPHA) * s7_mse_ewma;
+                            st.s7_mse_ewma =
+                                S7_MSE_ALPHA * mse + (1.0 - S7_MSE_ALPHA) * st.s7_mse_ewma;
                         }
-                        s7_ewma_n += 1;
-                        if s7_stagnant >= S7_STAGNANT_CYCLES && effective_wake_interval > 1 {
-                            effective_wake_interval -= 1;
-                            s7_stagnant = 0;
+                        st.s7_ewma_n += 1;
+                        if st.s7_stagnant >= S7_STAGNANT_CYCLES && st.effective_wake_interval > 1 {
+                            st.effective_wake_interval -= 1;
+                            st.s7_stagnant = 0;
                             tracing::info!(
-                                effective_wake_interval,
-                                s7_mse_ewma,
+                                st.effective_wake_interval,
+                                st.s7_mse_ewma,
                                 "S7: reduced wake_reconstruct_interval (stagnant MSE)"
                             );
                         }
@@ -1796,21 +1866,21 @@ pub async fn run() -> Result<()> {
                         let grew = !stats.regions_grown.is_empty();
                         let prior_cosine_mean: Vec<Option<f64>> = (0..5)
                             .map(|i| {
-                                if prior_cosine_counts[i] > 0 {
-                                    Some(prior_cosine_sums[i] / prior_cosine_counts[i] as f64)
+                                if st.prior_cosine_counts[i] > 0 {
+                                    Some(st.prior_cosine_sums[i] / st.prior_cosine_counts[i] as f64)
                                 } else {
                                     None
                                 }
                             })
                             .collect();
                         // ADR 0022: salience stats (None when warm was empty all cycle).
-                        let mean_salience_wake = if salience_n > 0 {
-                            Some(salience_sum / salience_n as f64)
+                        let mean_salience_wake = if st.salience_n > 0 {
+                            Some(st.salience_sum / st.salience_n as f64)
                         } else {
                             None
                         };
-                        let min_salience_wake = if salience_n > 0 {
-                            Some(salience_min)
+                        let min_salience_wake = if st.salience_n > 0 {
+                            Some(st.salience_min)
                         } else {
                             None
                         };
@@ -1821,7 +1891,7 @@ pub async fn run() -> Result<()> {
                             .map(|d| d.as_secs_f64())
                             .unwrap_or(0.0);
                         let line = serde_json::json!({
-                            "cycle":             sleep_cycle_count,
+                            "cycle":             st.sleep_cycle_count,
                             "session":           if args.session > 0 { Some(args.session) } else { None },
                             "ts":                ts,
                             "sleep_trigger":     sleep_trigger,
@@ -1843,25 +1913,25 @@ pub async fn run() -> Result<()> {
                             "grew":              grew,
                             "regions_grown":     stats.regions_grown.iter().map(|r| r.as_index()).collect::<Vec<_>>(),
                             "growth_cooldown_remaining": stats.growth_cooldown_remaining,
-                            "wake_episodes":     wake_episodes,
-                            "episodes_speech":   episodes_speech,
-                            "episodes_env":      episodes_env,
-                            "episodes_visual":   episodes_visual,
-                            "episodes_language": episodes_language,
-                            "episodes_mixed":    episodes_mixed,
+                            "st.wake_episodes":     st.wake_episodes,
+                            "st.episodes_speech":   st.episodes_speech,
+                            "st.episodes_env":      st.episodes_env,
+                            "st.episodes_visual":   st.episodes_visual,
+                            "st.episodes_language": st.episodes_language,
+                            "st.episodes_mixed":    st.episodes_mixed,
                             "asr_count":         cycle_asr,
-                            "lang_ingest_count": lang_ingest_count,
+                            "st.lang_ingest_count": st.lang_ingest_count,
                             "mean_salience_wake":       mean_salience_wake,
                             "min_salience_wake":        min_salience_wake,
-                            "high_salience_episodes":   high_salience_episodes,
-                            "blend_count":              blend_count,
-                            "wake_reconstruct_attempts":       wake_reconstruct_counter,
-                            "wake_reconstruct_throttle_passed": wake_reconstruct_throttle_passed,
-                            "wake_reconstruct_fired":          wake_output_mse_n,
-                            "wake_recon_dropped":              wake_recon_dropped,
-                            "settle_trigger_count":  settle_trigger_count,
-                            "settle_iters_sum":      settle_iters_sum,
-                            "settle_delta_mean": if settle_trigger_count > 0 { Some(settle_delta_sum / settle_trigger_count as f64) } else { None },
+                            "st.high_salience_episodes":   st.high_salience_episodes,
+                            "st.blend_count":              st.blend_count,
+                            "wake_reconstruct_attempts":       st.wake_reconstruct_counter,
+                            "st.wake_reconstruct_throttle_passed": st.wake_reconstruct_throttle_passed,
+                            "wake_reconstruct_fired":          st.wake_output_mse_n,
+                            "st.wake_recon_dropped":              st.wake_recon_dropped,
+                            "st.settle_trigger_count":  st.settle_trigger_count,
+                            "st.settle_iters_sum":      st.settle_iters_sum,
+                            "settle_delta_mean": if st.settle_trigger_count > 0 { Some(st.settle_delta_sum / st.settle_trigger_count as f64) } else { None },
                             "mean_output_mse_wake": mean_mse_wake,
                             "prior_cosine_mean": prior_cosine_mean,
                             "mean_proj_loss":    stats.mean_proj_loss,
@@ -1879,32 +1949,32 @@ pub async fn run() -> Result<()> {
                             "snapshot_wall_ms":           stats.snapshot_wall_ms,
                             "lm_hidden_computed":         stats.lm_hidden_computed,
                             "lm_hidden_unique":           stats.lm_hidden_unique,
-                            "speech_encode_total_ms":     speech_encode_total_ms,
-                            "env_encode_total_ms":        env_encode_total_ms,
-                            "video_encode_total_ms":      video_encode_total_ms,
+                            "st.speech_encode_total_ms":     st.speech_encode_total_ms,
+                            "st.env_encode_total_ms":        st.env_encode_total_ms,
+                            "st.video_encode_total_ms":      st.video_encode_total_ms,
                             "gain_update_total_ms":       0u64,
-                            "perception_total_ms":        perception_total_ms,
+                            "st.perception_total_ms":        st.perception_total_ms,
                             "perc_kwta_us":         perf_breakdown.kwta_us,
                             "perc_symbolic_us":     perf_breakdown.symbolic_us,
                             "perc_bind_us":         perf_breakdown.bind_us,
                             "perc_prior_us":        perf_breakdown.prior_us,
                             "perc_settle_us":       perf_breakdown.settle_us,
                             "perc_prior_update_us": perf_breakdown.prior_update_us,
-                            "warm_query_us_mean": hnsw_query_us_sum.checked_div(hnsw_query_n),
-                            "sal_ewma_mean":  sal_mu as f64,
-                            "sal_ewma_std":   sal_sigma as f64,
-                            "sal_threshold":  sal_gate(sal_mu, sal_sigma, sal_n) as f64,
-                            "settle_ewma_mean":    settle_mu as f64,
-                            "settle_gate_dynamic": settle_gate_val(settle_mu, settle_n, args.settle_gate) as f64,
-                            "wakefulness_pressure": wakefulness_pressure as f64,
-                            "prior_beta_effective": if s4_beta_active { 0.05f64 } else { args.prior_beta as f64 },
+                            "warm_query_us_mean": st.hnsw_query_us_sum.checked_div(st.hnsw_query_n),
+                            "sal_ewma_mean":  st.sal_mu as f64,
+                            "sal_ewma_std":   st.sal_sigma as f64,
+                            "sal_threshold":  sal_gate(st.sal_mu, st.sal_sigma, st.sal_n) as f64,
+                            "settle_ewma_mean":    st.settle_mu as f64,
+                            "settle_gate_dynamic": settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate) as f64,
+                            "st.wakefulness_pressure": st.wakefulness_pressure as f64,
+                            "prior_beta_effective": if st.s4_beta_active { 0.05f64 } else { args.prior_beta as f64 },
                             "prior_betas_effective": perception.prior_betas().map(|b| b as f64),
-                            "wake_ewma_mean":       wake_ewma_mu as f64,
-                            "max_wake_secs_effective": max_wake.as_secs(),
+                            "wake_ewma_mean":       st.wake_ewma_mu as f64,
+                            "max_wake_secs_effective": st.max_wake.as_secs(),
                             "max_cold_records_effective": effective_max_cold,
                             "sleep_max_secs_effective": effective_sleep_max_secs,
-                            "wake_interval_effective": effective_wake_interval,
-                            "s7_mse_ewma":           if s7_ewma_n > 0 { Some(s7_mse_ewma) } else { None },
+                            "wake_interval_effective": st.effective_wake_interval,
+                            "st.s7_mse_ewma":           if st.s7_ewma_n > 0 { Some(st.s7_mse_ewma) } else { None },
                             "fine_metrics":          fine_metrics,
                         })
                         .to_string();
@@ -1915,41 +1985,41 @@ pub async fn run() -> Result<()> {
                         }
                     }
                     // Reset per-wake-cycle counters.
-                    wake_episodes = 0;
-                    wake_output_mse_sum = 0.0;
-                    wake_output_mse_n = 0;
-                    prior_cosine_sums = [0.0; 5];
-                    prior_cosine_counts = [0; 5];
-                    lang_ingest_count = 0;
-                    gain_episode_counter = 0;
-                    wake_reconstruct_counter = 0;
+                    st.wake_episodes = 0;
+                    st.wake_output_mse_sum = 0.0;
+                    st.wake_output_mse_n = 0;
+                    st.prior_cosine_sums = [0.0; 5];
+                    st.prior_cosine_counts = [0; 5];
+                    st.lang_ingest_count = 0;
+                    st.gain_episode_counter = 0;
+                    st.wake_reconstruct_counter = 0;
                     // ADR 0022 counters.
-                    salience_sum = 0.0;
-                    salience_n = 0;
-                    salience_min = f32::MAX;
-                    high_salience_episodes = 0;
-                    blend_count = 0;
-                    hnsw_query_us_sum = 0;
-                    hnsw_query_n = 0;
-                    wake_reconstruct_throttle_passed = 0;
-                    wake_recon_dropped = 0;
-                    episodes_speech = 0;
-                    episodes_env = 0;
-                    episodes_visual = 0;
-                    episodes_language = 0;
-                    episodes_mixed = 0;
-                    settle_trigger_count = 0;
-                    settle_iters_sum = 0;
-                    settle_delta_sum = 0.0;
-                    speech_encode_total_ms = 0;
-                    env_encode_total_ms = 0;
-                    video_encode_total_ms = 0;
-                    perception_total_ms = 0;
-                    cosine_ewma = None;
-                    cosine_baseline = None;
-                    cosine_baseline_accum = 0.0;
-                    cosine_baseline_n = 0;
-                    perf_sleep_flag = false;
+                    st.salience_sum = 0.0;
+                    st.salience_n = 0;
+                    st.salience_min = f32::MAX;
+                    st.high_salience_episodes = 0;
+                    st.blend_count = 0;
+                    st.hnsw_query_us_sum = 0;
+                    st.hnsw_query_n = 0;
+                    st.wake_reconstruct_throttle_passed = 0;
+                    st.wake_recon_dropped = 0;
+                    st.episodes_speech = 0;
+                    st.episodes_env = 0;
+                    st.episodes_visual = 0;
+                    st.episodes_language = 0;
+                    st.episodes_mixed = 0;
+                    st.settle_trigger_count = 0;
+                    st.settle_iters_sum = 0;
+                    st.settle_delta_sum = 0.0;
+                    st.speech_encode_total_ms = 0;
+                    st.env_encode_total_ms = 0;
+                    st.video_encode_total_ms = 0;
+                    st.perception_total_ms = 0;
+                    st.cosine_ewma = None;
+                    st.cosine_baseline = None;
+                    st.cosine_baseline_accum = 0.0;
+                    st.cosine_baseline_n = 0;
+                    st.perf_sleep_flag = false;
                 }
                 Err(e) => {
                     tracing::warn!(?e, "sleep cycle error");
@@ -1961,7 +2031,7 @@ pub async fn run() -> Result<()> {
             if let Some(ref w) = wake_recon_worker {
                 w.set_weights(perception.head_weights_flat());
             }
-            wake_start = std::time::Instant::now();
+            st.wake_start = std::time::Instant::now();
 
             // ADR 0048 (gaps.md §33 candidate (e)): hard-copy the live binding
             // training copy into the wake-time snapshot only every
@@ -1979,7 +2049,10 @@ pub async fn run() -> Result<()> {
             // default/production path), which is not this ADR's intent. lag=1
             // (the default) reproduces the pre-ADR-0048 always-immediate behavior
             // exactly in both configurations.
-            if sleep_cycle_count.is_multiple_of(args.binding_wake_lag_cycles.max(1)) {
+            if st
+                .sleep_cycle_count
+                .is_multiple_of(args.binding_wake_lag_cycles.max(1))
+            {
                 perception.sync_wake_binding();
             }
 
@@ -1989,7 +2062,7 @@ pub async fn run() -> Result<()> {
             if let (Some(ref onnx_dir), Some(ref script)) = (&onnx_dir, &onnx_script_path) {
                 let already_active = perception.ort_active();
                 let now_wants_ort = already_active
-                    || (!onnx_failed
+                    || (!st.onnx_failed
                         && should_use_ort_inference(
                             &perception.region_sizes(),
                             args.onnx_crossover_units,
@@ -2026,16 +2099,16 @@ pub async fn run() -> Result<()> {
                                 somnus_metrics::Metric::OrtSessionInitFailed,
                                 1
                             );
-                            onnx_failed = true;
+                            st.onnx_failed = true;
                         }
                     }
                 }
             }
 
             // Exit after N sleep cycles if requested.
-            if args.max_sleep_cycles > 0 && sleep_cycle_count >= args.max_sleep_cycles {
+            if args.max_sleep_cycles > 0 && st.sleep_cycle_count >= args.max_sleep_cycles {
                 info!(
-                    cycles = sleep_cycle_count,
+                    cycles = st.sleep_cycle_count,
                     "max-sleep-cycles reached — exiting"
                 );
                 sink_flush(&mut sink);
@@ -2050,8 +2123,8 @@ pub async fn run() -> Result<()> {
                         let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &audio_emb_json(&emb));
                         match emb.source {
-                            AudioEncoderSource::Speech => speech_encode_total_ms += emb.encode_ms,
-                            AudioEncoderSource::Env    => env_encode_total_ms    += emb.encode_ms,
+                            AudioEncoderSource::Speech => st.speech_encode_total_ms += emb.encode_ms,
+                            AudioEncoderSource::Env    => st.env_encode_total_ms    += emb.encode_ms,
                         }
                         let (result, d_perc) = somnus_metrics::timed_core!(
                             somnus_metrics::Metric::MainPerceptionIngest,
@@ -2060,34 +2133,34 @@ pub async fn run() -> Result<()> {
                                 AudioEncoderSource::Env    => perception.ingest_env(&emb.values),
                             }
                         );
-                        perception_total_ms += d_perc.as_millis() as u64;
+                        st.perception_total_ms += d_perc.as_millis() as u64;
                         match result {
                             Ok(out) => {
-                                accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
-                                if out.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += out.settle_iters; settle_delta_sum += out.settle_delta as f64; }
+                                accumulate_cosines(&out.prior_cosines, &mut st.prior_cosine_sums, &mut st.prior_cosine_counts);
+                                if out.settle_iters > 0 { st.settle_trigger_count += 1; st.settle_iters_sum += out.settle_iters; st.settle_delta_sum += out.settle_delta as f64; }
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
-                                    let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
-                                    accumulate_salience(rec, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
-                                    update_sal_ewma(rec.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
-                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut wakefulness_pressure);
-                                    hnsw_query_us_sum += rec.hnsw_query_us;
-                                    hnsw_query_n += 1;
+                                    let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
+                                    accumulate_salience(rec, sal_thresh, &mut st.salience_sum, &mut st.salience_n, &mut st.salience_min, &mut st.high_salience_episodes, &mut st.blend_count, &mut st.episodes_speech, &mut st.episodes_env, &mut st.episodes_visual, &mut st.episodes_language, &mut st.episodes_mixed);
+                                    update_sal_ewma(rec.salience, &mut st.sal_mu, &mut st.sal_sigma, &mut st.sal_n);
+                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut st.wakefulness_pressure);
+                                    st.hnsw_query_us_sum += rec.hnsw_query_us;
+                                    st.hnsw_query_n += 1;
                                 }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                                    wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(effective_wake_interval) {
-                                        wake_reconstruct_throttle_passed += 1;
-                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(sal_mu, sal_sigma, sal_n)) {
+                                    st.wake_reconstruct_counter += 1;
+                                    if st.wake_reconstruct_counter.is_multiple_of(st.effective_wake_interval) {
+                                        st.wake_reconstruct_throttle_passed += 1;
+                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(st.sal_mu, st.sal_sigma, st.sal_n)) {
                                             if let Some(ref w) = wake_recon_worker {
                                                 if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
-                                                    wake_recon_dropped += 1;
+                                                    st.wake_recon_dropped += 1;
                                                 }
                                             } else {
                                                 match perception.wake_reconstruct_step(&ep.0, regional) {
                                                     Ok(mse) => {
-                                                        wake_output_mse_sum += mse as f64;
-                                                        wake_output_mse_n += 1;
+                                                        st.wake_output_mse_sum += mse as f64;
+                                                        st.wake_output_mse_n += 1;
                                                         tracing::info!(output_mse = mse, "wake reconstruction");
                                                     }
                                                     Err(e) => {
@@ -2104,20 +2177,20 @@ pub async fn run() -> Result<()> {
                                         // node accumulation from forward passes slowing into_data().
                                         perception.refresh_autodiff_state();
                                     }
-                                    wake_episodes += 1;
+                                    st.wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
-                                        update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
-                                        update_settle_ewma(m, &mut settle_mu, &mut settle_n);
-                                        perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
+                                        update_perf_ewma(m, &mut st.cosine_ewma, &mut st.cosine_baseline, &mut st.cosine_baseline_accum, &mut st.cosine_baseline_n, &mut st.perf_sleep_flag, args.perf_sleep_threshold);
+                                        update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
+                                        perception.set_settle_gate(settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate));
                                     }
                                 }
-                                if !startup_query_fired && out.episode.is_some() {
-                                    startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
+                                if !st.startup_query_fired && out.episode.is_some() {
+                                    st.startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
                                 if let Some(ref gw) = gain_worker {
                                     if let Some(ep) = &out.episode {
-                                        gain_episode_counter += 1;
-                                        if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                        st.gain_episode_counter += 1;
+                                        if st.gain_episode_counter.is_multiple_of(args.gain_interval) {
                                             gw.request_gain(ep.0.clone());
                                         }
                                     }
@@ -2140,39 +2213,39 @@ pub async fn run() -> Result<()> {
                     Some(emb) => {
                         let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &video_emb_json(&emb));
-                        video_encode_total_ms += emb.encode_ms;
+                        st.video_encode_total_ms += emb.encode_ms;
                         let (vis_result, d_perc) = somnus_metrics::timed_core!(
                             somnus_metrics::Metric::MainPerceptionIngest,
                             perception.ingest_visual(&emb.values)
                         );
-                        perception_total_ms += d_perc.as_millis() as u64;
+                        st.perception_total_ms += d_perc.as_millis() as u64;
                         match vis_result {
                             Ok(out) => {
-                                accumulate_cosines(&out.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
-                                if out.settle_iters > 0 { settle_trigger_count += 1; settle_iters_sum += out.settle_iters; settle_delta_sum += out.settle_delta as f64; }
+                                accumulate_cosines(&out.prior_cosines, &mut st.prior_cosine_sums, &mut st.prior_cosine_counts);
+                                if out.settle_iters > 0 { st.settle_trigger_count += 1; st.settle_iters_sum += out.settle_iters; st.settle_delta_sum += out.settle_delta as f64; }
                                 let rec = record_episode(&out, &emb.timestamp, &mut sink, &mut episodic, args.top_k, &recall);
                                 if let Some(ref rec) = rec {
-                                    let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
-                                    accumulate_salience(rec, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
-                                    update_sal_ewma(rec.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
-                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut wakefulness_pressure);
-                                    hnsw_query_us_sum += rec.hnsw_query_us;
-                                    hnsw_query_n += 1;
+                                    let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
+                                    accumulate_salience(rec, sal_thresh, &mut st.salience_sum, &mut st.salience_n, &mut st.salience_min, &mut st.high_salience_episodes, &mut st.blend_count, &mut st.episodes_speech, &mut st.episodes_env, &mut st.episodes_visual, &mut st.episodes_language, &mut st.episodes_mixed);
+                                    update_sal_ewma(rec.salience, &mut st.sal_mu, &mut st.sal_sigma, &mut st.sal_n);
+                                    accumulate_wakefulness_pressure(rec.salience, sal_thresh, &mut st.wakefulness_pressure);
+                                    st.hnsw_query_us_sum += rec.hnsw_query_us;
+                                    st.hnsw_query_n += 1;
                                 }
                                 if let (Some(ep), Some(regional)) = (&out.episode, &out.regional_inputs) {
-                                    wake_reconstruct_counter += 1;
-                                    if wake_reconstruct_counter.is_multiple_of(effective_wake_interval) {
-                                        wake_reconstruct_throttle_passed += 1;
-                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(sal_mu, sal_sigma, sal_n)) {
+                                    st.wake_reconstruct_counter += 1;
+                                    if st.wake_reconstruct_counter.is_multiple_of(st.effective_wake_interval) {
+                                        st.wake_reconstruct_throttle_passed += 1;
+                                        if rec.as_ref().is_some_and(|r| r.salience > sal_gate(st.sal_mu, st.sal_sigma, st.sal_n)) {
                                             if let Some(ref w) = wake_recon_worker {
                                                 if !w.request_train(ep.0.clone(), regional.clone(), perception.learning_rate()) {
-                                                    wake_recon_dropped += 1;
+                                                    st.wake_recon_dropped += 1;
                                                 }
                                             } else {
                                                 match perception.wake_reconstruct_step(&ep.0, regional) {
                                                     Ok(mse) => {
-                                                        wake_output_mse_sum += mse as f64;
-                                                        wake_output_mse_n += 1;
+                                                        st.wake_output_mse_sum += mse as f64;
+                                                        st.wake_output_mse_n += 1;
                                                         tracing::info!(output_mse = mse, "wake reconstruction");
                                                     }
                                                     Err(e) => {
@@ -2189,20 +2262,20 @@ pub async fn run() -> Result<()> {
                                         // node accumulation from forward passes slowing into_data().
                                         perception.refresh_autodiff_state();
                                     }
-                                    wake_episodes += 1;
+                                    st.wake_episodes += 1;
                                     if let Some(m) = episode_cosine_mean(&out.prior_cosines) {
-                                        update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
-                                        update_settle_ewma(m, &mut settle_mu, &mut settle_n);
-                                        perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
+                                        update_perf_ewma(m, &mut st.cosine_ewma, &mut st.cosine_baseline, &mut st.cosine_baseline_accum, &mut st.cosine_baseline_n, &mut st.perf_sleep_flag, args.perf_sleep_threshold);
+                                        update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
+                                        perception.set_settle_gate(settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate));
                                     }
                                 }
-                                if !startup_query_fired && out.episode.is_some() {
-                                    startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
+                                if !st.startup_query_fired && out.episode.is_some() {
+                                    st.startup_query_fired = maybe_startup_query(&args.query, &mut decoder, &episodic, args.action_max_tokens);
                                 }
                                 if let Some(ref gw) = gain_worker {
                                     if let Some(ep) = &out.episode {
-                                        gain_episode_counter += 1;
-                                        if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                        st.gain_episode_counter += 1;
+                                        if st.gain_episode_counter.is_multiple_of(args.gain_interval) {
                                             gw.request_gain(ep.0.clone());
                                         }
                                     }
@@ -2233,41 +2306,41 @@ pub async fn run() -> Result<()> {
                             args.top_k,
                             &recall,
                             &mut decoder,
-                            &mut wake_reconstruct_counter,
-                            effective_wake_interval,
+                            &mut st.wake_reconstruct_counter,
+                            st.effective_wake_interval,
                             wake_recon_worker.as_ref(),
-                            &mut wake_recon_dropped,
-                            sal_gate(sal_mu, sal_sigma, sal_n),
+                            &mut st.wake_recon_dropped,
+                            sal_gate(st.sal_mu, st.sal_sigma, st.sal_n),
                         ) {
-                            lang_ingest_count += 1;
-                            perception_total_ms += r.perception_ms;
+                            st.lang_ingest_count += 1;
+                            st.perception_total_ms += r.perception_ms;
                             if r.episode_produced {
-                                wake_episodes += 1;
+                                st.wake_episodes += 1;
                                 if let Some(m) = episode_cosine_mean(&r.prior_cosines) {
-                                    update_perf_ewma(m, &mut cosine_ewma, &mut cosine_baseline, &mut cosine_baseline_accum, &mut cosine_baseline_n, &mut perf_sleep_flag, args.perf_sleep_threshold);
-                                    update_settle_ewma(m, &mut settle_mu, &mut settle_n);
-                                    perception.set_settle_gate(settle_gate_val(settle_mu, settle_n, args.settle_gate));
+                                    update_perf_ewma(m, &mut st.cosine_ewma, &mut st.cosine_baseline, &mut st.cosine_baseline_accum, &mut st.cosine_baseline_n, &mut st.perf_sleep_flag, args.perf_sleep_threshold);
+                                    update_settle_ewma(m, &mut st.settle_mu, &mut st.settle_n);
+                                    perception.set_settle_gate(settle_gate_val(st.settle_mu, st.settle_n, args.settle_gate));
                                 }
                                 if let Some(ref gw) = gain_worker {
                                     if let Some(ref ep) = r.last_episode {
-                                        gain_episode_counter += 1;
-                                        if gain_episode_counter.is_multiple_of(args.gain_interval) {
+                                        st.gain_episode_counter += 1;
+                                        if st.gain_episode_counter.is_multiple_of(args.gain_interval) {
                                             gw.request_gain(ep.clone());
                                         }
                                     }
                                 }
                             }
-                            if let Some(m) = r.reconstruct_mse { wake_output_mse_sum += m as f64; wake_output_mse_n += 1; }
-                            if r.throttle_passed { wake_reconstruct_throttle_passed += 1; }
+                            if let Some(m) = r.reconstruct_mse { st.wake_output_mse_sum += m as f64; st.wake_output_mse_n += 1; }
+                            if r.throttle_passed { st.wake_reconstruct_throttle_passed += 1; }
                             if let Some(ref es) = r.ep_stats {
-                                let sal_thresh = sal_gate(sal_mu, sal_sigma, sal_n);
-                                accumulate_salience(es, sal_thresh, &mut salience_sum, &mut salience_n, &mut salience_min, &mut high_salience_episodes, &mut blend_count, &mut episodes_speech, &mut episodes_env, &mut episodes_visual, &mut episodes_language, &mut episodes_mixed);
-                                update_sal_ewma(es.salience, &mut sal_mu, &mut sal_sigma, &mut sal_n);
-                                accumulate_wakefulness_pressure(es.salience, sal_thresh, &mut wakefulness_pressure);
-                                hnsw_query_us_sum += es.hnsw_query_us;
-                                hnsw_query_n += 1;
+                                let sal_thresh = sal_gate(st.sal_mu, st.sal_sigma, st.sal_n);
+                                accumulate_salience(es, sal_thresh, &mut st.salience_sum, &mut st.salience_n, &mut st.salience_min, &mut st.high_salience_episodes, &mut st.blend_count, &mut st.episodes_speech, &mut st.episodes_env, &mut st.episodes_visual, &mut st.episodes_language, &mut st.episodes_mixed);
+                                update_sal_ewma(es.salience, &mut st.sal_mu, &mut st.sal_sigma, &mut st.sal_n);
+                                accumulate_wakefulness_pressure(es.salience, sal_thresh, &mut st.wakefulness_pressure);
+                                st.hnsw_query_us_sum += es.hnsw_query_us;
+                                st.hnsw_query_n += 1;
                             }
-                            accumulate_cosines(&r.prior_cosines, &mut prior_cosine_sums, &mut prior_cosine_counts);
+                            accumulate_cosines(&r.prior_cosines, &mut st.prior_cosine_sums, &mut st.prior_cosine_counts);
                             if let (Some(ref export_path), Some(ref ep)) =
                                 (&args.export_training_data, &r.last_episode)
                             {
