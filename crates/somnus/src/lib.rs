@@ -1655,34 +1655,11 @@ pub async fn run() -> Result<()> {
                             gw.update_weights(dec.proj_weights_flat());
                         }
                     }
-                    // S4: prior-beta scale-up controller (ADR 0024).
-                    // Scales from base --prior-beta to 0.05 when global prior_cosine > 0.65
-                    // for 3 consecutive cycles; drops back to base when any cycle < 0.40.
-                    // Disabled in static per-region mode (--prior-beta-regions).
+                    // S4: prior-beta scale-up controller (ADR 0024); disabled in static
+                    // per-region mode (--prior-beta-regions).
                     if prior_beta_regions_static.is_none() && args.prior_beta < 0.05 {
-                        let global_cosine: Option<f64> =
-                            global_prior_cosine(&st.prior_cosine_sums, &st.prior_cosine_counts);
-                        st.s4_ring[st.s4_ring_pos % 3] = global_cosine;
-                        st.s4_ring_pos += 1;
-                        if let Some(c) = global_cosine {
-                            if c < 0.40 && st.s4_beta_active {
-                                st.s4_beta_active = false;
-                                perception.set_prior_beta(args.prior_beta);
-                                tracing::info!(
-                                    prior_cosine = c,
-                                    "S4: prior-beta scaled down to base (< 0.40)"
-                                );
-                            } else if !st.s4_beta_active && st.s4_ring_pos >= 3 {
-                                let all_high = s4_ring_all_high(&st.s4_ring);
-                                if all_high {
-                                    st.s4_beta_active = true;
-                                    perception.set_prior_beta(0.05);
-                                    tracing::info!(
-                                        prior_cosine = c,
-                                        "S4: prior-beta scaled up to 0.05 (> 0.65 for 3 cycles)"
-                                    );
-                                }
-                            }
+                        if let Some(beta) = st.s4_step(args.prior_beta) {
+                            perception.set_prior_beta(beta);
                         }
                     }
                     // P1b: record sleep duration for auto sleep-max-secs cap.
@@ -1696,49 +1673,13 @@ pub async fn run() -> Result<()> {
                     }
                     st.sleep_dur_secs_history.push_back(total_sleep_secs);
 
-                    // P2a / S7: adapt effective_wake_interval from cycle-level MSE trend.
-                    // Reduces interval when MSE improves < 1% for 3 consecutive cycles;
-                    // restores toward user default when MSE starts improving again.
+                    // P2a / S7: adapt effective_wake_interval from the cycle-level MSE trend.
                     let mean_mse_wake = if st.wake_output_mse_n > 0 {
                         Some(st.wake_output_mse_sum / st.wake_output_mse_n as f64)
                     } else {
                         None
                     };
-                    const S7_STAGNANT_THRESHOLD: f64 = 0.01;
-                    const S7_STAGNANT_CYCLES: u32 = 3;
-                    const S7_MSE_ALPHA: f64 = 0.3;
-                    if let Some(mse) = mean_mse_wake {
-                        if st.s7_ewma_n == 0 {
-                            st.s7_mse_ewma = mse;
-                        } else {
-                            let improvement = (st.s7_mse_ewma - mse) / st.s7_mse_ewma.max(1e-9);
-                            if improvement < S7_STAGNANT_THRESHOLD {
-                                st.s7_stagnant += 1;
-                            } else {
-                                st.s7_stagnant = 0;
-                                if st.effective_wake_interval < args.wake_reconstruct_interval {
-                                    st.effective_wake_interval = (st.effective_wake_interval + 1)
-                                        .min(args.wake_reconstruct_interval);
-                                    tracing::info!(
-                                        effective_wake_interval = st.effective_wake_interval,
-                                        "S7: restored wake_reconstruct_interval"
-                                    );
-                                }
-                            }
-                            st.s7_mse_ewma =
-                                S7_MSE_ALPHA * mse + (1.0 - S7_MSE_ALPHA) * st.s7_mse_ewma;
-                        }
-                        st.s7_ewma_n += 1;
-                        if st.s7_stagnant >= S7_STAGNANT_CYCLES && st.effective_wake_interval > 1 {
-                            st.effective_wake_interval -= 1;
-                            st.s7_stagnant = 0;
-                            tracing::info!(
-                                effective_wake_interval = st.effective_wake_interval,
-                                s7_mse_ewma = st.s7_mse_ewma,
-                                "S7: reduced wake_reconstruct_interval (stagnant MSE)"
-                            );
-                        }
-                    }
+                    st.s7_step(mean_mse_wake, args.wake_reconstruct_interval);
 
                     // Write metrics NDJSON line.
                     if let Some(ref mut mf) = metrics_sink {
@@ -1767,42 +1708,7 @@ pub async fn run() -> Result<()> {
                             somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                         }
                     }
-                    // Reset per-wake-cycle counters.
-                    st.wake_episodes = 0;
-                    st.wake_output_mse_sum = 0.0;
-                    st.wake_output_mse_n = 0;
-                    st.prior_cosine_sums = [0.0; 5];
-                    st.prior_cosine_counts = [0; 5];
-                    st.lang_ingest_count = 0;
-                    st.gain_episode_counter = 0;
-                    st.wake_reconstruct_counter = 0;
-                    // ADR 0022 counters.
-                    st.salience_sum = 0.0;
-                    st.salience_n = 0;
-                    st.salience_min = f32::MAX;
-                    st.high_salience_episodes = 0;
-                    st.blend_count = 0;
-                    st.hnsw_query_us_sum = 0;
-                    st.hnsw_query_n = 0;
-                    st.wake_reconstruct_throttle_passed = 0;
-                    st.wake_recon_dropped = 0;
-                    st.episodes_speech = 0;
-                    st.episodes_env = 0;
-                    st.episodes_visual = 0;
-                    st.episodes_language = 0;
-                    st.episodes_mixed = 0;
-                    st.settle_trigger_count = 0;
-                    st.settle_iters_sum = 0;
-                    st.settle_delta_sum = 0.0;
-                    st.speech_encode_total_ms = 0;
-                    st.env_encode_total_ms = 0;
-                    st.video_encode_total_ms = 0;
-                    st.perception_total_ms = 0;
-                    st.cosine_ewma = None;
-                    st.cosine_baseline = None;
-                    st.cosine_baseline_accum = 0.0;
-                    st.cosine_baseline_n = 0;
-                    st.perf_sleep_flag = false;
+                    st.reset_cycle();
                 }
                 Err(e) => {
                     tracing::warn!(?e, "sleep cycle error");
