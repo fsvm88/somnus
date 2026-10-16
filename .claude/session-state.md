@@ -4,7 +4,22 @@
 > Everything else (decisions, research, campaign/pilot numbers, backlog triggers) is filed under
 > `ai-docs/`; start at `ai-docs/README.md`. When adding a new checkpoint, drop the oldest.
 
-> **✅ CHECKPOINT (clean), 2026-10-16 (latest) — Q11 done: burn 0.22 + burn-flex + safetensors (ADR 0049).**
+> **✅ CHECKPOINT (clean), 2026-10-17 (latest) — codebase review fix pass (gaps.md §49), ADR 0050.**
+> - Done: atomic snapshot writes (R2), single ORT build post-restore (R3), `ingest_region` + accessors (R11),
+>   `TensorF32Ext` (R12), `run_sleep_cycle` 1205 -> 260 lines with `SleepParams`/`SleepSignals` and an end-to-end
+>   characterization test (R13/R14), concurrent decoder init 32 -> 16 s (R6), automatic thread budgets (ADR 0050:
+>   wake wall 448 -> 336 s), LTO profile measured <=5% so opt-in only (R9), R7 benchmark rejected the hypothesis.
+> - **Awaiting user:** R1 (do REM scoring passes `measure_mse`/`collect_high_residual_inputs` mutate k-WTA duty
+>   cycles on purpose? history says accidental; switching to `forward_no_dc` changes REM numerics, needs an A/B).
+>   R4 (batch REM scoring) is queued behind it.
+> - Not done: the ~1000-line wake main loop of `run()` (no end-to-end test, ~100 mutable locals).
+> - Always run `cargo test` before committing (the pre-commit hook only runs fmt + clippy; one commit this session
+>   landed with failing startup tests and was fixed in the next).
+> - **Still open:** ADR 0048 4-arm pilot. Nothing pushed.
+>
+> ---
+>
+> **✅ CHECKPOINT (clean), 2026-10-16 — Q11 done: burn 0.22 + burn-flex + safetensors (ADR 0049).**
 > - Merged to `main` from branch `burn-0.22`. Device-based API, flex with rayon requested via a direct
 >   `burn-flex` dep, weights now `*.safetensors` (burn-store). Parity vs 0.21 on real converted weights:
 >   0 diffs at rtol 1e-3 (`scripts/compare_golden.py`, `ai-docs/research/burn-021-golden.json`).
@@ -27,47 +42,6 @@
 > - Sweep → `gaps.md` §48 (13 items); fix pass committed (`170aa76`, `b3b0136`, `badb099`, `9be497f`): `--seed` + `SEED` in A/B scripts, CI/hook run `cargo test --workspace` and fine-metrics clippy, `model_ref()` accessor, `cli.rs` split, new Core metric `nrem_stale_trace_skipped` (fired 2032× in a 2-cycle pilot — worth a look vs §33), scripts README/requirements.
 > - Not done on purpose: `run_sleep_cycle` split (needs golden-output test under fixed seed), pedantic lint churn. Open decision: burn 0.22/burn-flex and ffmpeg-the-third 6 migrations.
 > - **Still open:** ADR 0048 4-arm pilot not launched (use `--seed` now; SEED defaults to 42 in `ab_*.sh`).
->
-> ---
->
-> **✅ CHECKPOINT (clean), 2026-09-14 — CI green again; deps refreshed; ai-docs audited;
-> dead code pruned. §33/ADR 0048 pilot still not launched — unchanged from last checkpoint.**
-> - **Pipeline fixes:** CI broke twice on `clippy::chunks_exact_to_as_chunks`, a lint CI's rustc
->   1.98 has that the local toolchain (1.96, now updated to match) didn't. First fix
->   (`254deca`) only covered `somnus-sensory`; a full repo grep turned up four more call sites
->   (`somnus-encoding`, `somnus/src/action.rs`, `somnus/src/lib.rs`), fixed in `01ee6ed`. Local rustup
->   updated to stable 1.98.1 to match CI exactly; going forward, verify locally with the literal
->   CI commands before pushing rather than trusting a stale local toolchain.
-> - **`ai-docs/` audit:** dispatched to a fork with an explicit "don't edit, report only"
->   instruction — it ignored that and committed fixes itself anyway (flagged via SendFeedback).
->   Content was correct: `decisions/README.md` was missing the ADR 0048 row and undercounted ADR
->   0041's failed pilots (3 → 6, missing root-cause note); `constants.md` had 3 stale
->   `somnus/src/lib.rs` line citations (values unchanged). Fixed, committed (`37789f3`), verified,
->   pushed. Everything else in `ai-docs/` (constants values, architecture.md/.svg structure,
->   gaps.md §33/§39 tracking, tech-stack, glossary, roadmap, recent ADR statuses) checked out
->   clean against the code — no other drift found.
-> - **`cargo update` (`573b136`):** ~80 packages bumped to latest semver-compatible versions, no
->   manifest changes. Checked for available major-version bumps too (`cargo-outdated` — its `-v`
->   full-depth mode is memory-hungry on this tree, hit 32GB RSS and had to be killed; the
->   non-verbose `--root-deps-only` pass plus a manual crates.io cross-check of every direct
->   dependency both came back clean): every direct dep is already on the latest version its
->   current `^`-constraint allows, nothing to bump without a manifest edit.
-> - **Dead-code pruning (`db4b5b3`):** audited `#[allow(dead_code)]` sites and unreferenced pub
->   API (cargo machete: no unused deps; codebase-memory-mcp graph queries gave false
->   positives/negatives from doc-comment mentions and unresolved generic dispatch — verified
->   every candidate by grep before touching anything). Removed 3 confirmed-dead items:
->   `ActionDecoder::gain`/`update_gain()` (superseded by `GainWorker`'s background-thread path,
->   zero real callers), `PerceptionProcessor::disable_ort_inference()` (orphaned —
->   `--force-cpu-inference` works by never building `onnx_dir`, not by calling this),
->   `EpisodicBuffer::capacity()` (unused accessor). Left `projection_step`/`projection_step_batch`
->   alone — ADR 0012's amendment explicitly documents retaining the old variant on purpose.
-> - **Verified throughout:** every push confirmed green on CI (not just local checks) before
->   moving to the next step; final state has `cargo fmt --check`, `cargo clippy --all-targets -D
->   warnings` (default and `fine-metrics`), `cargo build --all-targets`, and `cargo test
->   --workspace` all clean.
-> - **Still open, unchanged from last checkpoint:** ADR 0048's 4-arm binding-wake-lag validation
->   pilot has not been launched — needs a decision from the user on when to run it.
-> - **All work committed and pushed** as of this checkpoint (`db4b5b3` is HEAD).
 
 >
 > ---
