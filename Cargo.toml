@@ -41,6 +41,14 @@ somnus-metrics        = { path = "crates/somnus-metrics" }
 proptest           = "1"
 tempfile           = "3"
 
+# Release with thin LTO and a single codegen unit (ADR 0049 follow-up, gaps.md R9). Opt-in because
+# it costs build time; `cargo build --profile release-lto -p somnus`. Measured against `release` with
+# `bench_nrem_batch` / `bench_wake_percep` before being made the default.
+[profile.release-lto]
+inherits       = "release"
+lto            = "thin"
+codegen-units  = 1
+
 # Profile for flamegraph: release-optimised but with debug symbols intact so
 # perf/flamegraph can map addresses back to source.
 [profile.release-debug]

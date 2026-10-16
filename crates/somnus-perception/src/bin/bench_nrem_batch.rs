@@ -7,12 +7,10 @@
 ///
 /// Run: cargo run --release -p somnus-perception --bin bench_nrem_batch
 use burn::tensor::Device;
-use somnus_perception::PerceptionProcessor;
+use somnus_perception::{PerceptionProcessor, EPISODE_DIM, REGION_DIMS};
 use std::time::Instant;
 
 const N_TRACES: usize = 3276;
-const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 896];
-const EPISODE_DIM: usize = 640;
 const BATCH_SIZES: &[usize] = &[1, 16, 32, 64, 128];
 
 fn random_regional(seed_base: usize) -> [Vec<f32>; 5] {

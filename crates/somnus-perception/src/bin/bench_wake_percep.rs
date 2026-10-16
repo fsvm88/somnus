@@ -5,11 +5,10 @@
 ///
 /// Run: cargo run --release -p somnus-perception --bin bench_wake_percep
 use burn::tensor::Device;
-use somnus_perception::{PerceptionProcessor, EPISODE_DIM};
+use somnus_perception::{PerceptionProcessor, EPISODE_DIM, REGION_DIMS};
 use std::time::Instant;
 
 const N_REPS: usize = 200;
-const REGION_DIMS: [usize; 5] = [384, 512, 384, 384, 896];
 
 fn lcg(s: &mut u64) -> f32 {
     *s = s
