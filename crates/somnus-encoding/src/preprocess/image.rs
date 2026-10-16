@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{EncodingError, EncodingResult};
 use somnus_sensory::{PixelFormat, VideoFrame};
 
@@ -7,40 +9,69 @@ const TARGET: usize = 224;
 
 /// Convert a `VideoFrame` to a `(3, 224, 224)` f32 tensor, ImageNet-normalised,
 /// channel-first. Matches the DINOv2 preprocessing in ADR 0004.
+///
+/// Samples the bilinear taps straight from the `u8` frame (converting each tap with the same
+/// `b as f32 / 255.0` the PyTorch pipeline applies before interpolating), so the full-resolution
+/// frame is never converted to floats or copied: ~4 x 224 x 224 x 3 reads instead of
+/// `width x height x 3` conversions. Bit-identical to converting first (see the
+/// `matches_convert_then_resize_reference` test).
 pub fn frame_to_tensor(frame: &VideoFrame) -> EncodingResult<Vec<f32>> {
     let rgb = to_rgb24(frame)?;
     let sw = frame.width as usize;
     let sh = frame.height as usize;
-
-    // Convert u8 → f32 in [0, 1] before resizing, matching PyTorch's pipeline
-    // (torch tensor / 255.0, then F.interpolate in float space).
-    let rgb_f32: Vec<f32> = rgb.iter().map(|&b| b as f32 / 255.0).collect();
-
-    // Bilinear resize in float space → (TARGET, TARGET, 3) interleaved
-    let resized = bilinear_resize_f32(&rgb_f32, sw, sh, TARGET, TARGET);
-
-    // Channel-first layout + ImageNet normalisation
-    let mut out = vec![0.0f32; 3 * TARGET * TARGET];
-    for c in 0..3 {
-        for i in 0..TARGET * TARGET {
-            out[c * TARGET * TARGET + i] =
-                (resized[i * 3 + c] - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
-        }
-    }
-    Ok(out)
+    Ok(resize_normalise(&rgb, sw, sh))
 }
 
-fn to_rgb24(frame: &VideoFrame) -> EncodingResult<Vec<u8>> {
+/// Bilinear resize (PyTorch `align_corners=False`) of an interleaved RGB `u8` image to
+/// `TARGET x TARGET`, ImageNet-normalised, written channel-first.
+fn resize_normalise(src: &[u8], sw: usize, sh: usize) -> Vec<f32> {
+    let x_scale = sw as f32 / TARGET as f32;
+    let y_scale = sh as f32 / TARGET as f32;
+
+    // Per-column source indices and weights are the same for every output row.
+    let cols: Vec<(usize, usize, f32)> = (0..TARGET)
+        .map(|dx| {
+            let sx = (dx as f32 + 0.5) * x_scale - 0.5;
+            let x0 = (sx.floor() as isize).clamp(0, sw as isize - 1) as usize;
+            (x0, (x0 + 1).min(sw - 1), sx - sx.floor())
+        })
+        .collect();
+
+    let plane = TARGET * TARGET;
+    let mut out = vec![0.0f32; 3 * plane];
+    for dy in 0..TARGET {
+        let sy = (dy as f32 + 0.5) * y_scale - 0.5;
+        let y0 = (sy.floor() as isize).clamp(0, sh as isize - 1) as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let wy = sy - sy.floor();
+        let (row0, row1) = (y0 * sw, y1 * sw);
+        for (dx, &(x0, x1, wx)) in cols.iter().enumerate() {
+            for c in 0..3 {
+                let tap = |i: usize| src[i * 3 + c] as f32 / 255.0;
+                let (p00, p01) = (tap(row0 + x0), tap(row0 + x1));
+                let (p10, p11) = (tap(row1 + x0), tap(row1 + x1));
+                let v = p00 * (1.0 - wx) * (1.0 - wy)
+                    + p01 * wx * (1.0 - wy)
+                    + p10 * (1.0 - wx) * wy
+                    + p11 * wx * wy;
+                out[c * plane + dy * TARGET + dx] = (v - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
+            }
+        }
+    }
+    out
+}
+
+fn to_rgb24(frame: &VideoFrame) -> EncodingResult<Cow<'_, [u8]>> {
     match frame.format {
-        PixelFormat::Rgb8 => Ok(frame.data.to_vec()),
+        PixelFormat::Rgb8 => Ok(Cow::Borrowed(&frame.data)),
         PixelFormat::Bgr8 => {
             let mut out = frame.data.to_vec();
             for px in out.as_chunks_mut::<3>().0 {
                 px.swap(0, 2);
             }
-            Ok(out)
+            Ok(Cow::Owned(out))
         }
-        PixelFormat::Yuyv422 => Ok(yuyv_to_rgb(&frame.data)),
+        PixelFormat::Yuyv422 => Ok(Cow::Owned(yuyv_to_rgb(&frame.data))),
         fmt => Err(EncodingError::UnsupportedPixelFormat(fmt)),
     }
 }
@@ -67,8 +98,9 @@ fn yuyv_to_rgb(yuyv: &[u8]) -> Vec<u8> {
     rgb
 }
 
-/// Bilinear resize in float space. `src` is HxWx3 f32 in [0, 1], interleaved RGB.
+/// Reference bilinear resize in float space (test oracle for [`resize_normalise`]). `src` is HxWx3 f32 in [0, 1], interleaved RGB.
 /// Matches PyTorch `F.interpolate(..., mode='bilinear', align_corners=False)`.
+#[cfg(test)]
 fn bilinear_resize_f32(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
     let mut dst = vec![0.0f32; dh * dw * 3];
     let x_scale = sw as f32 / dw as f32;
@@ -226,6 +258,48 @@ mod tests {
                 plane.iter().all(|&v| (v - expect).abs() < 1e-6),
                 "channel {c} deviates from {expect}"
             );
+        }
+    }
+
+    // ── optimised path vs the original convert-then-resize pipeline ────────────
+
+    /// The original implementation: convert the whole frame to f32, resize in float space,
+    /// then normalise channel-first.
+    fn reference_frame_to_tensor(rgb: &[u8], sw: usize, sh: usize) -> Vec<f32> {
+        let rgb_f32: Vec<f32> = rgb.iter().map(|&b| b as f32 / 255.0).collect();
+        let resized = bilinear_resize_f32(&rgb_f32, sw, sh, TARGET, TARGET);
+        let mut out = vec![0.0f32; 3 * TARGET * TARGET];
+        for c in 0..3 {
+            for i in 0..TARGET * TARGET {
+                out[c * TARGET * TARGET + i] =
+                    (resized[i * 3 + c] - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn matches_convert_then_resize_reference() {
+        // Odd sizes, up- and down-scaling, 1-pixel extents: every clamping branch.
+        for &(w, h) in &[
+            (640usize, 480usize),
+            (1920, 1080),
+            (97, 61),
+            (224, 224),
+            (50, 300),
+            (1, 7),
+            (300, 1),
+        ] {
+            let mut x = (w * 31 + h) as u32;
+            let data: Vec<u8> = (0..w * h * 3)
+                .map(|_| {
+                    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (x >> 24) as u8
+                })
+                .collect();
+            let want = reference_frame_to_tensor(&data, w, h);
+            let got = frame_to_tensor(&frame(data, w as u32, h as u32, PixelFormat::Rgb8)).unwrap();
+            assert_eq!(got, want, "{w}x{h} must be bit-identical to the reference");
         }
     }
 
