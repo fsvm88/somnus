@@ -2,7 +2,7 @@
 
 > **Contents:** Open, undecided items only — algorithm/encoder/LLM upgrade candidates awaiting a decision, and known incompleteness with no chosen fix yet. Items that reached a decision (accepted/deployed/adopted, or rejected/not-pursued/null-result) live in [`engineering-log.md`](engineering-log.md), verbatim, under the same section numbers. Pruned to open-only 2026-08-15 (was §0-§37; see `engineering-log.md`'s header for what moved and why). §38 (Qwen3 KV-cache generation speedup) resolved and removed from this file 2026-08-15; full record at `engineering-log.md` §38. §41 (change-gated video encoder) rejected as a null-result and removed 2026-08-16; full record at `engineering-log.md` §43.
 > **When to read:** Picking the next item to try, or checking whether something is still undecided.
-> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `engineering-log.md`, not that it never existed. New items get the next unused number across both files (next: §49).
+> **Numbering:** section numbers are stable identifiers, not sequential — they're cited by ADRs, `architecture.md`, `roadmap.md`, and `session-state.md`. Gaps in the sequence (e.g. no §1-§3, §5-§6) mean that number's item moved to `engineering-log.md`, not that it never existed. New items get the next unused number across both files (next: §50).
 
 ---
 
@@ -172,6 +172,52 @@ Collected by a read-only sweep of code, CI, scripts, metrics coverage and docs. 
 - **Not an issue (closed):** Q3 (root manifest is a virtual workspace, so `--all-targets` already covers every crate). Q5 (`stop_graceful.sh` deliberately omits `-e`, documented in the script, and already has `-uo pipefail`). Q12 (ASR failure counters `AsrError`/`AsrPanic`/`AsrPostPanic*` already exist; video/sensory thinness is not a policy violation).
 - **Deliberately not done:** Q7b (splitting `run_sleep_cycle`: ~1200 lines of shared mutable locals across NREM/REM phases, no focused test of it, high regression risk in the function every campaign depends on; do it only with a golden-output comparison under a fixed `--seed`). Q9 (the remaining `unnecessary_wraps` / `needless_pass_by_value` hits are signature-symmetry choices such as stub-like `Result`-returning action methods; changing them only churns callers). Q13 (docs re-audit, nothing new looked at).
 - **Q11 (burn):** done and merged, see ADR 0049 (device-based API, burn-flex with rayon requested explicitly, safetensors persistence, parity vs 0.21 on real converted weights, plus a pre-existing `wake_binding` GRU/temporal_proj bug fixed). **ffmpeg-the-third:** not migrated and not recommended: `ffmpeg-next 9.0.0` is itself current (built for FFmpeg 9), so the fork offers nothing; revisit only if `ffmpeg-next` stalls. The CI runner's apt ffmpeg (Ubuntu) is older than Arch's, which is the real constraint on any ffmpeg crate bump.
+
+---
+
+## §49 — Codebase review: cleanup and optimization queue (2026-10-17)
+
+Sources: a codebase-memory graph index of the repo (692 functions/methods, 57 structs; dead-code,
+duplicate and hotspot queries), `clippy` perf/complexity lints (clean apart from cognitive
+complexity), line-count/duplication scans, and the fine-metrics profile of the ADR 0049 restore
+pilot (`mean` over one 3.3k-episode cycle; clip `animation.mp4`, so absolute numbers are
+indicative). **Nothing here is started.** "Verified" = read in code or measured; "hypothesis" =
+needs a measurement before acting.
+
+### Correctness-adjacent (do first)
+
+| # | Finding | Evidence | Proposed action |
+|---|---------|----------|-----------------|
+| R1 | REM scoring passes **mutate k-WTA duty cycles**: `measure_mse` (documented "no weight update") and `collect_high_residual_inputs` call `KWtaLayer::forward`, which advances `duty_cycle`; `forward_no_dc(&self)` exists for exactly this. One REM pass = one spurious duty-cycle step per trace per region (~16k per cycle at 3.3k traces), perturbing boosting before the next wake phase. | Verified: `region.rs` `forward` vs `forward_no_dc`; `lib.rs` `measure_mse` / `collect_high_residual_inputs`. *Intent unverified* (no ADR found). | Decide if intended; if not, switch both to `forward_no_dc` (also lets them run on `&self`, enabling batching, see R4). Changes REM numerics: A/B it. |
+| R2 | **Weight snapshots are not atomic.** `save_weights` (perception + decoder) writes `<stem>.safetensors` in place; a kill mid-write leaves a truncated multi-hundred-MB file and the next start falls back to fresh weights. `stop_graceful.sh` mitigates SIGTERM but not SIGKILL/OOM/power loss. | Verified: `SafetensorsStore::from_file(path)` writes directly. | Write to `<stem>.safetensors.tmp`, `fsync`, `rename`. Same for the small `*.bin` state files in `snapshot.rs`. |
+| R3 | **ORT binding session is built twice at startup** on every restored run (~10 s each): once from the random pre-grown model, again after the weight restore (needed for correctness, ADR 0049). | Verified: pilot `rebuild_ort_session n=2` in cycle 1, ~10.6 s/call. | Skip the first build when a weights snapshot will be restored (decide after reading `weights.safetensors` existence); build once post-restore. |
+
+### Optimization (ranked by measured/estimated cost)
+
+| # | Finding | Evidence | Proposed action |
+|---|---------|----------|-----------------|
+| R4 | REM scoring is **batch-1 per trace**: `measure_mse` 3276 calls x 3.6 ms = 11.6 s, `collect_high_residual_inputs` 12.2 s in a growth cycle (sorts and clones every input to keep the top `cap`). | Measured (pilot cycle 1). | Batch the k-WTA matmul over traces (batched `forward_tracked_batch` exists for training); subsample like the other REM probes (`REM_SYNTH_MAX_N`); keep indices and clone only the winners; `select_nth_unstable` instead of a full sort. |
+| R5 | `encode_video` is the largest wake cost: 48 ms/frame x 3180 = 153 s per cycle; `encode_env` 450 ms/call, `encode_speech` 1.08 s/call, `asr_decode` 690 ms. These share cores with rayon (Q14, +28 %/call after the flex migration). | Measured. | Q14 first (size rayon's pool); then consider batching frames per ORT call. §41 already rejected change-gating for video. |
+| R6 | `action_decoder_init` = **31.7 s** at every start (several ORT sessions plus a ~600 MB embedding-table conversion), serial. | Measured. | Create sessions on parallel threads; convert/mmap the embed table without the intermediate `Vec`; lazy-load the generation sessions not needed before first use. |
+| R7 | **Inference matmuls run on the autodiff device.** `forward`, `forward_no_dc`, `measure_mse`, `ema` paths build tensors on `self.device` (autodiff-enabled since the 0.22 port) even though they never need gradients, so each op pays autodiff dispatch. | *Hypothesis* (0.21 used plain `NdArray` here). | Use `device.inner()` for no-grad inference tensors; measure `kwta_score_matmul` (520 us/call) and `ingest_bind` (4.6 ms) before/after. |
+| R8 | k-WTA selection allocates per call: `z_vec.clone()`, a `boosted` Vec, a 9.8k-entry `Vec<(usize, f32)>` (16 B each), then output Vecs, x5 regions per ingest. `select_top_k` and `select_top_k_no_dc` are copy-pasted. | Verified (`region.rs`). | One shared implementation taking a `update_dc: bool`; reuse scratch buffers held on the layer; select on `(f32, u16)`. Minor per call, large in aggregate (3.3k ingests x 5). |
+| R9 | **Release profile is default** (`opt-level 3`, no LTO, 16 codegen units). | Verified (`Cargo.toml` has only `release-debug`). | Experiment: `lto = "thin"`, `codegen-units = 1` and measure with `bench_nrem_batch` / `bench_wake_percep` (both already exist). Record build-time cost too. |
+| R10 | `ColdArchive::append` re-opens the file and builds a `BufWriter` per record (spill loop calls it per record). | Verified (`cold.rs`, `sleep.rs`); cost small today (spill ~0.7 s per 3k records). | `append_batch(&[EpisodeRecord])` holding one handle; matters only if spill volume grows (§deferred item A). |
+
+### Cleanup
+
+| # | Finding | Evidence | Proposed action |
+|---|---------|----------|-----------------|
+| R11 | `ingest_speech` / `ingest_env` / `ingest_visual` / `ingest_language` are four ~75-line copies of one pipeline (gain, prior blend, k-WTA/ORT bootstrap, decode error, symbolic, bind, settle, WM push). | Verified (graph `SIMILAR_TO`; `lib.rs` 471-800). | One `ingest_region(idx, values)` plus per-region thin wrappers; ~250 lines removed. Needs the golden harness (`golden_dump`) as the regression check. |
+| R12 | 47 copies of `.into_data().convert::<f32>().try_to_vec::<f32>().unwrap()`. | Verified (grep). | `fn to_f32_vec<const D: usize>(t: Tensor<D>) -> Vec<f32>`; one place to handle the error. |
+| R13 | `run()` is 2006 lines (cognitive complexity 246), `run_sleep_cycle` 1205 (162); next largest are 240 and 219. | Verified (clippy `cognitive_complexity`, line scan). | Staged split (Q7b): config struct from CLI, startup/restore, wake loop, sleep phases. Prerequisite R14. |
+| R14 | **Neither `run()` nor `run_sleep_cycle` has a test** that exercises it. | Verified (no test references). | A deterministic mini-cycle fixture (tiny model, 20 synthetic episodes, fixed `--seed`) asserting metrics keys and counters; becomes the guard for R13. |
+| R15 | Three near-identical `save_*_ewma` / `load_*_ewma` pairs (`sal`, `settle`, `wake`); `argmax` defined in both `action.rs` and `whisper_asr.rs`. | Verified (graph `SIMILAR_TO`). | A small `EwmaState` (de)serializer and one shared `argmax`. |
+| R16 | One-off tools with a single reference (own definition or one doc line): `onnx_validate_prepare`, `bench_wake_percep`, `bench_warm_rebuild`, `analyze_ab_prior_beta.py`, `run_novel_experiment.sh`, `run_ef_scale_ab.sh`. `bench_nrem_batch` is needed for R9. | Verified (grep over docs, scripts, crates). | Move to `experiments/` or delete after checking the engineering-log entry that introduced each (staleness can mean a lost thread). |
+| R17 | Python overlap: `export_kv_cache.py` vs `export_kv_cache_qwen3.py` (276/295 lines, graph-flagged), and three reporting scripts (`eval_metrics.py` 754, `campaign_status.py` 535, `status.py` 249). | Verified sizes; overlap *partly* assumed. | Share a module for the KV-export boilerplate; check whether `status.py` is subsumed by `campaign_status.py`. |
+| R18 | Dependency tree carries duplicate majors (`rand` 0.9/0.10, `getrandom` x3, `regex-*`, `darling` x3, `itertools`, `hashbrown` x3). | Verified (`cargo tree --duplicates`). | Upstream-driven; low value. Revisit only when a dependency refresh removes them for free. |
+
+**Suggested order:** R1 (decide intent) and R2 (small, protects 250 MB state), R3, then R4+R7 together (measure R7 first), R14 -> R11/R13, R9 as a quick experiment, the rest opportunistically.
 
 ---
 
