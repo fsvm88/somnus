@@ -2,6 +2,7 @@ pub mod cold;
 pub mod episode;
 pub mod episodic;
 pub mod error;
+pub mod fsutil;
 pub mod pq;
 pub mod recollection;
 pub mod semantic;

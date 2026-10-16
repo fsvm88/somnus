@@ -220,7 +220,7 @@ impl SemanticStore {
         let mut vbuf = [0u8; 6];
         vbuf[..4].copy_from_slice(WARM_MAGIC);
         vbuf[4..6].copy_from_slice(&WARM_VERSION.to_le_bytes());
-        fs::write(warm_dir.join("version"), vbuf)?;
+        crate::fsutil::write_atomic(&warm_dir.join("version"), vbuf)?;
 
         // hnsw_rs::file_dump only overwrites "index.hnsw.{data,graph}" in place when no
         // mmap datamap is active on self.index. Once the index has been reloaded via
@@ -248,7 +248,7 @@ impl SemanticStore {
         // Sidecar
         let encoded =
             bitcode::serialize(&self.records).map_err(|e| std::io::Error::other(e.to_string()))?;
-        fs::write(warm_dir.join("records.bin"), encoded)?;
+        crate::fsutil::write_atomic(&warm_dir.join("records.bin"), encoded)?;
 
         let bytes_written: u64 = fs::read_dir(warm_dir)?
             .flatten()
@@ -472,7 +472,10 @@ mod tests {
         }
         assert_eq!(capped.len(), 3, "inserts beyond the cap are skipped");
         // First-writer-wins: records 0-2 kept, later ones dropped.
-        let ids: Vec<u64> = capped.query(&[0.0f32; 8], 3).iter().map(|r| r.id).collect();
+        // Order-insensitive: HNSW result order among near-equal candidates is not stable
+        // (this assertion failed ~1 in 3 full-suite runs with the order-sensitive form).
+        let mut ids: Vec<u64> = capped.query(&[0.0f32; 8], 3).iter().map(|r| r.id).collect();
+        ids.sort_unstable();
         assert_eq!(ids, vec![0, 1, 2]);
 
         let mut uncapped = SemanticStore::new(8);

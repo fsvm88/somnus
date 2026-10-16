@@ -22,6 +22,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::fsutil::{commit_tmp, tmp_path, write_atomic};
 use crate::{
     cold::ColdArchive,
     episodic::EpisodicBuffer,
@@ -156,22 +157,25 @@ pub fn save_snapshot(episodic: &EpisodicBuffer, memory_dir: &Path) -> MemoryResu
 }
 
 fn save_snapshot_inner(episodic: &EpisodicBuffer, memory_dir: &Path) -> MemoryResult<()> {
-    let tmp = memory_dir.join("snapshot.tmp");
     let snap = memory_dir.join("snapshot");
+    fs::create_dir_all(&snap)?;
+    // A `snapshot.tmp/` left by the previous (directory-swapping) implementation is dead weight.
+    let _ = fs::remove_dir_all(memory_dir.join("snapshot.tmp"));
 
-    fs::create_dir_all(&tmp)?;
-    save_episodic(episodic, &tmp.join("episodic.bin"))?;
+    // Replace the files in place, one atomic rename each. The old implementation swapped the whole
+    // directory, which wiped weights/region sizes/EWMAs written by earlier cycles and left the
+    // snapshot without them until the later saves of the same cycle finished (a crash in that
+    // window lost the trained weights).
+    let ep_path = snap.join("episodic.bin");
+    let ep_tmp = tmp_path(&ep_path);
+    save_episodic(episodic, &ep_tmp)?;
+    commit_tmp(&ep_tmp, &ep_path)?;
     // Persist the global next_id so IDs remain monotonic across restarts even
     // when the hot buffer is cleared (which would otherwise reset next_id to 1).
-    fs::write(
-        tmp.join("next_id.bin"),
+    write_atomic(
+        &snap.join("next_id.bin"),
         episodic.next_id_counter().to_le_bytes(),
     )?;
-
-    if snap.exists() {
-        fs::remove_dir_all(&snap)?;
-    }
-    fs::rename(&tmp, &snap)?;
     Ok(())
 }
 
@@ -199,7 +203,7 @@ pub fn save_region_sizes(sizes: [usize; 5], memory_dir: &Path) -> MemoryResult<(
     for (i, &s) in sizes.iter().enumerate() {
         buf[i * 8..i * 8 + 8].copy_from_slice(&(s as u64).to_le_bytes());
     }
-    fs::write(path, buf)?;
+    write_atomic(&path, buf)?;
     Ok(())
 }
 
@@ -220,7 +224,7 @@ pub fn load_region_sizes(memory_dir: &Path) -> Option<[usize; 5]> {
 /// Save the number of cycles remaining in the growth cooldown (single u64 LE).
 pub fn save_growth_cooldown_remaining(remaining: usize, memory_dir: &Path) -> MemoryResult<()> {
     let path = memory_dir.join("snapshot").join("growth_cooldown.bin");
-    fs::write(path, (remaining as u64).to_le_bytes())?;
+    write_atomic(&path, (remaining as u64).to_le_bytes())?;
     Ok(())
 }
 
@@ -242,7 +246,7 @@ pub fn save_sal_ewma(mu: f32, sigma: f32, n: u64, memory_dir: &Path) -> MemoryRe
     buf[0..4].copy_from_slice(&mu.to_le_bytes());
     buf[4..8].copy_from_slice(&sigma.to_le_bytes());
     buf[8..16].copy_from_slice(&n.to_le_bytes());
-    fs::write(path, buf)?;
+    write_atomic(&path, buf)?;
     Ok(())
 }
 
@@ -265,7 +269,7 @@ pub fn save_settle_ewma(mu: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> 
     let mut buf = [0u8; 12];
     buf[0..4].copy_from_slice(&mu.to_le_bytes());
     buf[4..12].copy_from_slice(&n.to_le_bytes());
-    fs::write(path, buf)?;
+    write_atomic(&path, buf)?;
     Ok(())
 }
 
@@ -287,7 +291,7 @@ pub fn save_wake_ewma(mu: f32, n: u64, memory_dir: &Path) -> MemoryResult<()> {
     let mut buf = [0u8; 12];
     buf[0..4].copy_from_slice(&mu.to_le_bytes());
     buf[4..12].copy_from_slice(&n.to_le_bytes());
-    fs::write(path, buf)?;
+    write_atomic(&path, buf)?;
     Ok(())
 }
 
@@ -479,6 +483,43 @@ fn read_f32_vec(r: &mut impl Read, n: usize) -> MemoryResult<Vec<f32>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Regression: saving the episodic snapshot used to swap the whole `snapshot/` directory,
+    /// wiping weights/region sizes/EWMAs from earlier cycles until the same cycle re-wrote them
+    /// (a crash in that window lost the trained weights). Sibling files must survive.
+    #[test]
+    fn save_snapshot_preserves_sibling_state_files() {
+        let dir = TempDir::new().unwrap();
+        let snap = dir.path().join("snapshot");
+        fs::create_dir_all(&snap).unwrap();
+        fs::write(snap.join("weights.safetensors"), b"trained").unwrap();
+        save_region_sizes([9; 5], dir.path()).unwrap();
+
+        let mut buf = EpisodicBuffer::new(4);
+        buf.push(
+            1.0,
+            vec![0.1f32; 640],
+            Default::default(),
+            f32::MAX,
+            crate::episode::IngestSource::Unknown,
+        );
+        save_snapshot(&buf, dir.path()).unwrap();
+        save_snapshot(&buf, dir.path()).unwrap();
+
+        assert_eq!(
+            fs::read(snap.join("weights.safetensors")).unwrap(),
+            b"trained"
+        );
+        assert_eq!(load_region_sizes(dir.path()), Some([9; 5]));
+        assert!(load_snapshot(dir.path(), 4, 640).unwrap().is_some());
+        assert!(
+            fs::read_dir(&snap)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+            "no temp files left behind"
+        );
+    }
 
     #[test]
     fn episodic_round_trip() {

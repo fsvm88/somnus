@@ -21,6 +21,7 @@ ignored = ["burn-flex"]
 burn         = { workspace = true }
 burn-flex  = { workspace = true }
 burn-store   = { workspace = true }
+somnus-memory   = { path = "../somnus-memory" }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
 serde_json   = { workspace = true }

@@ -1018,10 +1018,15 @@ impl ActionDecoder {
     /// Save projection weights as safetensors (`<path>.safetensors`).
     pub fn save_weights(&self, path: &std::path::Path) -> Result<()> {
         use burn_store::{ModuleSnapshot, SafetensorsStore};
-        let mut store = SafetensorsStore::from_file(path.with_extension("safetensors"));
+        // Write beside the target and rename: a kill mid-write must not truncate the only copy.
+        let dst = path.with_extension("safetensors");
+        let tmp = somnus_memory::fsutil::tmp_path(&dst);
+        let mut store = SafetensorsStore::from_file(&tmp);
         self.model_ref()
             .save_into(&mut store)
-            .map_err(|e| anyhow::anyhow!("save_weights failed: {e:?}"))
+            .map_err(|e| anyhow::anyhow!("save_weights failed: {e:?}"))?;
+        somnus_memory::fsutil::commit_tmp(&tmp, &dst)?;
+        Ok(())
     }
 
     /// Load projection weights from `<path>.safetensors`. On failure the model is replaced by

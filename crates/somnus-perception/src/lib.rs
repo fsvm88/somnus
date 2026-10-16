@@ -2906,13 +2906,18 @@ impl PerceptionProcessor {
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        std::fs::write(path.with_extension("sizes"), &sizes_str)
-            .map_err(|e| PerceptionError::Burn(e.to_string()))?;
+        let io_err = |e: std::io::Error| PerceptionError::Burn(e.to_string());
+        somnus_memory::fsutil::write_atomic(&path.with_extension("sizes"), sizes_str)
+            .map_err(io_err)?;
 
-        let mut store = SafetensorsStore::from_file(path.with_extension("safetensors"));
+        // Write beside the target and rename: a kill mid-write must not truncate the only copy.
+        let dst = path.with_extension("safetensors");
+        let tmp = somnus_memory::fsutil::tmp_path(&dst);
+        let mut store = SafetensorsStore::from_file(&tmp);
         self.model_ref()
             .save_into(&mut store)
-            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))
+            .map_err(|e| PerceptionError::Burn(format!("{e:?}")))?;
+        somnus_memory::fsutil::commit_tmp(&tmp, &dst).map_err(io_err)
     }
 
     /// Load weights written by `save_weights` (`<path>.safetensors`). Regions must already be
