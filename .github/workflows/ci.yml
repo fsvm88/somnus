@@ -23,5 +23,9 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (fine-metrics)
+        run: cargo clippy --all-targets --features fine-metrics -- -D warnings
       - name: Build
         run: cargo build --all-targets
+      - name: Test
+        run: cargo test --workspace

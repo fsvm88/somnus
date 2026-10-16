@@ -8,3 +8,6 @@ cargo fmt --check
 
 echo "pre-commit: cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
+
+echo "pre-commit: cargo clippy --all-targets --features fine-metrics -- -D warnings"
+cargo clippy --all-targets --features fine-metrics -- -D warnings

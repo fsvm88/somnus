@@ -36,6 +36,7 @@
 #   CYCLES=10 bash scripts/ab_binding_replay_freeze_heads_cpu.sh
 #   SKIP_BUILD=1 SKIP_COPY=1 bash scripts/ab_binding_replay_freeze_heads_cpu.sh   # re-run/analyze only
 set -euo pipefail
+export SEED="${SEED:-42}"   # fixed burn RNG seed for both arms (standing reproducibility policy)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 

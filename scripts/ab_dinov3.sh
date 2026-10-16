@@ -1,4 +1,7 @@
 #!/bin/bash
+# HISTORICAL: predates the 2026-08-15 standing A/B instruction (build+run both arms with
+# fine-metrics, record deviations). Results are recorded in ai-docs/; to re-run, add
+# --features fine-metrics to the build first.
 # A/B validation: DINOv2-S (control) vs DINOv3-ViT-S (treatment)
 # Item 6 — drop-in encoder swap parity test
 
@@ -41,6 +44,7 @@ for i in $(seq 1 "$SESSIONS"); do
         --action \
         --action-distill-only \
         --lang-use-lm \
+        --seed "${SEED:-42}" \
         --memory-dir "$CONTROL_DIR" \
         --session "$i" \
         --max-sleep-cycles "$CYCLES" \
@@ -62,6 +66,7 @@ for i in $(seq 1 "$SESSIONS"); do
         --action \
         --action-distill-only \
         --lang-use-lm \
+        --seed "${SEED:-42}" \
         --memory-dir "$TREATMENT_DIR" \
         --session "$i" \
         --max-sleep-cycles "$CYCLES" \

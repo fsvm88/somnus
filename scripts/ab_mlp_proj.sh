@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# HISTORICAL: predates the 2026-08-15 standing A/B instruction (build+run both arms with
+# fine-metrics, record deviations). Results are recorded in ai-docs/; to re-run, add
+# --features fine-metrics to the build first.
 # A/B: validate ADR 0032 MLP projection vs single linear layer.
 #
 # Control:   --linear-proj  (EPISODE_DIM → N_REGIONS*LM_HIDDEN, single layer)
@@ -11,6 +14,7 @@
 #   bash scripts/ab_mlp_proj.sh
 #   SESSIONS=5 CYCLES=2 bash scripts/ab_mlp_proj.sh
 set -euo pipefail
+export SEED="${SEED:-42}"   # fixed burn RNG seed for both arms (standing reproducibility policy)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 

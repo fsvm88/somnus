@@ -69,6 +69,10 @@ ONNX_SCRIPT="${ONNX_SCRIPT:-}"       # override path to export_perception_graph.
 # Skip the build step below — for callers that pre-build target/release/somnus themselves
 # (e.g. with non-default --features, which this script's own `cargo build` doesn't pass).
 SKIP_BUILD="${SKIP_BUILD:-0}"
+# Optional burn RNG seed (--seed). Unset = OS entropy (normal campaigns); A/B scripts set it.
+SEED="${SEED:-}"
+SEED_FLAG=""
+[ -n "$SEED" ] && SEED_FLAG="--seed $SEED"
 
 METRICS_FILE="${CAMPAIGN_DIR}/metrics.jsonl"
 LOG_DIR="${CAMPAIGN_DIR}/logs"
@@ -150,6 +154,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --log-file "$SESSION_LOG" \
             --session "$i" \
             $ONNX_DIR_FLAG \
+            $SEED_FLAG \
             $EXTRA_ARGS \
             2>>"$SESSION_LOG" || EXIT=$?
     else
@@ -167,6 +172,7 @@ for i in $(seq "$SESSION_START" "$SESSION_END"); do
             --log-file "$SESSION_LOG" \
             --session "$i" \
             $ONNX_DIR_FLAG \
+            $SEED_FLAG \
             $EXTRA_ARGS \
             2>>"$SESSION_LOG" || EXIT=$?
     fi

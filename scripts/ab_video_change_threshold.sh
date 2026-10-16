@@ -20,6 +20,7 @@
 #   THRESHOLD=0.1 CYCLES=5 bash scripts/ab_video_change_threshold.sh
 #   SKIP_BUILD=1 SKIP_COPY=1 bash scripts/ab_video_change_threshold.sh   # re-run/analyze only
 set -euo pipefail
+export SEED="${SEED:-42}"   # fixed burn RNG seed for both arms (standing reproducibility policy)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 

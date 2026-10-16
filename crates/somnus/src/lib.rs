@@ -128,6 +128,12 @@ struct Args {
     #[arg(long, default_value = "models")]
     models_dir: PathBuf,
 
+    /// Seed burn's global RNG (parameter init, dropout-style sampling) so runs are
+    /// reproducible. Unset = OS entropy, as before. Logged at startup either way
+    /// for the explicit case only; A/B scripts should always pass it.
+    #[arg(long)]
+    seed: Option<u64>,
+
     #[arg(long)]
     embeddings_out: Option<PathBuf>,
 
@@ -945,6 +951,12 @@ pub async fn run() -> Result<()> {
     }
 
     ort::init_from("/usr/lib/libonnxruntime.so")?.commit();
+
+    if let Some(seed) = args.seed {
+        use burn::tensor::backend::Backend;
+        <burn::backend::NdArray as Backend>::seed(&NdArrayDevice::Cpu, seed);
+        info!(seed, "burn RNG seeded");
+    }
 
     // Write PID file for status scripts.
     if let Some(ref pid_path) = args.pid_file {

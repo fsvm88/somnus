@@ -1,0 +1,12 @@
+# Python deps for scripts/*.py (export + analysis). Venv lives at scripts/.venv (gitignored);
+# scripts/.venv-efficientat has its own incompatible torch pin (see ai-docs/gaps.md / engineering-log).
+# Only torch is pinned here (from the .gitignore note); the others were not recorded when the
+# venv was built. TODO when the venv is next rebuilt: run `pip freeze` and pin them all.
+torch==2.11.0
+transformers
+peft
+onnx
+onnxruntime
+onnxconverter-common
+numpy
+matplotlib

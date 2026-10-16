@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# HISTORICAL: predates the 2026-08-15 standing A/B instruction (build+run both arms with
+# fine-metrics, record deviations). Results are recorded in ai-docs/; to re-run, add
+# --features fine-metrics to the build first.
 # A/B: EfficientAT mn10 env encoder (960-dim, --features mn10_env) vs. CLAP-HTSAT
 # (512-dim, default) — gaps.md item 9.
 #
@@ -22,6 +25,7 @@
 #   bash scripts/ab_efficientat_mn10.sh
 #   SESSIONS=5 CYCLES=2 bash scripts/ab_efficientat_mn10.sh
 set -euo pipefail
+export SEED="${SEED:-42}"   # fixed burn RNG seed for both arms (standing reproducibility policy)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# HISTORICAL: predates the 2026-08-15 standing A/B instruction (build+run both arms with
+# fine-metrics, record deviations). Results are recorded in ai-docs/; to re-run, add
+# --features fine-metrics to the build first.
 # A/B validation: Qwen2.5-0.5B (control) vs Qwen3-0.6B (treatment) — Item 5, redo
 #
 # Replaces the 2026-06-28 run, which was invalid: LM_HIDDEN was a single global
@@ -65,6 +68,7 @@ for i in $(seq 1 "$SESSIONS"); do
         --action-distill-only \
         --lang-use-lm \
         --action-model-prefix qwen25 \
+        --seed "${SEED:-42}" \
         --memory-dir "$CONTROL_DIR" \
         --session "$i" \
         --max-sleep-cycles "$CYCLES" \
@@ -86,6 +90,7 @@ for i in $(seq 1 "$SESSIONS"); do
         --action-distill-only \
         --lang-use-lm \
         --action-model-prefix qwen3 \
+        --seed "${SEED:-42}" \
         --memory-dir "$TREATMENT_DIR" \
         --session "$i" \
         --max-sleep-cycles "$CYCLES" \
