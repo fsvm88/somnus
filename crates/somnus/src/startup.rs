@@ -98,6 +98,7 @@ pub(crate) fn build_perception(args: &Args) -> Result<(PerceptionProcessor, Opti
     perception.set_settle_beta(args.settle_beta);
     perception.set_settle_gate(args.settle_gate);
     perception.set_grown_init_scale(args.grown_unit_init_scale);
+    perception.set_boost_strength(args.kwta_boost_strength);
     perception.set_settle_every(args.settle_every);
     perception.set_wm_size(args.working_memory_size);
     perception.set_sae_l1_coeff(args.sae_l1_coeff);
@@ -256,6 +257,15 @@ pub(crate) fn restore_memory(
                         somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
                     } else {
                         info!(sizes = ?sizes, "perception weights restored");
+                        if args.persist_duty_cycles {
+                            match somnus_memory::load_duty_cycles(&args.memory_dir) {
+                                Some(duty) => {
+                                    let n = perception.set_duty_cycles(duty);
+                                    info!(regions_restored = n, "k-WTA duty cycles restored");
+                                }
+                                None => info!("no duty_cycles.bin — duty cycles start at zero"),
+                            }
+                        }
                     }
                 }
                 (ep, sem)

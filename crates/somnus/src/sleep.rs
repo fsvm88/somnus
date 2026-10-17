@@ -16,8 +16,8 @@ use std::{
 
 use anyhow::Result;
 use somnus_memory::{
-    save_growth_cooldown_remaining, save_region_sizes, save_snapshot, weights_path, EpisodicBuffer,
-    IngestSource, RecollectionLayer,
+    save_duty_cycles, save_growth_cooldown_remaining, save_region_sizes, save_snapshot,
+    weights_path, EpisodicBuffer, IngestSource, RecollectionLayer,
 };
 use somnus_perception::{PerceptionProcessor, RegionId, N_UNITS};
 
@@ -385,6 +385,10 @@ fn persist_snapshot(
     // Region sizes written so restore can pre-grow before loading weights.
     if let Err(e) = save_region_sizes(perception.region_sizes(), memory_dir) {
         tracing::warn!(?e, "region sizes write failed");
+        write_failed();
+    }
+    if let Err(e) = save_duty_cycles(&perception.duty_cycles(), memory_dir) {
+        tracing::warn!(?e, "duty cycles write failed");
         write_failed();
     }
     if let Err(e) = save_growth_cooldown_remaining(growth_cooldown_remaining, memory_dir) {

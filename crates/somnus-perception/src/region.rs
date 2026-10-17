@@ -121,6 +121,9 @@ pub struct KWtaLayer {
     /// Active-slot magnitude diagnostics, updated by `select_top_k` (ingest path only).
     #[module(skip)]
     pub slot_stats: SlotStats,
+    /// Duty-cycle boost magnitude (default `BOOST_STRENGTH` = 1.0; `--kwta-boost-strength`).
+    #[module(skip)]
+    pub boost_strength: f32,
 }
 
 impl KWtaLayer {
@@ -135,6 +138,7 @@ impl KWtaLayer {
             k_active: K_ACTIVE,
             duty_cycle: vec![0.0f32; N_UNITS],
             slot_stats: SlotStats::default(),
+            boost_strength: BOOST_STRENGTH,
         }
     }
 
@@ -228,7 +232,7 @@ impl KWtaLayer {
             .iter()
             .zip(&self.duty_cycle)
             .enumerate()
-            .map(|(i, (z, dc))| (i, z + BOOST_STRENGTH * (target_dc - dc)))
+            .map(|(i, (z, dc))| (i, z + self.boost_strength * (target_dc - dc)))
             .collect();
         let split = n - k;
         indexed.select_nth_unstable_by(split, |a, b| {
@@ -297,7 +301,7 @@ impl KWtaLayer {
                 .enumerate()
                 .map(|(idx, &z)| {
                     let dc = self.duty_cycle[idx % n];
-                    z + BOOST_STRENGTH * (target_dc - dc)
+                    z + self.boost_strength * (target_dc - dc)
                 })
                 .collect();
 
@@ -332,7 +336,7 @@ impl KWtaLayer {
             for (si, z_row) in z_vals.chunks(n).enumerate() {
                 let mut boosted: Vec<f32> = z_row.to_vec();
                 for (i, dc) in self.duty_cycle.iter().enumerate() {
-                    boosted[i] += BOOST_STRENGTH * (target_dc - dc);
+                    boosted[i] += self.boost_strength * (target_dc - dc);
                 }
                 let mut indexed: Vec<(usize, f32)> = boosted.iter().copied().enumerate().collect();
                 let split = n - k;
@@ -544,6 +548,27 @@ pub mod hierarchical_validation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn boost_strength_changes_selection_and_default_is_unchanged() {
+        let device = Device::flex();
+        let layer = make_layer(RegionId::Visual, 384);
+        assert_eq!(layer.boost_strength, BOOST_STRENGTH);
+        // Unit 0 gets the largest z but has a saturated duty cycle; a strong boost must dislodge it.
+        let mut z = vec![0.0f32; layer.n_units];
+        z[0] = 2.0;
+        let mut hot = layer;
+        hot.duty_cycle[0] = 1.0;
+        let weak = hot.select_top_k_no_dc(z.clone());
+        assert!(
+            weak.indices.contains(&0),
+            "default boost (-0.98 at dc=1) cannot dislodge a z=2.0 unit"
+        );
+        hot.boost_strength = 10.0;
+        let strong = hot.select_top_k_no_dc(z);
+        assert!(!strong.indices.contains(&0), "boost 10 must dislodge it");
+        let _ = device;
+    }
+
     use super::*;
     use burn::tensor::Device;
 

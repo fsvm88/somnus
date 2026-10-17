@@ -36,6 +36,18 @@ pub(crate) struct Args {
     #[arg(long, default_value = "0.01")]
     pub(crate) grown_unit_init_scale: f32,
 
+    /// k-WTA duty-cycle boost magnitude (`z + boost * (target_dc - dc)`). Default 1.0 is the
+    /// historical value; the boost is at most ~0.02 at start and cannot dislodge units whose
+    /// `z` is far larger (gaps.md §50). Experiment knob; do not change the default without an A/B.
+    #[arg(long, default_value = "1.0")]
+    pub(crate) kwta_boost_strength: f32,
+
+    /// Restore the k-WTA duty cycles from the snapshot (`snapshot/duty_cycles.bin`, always
+    /// written) instead of starting every process at zero. Off = historical behaviour, where
+    /// every restart re-enters a boost-driven regime for the first ~1000 ingests (gaps.md §50).
+    #[arg(long, default_value = "false")]
+    pub(crate) persist_duty_cycles: bool,
+
     /// Size of the global rayon pool that burn-flex's CPU kernels run on. 0 = auto: half the
     /// logical cores. The encoder/ASR ONNX sessions share the machine with it; with every library
     /// at "all cores" the wake loop ran 2x slower (ADR 0049 pilot, gaps.md Q14/R5).

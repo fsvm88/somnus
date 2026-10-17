@@ -221,6 +221,45 @@ pub fn load_region_sizes(memory_dir: &Path) -> Option<[usize; 5]> {
     Some(sizes)
 }
 
+/// Path of the persisted per-region k-WTA duty cycles.
+fn duty_cycles_path(memory_dir: &Path) -> PathBuf {
+    memory_dir.join("snapshot").join("duty_cycles.bin")
+}
+
+/// Save the five regions' k-WTA duty-cycle vectors: per region a u64 LE length then that many f32 LE.
+pub fn save_duty_cycles(duty: &[Vec<f32>; 5], memory_dir: &Path) -> MemoryResult<()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(duty.iter().map(|d| 8 + 4 * d.len()).sum());
+    for d in duty {
+        buf.extend_from_slice(&(d.len() as u64).to_le_bytes());
+        for v in d {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    write_atomic(&duty_cycles_path(memory_dir), buf)?;
+    Ok(())
+}
+
+/// Load persisted duty cycles. `None` if the file is absent or malformed (never an error: a
+/// missing file just means "start from zero", the historical behaviour).
+pub fn load_duty_cycles(memory_dir: &Path) -> Option<[Vec<f32>; 5]> {
+    let data = fs::read(duty_cycles_path(memory_dir)).ok()?;
+    let mut pos = 0usize;
+    let mut out: [Vec<f32>; 5] = Default::default();
+    for slot in out.iter_mut() {
+        let len = u64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?) as usize;
+        pos += 8;
+        let bytes = data.get(pos..pos.checked_add(len.checked_mul(4)?)?)?;
+        *slot = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        pos += len * 4;
+    }
+    (pos == data.len()).then_some(out)
+}
+
 /// Save the number of cycles remaining in the growth cooldown (single u64 LE).
 pub fn save_growth_cooldown_remaining(remaining: usize, memory_dir: &Path) -> MemoryResult<()> {
     let path = memory_dir.join("snapshot").join("growth_cooldown.bin");
@@ -479,6 +518,26 @@ fn read_f32_vec(r: &mut impl Read, n: usize) -> MemoryResult<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duty_cycles_round_trip_and_reject_malformed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("snapshot")).unwrap();
+        assert!(
+            load_duty_cycles(dir.path()).is_none(),
+            "absent file -> None"
+        );
+        let duty: [Vec<f32>; 5] =
+            std::array::from_fn(|i| (0..(3 + i)).map(|j| 0.001 * (i * 10 + j) as f32).collect());
+        save_duty_cycles(&duty, dir.path()).unwrap();
+        assert_eq!(load_duty_cycles(dir.path()).unwrap(), duty);
+        // Truncated file -> None, never a panic or partial result.
+        let p = dir.path().join("snapshot").join("duty_cycles.bin");
+        let mut b = std::fs::read(&p).unwrap();
+        b.truncate(b.len() - 2);
+        std::fs::write(&p, &b).unwrap();
+        assert!(load_duty_cycles(dir.path()).is_none());
+    }
+
     use super::*;
     use tempfile::TempDir;
 

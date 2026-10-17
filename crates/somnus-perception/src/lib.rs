@@ -2546,6 +2546,29 @@ impl PerceptionProcessor {
         self.settle_gate = gate;
     }
 
+    /// Set the k-WTA duty-cycle boost magnitude on all five layers (default 1.0).
+    pub fn set_boost_strength(&mut self, strength: f32) {
+        let m = self.model_mut();
+        for idx in 0..5 {
+            m.layer_mut(idx).boost_strength = strength;
+        }
+    }
+
+    /// Restore persisted duty cycles. Applied per region only when the length matches that
+    /// layer's current `n_units`; returns how many regions were restored.
+    pub fn set_duty_cycles(&mut self, duty: [Vec<f32>; 5]) -> usize {
+        let m = self.model_mut();
+        let mut n = 0;
+        for (idx, d) in duty.into_iter().enumerate() {
+            let layer = m.layer_mut(idx);
+            if d.len() == layer.n_units {
+                layer.duty_cycle = d;
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Encoder-column L2 norm for units added by `grow_region_seeded` (default 0.01).
     pub fn set_grown_init_scale(&mut self, scale: f32) {
         self.grown_init_scale = scale;
