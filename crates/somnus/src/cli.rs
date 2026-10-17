@@ -494,6 +494,12 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) force_cpu_inference: bool,
 
+    /// Run the video encoder (DINOv3/v2) on the plain CPU execution provider instead of
+    /// MIGraphX. Isolated measurement: 23 ms vs 54 ms per frame (gaps.md §49 R5). Default off
+    /// until an A/B on the live pipeline confirms it.
+    #[arg(long, default_value = "false")]
+    pub(crate) video_encoder_cpu: bool,
+
     /// Region size (units) at or above which ORT/MIGraphX perception inference is
     /// automatically enabled (ADR 0037; empirical CPU/GPU crossover from ADR 0023's
     /// scaling analysis, research/gpu-unification-design.md §2). Once any region

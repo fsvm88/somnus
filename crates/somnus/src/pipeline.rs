@@ -390,11 +390,12 @@ pub(crate) fn spawn_video_encoder(
         let models_dir = args.models_dir.clone();
         let mut video_rx = video_rx;
         let pending = Arc::clone(pending_embs);
+        let video_encoder_cpu = args.video_encoder_cpu;
         let video_stride = args.video_stride.max(1);
         let video_change_threshold = args.video_change_threshold;
         let video_change_max_skip = args.video_change_max_skip.max(1);
         tokio::task::spawn_blocking(move || {
-            let mut enc = match VideoEncoder::new(&models_dir) {
+            let mut enc = match VideoEncoder::with_provider(&models_dir, video_encoder_cpu) {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!(?e, "video encoder init failed");

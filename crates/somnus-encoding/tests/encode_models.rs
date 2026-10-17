@@ -125,3 +125,55 @@ fn video_encode_contract_and_determinism() {
     let emb2 = enc.encode(&frame).expect("video encode rerun");
     assert_eq!(emb.values, emb2.values, "video embedding not deterministic");
 }
+
+/// CPU-EP vs MIGraphX-EP video encoder: embeddings must agree (cosine) and timings are printed.
+/// `cargo test -p somnus-encoding --release --test encode_models video_cpu_vs_gpu -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn video_cpu_vs_gpu_equivalence_and_timing() {
+    let dir = models_dir();
+    if !dir.join("dinov3_small.onnx").exists() && !dir.join("dinov2_small.onnx").exists() {
+        eprintln!("skipping: no video model");
+        return;
+    }
+    let mut gpu = VideoEncoder::with_provider(&dir, false).expect("gpu enc");
+    let mut cpu = VideoEncoder::with_provider(&dir, true).expect("cpu enc");
+    let (w, h) = (320usize, 240usize);
+    let frames: Vec<VideoFrame> = (0..16)
+        .map(|s| VideoFrame {
+            data: (0..w * h * 3)
+                .map(|i| ((i * 7 + s * 31) % 251) as u8)
+                .collect(),
+            width: w as u32,
+            height: h as u32,
+            format: PixelFormat::Rgb8,
+            timestamp: Timestamp::now(),
+        })
+        .collect();
+    let time = |enc: &mut VideoEncoder| {
+        let _ = enc.encode(&frames[0]).unwrap(); // warm-up (MIGraphX compiles here)
+        let t = std::time::Instant::now();
+        let out: Vec<_> = frames
+            .iter()
+            .map(|f| enc.encode(f).unwrap().values)
+            .collect();
+        (out, t.elapsed().as_secs_f64() * 1e3 / frames.len() as f64)
+    };
+    let (g, g_ms) = time(&mut gpu);
+    let (c, c_ms) = time(&mut cpu);
+    let cos = |a: &[f32], b: &[f32]| {
+        let d: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        d / (a.iter().map(|x| x * x).sum::<f32>().sqrt()
+            * b.iter().map(|x| x * x).sum::<f32>().sqrt())
+    };
+    let min_cos = g
+        .iter()
+        .zip(&c)
+        .map(|(a, b)| cos(a, b))
+        .fold(1.0f32, f32::min);
+    println!("VIDEO_EP gpu {g_ms:.1} ms/frame, cpu {c_ms:.1} ms/frame, min cosine {min_cos:.6}");
+    assert!(
+        min_cos > 0.999,
+        "CPU and GPU embeddings diverge: min cosine {min_cos}"
+    );
+}

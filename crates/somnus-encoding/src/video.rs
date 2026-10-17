@@ -5,8 +5,8 @@ use ndarray::Array4;
 use ort::{session::Session, value::TensorRef};
 
 use crate::{
-    audio::mean_pool_2d, preprocess::image::frame_to_tensor, session_with_migraphx, EncodingError,
-    EncodingResult,
+    audio::mean_pool_2d, preprocess::image::frame_to_tensor, session_cpu, session_with_migraphx,
+    EncodingError, EncodingResult,
 };
 
 pub struct VideoEmbedding {
@@ -27,6 +27,13 @@ pub struct VideoEncoder {
 
 impl VideoEncoder {
     pub fn new(models_dir: &Path) -> EncodingResult<Self> {
+        Self::with_provider(models_dir, false)
+    }
+
+    /// `cpu`: run on the plain CPU execution provider instead of MIGraphX (gaps.md §49 R5:
+    /// isolated measurement 23 ms vs 54 ms per frame; the MIGraphX path competes with the
+    /// other GPU sessions).
+    pub fn with_provider(models_dir: &Path, cpu: bool) -> EncodingResult<Self> {
         // Prefer DINOv3 if available (drop-in replacement with same 384-dim output), else fall back to DINOv2.
         let dinov3_path = models_dir.join("dinov3_small.onnx");
         let (model_path, prefix_tokens, total_tokens) = if dinov3_path.exists() {
@@ -34,7 +41,11 @@ impl VideoEncoder {
         } else {
             (models_dir.join("dinov2_small.onnx"), 1, 257) // CLS + 256 patches (16x16 @ patch14)
         };
-        let session = session_with_migraphx(&model_path)?;
+        let session = if cpu {
+            session_cpu(&model_path)?
+        } else {
+            session_with_migraphx(&model_path)?
+        };
         Ok(Self {
             session,
             prefix_tokens,

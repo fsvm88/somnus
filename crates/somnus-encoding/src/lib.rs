@@ -20,6 +20,21 @@ pub fn set_ort_intra_threads(n: usize) {
     ORT_INTRA_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Plain CPU-EP session with the same thread settings as `session_with_migraphx`.
+pub(crate) fn session_cpu(path: &std::path::Path) -> EncodingResult<ort::session::Session> {
+    let mut builder = ort::session::Session::builder()?;
+    let intra = ORT_INTRA_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+    if intra > 0 {
+        builder = builder
+            .with_intra_threads(intra)
+            .map_err(|e| EncodingError::Ort(e.into()))?;
+        builder = builder
+            .with_inter_threads(1)
+            .map_err(|e| EncodingError::Ort(e.into()))?;
+    }
+    Ok(builder.commit_from_file(path)?)
+}
+
 /// Register MIGraphX EP on a session builder using the generic key-value ORT API.
 ///
 /// The struct-based `SessionOptionsAppendExecutionProvider_MIGraphX` triggers MIGraphX's
