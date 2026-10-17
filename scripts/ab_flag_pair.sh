@@ -7,6 +7,7 @@
 # "kwta duty-cycle report" log lines for slot share / activation size, plus the usual MSE metrics.
 # Usage: PILOT_ROOT=memory/ab_x TREATMENT_ARGS='--persist-duty-cycles' SESSIONS=2 CYCLES=10 bash scripts/ab_flag_pair.sh
 #        (SKIP_BUILD / SKIP_COPY / ANALYZE_ONLY supported; arms run in parallel, ~36 GiB RSS)
+#        PATCH_TREATMENT_CMD: shell command run once on the copied treatment state ($ARM_DIR), e.g. a snapshot transform
 set -euo pipefail
 export SEED="${SEED:-42}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,6 +29,12 @@ if [ "$ANALYZE_ONLY" != "1" ]; then
             rm -rf "$PILOT_ROOT/$arm"; mkdir -p "$PILOT_ROOT/$arm"
             for d in snapshot warm episodes.cold onnx_models; do cp -a --reflink=auto "$SRC_MEMORY/$d" "$PILOT_ROOT/$arm/$d"; done
         done
+    fi
+    if [ -n "${PATCH_TREATMENT_CMD:-}" ] && [ "$SKIP_COPY" != "1" ]; then
+        # e.g. PATCH_TREATMENT_CMD='python3 scripts/rescale_grown_units.py "$ARM_DIR/snapshot/weights.safetensors" 0.5'
+        ARM_DIR="$PILOT_ROOT/treatment"; export ARM_DIR
+        echo "patching treatment state: $PATCH_TREATMENT_CMD"
+        eval "$PATCH_TREATMENT_CMD"
     fi
     for arm in control treatment; do
         extra="$CONTROL_ARGS"; [ "$arm" = "treatment" ] && extra="$TREATMENT_ARGS"
