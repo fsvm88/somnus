@@ -479,6 +479,13 @@ pub(crate) struct Args {
     #[arg(long, default_value = "1")]
     pub(crate) binding_wake_lag_cycles: usize,
 
+    /// Fraction of the `binding` -> `wake_binding` gap closed at each sync (`--binding-wake-lag-cycles`
+    /// cadence). 1.0 = hard copy (historical, ADR 0048). Below 1.0 the wake binder trails the live
+    /// one exponentially, so each promotion is a smaller generation jump (ADR 0048 pilots: a
+    /// 30-cycle hard promotion collapses the settle gate, frequent small ones do not).
+    #[arg(long, default_value = "1.0")]
+    pub(crate) binding_wake_interp: f32,
+
     /// Enable ORT Chrome-trace profiling for CPU sessions (Qwen LM).
     /// Writes `<dir>/qwen3_lm_<timestamp>.json` — open in https://ui.perfetto.dev
     /// or chrome://tracing. Profiling data is flushed before process exit.

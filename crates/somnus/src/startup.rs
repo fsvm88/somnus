@@ -99,6 +99,7 @@ pub(crate) fn build_perception(args: &Args) -> Result<(PerceptionProcessor, Opti
     perception.set_settle_gate(args.settle_gate);
     perception.set_grown_init_scale(args.grown_unit_init_scale);
     perception.set_boost_strength(args.kwta_boost_strength);
+    perception.set_wake_binding_interp(args.binding_wake_interp);
     perception.set_settle_every(args.settle_every);
     perception.set_wm_size(args.working_memory_size);
     perception.set_sae_l1_coeff(args.sae_l1_coeff);

@@ -599,6 +599,51 @@ mod tests {
         );
     }
 
+    /// `set_wake_binding_interp(<1)` makes `sync_wake_binding` close only part of the gap: one sync
+    /// leaves wake strictly between its old value and binding's, repeated syncs converge to
+    /// binding, and interp 1.0 stays the exact hard copy (ADR 0048 follow-up).
+    #[test]
+    fn wake_binding_interp_moves_part_way_then_converges() {
+        let mut proc = make_proc();
+        proc.refresh_autodiff_state();
+        let regional = regional_inputs();
+        let wake0 = proc.wake_binding_proj_row_norms(RegionId::AudioSpeech);
+        for _ in 0..10 {
+            proc.binding_replay_step_batch(&[&regional], 1.0, false)
+                .unwrap();
+        }
+        let live = proc.binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_ne!(wake0, live);
+
+        proc.set_wake_binding_interp(0.5);
+        proc.sync_wake_binding();
+        let wake1 = proc.wake_binding_proj_row_norms(RegionId::AudioSpeech);
+        assert_ne!(wake1, wake0, "interp sync must move wake_binding");
+        assert_ne!(wake1, live, "interp 0.5 must not jump all the way");
+        let dist =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum() };
+        assert!(
+            dist(&wake1, &live) < dist(&wake0, &live),
+            "one interp sync must move wake closer to binding"
+        );
+
+        for _ in 0..40 {
+            proc.sync_wake_binding();
+        }
+        let wake_n = proc.wake_binding_proj_row_norms(RegionId::AudioSpeech);
+        assert!(
+            dist(&wake_n, &live) < 1e-3 * dist(&wake0, &live).max(1e-9),
+            "repeated interp syncs must converge to binding"
+        );
+
+        proc.set_wake_binding_interp(1.0);
+        proc.sync_wake_binding();
+        assert_eq!(
+            proc.wake_binding_proj_row_norms(RegionId::AudioSpeech),
+            live
+        );
+    }
+
     /// `grow_region`/`grow_region_seeded`/`prune_region` must reshape `binding` and
     /// `wake_binding` in lockstep, unconditionally — shape never lags, only trained
     /// values do (ADR 0048). A shape mismatch here would panic the next

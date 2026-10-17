@@ -370,6 +370,10 @@ pub struct PerceptionProcessor {
     /// L2 norm of the encoder columns given to new units by `grow_region_seeded` (default 0.01,
     /// the historical value; gaps.md §50 experiment `--grown-unit-init-scale`).
     grown_init_scale: f32,
+    /// Fraction of the gap `sync_wake_binding` closes per call: 1.0 = hard copy (historical),
+    /// <1.0 = exponential interpolation of `wake_binding` toward `binding` (ADR 0048 follow-up,
+    /// `--binding-wake-interp`): a smaller generation jump per promotion.
+    wake_binding_interp: f32,
     settle_every: usize,
     settle_episode_count: usize,
     region_gain: [f32; 5],
@@ -468,6 +472,7 @@ impl PerceptionProcessor {
             settle_beta: 0.5,
             settle_gate: SETTLE_COSINE_GATE_DEFAULT,
             grown_init_scale: 0.01,
+            wake_binding_interp: 1.0,
             settle_every: 1,
             settle_episode_count: 0,
             region_gain: [1.0; 5],
@@ -1092,6 +1097,7 @@ impl PerceptionProcessor {
     /// Called by the sleep-cycle driver loop on a `--binding-wake-lag-cycles` cadence,
     /// not every cycle — that's the whole point of this ADR.
     pub fn sync_wake_binding(&mut self) {
+        let interp = self.wake_binding_interp;
         somnus_metrics::timed_core!(somnus_metrics::Metric::BindingWakeSync, {
             let model = self.model_mut();
 
@@ -1130,8 +1136,18 @@ impl PerceptionProcessor {
 
             macro_rules! copy_linear {
                 ($field:ident) => {
-                    model.wake_binding.$field.weight =
-                        Param::initialized(ParamId::new(), model.binding.$field.weight.val());
+                    if interp >= 1.0 {
+                        model.wake_binding.$field.weight =
+                            Param::initialized(ParamId::new(), model.binding.$field.weight.val());
+                    } else {
+                        // wake += interp * (live - wake), on detached inner tensors (the wake copy
+                        // is never trained, so it must not carry a graph link to `binding`).
+                        let wake = model.wake_binding.$field.weight.val().inner();
+                        let live = model.binding.$field.weight.val().inner();
+                        let mixed = wake * (1.0 - interp) + live * interp;
+                        model.wake_binding.$field.weight =
+                            Param::initialized(ParamId::new(), Tensor::from_inner(mixed));
+                    }
                 };
             }
             copy_linear!(region_0);
@@ -2544,6 +2560,11 @@ impl PerceptionProcessor {
 
     pub fn set_settle_gate(&mut self, gate: f32) {
         self.settle_gate = gate;
+    }
+
+    /// Fraction of the `binding` -> `wake_binding` gap closed per `sync_wake_binding` (1.0 = hard copy).
+    pub fn set_wake_binding_interp(&mut self, interp: f32) {
+        self.wake_binding_interp = interp.clamp(0.0, 1.0);
     }
 
     /// Set the k-WTA duty-cycle boost magnitude on all five layers (default 1.0).
