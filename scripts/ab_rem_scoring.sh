@@ -114,7 +114,7 @@ print("-" * 72)
 for k in ["mean_output_mse", "mean_output_mse_wake", "mean_real_inference_mse",
           "mean_synthetic_output_mse", "mean_loss", "mean_proj_loss", "gist_recall_rate",
           "within_session_gist_rate", "warm_recall_l2", "nrem_wall_ms", "rem_wall_ms",
-          "sal_threshold", "settle_iters_sum", "prior_cosine_mean"]:
+          "sal_threshold", "settle_iters_sum"]:
     c, t = mean(ctrl, k), mean(trt, k)
     if c is None or t is None:
         continue
@@ -134,7 +134,7 @@ for arm, rows in (("control", ctrl), ("treatment", trt)):
     grew = sum(1 for r in rows if r.get("grew"))
     nan = sum((r.get("fine_metrics") or {}).get("training_nan_detected", {}).get("count", 0) for r in rows)
     sizes = struct.unpack("<5Q", open(f"{root}/{arm}/snapshot/region_sizes.bin", "rb").read())
-    print(f"{arm}: cycles={len(rows)} grew_events={grew} regions_grown={sum(r.get('regions_grown',0) or 0 for r in rows)} "
+    print(f"{arm}: cycles={len(rows)} grew_events={grew} regions_grown={[r.get('regions_grown') for r in rows if r.get('regions_grown')]} "
           f"training_nan={nan} final_region_sizes={list(sizes)}")
 
 print("\n-- per-cycle growth flag / mean_output_mse (divergence is the R1 signal) --")
@@ -143,7 +143,7 @@ for a, b in zip(ctrl, trt):
           f"mse {a.get('mean_output_mse',0):.5f}/{b.get('mean_output_mse',0):.5f}")
 
 def flat(r):
-    o = {k: v for k, v in r.items() if isinstance(v, (int, float)) and k not in ("session", "cycle", "ts")}
+    o = {k: v for k, v in r.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in ("session", "cycle", "ts")}
     for k, v in (r.get("fine_metrics") or {}).items():
         if isinstance(v, dict) and "count" in v:
             o[f"fm.{k}.count"] = v["count"]
