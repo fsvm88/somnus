@@ -234,4 +234,103 @@ mod tests {
         let b = dec.decode_greedy(&hidden, 16).expect("decode run 2");
         assert_eq!(a, b, "ASR decode not deterministic on real encoder output");
     }
+
+    /// Stress battery for gaps.md §40 (intermittent ORT panic "GetElementType is not implemented"):
+    /// hostile / extreme encoder hidden states through the real decoder, each under `catch_unwind`.
+    /// Reports every panic with its message, then checks the poisoning question: does a known-good
+    /// input still decode to its pre-battery output afterwards?
+    /// `cargo test -p somnus --release whisper_asr::tests::stress -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stress_decode_battery_for_ort_panic() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let Some(mut dec) = decoder() else { return };
+        let n = WHISPER_ENC_SEQ * WHISPER_ENC_DIM;
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move || {
+            // xorshift64* -> roughly gaussian via sum of 4 uniforms
+            let mut g = 0.0f32;
+            for _ in 0..4 {
+                seed ^= seed >> 12;
+                seed ^= seed << 25;
+                seed ^= seed >> 27;
+                let u = (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32 / (1u64 << 24) as f32;
+                g += u - 0.5;
+            }
+            g * 1.7
+        };
+        let good: Vec<f32> = (0..n).map(|_| rnd() * 0.5).collect();
+        let baseline = dec.decode_greedy(&good, 16).expect("baseline decode");
+        println!("STRESS baseline text: {baseline:?}");
+
+        let mut cases: Vec<(String, Vec<f32>)> = vec![];
+        for scale in [1e-6f32, 1e-3, 1.0, 10.0, 1e3, 1e6, 1e12] {
+            cases.push((
+                format!("gauss x{scale:e}"),
+                (0..n).map(|_| rnd() * scale).collect(),
+            ));
+        }
+        cases.push(("all NaN".into(), vec![f32::NAN; n]));
+        cases.push(("all +Inf".into(), vec![f32::INFINITY; n]));
+        cases.push(("all -Inf".into(), vec![f32::NEG_INFINITY; n]));
+        cases.push(("one NaN".into(), {
+            let mut v = good.clone();
+            v[12345] = f32::NAN;
+            v
+        }));
+        cases.push(("one Inf".into(), {
+            let mut v = good.clone();
+            v[n / 2] = f32::INFINITY;
+            v
+        }));
+        cases.push(("denormals".into(), vec![1e-40f32; n]));
+        cases.push((
+            "alt +/-1e30".into(),
+            (0..n)
+                .map(|i| if i % 2 == 0 { 1e30 } else { -1e30 })
+                .collect(),
+        ));
+        cases.push(("constant 1".into(), vec![1.0; n]));
+        cases.push((
+            "sparse spikes".into(),
+            (0..n)
+                .map(|i| if i % 997 == 0 { 50.0 } else { 0.0 })
+                .collect(),
+        ));
+        for k in 0..40 {
+            cases.push((format!("gauss run {k}"), (0..n).map(|_| rnd()).collect()));
+        }
+        let (mut panics, mut errs, mut oks) = (0, 0, 0);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        for (name, hidden) in &cases {
+            for max_tokens in [1usize, 8, 64, 200] {
+                match catch_unwind(AssertUnwindSafe(|| dec.decode_greedy(hidden, max_tokens))) {
+                    Ok(Ok(_)) => oks += 1,
+                    Ok(Err(e)) => {
+                        errs += 1;
+                        println!("STRESS err   [{name}, max_tokens={max_tokens}]: {e}");
+                    }
+                    Err(p) => {
+                        panics += 1;
+                        let msg = p
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        println!("STRESS PANIC [{name}, max_tokens={max_tokens}]: {msg}");
+                    }
+                }
+            }
+        }
+        std::panic::set_hook(prev_hook);
+        let after = catch_unwind(AssertUnwindSafe(|| dec.decode_greedy(&good, 16)));
+        println!("STRESS summary: ok={oks} err={errs} panic={panics}; post-battery decode of known-good input: {:?} (baseline {baseline:?})", after.as_ref().map(|r| r.as_ref().ok()));
+        if let Ok(Ok(t)) = after {
+            assert_eq!(
+                t, baseline,
+                "decoder state poisoned: known-good output changed after the battery"
+            );
+        }
+    }
 }

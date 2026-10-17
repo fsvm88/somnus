@@ -90,6 +90,16 @@ impl SparseActivation {
     }
 }
 
+/// Cumulative (since process start) magnitude statistics of the active slots chosen on the ingest
+/// path, split between the original `N_UNITS` and grown units (gaps.md §50 diagnostics).
+#[derive(Debug, Clone, Default)]
+pub struct SlotStats {
+    pub base_abs_sum: f64,
+    pub base_n: u64,
+    pub grown_abs_sum: f64,
+    pub grown_n: u64,
+}
+
 /// k-WTA linear layer with per-unit duty-cycle boosting.
 ///
 /// Generic over backend B. The training-path methods (forward_tracked,
@@ -108,6 +118,9 @@ pub struct KWtaLayer {
     pub k_active: usize,
     #[module(skip)]
     pub duty_cycle: Vec<f32>,
+    /// Active-slot magnitude diagnostics, updated by `select_top_k` (ingest path only).
+    #[module(skip)]
+    pub slot_stats: SlotStats,
 }
 
 impl KWtaLayer {
@@ -121,6 +134,7 @@ impl KWtaLayer {
             n_units: N_UNITS,
             k_active: K_ACTIVE,
             duty_cycle: vec![0.0f32; N_UNITS],
+            slot_stats: SlotStats::default(),
         }
     }
 
@@ -189,8 +203,16 @@ impl KWtaLayer {
             for dc in self.duty_cycle.iter_mut() {
                 *dc *= 1.0 - DUTY_CYCLE_ALPHA;
             }
-            for &i in &act.indices {
+            for (&i, &v) in act.indices.iter().zip(&act.values) {
                 self.duty_cycle[i as usize] += DUTY_CYCLE_ALPHA;
+                let st = &mut self.slot_stats;
+                if (i as usize) < N_UNITS {
+                    st.base_abs_sum += v.abs() as f64;
+                    st.base_n += 1;
+                } else {
+                    st.grown_abs_sum += v.abs() as f64;
+                    st.grown_n += 1;
+                }
             }
             act
         })

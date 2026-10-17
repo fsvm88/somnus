@@ -110,7 +110,7 @@ With training data in hand, `peft`/`transformers` are already installed in `.ven
 
 **Instrumented 2026-08-15** (crates/somnus-metrics, crates/somnus/src/lib.rs): `AsrError` (returned `Err`) and the new `AsrPanic` (actual panic) counters are now split — they were previously conflated under one `AsrError` counter, which made root-cause triage from the metrics file alone impossible. Two new Core counters, `AsrPostPanicSuccess`/`AsrPostPanicFailure`, fire on every ASR decode *after* the first `AsrPanic` in a process session — directly answers the open poisoning question (does the `Session` recover fully, or silently degrade) the next time a panic actually fires, without needing to force a reproduction. Note "poisoning" here is not Rust `Mutex` poisoning (no `Mutex` is involved — the `Session` is exclusively owned by the single ASR thread); it means ORT-internal (FFI-side) state possibly left inconsistent after an unwind through `Session::run`. Also added: the panicking input (`encoder_hidden`, the raw Whisper encoder output) is now dumped to `<memory_dir>/asr_panic_captures/panic_input_<ts>.bin` on every panic, so the next occurrence leaves a reproducible input instead of vanishing with the dropped cycle.
 
-**2026-10-17 check:** zero `asr_panic`/`asr_error` in every `ab_*` pilot's metrics (1971 `asr_decode` calls summed over every `ab_*` pilot, incl. the 8 x 40-cycle wake-lag arms), so no recurrence to observe; consistent with the panic being input-correlated (clip-specific), not a restore/threading effect. **Still open:** the poisoning question itself and the root cause — both need a natural panic recurrence to observe (can't be forced on demand). No decision on priority beyond the instrumentation landing.
+**2026-10-17 check:** zero `asr_panic`/`asr_error` in every `ab_*` pilot's metrics (1971 `asr_decode` calls summed over every `ab_*` pilot, incl. the 8 x 40-cycle wake-lag arms), so no recurrence to observe; consistent with the panic being input-correlated (clip-specific), not a restore/threading effect. **Reproduction attempt 2026-10-17 (negative):** `whisper_asr::tests::stress_decode_battery_for_ort_panic` (ignored test) ran 56 hostile encoder-hidden inputs x 4 `max_tokens` values (gaussian at scales 1e-6..1e12, all-NaN, all-+/-Inf, single NaN/Inf, denormals, alternating +/-1e30, constants, sparse spikes, 40 random) through the real decoder under `catch_unwind`: 224 decodes, **0 panics, 0 errors**, and a known-good input decoded identically after the battery (no poisoning visible). So the panic is not triggered by extreme or non-finite hidden values on this build; the remaining suspects are concurrency/ownership (ASR thread vs other ORT sessions), a different ORT/ort-crate version at the time (July), or a specific real-audio-derived tensor. Not resolvable without a natural recurrence. **Still open:** the poisoning question after a *real* panic and the root cause — both need a natural panic recurrence to observe (can't be forced on demand). No decision on priority beyond the instrumentation landing.
 
 ---
 
@@ -274,12 +274,22 @@ top; or (b) keep and document as intended (R4 then batches while preserving the 
 3. **Grown units barely learn:** `scripts/unit_utilization.py` on final snapshots: grown column norms p50 0.0095-0.0101 (init 0.01), p99 0.017-0.06,
    <0.2% above 0.1, same in the older `/data/somnus/memory/snapshot`; base medians identical across arms to 3 digits.
 
-**Interpretation (inference, not directly measured):** with a fixed k (~193 at 10k units) and only a few hundred original units carrying positive
-evidence for a given input, the remaining slots are filled by units whose `z` is about zero (grown units, boosted from dc = 0), i.e. a large part of
-every sparse code is near-zero-valued filler. If so, region growth buys compute (scoring matmul ~10x wider) without proportional information. The
-direct check (not done): log the mean |value| of active slots split base vs grown, per region.
+**Direct check (done 2026-10-17, `SlotStats` in `KWtaLayer`, logged by the same report; 6-cycle restored run `memory/diag_duty2/`, cumulative since
+process start, so recent slots are if anything more skewed):** share of active slots held by grown units and mean |z| of active slots, base vs grown:
 
-**Open / needs a design decision (user):** (a) whether near-zero-filler slots matter for reconstruction/MSE (the direct check above, then an A/B with
+| region | cycle 1 grown share | cycle 6 grown share | cycle 6 mean abs z base | cycle 6 mean abs z grown | ratio |
+|---|---|---|---|---|---|
+| speech | 0.16 | 0.50 | 0.274 | 0.027 | 10x |
+| env | 0.21 | 0.61 | 0.150 | 0.0068 | 22x |
+| visual | 0.30 | 0.73 | 0.167 | 0.0061 | 27x |
+| symbolic | 0.03 | 0.17 | 0.188 | 0.019 | 10x |
+| language | 0.00 | 0.75 | 0.024 | 0.0001 | 240x |
+
+**Conclusion (now measured, for activation magnitude; its effect on reconstruction/MSE is still not measured):** by cycle 6 grown units hold 17-75% of the
+active slots but with activations 10-240x smaller than the original units', i.e. a large part of each sparse code is near-zero filler, most extremely in
+the language region. Region growth buys compute (scoring matmul ~10x wider) without proportional signal.
+
+**Open / needs a design decision (user):** (a) whether near-zero-filler slots matter for reconstruction/MSE (A/B with
 a norm-matched init for grown units and/or a boost scaled to the z distribution); (b) dominant-unit mitigation (stronger/normalised boost, or
 column-norm control); (c) persisting `duty_cycle` in the snapshot (restart reset makes every cycle-1 boost-driven; changes numerics, needs an A/B);
 (d) ADR 0025's named trigger ("dead units accumulate at scale and duty-cycle fails to prevent it -> revisit ReLU+L1") is arguably met by (1).

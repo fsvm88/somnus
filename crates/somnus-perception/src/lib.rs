@@ -420,6 +420,11 @@ pub struct RegionDutyReport {
     pub grown_units_ever_fired: usize,
     pub base_units_silent: usize,
     pub top5: Vec<(usize, f32)>,
+    /// Mean |z| of active slots held by original / grown units (cumulative since process start;
+    /// NaN when that group never held a slot), and the share of active slots held by grown units.
+    pub mean_abs_active_base: f64,
+    pub mean_abs_active_grown: f64,
+    pub grown_slot_share: f64,
 }
 
 impl PerceptionProcessor {
@@ -2910,6 +2915,12 @@ impl PerceptionProcessor {
                     grown_units_ever_fired: dc[base_end..].iter().filter(|&&d| d > 1e-4).count(),
                     base_units_silent: dc[..base_end].iter().filter(|&&d| d <= 1e-4).count(),
                     top5: top,
+                    mean_abs_active_base: layer.slot_stats.base_abs_sum
+                        / layer.slot_stats.base_n as f64,
+                    mean_abs_active_grown: layer.slot_stats.grown_abs_sum
+                        / layer.slot_stats.grown_n as f64,
+                    grown_slot_share: layer.slot_stats.grown_n as f64
+                        / (layer.slot_stats.base_n + layer.slot_stats.grown_n).max(1) as f64,
                 }
             })
             .collect()

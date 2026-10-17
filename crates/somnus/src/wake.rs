@@ -701,6 +701,9 @@ pub(crate) fn sleep_cycle(
                     base_units_over_half = r.base_units_over_half,
                     base_units_silent = r.base_units_silent,
                     grown_units_ever_fired = r.grown_units_ever_fired,
+                    mean_abs_active_base = r.mean_abs_active_base,
+                    mean_abs_active_grown = r.mean_abs_active_grown,
+                    grown_slot_share = r.grown_slot_share,
                     top5 = ?r.top5,
                     "kwta duty-cycle report"
                 );
