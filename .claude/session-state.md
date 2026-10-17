@@ -20,8 +20,8 @@
 >   `forward_no_dc`, run a 2-arm A/B on a campaign snapshot (fine-metrics on; compare mean_output_mse, per-region MSE,
 >   growth events, gist rates, duty-cycle stats; record deviations); (b) keep it, document as intended in an ADR note.
 >   **R4** (batch the REM scoring matmul: ~11.6 s + ~12 s/cycle) is queued behind it.
-> - **Still queued (user said keep):** ADR 0048 4-arm pilot (now runnable on a build with the restore fixes; use `--seed`,
->   `SEED` defaults to 42 in `ab_*.sh`), R8 (k-WTA alloc/dedupe), R10 (cold append batch, not worthwhile today),
+> - **ADR 0048 4-arm pilot RUN 2026-10-17** (results in the ADR: lag fixes the settle-gate cascade, adopt criterion on mean_output_mse NOT met, single seed). Next: second seed / noise baseline, duty-cycle metric.
+> - **Still queued (user said keep):** R8 (k-WTA alloc/dedupe), R10 (cold append batch, not worthwhile today),
 >   moving the video encoder off MIGraphX (CPU EP measured 23 ms vs 54 ms isolated), other `ab_*` snapshot dirs still
 >   need conversion to safetensors (tool on `tooling/convert-weights-pre0048`).
 > - Habits to keep: run `cargo test` before committing (hook only runs fmt+clippy); after mechanical renames, diff the

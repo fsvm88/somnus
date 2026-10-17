@@ -8,7 +8,7 @@
   diff split into 6 self-contained chunks (metrics registry, the burn-clone-quirk regression test,
   the CLI flag/sleep-loop gating, the two new unit tests, and the `somnus-perception/src/lib.rs`
   changes split in two) — 26/26 checks came back clean, no issues found, independently confirming
-  the self-review. **Not yet piloted** — this ADR's own validation plan (below) has not been run.
+  the self-review. **Piloted 2026-10-17** — see "Pilot results" at the end (mixed: fixes the settle-gate cascade, does not beat the headline `mean_output_mse` criterion).
 - **Date:** 2026-09-13
 - **Correction 2026-10-16 (found during the burn 0.22 migration, ADR 0049):** the "plain value copy
   of the eight trained tensors" left `wake_binding`'s GRU gates and `temporal_proj` independently
@@ -256,3 +256,40 @@ promotion (this ADR's "Alternatives considered" deferred option) or revisiting d
   never longer than the growth cadence — would mean this design needs a smarter growth interaction
   (e.g. resetting the lag counter, or growth-triggered syncs counting toward `BindingWakeSyncCount`
   separately) before a real read is possible.
+
+## Pilot results (2026-10-17, `scripts/ab_binding_wake_lag.sh`)
+
+4 arms x 40 cycles, one binary (HEAD `56925da`, fine-metrics), same restored snapshot, `SEED=42`, two arms
+concurrently. Control = no `--binding-replay`; lag1/lag10/lag30 = `--binding-replay --binding-wake-lag-cycles N`.
+Artifacts: `memory/ab_binding_wake_lag/` (gitignored; `analysis.txt` has every table). **Single seed, no noise
+baseline for this pilot**; the R1 pilot's control-vs-control spread on `mean_output_mse` was ~14%.
+Means by cycle bin (1-10 / 11-25 / 26-40):
+
+| metric | control | lag1 | lag10 | lag30 |
+|---|---|---|---|---|
+| `mean_output_mse` | .0168 / .0160 / .0234 | .0560 / .0408 / .0225 | .0204 / .0386 / .0389 | .0169 / .0226 / .0215 |
+| `mean_output_mse_wake` | .046 / .046 / .045 | .051 / .069 / .107 | .042 / .031 / .028 | .044 / .047 / .036 |
+| `settle_gate_dynamic` | .80 / .82 / .80 | .30 / .28 / .26 | .81 / .74 / .77 | .79 / .81 / .63 |
+| `settle_iters_sum` | 12 / 13 / 15 | 37 / 41 / 56 | 12 / 19 / 16 | 14 / 14 / 15 |
+| `gist_recall_rate` | .60 / .71 / .70 | .44 / .44 / .53 | .68 / .39 / .70 | .58 / .73 / .61 |
+| `warm_recall_l2` | .51 / .46 / .45 | .71 / .71 / .72 | .48 / .63 / .50 | .47 / .46 / .58 |
+
+- **Plumbing check passed:** lag1 reproduces the known failure (the §47 settle-gate collapse: gate .26-.30 vs .80,
+  settle iterations 3-4x, wake MSE rising 0.05 -> 0.11, `warm_recall_l2` .71). `binding_wake_sync` fired 40/40/4/2
+  times for control/lag1/lag10/lag30, as designed.
+- **The lag lever works on the cascade:** lag10 and lag30 have no settle-gate collapse, normal settle iterations,
+  and wake MSE at or below control; `gist_recall_rate` and `warm_recall_l2` recover to control-like values (lag10 had a
+  bad middle bin, 11-25, on both).
+- **But the ADR's stated adopt criterion is NOT met:** cycles 26-40 `mean_output_mse` vs lag1: lag30 -4.3% (within
+  noise, not "materially below"), lag10 +73% (worse). Control reaches the same band as lag30 (.0234 vs .0215), i.e.
+  lag-N restores baseline behaviour; it does not beat it. lag1's `mean_output_mse` is far worse early (.056) but
+  converges to .0225 by 26-40 while its wake metrics keep degrading, so this metric alone hides the damage.
+- **Not shown by this pilot:** any benefit of `binding_replay` itself (lag30 ~ control). The pilot measured removal of
+  harm, not gain. Growth cadence differed per arm (8-10 growth events, final sizes 10139-10295), a confounder; lag10's
+  late-bin `mean_output_mse` excess is unexplained and could be noise or a real per-lag effect (needs a second seed).
+- `BindingWakeDivergenceL2` was recorded (fine-metrics counters, summed) but I did not analyze how much drift each lag
+  window accumulated; that remains the open check on the "what would invalidate this" first bullet.
+
+**Status:** not adopted as a default. Next questions: a second seed (or a control-vs-control baseline) for lag10 vs
+lag30; whether `binding_replay` yields any benefit worth the lag (needs a metric that rewards it); then the
+validated/gated promotion alternative if not.
