@@ -1769,10 +1769,8 @@ impl PerceptionProcessor {
                 if input.is_empty() {
                     continue;
                 }
-                let act = {
-                    let model = self.model_mut();
-                    model.layer_mut(idx).forward(input, &device)
-                };
+                // Scoring pass, not an ingest: must not advance k-WTA duty cycles (gaps.md R1).
+                let act = self.model_ref().layer(idx).forward_no_dc(input, &device);
                 let err = {
                     let model = self.model_ref();
                     model
@@ -2181,13 +2179,10 @@ impl PerceptionProcessor {
                         if input.is_empty() {
                             continue;
                         }
-                        let (act, recon) = {
-                            let model = self.model_mut();
-                            let act = model.layer_mut(idx).forward(input, &device);
-                            let recon = model.decoder(idx).reconstruct(&act, &device);
-                            (act, recon)
-                        };
-                        let _ = act;
+                        // Scoring pass, not an ingest: must not advance k-WTA duty cycles (gaps.md R1).
+                        let model = self.model_ref();
+                        let act = model.layer(idx).forward_no_dc(input, &device);
+                        let recon = model.decoder(idx).reconstruct(&act, &device);
                         let mse: f32 = input
                             .iter()
                             .zip(&recon)

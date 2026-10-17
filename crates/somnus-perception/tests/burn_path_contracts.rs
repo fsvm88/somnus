@@ -44,6 +44,23 @@ mod tests {
         assert_eq!(mse[3], 0.0, "empty region slot must stay 0.0");
     }
 
+    /// REM scoring passes are not ingests: they must leave k-WTA duty cycles untouched (gaps.md R1).
+    #[test]
+    fn rem_scoring_passes_do_not_advance_duty_cycles() {
+        let mut proc = make_proc();
+        let regional = regional_inputs();
+        let before = proc.duty_cycles();
+        proc.measure_mse(&regional).unwrap();
+        type Trace = (Vec<f32>, [Vec<f32>; 5], (), ());
+        let traces: Vec<Trace> = vec![(vec![], regional.clone(), (), ())];
+        proc.collect_high_residual_inputs(&traces, 4);
+        assert_eq!(
+            proc.duty_cycles(),
+            before,
+            "scoring must not mutate duty cycles"
+        );
+    }
+
     /// The growth gate reads measure_mse; it must actually decrease when the
     /// SAE is trained on the same inputs via replay_step_batch.
     #[test]
