@@ -1760,28 +1760,45 @@ impl PerceptionProcessor {
 
     // ── Inference ────────────────────────────────────────────────────────────
 
+    /// Per-input SAE reconstruction MSE for region `idx`, batched in chunks of `SCORE_CHUNK`.
+    /// Inference only: no weight update, no duty-cycle update.
+    fn score_region(&self, idx: usize, inputs: &[&[f32]]) -> Vec<f32> {
+        const SCORE_CHUNK: usize = 256;
+        let model = self.model_ref();
+        let mut out = Vec::with_capacity(inputs.len());
+        for chunk in inputs.chunks(SCORE_CHUNK) {
+            let acts = model.layer(idx).forward_no_dc_batch(chunk, &self.device);
+            out.extend(
+                model
+                    .decoder(idx)
+                    .reconstruction_errors_batch(chunk, &acts, &self.device),
+            );
+        }
+        out
+    }
+
     /// Measure SAE reconstruction MSE per region (inference, no weight update).
     pub fn measure_mse(&mut self, regional: &[Vec<f32>; 5]) -> PerceptionResult<[f32; 5]> {
+        Ok(self.measure_mse_many(&[regional])[0])
+    }
+
+    /// `measure_mse` for many traces at once (one batched matmul per region instead of one
+    /// per trace). Empty region slots stay 0.0 in their trace's result.
+    pub fn measure_mse_many(&self, traces: &[&[Vec<f32>; 5]]) -> Vec<[f32; 5]> {
         let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::MeasureMse, {
-            let device = self.device.clone();
-            let mut result = [0.0f32; 5];
-            for (idx, input) in regional.iter().enumerate() {
-                if input.is_empty() {
-                    continue;
+            let mut result = vec![[0.0f32; 5]; traces.len()];
+            for idx in 0..5 {
+                let rows: Vec<usize> = (0..traces.len())
+                    .filter(|&t| !traces[t][idx].is_empty())
+                    .collect();
+                let inputs: Vec<&[f32]> = rows.iter().map(|&t| traces[t][idx].as_slice()).collect();
+                for (&t, err) in rows.iter().zip(self.score_region(idx, &inputs)) {
+                    result[t][idx] = err;
                 }
-                // Scoring pass, not an ingest: must not advance k-WTA duty cycles (gaps.md R1).
-                let act = self.model_ref().layer(idx).forward_no_dc(input, &device);
-                let err = {
-                    let model = self.model_ref();
-                    model
-                        .decoder(idx)
-                        .reconstruction_error(input, &act, &device)
-                };
-                result[idx] = err;
             }
             result
         });
-        Ok(result)
+        result
     }
 
     /// Blend two sets of regional encoder inputs and produce a synthetic episode.
@@ -2170,34 +2187,27 @@ impl PerceptionProcessor {
     ) -> [Vec<Vec<f32>>; 5] {
         let (result, _) =
             somnus_metrics::timed_core!(somnus_metrics::Metric::CollectHighResidualInputs, {
-                let device = self.device.clone();
-                // Per-region: (residual_mse, input_vec)
-                let mut scored: [Vec<(f32, Vec<f32>)>; 5] = Default::default();
-
-                for (_, regional, _, _) in traces {
-                    for (idx, input) in regional.iter().enumerate() {
-                        if input.is_empty() {
-                            continue;
-                        }
-                        // Scoring pass, not an ingest: must not advance k-WTA duty cycles (gaps.md R1).
-                        let model = self.model_ref();
-                        let act = model.layer(idx).forward_no_dc(input, &device);
-                        let recon = model.decoder(idx).reconstruct(&act, &device);
-                        let mse: f32 = input
-                            .iter()
-                            .zip(&recon)
-                            .map(|(a, b)| (a - b).powi(2))
-                            .sum::<f32>()
-                            / input.len() as f32;
-                        scored[idx].push((mse, input.clone()));
-                    }
-                }
-
                 let mut result: [Vec<Vec<f32>>; 5] = Default::default();
-                for i in 0..5 {
-                    scored[i]
-                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                    result[i] = scored[i].drain(..).take(cap).map(|(_, v)| v).collect();
+                for (idx, out) in result.iter_mut().enumerate() {
+                    let inputs: Vec<&[f32]> = traces
+                        .iter()
+                        .map(|(_, regional, _, _)| regional[idx].as_slice())
+                        .filter(|v| !v.is_empty())
+                        .collect();
+                    let mse = self.score_region(idx, &inputs);
+                    // Highest residual first; only the winners are cloned.
+                    let mut order: Vec<usize> = (0..inputs.len()).collect();
+                    let by_mse_desc = |a: &usize, b: &usize| {
+                        mse[*b]
+                            .partial_cmp(&mse[*a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    };
+                    if cap < order.len() {
+                        order.select_nth_unstable_by(cap, by_mse_desc);
+                        order.truncate(cap);
+                    }
+                    order.sort_by(by_mse_desc);
+                    *out = order.into_iter().map(|i| inputs[i].to_vec()).collect();
                 }
                 result
             });

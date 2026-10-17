@@ -145,6 +145,24 @@ impl KWtaLayer {
         self.select_top_k_no_dc(z_vec)
     }
 
+    /// Batched `forward_no_dc`: one `[B, n_in]` matmul for `inputs`, then per-row top-k.
+    /// Row-for-row equal to calling `forward_no_dc` on each input (duty cycles untouched).
+    pub fn forward_no_dc_batch(&self, inputs: &[&[f32]], device: &Device) -> Vec<SparseActivation> {
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let n_in = inputs[0].len();
+        let flat: Vec<f32> = inputs.iter().flat_map(|v| v.iter().copied()).collect();
+        let t = Tensor::<2>::from_data(TensorData::new(flat, [inputs.len(), n_in]), device);
+        let z: Tensor<2> =
+            somnus_metrics::timed!(somnus_metrics::Metric::KwtaScoreMatmul, self.linear.forward(t));
+        let z_vec: Vec<f32> = z.to_f32_vec();
+        z_vec
+            .chunks_exact(self.n_units)
+            .map(|row| self.select_top_k_no_dc(row.to_vec()))
+            .collect()
+    }
+
     /// Apply k-WTA topk + duty-cycle update to a pre-computed z vector.
     ///
     /// Use when the linear matmul runs externally (e.g. encoder ORT session in Phase 1.5).

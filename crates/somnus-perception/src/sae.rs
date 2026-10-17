@@ -56,6 +56,39 @@ impl SaeDecoder {
             / self.n_in as f32
     }
 
+    /// Batched `reconstruction_error`: one `[B, n_units] -> [B, n_in]` decoder matmul.
+    /// Element-for-element equal to `reconstruction_error` per (input, act) pair.
+    pub fn reconstruction_errors_batch(
+        &self,
+        inputs: &[&[f32]],
+        acts: &[SparseActivation],
+        device: &Device,
+    ) -> Vec<f32> {
+        debug_assert_eq!(inputs.len(), acts.len());
+        if inputs.is_empty() {
+            return Vec::new();
+        }
+        let mut dense = Vec::with_capacity(acts.len() * self.n_units);
+        for act in acts {
+            dense.extend(act.to_dense_n(self.n_units));
+        }
+        let dense_t =
+            Tensor::<2>::from_data(TensorData::new(dense, [acts.len(), self.n_units]), device);
+        let recon: Vec<f32> = self.decoder.forward(dense_t).to_f32_vec();
+        inputs
+            .iter()
+            .zip(recon.chunks_exact(self.n_in))
+            .map(|(input, rec)| {
+                input
+                    .iter()
+                    .zip(rec)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    / self.n_in as f32
+            })
+            .collect()
+    }
+
     /// Decoder reconstruction of `act` as a dense Vec (same length as n_in).
     /// Inference only — no gradient tracking.
     pub fn reconstruct(&self, act: &SparseActivation, device: &Device) -> Vec<f32> {
@@ -100,5 +133,35 @@ mod tests {
         let err = dec.reconstruction_error(&input, &act, &device);
         assert!(err.is_finite());
         assert!(err >= 0.0);
+    }
+
+    /// The batched scoring path must match the single-input path row for row (R4).
+    #[test]
+    fn batched_scoring_matches_single_input_path() {
+        let device = Device::flex();
+        let n_in = 384;
+        let layer = crate::region::KWtaLayer::new(RegionId::Visual, n_in, &device);
+        let dec = make_decoder(RegionId::Visual, n_in);
+        let inputs: Vec<Vec<f32>> = (0..7)
+            .map(|s| {
+                (0..n_in)
+                    .map(|j| ((j + 11 * s) as f32 * 0.05).sin())
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[f32]> = inputs.iter().map(|v| v.as_slice()).collect();
+
+        let acts = layer.forward_no_dc_batch(&refs, &device);
+        let batched = dec.reconstruction_errors_batch(&refs, &acts, &device);
+        for (i, input) in inputs.iter().enumerate() {
+            let single_act = layer.forward_no_dc(input, &device);
+            assert_eq!(acts[i].indices, single_act.indices, "row {i} indices");
+            let single = dec.reconstruction_error(input, &single_act, &device);
+            assert!(
+                (batched[i] - single).abs() <= 1e-5 * single.abs().max(1.0),
+                "row {i}: batched {} vs single {single}",
+                batched[i]
+            );
+        }
     }
 }

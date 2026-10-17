@@ -595,19 +595,15 @@ fn measure_region_mse(
     let mut per_region_mse = [0.0f32; 5];
     let mut per_region_count = [0usize; 5];
     // Measure SAE reconstruction quality without updating weights.
-    for (_, regional, _, _) in traces_for_rem {
-        match perception.measure_mse(regional) {
-            Ok(mse) => {
-                for i in 0..5 {
-                    if !regional[i].is_empty() {
-                        per_region_mse[i] += mse[i];
-                        per_region_count[i] += 1;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(?e, "measure_mse error");
-                somnus_metrics::counted_core!(somnus_metrics::Metric::RemProbeError, 1);
+    let regionals: Vec<&[Vec<f32>; 5]> = traces_for_rem.iter().map(|(_, r, _, _)| r).collect();
+    for (regional, mse) in regionals
+        .iter()
+        .zip(perception.measure_mse_many(&regionals))
+    {
+        for i in 0..5 {
+            if !regional[i].is_empty() {
+                per_region_mse[i] += mse[i];
+                per_region_count[i] += 1;
             }
         }
     }
