@@ -2826,6 +2826,24 @@ impl PerceptionProcessor {
 
     // ── ONNX validation helpers ──────────────────────────────────────────────
 
+    /// `(mean |duty_cycle - k_active/n_units|, max duty_cycle)` over every k-WTA unit of all 5
+    /// regions. Health summary of the homeostatic boosting state (Core metrics
+    /// `KwtaDutyDevMean` / `KwtaDutyMax`).
+    pub fn duty_cycle_summary(&self) -> (f32, f32) {
+        let m = self.model_ref();
+        let (mut dev_sum, mut n, mut max) = (0.0f64, 0usize, 0.0f32);
+        for idx in 0..5 {
+            let layer = m.layer(idx);
+            let target = layer.k_active as f32 / layer.n_units as f32;
+            for &dc in &layer.duty_cycle {
+                dev_sum += (dc - target).abs() as f64;
+                max = max.max(dc);
+            }
+            n += layer.duty_cycle.len();
+        }
+        ((dev_sum / n.max(1) as f64) as f32, max)
+    }
+
     /// Return per-region duty cycles (for ONNX validation: must pass same dc to Python topk).
     pub fn duty_cycles(&self) -> [Vec<f32>; 5] {
         let m = self.model_ref();

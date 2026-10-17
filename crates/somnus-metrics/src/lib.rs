@@ -438,10 +438,20 @@ pub enum Metric {
     /// targets are drifting away from the live model, the §33 failure mode, and it was
     /// previously computed into `SleepStats` but never read or reported.
     NremStaleTraceSkipped,
+    /// Mean over all k-WTA units (all 5 regions) of `|duty_cycle - k_active/n_units|`, x1e6,
+    /// sampled once per sleep cycle via `counted_core!` (raw value, like `ProcessRssBytes`).
+    /// Direct health signal for the homeostatic boosting state: 0 = every unit fires at its
+    /// target rate; a rising value means boosting is saturated or distorted. Added for the
+    /// R1 fix (REM scoring passes no longer advance duty cycles; gaps.md R1) so duty-cycle
+    /// drift is observable instead of inferred from downstream MSE.
+    KwtaDutyDevMean,
+    /// Maximum single-unit duty cycle across all regions, x1e6, sampled with `KwtaDutyDevMean`.
+    /// A unit stuck near 1.0 is a dominant/"always-on" unit.
+    KwtaDutyMax,
 }
 
 impl Metric {
-    pub const COUNT: usize = 108;
+    pub const COUNT: usize = 110;
 
     const fn as_index(self) -> usize {
         match self {
@@ -553,6 +563,8 @@ impl Metric {
             Metric::BindingWakeSync => 105,
             Metric::BindingWakeDivergenceL2 => 106,
             Metric::NremStaleTraceSkipped => 107,
+            Metric::KwtaDutyDevMean => 108,
+            Metric::KwtaDutyMax => 109,
         }
     }
 
@@ -666,6 +678,8 @@ impl Metric {
             Metric::BindingWakeSync => "binding_wake_sync",
             Metric::BindingWakeDivergenceL2 => "binding_wake_divergence_l2",
             Metric::NremStaleTraceSkipped => "nrem_stale_trace_skipped",
+            Metric::KwtaDutyDevMean => "kwta_duty_dev_mean",
+            Metric::KwtaDutyMax => "kwta_duty_max",
         }
     }
 
@@ -778,6 +792,8 @@ impl Metric {
         Metric::BindingWakeSync,
         Metric::BindingWakeDivergenceL2,
         Metric::NremStaleTraceSkipped,
+        Metric::KwtaDutyDevMean,
+        Metric::KwtaDutyMax,
     ];
 }
 

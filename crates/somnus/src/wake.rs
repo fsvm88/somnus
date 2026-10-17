@@ -691,6 +691,12 @@ pub(crate) fn sleep_cycle(
                 somnus_metrics::Metric::ProcessRssBytes,
                 current_process_rss_bytes()
             );
+            let (duty_dev, duty_max) = perception.duty_cycle_summary();
+            somnus_metrics::counted_core!(
+                somnus_metrics::Metric::KwtaDutyDevMean,
+                (duty_dev * 1e6) as u64
+            );
+            somnus_metrics::counted_core!(somnus_metrics::Metric::KwtaDutyMax, (duty_max * 1e6) as u64);
             somnus_metrics::counted_core!(
                 somnus_metrics::Metric::MemoryDirDiskFreeBytes,
                 memory_dir_disk_free_bytes(&args.memory_dir)
