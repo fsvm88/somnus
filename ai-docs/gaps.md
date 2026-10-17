@@ -160,7 +160,7 @@ Collected by a read-only sweep of code, CI, scripts, metrics coverage and docs. 
 | Q7 | Med | File size | `somnus/src/lib.rs` is 4605 lines (71 `#[arg]` CLI fields in it) and `somnus-perception/src/lib.rs` 3839; `run_sleep_cycle` in `sleep.rs` spans ~1200 lines (354-1558). Splitting is cheap per CLAUDE.md only once boundaries are real, so queue as: (a) move the CLI struct to its own module, (b) extract NREM/REM phases from `run_sleep_cycle`. No behavior change; do not mix with feature work. |
 | Q8 | Low | Dead code | Remaining `#[allow(dead_code)]`: `SleepStats` (`sleep.rs:156`, struct is only returned, fields unread?), `proj_weight_norm` (`action.rs:922`), `_decode_thread` and `stream` handles (legitimate keep-alive fields; rename or comment instead of allow), `resample.rs:1` module-wide allow ("used by binary, not the lib itself"; replace with a scoped allow or `pub`). `projection_step`/`_batch` stay (ADR 0012 amendment). **Status 2026-10-17:** `proj_weight_norm` is used (sleep.rs) and no longer allowed; the only `allow(dead_code)` left in `crates/` are `projection_step`/`projection_step_batch` (kept for reference by decision). Done. |
 | Q9 | Low | Lints | Clippy pedantic (excluding casts/docs) reports ~50 `float_cmp`, 27 `cast_lossless` f32->f64, 25 `redundant_closure_for_method_calls`, 16 `items_after_statements`, 8 `unnecessary_wraps`, 14 `needless_pass_by_value`. Not worth gating; if cleaning, only the `unnecessary_wraps` and `needless_pass_by_value` groups (they signal API shape) and the `float_cmp` hits outside tests. |
-| Q10 | Low | Scripts | `scripts/` has ~40 files with no index of which are live, historical or one-shot, and no Python requirements/pyproject (only gitignored venvs). Add `scripts/README.md` (one line per script) and a pinned `requirements.txt` for the export venv. **Status 2026-10-17:** `scripts/README.md` exists and lists every script (kept current); pinned Python requirements for the export venv still not added (venvs are gitignored; no `requirements.txt`). |
+| Q10 | Low | Scripts | `scripts/` has ~40 files with no index of which are live, historical or one-shot, and no Python requirements/pyproject (only gitignored venvs). Add `scripts/README.md` (one line per script) and a pinned `requirements.txt` for the export venv. **Status 2026-10-17:** `scripts/README.md` exists and lists every script (kept current); `scripts/requirements.txt` added 2026-10-17 (pins from a fresh venv; imports and script compilation verified, a full re-export with them not run). Done. |
 | Q11 | Low | Crate hygiene | Already tracked in §15 and not re-listed: usearch, burn-flex (check the 0.22 timeline against today, 2026-10), ffmpeg-the-third. Worth a dated re-check since burn's expected date has passed. |
 | Q12 | Info | Metrics | Core-tier macros are widely used (somnus/lib.rs 58, perception/lib.rs 54, sleep.rs 29). Thin spots: `somnus-encoding/video.rs` (1), `whisper_asr.rs` (1), `wake_worker.rs` (2), `somnus-sensory` (media_file 2, audio capture 0). Candidate: failure/fallback counters on the ORT-panic path in `whisper_asr.rs` (§40), which would also help diagnose it. Not a policy violation found, just the least-covered files. |
 | Q13 | Info | Docs | Docs were audited 2026-09-14 (`37789f3`) and no new drift was looked for beyond constants/ADR index. Not re-audited here. |
@@ -256,31 +256,34 @@ top; or (b) keep and document as intended (R4 then batches while preserving the 
 
 ---
 
-## §50 — Grown k-WTA units are (nearly) inert; duty-cycle boosting cannot rebalance (found 2026-10-17)
+## §50 — k-WTA load imbalance: a few dominant units fire on every ingest, grown units win slots at near-zero weight (found 2026-10-17)
 
-**Evidence (measured, not yet acted on):**
-- New Core metrics `kwta_duty_dev_mean` / `kwta_duty_max` (ADR 0039 update) on the two ADR 0048 wake-lag pilots'
-  seed-43 runs, all four arms: `kwta_duty_max` goes from ~0.5 (cycle 1) to **~1.0 by cycle 10 and stays there**, in every arm
-  including control. At least one unit per region fires on essentially every ingest. `kwta_duty_dev_mean` stays ~0.016-0.024
-  against a per-unit target of ~0.0195.
-- `scripts/unit_utilization.py` on the final snapshots: the original 1024 units per region have encoder column norms
-  0.49-0.59 (identical medians across arms to 3 digits), while the ~9.3k **grown units have p50 norm 0.0095-0.0101 (their init
-  value, `normalised seed x 0.01`), p99 0.017-0.06, max 0.06-0.23; <0.2% exceed 0.1.** Same shape in the older
-  `/data/somnus/memory/snapshot` (8.8k grown units, p50 0.0100): this holds across the whole growth campaign, not just these runs.
-- Mechanism (consistent with the numbers, **not isolated by an experiment**): selection ranks `z + BOOST_STRENGTH (=1.0) *
-  (target_dc - dc)`; the boost is at most ~0.02, while a base unit's `z` is orders larger than a 0.01-norm grown unit's, so
-  grown units almost never enter the top-k, receive no gradient, and stay at init. Fixed k scales with `n_units`
-  (k ~193 at 10k), so the ~1000 original units absorb nearly all slots.
+**Measured (nothing changed in the design):**
+1. **Dominant units never rotate out.** New Core metric `kwta_duty_max` (ADR 0039 update) goes ~0.5 (cycle 1) -> ~1.0 within 10 cycles in
+   all four ADR 0048 pilot arms, incl. control. A per-region diagnostic (`kwta duty-cycle report` log line,
+   `PerceptionProcessor::duty_cycle_report`; 6-cycle run `memory/diag_duty/`, restored snapshot, SEED 42) shows it is **1 unit per region
+   (4 in speech) with dc 0.64-0.95 and still climbing**: speech units 249/412/511/672 have *bit-identical* dc (0.927 at cycle 6), i.e. they
+   fired on literally every ingest since the process started; others: env 78, visual 895, symbolic 548, language 494. Their encoder
+   columns are the **largest-norm base columns** (1.10-1.27 vs base median 0.57 and grown ~0.01), so `z = w.x` is large and the boost
+   (`BOOST_STRENGTH` 1.0 x (target 0.0195 - dc), i.e. at most about -0.93 at dc ~ 0.95) does not dislodge them. Rich-get-richer: the winners train and grow.
+2. **Where the slots go (my earlier "grown units are inert / base units absorb the slots" reading was WRONG, corrected here).** Summed duty cycle
+   (= expected active slots per ingest; k = 193): cycle 1 base 29-45 / grown 30-57; by **cycle 6 base 18-60 / grown 120-161**. So the
+   **grown units take most of the k slots**, 4.3k-8.9k of ~8.8k grown units have fired recently, while **240-570 of the original 1024 units are
+   silent** (dc <= 1e-4) in every region. Duty cycles are *not persisted* across restarts (restart at 0, EMA alpha 1/1000), so the picture
+   during the first ~1000 ingests of any process is boost-driven by construction.
+3. **Grown units barely learn:** `scripts/unit_utilization.py` on final snapshots: grown column norms p50 0.0095-0.0101 (init 0.01), p99 0.017-0.06,
+   <0.2% above 0.1, same in the older `/data/somnus/memory/snapshot`; base medians identical across arms to 3 digits.
 
-**Consequence if the mechanism holds:** region growth raises `region_n_units` and compute cost (scoring matmul ~10x wider) but
-adds little *active* capacity. Growth decisions keyed on `measure_mse` would then be buying capacity that is not used.
+**Interpretation (inference, not directly measured):** with a fixed k (~193 at 10k units) and only a few hundred original units carrying positive
+evidence for a given input, the remaining slots are filled by units whose `z` is about zero (grown units, boosted from dc = 0), i.e. a large part of
+every sparse code is near-zero-valued filler. If so, region growth buys compute (scoring matmul ~10x wider) without proportional information. The
+direct check (not done): log the mean |value| of active slots split base vs grown, per region.
 
-**Not done / open:** (1) per-unit firing counts by index (is it the base units only?) and per-region `kwta_duty_max` rather than the
-all-region max; (2) whether a larger boost, norm-matched init for grown units, or both changes utilisation and MSE (A/B with
-the existing `ab_*` harness); (3) which unit saturates to dc=1.0 and why boosting cannot suppress it. ADR 0025 names this exact
-trigger ("evidence that dead units accumulate at scale and duty-cycle fails to prevent it -> revisit option (b), ReLU+L1");
-ADR 0041 (line ~296) already noted grown units do not win k-WTA in synthetic single-input tests. Decision on direction is the
-user's (touches the growth design); nothing changed.
+**Open / needs a design decision (user):** (a) whether near-zero-filler slots matter for reconstruction/MSE (the direct check above, then an A/B with
+a norm-matched init for grown units and/or a boost scaled to the z distribution); (b) dominant-unit mitigation (stronger/normalised boost, or
+column-norm control); (c) persisting `duty_cycle` in the snapshot (restart reset makes every cycle-1 boost-driven; changes numerics, needs an A/B);
+(d) ADR 0025's named trigger ("dead units accumulate at scale and duty-cycle fails to prevent it -> revisit ReLU+L1") is arguably met by (1).
+ADR 0041 (line ~296) already noted grown units do not win k-WTA in synthetic single-input tests; that is contradicted for the real pipeline by (2).
 
 ---
 

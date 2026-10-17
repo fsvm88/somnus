@@ -20,7 +20,7 @@
 >   `forward_no_dc`, run a 2-arm A/B on a campaign snapshot (fine-metrics on; compare mean_output_mse, per-region MSE,
 >   growth events, gist rates, duty-cycle stats; record deviations); (b) keep it, document as intended in an ADR note.
 >   **R4** (batch the REM scoring matmul: ~11.6 s + ~12 s/cycle) is queued behind it.
-> - **NEW FINDING gaps.md §50: grown k-WTA units are ~inert (norm stays 0.01 vs 0.5 base), `kwta_duty_max` saturates to 1.0.** Needs user direction (growth design). Seed-43 wake-lag pilot DONE: lag30 collapses the settle gate at the cycle-30 promotion (see ADR 0048 'Second seed').
+> - **gaps.md §50 (corrected after a per-region diagnostic): a few large-norm original units fire on every ingest (`kwta_duty_max`->1.0), grown units win most slots but stay at init norm 0.01 (near-zero filler, inferred).** Needs user direction (growth/boost design); `duty_cycle_report` log line added. Seed-43 wake-lag pilot DONE: lag30 collapses the settle gate at the cycle-30 promotion (see ADR 0048 'Second seed').
 > - **ADR 0048 4-arm pilot RUN 2026-10-17** (results in the ADR: lag fixes the settle-gate cascade, adopt criterion on mean_output_mse NOT met, single seed). Next: second seed / noise baseline, duty-cycle metric.
 > - **Still queued (user said keep):** R8 (k-WTA alloc/dedupe), R10 (cold append batch, not worthwhile today),
 >   moving the video encoder off MIGraphX (CPU EP measured 23 ms vs 54 ms isolated), other `ab_*` snapshot dirs still

@@ -1,12 +1,17 @@
-# Python deps for scripts/*.py (export + analysis). Venv lives at scripts/.venv (gitignored);
-# scripts/.venv-efficientat has its own incompatible torch pin (see ai-docs/gaps.md / engineering-log).
-# Only torch is pinned here (from the .gitignore note); the others were not recorded when the
-# venv was built. TODO when the venv is next rebuilt: run `pip freeze` and pin them all.
-torch==2.11.0
-transformers
-peft
-onnx
-onnxruntime
-onnxconverter-common
-numpy
-matplotlib
+# Python deps for the export / fine-tune / analysis scripts (scripts/export_*.py, convert_fp16.py,
+# train_lora_qwen3.py, compare_golden.py, unit_utilization.py).
+# Resolved and verified 2026-10-17 in a fresh venv: every package imports, and the main scripts
+# byte-compile. NOT verified: a full model export run with these exact versions (the models/ in this
+# tree were exported earlier, with whatever was installed then). torch is the CPU build:
+#   python3 -m venv scripts/.venv
+#   scripts/.venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.1
+#   scripts/.venv/bin/pip install -r scripts/requirements.txt
+# Exception: scripts/export_efficientat.py needs its own venv (scripts/.venv-efficientat) because of a
+# torch/torchvision pin conflict, see .gitignore.
+numpy==2.5.4
+onnx==1.23.2
+onnxruntime==1.31.0
+onnxconverter-common==1.16.0
+transformers==5.20.1
+peft==0.21.2
+safetensors==0.8.0

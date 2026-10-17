@@ -405,6 +405,23 @@ pub struct PerceptionProcessor {
     der_lambda_stats: Option<(f32, f32)>,
 }
 
+/// One region's duty-cycle diagnostics (see [`PerceptionProcessor::duty_cycle_report`]).
+/// `sum_dc_*` is the total expected active slots per ingest contributed by the original / grown
+/// units (their sum equals `k_active` in steady state). `grown_units_ever_fired` counts grown
+/// units with duty cycle above 1e-4 (EMA alpha 1/1000, so "fired recently").
+#[derive(Debug, Clone)]
+pub struct RegionDutyReport {
+    pub region: usize,
+    pub n_units: usize,
+    pub k_active: usize,
+    pub sum_dc_base: f32,
+    pub sum_dc_grown: f32,
+    pub base_units_over_half: usize,
+    pub grown_units_ever_fired: usize,
+    pub base_units_silent: usize,
+    pub top5: Vec<(usize, f32)>,
+}
+
 impl PerceptionProcessor {
     /// The model is `None` only while moved into an optimizer step (`take()` / put-back);
     /// any access in that window is a logic bug, so fail with a message that says so.
@@ -2863,6 +2880,39 @@ impl PerceptionProcessor {
             n += layer.duty_cycle.len();
         }
         ((dev_sum / n.max(1) as f64) as f32, max)
+    }
+
+    /// Per-region duty-cycle diagnostics (gaps.md §50): how the firing load splits between the
+    /// original `N_UNITS` and grown units, and which units saturate. Logged once per sleep cycle.
+    pub fn duty_cycle_report(&self) -> Vec<RegionDutyReport> {
+        let m = self.model_ref();
+        (0..5)
+            .map(|idx| {
+                let layer = m.layer(idx);
+                let dc = &layer.duty_cycle;
+                let base_end = N_UNITS.min(dc.len());
+                let mut order: Vec<usize> = (0..dc.len()).collect();
+                order.sort_by(|&a, &b| {
+                    dc[b]
+                        .partial_cmp(&dc[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top: Vec<(usize, f32)> = order.iter().take(5).map(|&i| (i, dc[i])).collect();
+                let sum_base: f32 = dc[..base_end].iter().sum();
+                let sum_grown: f32 = dc[base_end..].iter().sum();
+                RegionDutyReport {
+                    region: idx,
+                    n_units: dc.len(),
+                    k_active: layer.k_active,
+                    sum_dc_base: sum_base,
+                    sum_dc_grown: sum_grown,
+                    base_units_over_half: dc[..base_end].iter().filter(|&&d| d > 0.5).count(),
+                    grown_units_ever_fired: dc[base_end..].iter().filter(|&&d| d > 1e-4).count(),
+                    base_units_silent: dc[..base_end].iter().filter(|&&d| d <= 1e-4).count(),
+                    top5: top,
+                }
+            })
+            .collect()
     }
 
     /// Return per-region duty cycles (for ONNX validation: must pass same dc to Python topk).

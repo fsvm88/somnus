@@ -321,6 +321,4 @@ Replication of the seed-42 pilot. What replicated and what did not:
 and stays there** in every arm, including control (cycle 1: ~0.5). At least one k-WTA unit is active on essentially every
 ingest, so boosting (`BOOST_STRENGTH` 1.0 x (target - dc), target ~0.0195) cannot suppress it, and one of the ~193 active
 slots per region is permanently taken. `kwta_duty_dev_mean` is stable at ~0.016-0.024 (target dc 0.0195), i.e. the average
-unit is as far from target as the target itself. This is independent of binding_replay and of the lag. Which region/unit,
-and whether it predates R1 (the seed-42 pilots lack the metric), is not yet known. Candidate causes to check: a grown
-unit seeded with a large-norm weight (`grow_region_seeded`), or dead-by-design k-WTA dynamics with a weak boost.
+unit is as far from target as the target itself. This is independent of binding_replay and of the lag. Whether it predates R1 is still unknown (the seed-42 pilots lack the metric). **Resolved in gaps.md §50 (2026-10-17):** the saturating units are the largest-norm *original* units (1 per region, 4 in speech, firing on every ingest); not a grown unit. The boost (max ~0.02 at start, about -0.9 once dc ~ 0.95) cannot dislodge them. Independent of binding replay.

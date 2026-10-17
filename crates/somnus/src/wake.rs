@@ -691,6 +691,20 @@ pub(crate) fn sleep_cycle(
                 somnus_metrics::Metric::ProcessRssBytes,
                 current_process_rss_bytes()
             );
+            for r in perception.duty_cycle_report() {
+                info!(
+                    region = r.region,
+                    n_units = r.n_units,
+                    k_active = r.k_active,
+                    sum_dc_base = r.sum_dc_base,
+                    sum_dc_grown = r.sum_dc_grown,
+                    base_units_over_half = r.base_units_over_half,
+                    base_units_silent = r.base_units_silent,
+                    grown_units_ever_fired = r.grown_units_ever_fired,
+                    top5 = ?r.top5,
+                    "kwta duty-cycle report"
+                );
+            }
             let (duty_dev, duty_max) = perception.duty_cycle_summary();
             somnus_metrics::counted_core!(
                 somnus_metrics::Metric::KwtaDutyDevMean,

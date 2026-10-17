@@ -32,3 +32,5 @@ All export `SEED` (default 42) so both arms share a burn RNG seed.
 
 ## Git hooks
 `setup-hooks.sh` installs `hooks/pre-commit` (mirrors CI: fmt + clippy default and fine-metrics).
+
+`requirements.txt` — pinned Python deps for the export/analysis scripts (install steps in its header; `export_efficientat.py` uses a separate venv).
