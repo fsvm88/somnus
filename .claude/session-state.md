@@ -12,7 +12,7 @@
 >   snapshot writes; ORT built once post-restore (+ the restore bug); thread budgets (wake wall 448 -> 336 s);
 >   `run_sleep_cycle` 1205 -> 260 lines and `run()` 2006 -> 405 (loop ~285) with `startup.rs`/`pipeline.rs`/
 >   `wake_state.rs`/`wake.rs`; KV-cache generation fixed for Qwen3 (R19, verified token-identical to the reference).
-> - **R1 UPDATE (later 2026-10-17): option (a) implemented and committed** (both REM scoring passes use `forward_no_dc`; regression test added, fails on old code; workspace tests green). **The 2-arm A/B is still TODO** (deferred: user's GPU/RAM workload was running). R4 DONE too (batched REM scoring, ~5x in a synthetic bench; see gaps.md R4). A/B pilot (R1+R4 together vs old) still TODO when machine is free: ~18 GiB RSS/arm, needs old-commit worktree build.
+> - **R1 UPDATE (later 2026-10-17): option (a) implemented and committed** (both REM scoring passes use `forward_no_dc`; regression test added, fails on old code; workspace tests green). **The 2-arm A/B is still TODO** (deferred: user's GPU/RAM workload was running). All 10 `ab_*` snapshot arms converted to safetensors 2026-10-17 (originals kept; main-side load not yet exercised). R4 DONE too (batched REM scoring, ~5x in a synthetic bench; see gaps.md R4). A/B pilot (R1+R4 together vs old) still TODO when machine is free: ~18 GiB RSS/arm, needs old-commit worktree build.
 > - (Original R1 note, now resolved in code:) `measure_mse` and `collect_high_residual_inputs` (REM scoring passes) call
 >   `KWtaLayer::forward`, which advances k-WTA duty cycles (~16k spurious steps/cycle at 3.3k traces, several time
 >   constants at alpha=1/1000). History: `measure_mse` is from 2026-05-10; `forward_no_dc` came 2026-05-11 (ADR 0011,
