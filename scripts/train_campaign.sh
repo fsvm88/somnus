@@ -84,7 +84,7 @@ if [ "$SKIP_BUILD" != "1" ]; then
     echo "[campaign] building somnus (release)…"
     cargo build --release -p somnus 2>&1
 fi
-SOMNUS="$REPO_ROOT/target/release/somnus"
+SOMNUS="${SOMNUS_BIN:-$REPO_ROOT/target/release/somnus}"   # SOMNUS_BIN: A/B scripts pin per-arm binaries
 
 # ── Record campaign parameters ────────────────────────────────────────────────
 cat >> "${CAMPAIGN_DIR}/params.txt" <<EOF
