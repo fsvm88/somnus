@@ -256,6 +256,34 @@ top; or (b) keep and document as intended (R4 then batches while preserving the 
 
 ---
 
+## §50 — Grown k-WTA units are (nearly) inert; duty-cycle boosting cannot rebalance (found 2026-10-17)
+
+**Evidence (measured, not yet acted on):**
+- New Core metrics `kwta_duty_dev_mean` / `kwta_duty_max` (ADR 0039 update) on the two ADR 0048 wake-lag pilots'
+  seed-43 runs, all four arms: `kwta_duty_max` goes from ~0.5 (cycle 1) to **~1.0 by cycle 10 and stays there**, in every arm
+  including control. At least one unit per region fires on essentially every ingest. `kwta_duty_dev_mean` stays ~0.016-0.024
+  against a per-unit target of ~0.0195.
+- `scripts/unit_utilization.py` on the final snapshots: the original 1024 units per region have encoder column norms
+  0.49-0.59 (identical medians across arms to 3 digits), while the ~9.3k **grown units have p50 norm 0.0095-0.0101 (their init
+  value, `normalised seed x 0.01`), p99 0.017-0.06, max 0.06-0.23; <0.2% exceed 0.1.** Same shape in the older
+  `/data/somnus/memory/snapshot` (8.8k grown units, p50 0.0100): this holds across the whole growth campaign, not just these runs.
+- Mechanism (consistent with the numbers, **not isolated by an experiment**): selection ranks `z + BOOST_STRENGTH (=1.0) *
+  (target_dc - dc)`; the boost is at most ~0.02, while a base unit's `z` is orders larger than a 0.01-norm grown unit's, so
+  grown units almost never enter the top-k, receive no gradient, and stay at init. Fixed k scales with `n_units`
+  (k ~193 at 10k), so the ~1000 original units absorb nearly all slots.
+
+**Consequence if the mechanism holds:** region growth raises `region_n_units` and compute cost (scoring matmul ~10x wider) but
+adds little *active* capacity. Growth decisions keyed on `measure_mse` would then be buying capacity that is not used.
+
+**Not done / open:** (1) per-unit firing counts by index (is it the base units only?) and per-region `kwta_duty_max` rather than the
+all-region max; (2) whether a larger boost, norm-matched init for grown units, or both changes utilisation and MSE (A/B with
+the existing `ab_*` harness); (3) which unit saturates to dc=1.0 and why boosting cannot suppress it. ADR 0025 names this exact
+trigger ("evidence that dead units accumulate at scale and duty-cycle fails to prevent it -> revisit option (b), ReLU+L1");
+ADR 0041 (line ~296) already noted grown units do not win k-WTA in synthetic single-input tests. Decision on direction is the
+user's (touches the growth design); nothing changed.
+
+---
+
 ## Deferred backlog (do not raise unprompted)
 
 CLAUDE.md's "Deferred architectural items" section names these items and says not to suggest revisiting them unprompted; the trigger conditions live here (moved from `.claude/session-state.md` 2026-08-16 — that file is a short-window crash-resume journal now, not a durable record).
