@@ -1,6 +1,6 @@
 # 0048. Decoupled wake-time binding snapshot (§33 candidate (e), scoped after confirming the real root cause)
 
-- **Status:** implemented 2026-09-13 (`wake_binding` field, `sync_wake_binding`, growth/prune
+- **Status (2026-10-17): implemented but NOT adopted as a default.** The 4-arm x 2-seed wake-lag pilot did not meet this ADR's adopt criterion; `--binding-replay` stays off and `--binding-wake-lag-cycles` stays 1 (see "Pilot results" at the end). Original status: implemented 2026-09-13 (`wake_binding` field, `sync_wake_binding`, growth/prune
   lockstep, all wake-time call sites, ORT export, snapshot save/load, `--binding-wake-lag-cycles`
   CLI flag, 2 new unit tests, `cargo fmt`/`clippy -D warnings`/full test suite all clean).
   **Independently re-reviewed 2026-09-13** via a second model (local Lemonade/gpt-oss-20b through

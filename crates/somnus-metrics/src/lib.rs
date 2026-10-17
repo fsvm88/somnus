@@ -448,10 +448,30 @@ pub enum Metric {
     /// Maximum single-unit duty cycle across all regions, x1e6, sampled with `KwtaDutyDevMean`.
     /// A unit stuck near 1.0 is a dominant/"always-on" unit.
     KwtaDutyMax,
+    /// Maximum single-unit duty cycle in the speech region, x1e6, sampled once per sleep cycle with
+    /// `KwtaDutyMax` (which is the max over all regions). Per-region split so a saturating
+    /// dominant unit (gaps.md §50) can be attributed to a region from metrics.jsonl alone.
+    KwtaDutyMaxSpeech,
+    /// Maximum single-unit duty cycle in the env region, x1e6, sampled once per sleep cycle with
+    /// `KwtaDutyMax` (which is the max over all regions). Per-region split so a saturating
+    /// dominant unit (gaps.md §50) can be attributed to a region from metrics.jsonl alone.
+    KwtaDutyMaxEnv,
+    /// Maximum single-unit duty cycle in the visual region, x1e6, sampled once per sleep cycle with
+    /// `KwtaDutyMax` (which is the max over all regions). Per-region split so a saturating
+    /// dominant unit (gaps.md §50) can be attributed to a region from metrics.jsonl alone.
+    KwtaDutyMaxVisual,
+    /// Maximum single-unit duty cycle in the symbolic region, x1e6, sampled once per sleep cycle with
+    /// `KwtaDutyMax` (which is the max over all regions). Per-region split so a saturating
+    /// dominant unit (gaps.md §50) can be attributed to a region from metrics.jsonl alone.
+    KwtaDutyMaxSymbolic,
+    /// Maximum single-unit duty cycle in the language region, x1e6, sampled once per sleep cycle with
+    /// `KwtaDutyMax` (which is the max over all regions). Per-region split so a saturating
+    /// dominant unit (gaps.md §50) can be attributed to a region from metrics.jsonl alone.
+    KwtaDutyMaxLanguage,
 }
 
 impl Metric {
-    pub const COUNT: usize = 110;
+    pub const COUNT: usize = 115;
 
     const fn as_index(self) -> usize {
         match self {
@@ -565,6 +585,11 @@ impl Metric {
             Metric::NremStaleTraceSkipped => 107,
             Metric::KwtaDutyDevMean => 108,
             Metric::KwtaDutyMax => 109,
+            Metric::KwtaDutyMaxSpeech => 110,
+            Metric::KwtaDutyMaxEnv => 111,
+            Metric::KwtaDutyMaxVisual => 112,
+            Metric::KwtaDutyMaxSymbolic => 113,
+            Metric::KwtaDutyMaxLanguage => 114,
         }
     }
 
@@ -680,6 +705,11 @@ impl Metric {
             Metric::NremStaleTraceSkipped => "nrem_stale_trace_skipped",
             Metric::KwtaDutyDevMean => "kwta_duty_dev_mean",
             Metric::KwtaDutyMax => "kwta_duty_max",
+            Metric::KwtaDutyMaxSpeech => "kwta_duty_max_speech",
+            Metric::KwtaDutyMaxEnv => "kwta_duty_max_env",
+            Metric::KwtaDutyMaxVisual => "kwta_duty_max_visual",
+            Metric::KwtaDutyMaxSymbolic => "kwta_duty_max_symbolic",
+            Metric::KwtaDutyMaxLanguage => "kwta_duty_max_language",
         }
     }
 
@@ -794,6 +824,11 @@ impl Metric {
         Metric::NremStaleTraceSkipped,
         Metric::KwtaDutyDevMean,
         Metric::KwtaDutyMax,
+        Metric::KwtaDutyMaxSpeech,
+        Metric::KwtaDutyMaxEnv,
+        Metric::KwtaDutyMaxVisual,
+        Metric::KwtaDutyMaxSymbolic,
+        Metric::KwtaDutyMaxLanguage,
     ];
 }
 

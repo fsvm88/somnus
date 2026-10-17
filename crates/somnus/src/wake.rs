@@ -691,7 +691,16 @@ pub(crate) fn sleep_cycle(
                 somnus_metrics::Metric::ProcessRssBytes,
                 current_process_rss_bytes()
             );
+            const DUTY_MAX_METRICS: [somnus_metrics::Metric; 5] = [
+                somnus_metrics::Metric::KwtaDutyMaxSpeech,
+                somnus_metrics::Metric::KwtaDutyMaxEnv,
+                somnus_metrics::Metric::KwtaDutyMaxVisual,
+                somnus_metrics::Metric::KwtaDutyMaxSymbolic,
+                somnus_metrics::Metric::KwtaDutyMaxLanguage,
+            ];
             for r in perception.duty_cycle_report() {
+                let region_max = r.top5.first().map_or(0.0, |&(_, dc)| dc);
+                somnus_metrics::counted_core!(DUTY_MAX_METRICS[r.region], (region_max * 1e6) as u64);
                 info!(
                     region = r.region,
                     n_units = r.n_units,

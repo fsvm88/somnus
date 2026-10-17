@@ -71,7 +71,7 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0022](0022-instrumentation-metrics-expansion.md) | Instrumentation and metrics expansion: salience, blend, modality, NREM coverage | accepted |
 | [0023](0023-gpu-unification.md) | GPU unification: ORT/MIGraphX for perception inference | accepted; Phase 0+1 implemented |
 | [0024](0024-neuromodulatory-self-regulation.md) | Neuromodulatory self-regulation: derived signals replace fixed thresholds | accepted |
-| [0025](0025-sae-l1-coding-loss.md) | SAE L1 coding loss | closed — not adopted |
+| [0025](0025-sae-l1-coding-loss.md) | SAE L1 coding loss | closed — not adopted (reopen trigger met 2026-10-17, no change; see ADR) |
 | [0026](0026-pruning-ab-distribution-shift.md) | A/B: magnitude pruning safety under distribution shift | closed — FAIL, pruning disabled by default |
 | [0027](0027-per-region-prior-beta.md) | Per-region prior beta (Item G) | closed — FAIL (gist regression) |
 | [0028](0028-memory-recall-in-generation.md) | Memory recall in generation (R1) | accepted |
@@ -94,6 +94,6 @@ Routine implementation details; choices fully determined by `principles.md`/`tec
 | [0045](0045-dinov3-visual-encoder.md) | Adopt DINOv3-ViT-S as the visual encoder; drop DINOv2-S/14 | implemented |
 | [0046](0046-audio-env-encoder-candidates.md) | Audio env encoder candidates surveyed: CLAP-HTSAT retained | closed — status quo confirmed |
 | [0047](0047-harden-cli-defaults-to-production-settings.md) | Harden four CLI defaults (`--working-memory-size`, `--settle-steps`, `--max-warm-records`, `--lang-use-lm`) to match already-adopted production settings | accepted, shipped as default |
-| [0048](0048-decoupled-wake-binding-snapshot.md) | Decoupled wake-time binding snapshot (§33 candidate (e): `wake_binding` copy, `--binding-wake-lag-cycles`) | implemented; not yet piloted |
+| [0048](0048-decoupled-wake-binding-snapshot.md) | Decoupled wake-time binding snapshot (§33 candidate (e): `wake_binding` copy, `--binding-wake-lag-cycles`) | implemented; piloted 2026-10-17 (4 arms x 2 seeds), not adopted: lag10/lag30 don't beat control, lag30 collapses at promotion; binding replay shelved |
 | [0049](0049-burn-0.22-flex-safetensors.md) | Migrate burn 0.21 → 0.22 (NdArray → burn-flex, BinFile → safetensors, device-based autodiff) | implemented, merged 2026-10-16 |
 | [0050](0050-automatic-thread-budgets.md) | Automatic thread budgets: rayon pool = cores/2, encoder ORT intra-op = cores/8 (`--rayon-threads`, `--encoder-ort-threads`) | implemented |

@@ -1,6 +1,6 @@
 # 0041. Live-episode binding training in NREM (close the §33 never-trained-binding gap)
 
-- **Status:** implemented; isolated A/B pilot run 2026-08-15 (engineering-log.md §35) — mechanism validated
+- **Status (2026-10-17): shelved.** `--binding-replay` stays opt-in/off: eight pilots (six before ADR 0048, the 4-arm x 2-seed lag sweep after it) show no gain over the no-replay control and a recurring settle-gate cascade; the ADR 0048 lag lever only defers the shock (lag30) or costs `mean_output_mse` (lag10). Revisit only with a new mechanism (gated promotion/interpolation). Original status: implemented; isolated A/B pilot run 2026-08-15 (engineering-log.md §35) — mechanism validated
   and the §33 fix engages in production state, but the predicted episode-drift recall regression
   materialized and the NREM cost displaced ~30% of replay. **Not adopted.** Adoption path queued
   (engineering-log.md §35 "Adoption path"): step budget (`--binding-replay-steps`) → longer repeat pilot

@@ -1,7 +1,7 @@
 # ADR 0025 — SAE L1 Coding Loss
 
 **Date:** 2026-06-17
-**Status:** Closed — L1 not adopted
+**Status:** Closed — L1 not adopted. **Reopen trigger met 2026-10-17 (see "Update" at the end); no change made.**
 
 ## Context
 
@@ -35,3 +35,18 @@ Pre-stated win: s3-5 avg `mean_output_mse` drops >10% vs. control. λ=0.1 tested
 ## What would reopen this
 
 Evidence that dead units accumulate at scale and duty-cycle fails to prevent it → revisit option (b). A specific reconstruction bottleneck identified at higher session counts → re-test L1 at λ≤0.01 on a warm memory store, not cold.
+
+## Update 2026-10-17: the reopen trigger is met on the letter; nothing changed
+
+The "What would reopen this" condition (dead units accumulate at scale and duty-cycling fails to prevent it) is now
+supported by measurements, from the new duty-cycle diagnostics (gaps.md §50, ADR 0039 update): in every region of the
+restored production-scale snapshot (~9.9k units per region) **1 unit (4 in speech) fires on every ingest and its duty
+cycle keeps climbing toward 1.0** (`kwta_duty_max` ~0.5 -> ~1.0 within 10 cycles, in every arm), **240-570 of the
+original 1024 units are silent** (dc <= 1e-4), and the ~8.8k grown units hold 17-75% of the active slots with
+activations 10-240x smaller than the original units'. Duty-cycle boosting (`BOOST_STRENGTH` 1.0, at most ~0.02 at
+start) does not prevent either failure.
+
+What this does NOT show: that ReLU+L1 (option (b)) would fix it, or that the imbalance costs reconstruction quality
+(the one init-scale experiment, ~1.6% of units affected, was inconclusive). So the decision recorded here: **option (b) is
+a candidate again, but any pilot of it (or of a stronger/normalised boost, a norm-matched grown-unit init, or persisted
+duty cycles) is a separate decision**; this ADR stays "L1 not adopted" until such a pilot exists.
