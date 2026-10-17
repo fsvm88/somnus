@@ -29,6 +29,13 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) seed: Option<u64>,
 
+    /// L2 norm of the encoder column given to each unit added by seeded region growth. Default
+    /// 0.01 is the historical value; original units sit at ~0.5-0.6, so grown units start ~50x
+    /// weaker and mostly win k-WTA slots via the duty-cycle boost with near-zero activations
+    /// (gaps.md §50). Experiment knob; do not change the default without an A/B.
+    #[arg(long, default_value = "0.01")]
+    pub(crate) grown_unit_init_scale: f32,
+
     /// Size of the global rayon pool that burn-flex's CPU kernels run on. 0 = auto: half the
     /// logical cores. The encoder/ASR ONNX sessions share the machine with it; with every library
     /// at "all cores" the wake loop ran 2x slower (ADR 0049 pilot, gaps.md Q14/R5).

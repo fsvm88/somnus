@@ -367,6 +367,9 @@ pub struct PerceptionProcessor {
     settle_steps: usize,
     settle_beta: f32,
     settle_gate: f32,
+    /// L2 norm of the encoder columns given to new units by `grow_region_seeded` (default 0.01,
+    /// the historical value; gaps.md §50 experiment `--grown-unit-init-scale`).
+    grown_init_scale: f32,
     settle_every: usize,
     settle_episode_count: usize,
     region_gain: [f32; 5],
@@ -464,6 +467,7 @@ impl PerceptionProcessor {
             settle_steps: 0,
             settle_beta: 0.5,
             settle_gate: SETTLE_COSINE_GATE_DEFAULT,
+            grown_init_scale: 0.01,
             settle_every: 1,
             settle_episode_count: 0,
             region_gain: [1.0; 5],
@@ -2130,6 +2134,7 @@ impl PerceptionProcessor {
     ) {
         let device = self.device.clone();
         let n_in = REGION_DIMS[region.as_index()];
+        let init_scale = self.grown_init_scale;
         let model = self.model_mut();
 
         let new_n = {
@@ -2137,14 +2142,14 @@ impl PerceptionProcessor {
             let old_n = layer.n_units;
             let new_n = old_n + n_new;
 
-            // Build encoder columns: normalised seed × 0.01 (matches grow_region scale).
+            // Build encoder columns: normalised seed × `init_scale` (default 0.01, matches grow_region).
             let mut cols: Vec<f32> = Vec::with_capacity(n_in * n_new);
             let n_seeds = sorted_inputs.len();
             for k in 0..n_new {
                 let seed = &sorted_inputs[k % n_seeds];
                 let norm: f32 = seed.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
                 for &x in seed {
-                    cols.push(x / norm * 0.01);
+                    cols.push(x / norm * init_scale);
                 }
             }
             let cols_t: Tensor<2> = Tensor::from_inner(Tensor::<2>::from_data(
@@ -2539,6 +2544,11 @@ impl PerceptionProcessor {
 
     pub fn set_settle_gate(&mut self, gate: f32) {
         self.settle_gate = gate;
+    }
+
+    /// Encoder-column L2 norm for units added by `grow_region_seeded` (default 0.01).
+    pub fn set_grown_init_scale(&mut self, scale: f32) {
+        self.grown_init_scale = scale;
     }
 
     pub fn set_settle_every(&mut self, every: usize) {
