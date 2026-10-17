@@ -229,7 +229,7 @@ needs a measurement before acting.
 | R5 | Try to shave | **Done, bigger than expected.** Preprocessing was cheap (0.4 ms); the cost was thread oversubscription. ADR 0050: automatic thread budgets, wall 448 -> 336 s, per-op 1.5-3x. Also: bit-identical `u8`-sampling preprocessing (1.66 -> 0.44 ms at 1080p). Untried: move the video encoder to the CPU EP (23 ms vs 54 ms via MIGraphX, measured isolated). |
 | R6 | Improve | **Done** (concurrent session/embedding/tokenizer loading: 32.5 -> 16.5 s). Remaining ~16 s is the two FP32 KV sessions and MIGraphX compiles. |
 | R7 | Queue a benchmark | **Done, hypothesis rejected.** `bench_inference_device`: autodiff vs plain device inference 0.93-1.11x (<=0.05 ms absolute), within noise. No change made. |
-| R8 | (not decided by user) | Queued. |
+| R8 | Partly done 2026-10-17 | `select_top_k` now builds on `select_top_k_no_dc` (no duplicate code; one fewer `z_vec` clone and one fewer boosted Vec; same selection, workspace tests green). Scratch-buffer reuse and `(f32,u16)` entries NOT done (minor). |
 | R9 | Add and test | **Done.** `release-lto` profile (opt-in). Measured on `bench_nrem_batch` x3: <=5 % at batch 128, <2 % at 32/64, within noise, for +2m22s of build time. Not made default. |
 | R10 | (not decided by user) | Not done: spill is ~0.7 s of a ~100 s cycle. |
 | R11 | Clean up | **Done** (`ingest_region`, `PerceptionModel::layer/layer_mut/decoder`; 15 five-way matches collapsed; -263 lines; golden parity 0 diffs). |
