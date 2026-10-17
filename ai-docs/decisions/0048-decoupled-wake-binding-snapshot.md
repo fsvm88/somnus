@@ -322,3 +322,20 @@ and stays there** in every arm, including control (cycle 1: ~0.5). At least one 
 ingest, so boosting (`BOOST_STRENGTH` 1.0 x (target - dc), target ~0.0195) cannot suppress it, and one of the ~193 active
 slots per region is permanently taken. `kwta_duty_dev_mean` is stable at ~0.016-0.024 (target dc 0.0195), i.e. the average
 unit is as far from target as the target itself. This is independent of binding_replay and of the lag. Whether it predates R1 is still unknown (the seed-42 pilots lack the metric). **Resolved in gaps.md §50 (2026-10-17):** the saturating units are the largest-norm *original* units (1 per region, 4 in speech, firing on every ingest); not a grown unit. The boost (max ~0.02 at start, about -0.9 once dc ~ 0.95) cannot dislodge them. Independent of binding replay.
+
+### Follow-up: exponential interpolation instead of hard copy (`--binding-wake-interp`, 2026-10-17)
+
+New flag `--binding-wake-interp a` (default 1.0 = the hard copy above): each `sync_wake_binding` moves `wake_binding` a fraction `a` of the way toward `binding` on the 8 trained tensors (temporal GRU/proj still copied), instead of jumping. Rationale from the lag pilots: a large, late promotion (lag30) collapses the settle gate, many small ones (lag10) do not, so make every promotion small. Test: `wake_binding_interp_moves_part_way_then_converges`.
+
+**Pilot** (`scripts/ab_flag_pair.sh`, `memory/ab_interp/`, 40 cycles, SEED 42, fine-metrics, parallel arms): control = `--binding-replay` (lag 1, hard copy), treatment = `--binding-replay --binding-wake-interp 0.1`. **One seed; no no-replay control in this pilot** (the earlier lag pilots' no-replay controls are the reference: settle gate ~0.75-0.80, wake MSE ~0.045-0.049).
+
+| per-4th-cycle series | control (hard copy) | treatment (interp 0.1) |
+|---|---|---|
+| `settle_gate_dynamic` | .78 .65 **.00** .83 .77 .73 .53 **.13** .63 **.05** | .10 .66 .76 .81 .81 .81 .81 .79 .80 .79 |
+| `mean_output_mse_wake` | .04 .05 .12 .02 .03 .02 .06 .14 .03 .03 | .07 .07 .04 - .04 .03 .03 .02 .03 .02 |
+| `warm_recall_l2` | .51 .68 .95 .44 .79 .72 .71 .90 .63 .37 | 1.25 .85 .64 .48 .46 .64 .40 .31 .36 .44 |
+
+- **Health:** after a rough first cycle (gate .10, `warm_recall_l2` 1.25) treatment settles to a stable gate ~0.80 and steadily falling wake MSE (0.066 -> 0.017) and `warm_recall_l2`, while the hard-copy control keeps collapsing (gate 0.0 / 0.13 / 0.05 at three of ten sampled cycles). Cycles 21-40 means, treatment vs control: gate .79 vs .35, wake MSE .023 vs .061, `warm_recall_l2` .45 vs .68, `sal_threshold` .53 vs .79, `settle_iters_sum` 16 vs 27, `gist_recall_rate` .69 vs .55.
+- **Headline criterion not demonstrated:** `mean_output_mse` in cycles 21-40 is .063 vs .031 (+101%), but that series is erratic in both arms (control .00-.115 sampled, with 0.0 entries; treatment drifts .04 -> .07), so it cannot carry a verdict at n=1. It is the same metric that made lag10 look bad in both lag pilots; it may be measuring staleness of stored targets rather than health.
+- **Confounds:** growth cadence differed (10 vs 9 growth events, final sizes 10245 vs 10430); first-cycle transient in treatment unexplained.
+- **Reading:** interpolation looks like the first lever that removes the intermittent collapse while keeping training running, but this is one seed and still shows no benefit of binding replay over the no-replay control. Not adopted; flag stays at 1.0. Next if pursued: a second seed with a no-replay control arm, then `a` in {0.05, 0.2}.
