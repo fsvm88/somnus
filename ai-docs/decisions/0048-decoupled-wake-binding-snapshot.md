@@ -293,3 +293,34 @@ Means by cycle bin (1-10 / 11-25 / 26-40):
 **Status:** not adopted as a default. Next questions: a second seed (or a control-vs-control baseline) for lag10 vs
 lag30; whether `binding_replay` yields any benefit worth the lag (needs a metric that rewards it); then the
 validated/gated promotion alternative if not.
+
+### Second seed (SEED=43, 2026-10-17, same script/binary + duty-cycle metrics; `memory/ab_binding_wake_lag_s43/`)
+
+Replication of the seed-42 pilot. What replicated and what did not:
+
+- **lag1 reproduces the cascade** (settle gate .69 -> .52 -> .19 by bins; `warm_recall_l2` .59 -> .70; region-2 MSE 0.0095 vs
+  0.0050 control in cycles 26-40). Its `mean_output_mse` is huge early (.120 in cycles 1-10) and converges to control's
+  band by 26-40 (.0199 vs .0196), same as seed 42. So that metric converges while the health metrics keep degrading.
+- **lag10 is worse than control on `mean_output_mse` in both seeds**, cycles 26-40: .0389 vs .0234 (seed 42), .0353 vs
+  .0196 (seed 43), i.e. +66% / +80%. This replicated, so it is probably real, not noise; cause unknown. Its wake MSE is the
+  best of all arms in both seeds (.028 / .025) and it never collapses the settle gate.
+- **lag30 does NOT hold up: the lag only defers the shock.** Per-cycle settle gate for lag30 sits at ~0.80 until the
+  cycle-30 promotion, then collapses: seed 42 .80 -> .51 -> .24 -> .47 -> .68; seed 43 .79 -> **0.0, 0.03, 0.11** -> .48
+  -> .08. A promotion after 30 cycles of accumulated drift reproduces the §47 collapse at the moment it happens. lag10
+  (promotions every 10 cycles) shows only mild dips (.61-.80) in both seeds. The seed-42 table's "lag30 is fine" reading
+  was an artifact of the bins: it measured mostly the pre-promotion window.
+- **Adopt criterion: still not met** (lag30 vs lag1, cycles 26-40: -4.3% seed 42, +26.0% seed 43; lag10 +73% / +77%).
+- **Revised reading:** what matters is the size of the generation jump at promotion, not (only) its frequency; small, frequent
+  promotions (lag10) are safe for the settle gate but cost `mean_output_mse`; one big late promotion (lag30) is the
+  worst of both. This points at the ADR's deferred alternative (validated/gated promotion, or interpolating `wake_binding`
+  toward `binding` instead of hard-copying) rather than at a larger lag. Not decided; not implemented.
+- **Control (no binding replay) is as good as or better than every binding_replay arm** on the sleep/health metrics in
+  both seeds. The pilots still show no gain from binding_replay itself.
+
+**New observation (duty-cycle metrics, all four arms, both within the run):** `kwta_duty_max` reaches **~1.0 by cycle 10
+and stays there** in every arm, including control (cycle 1: ~0.5). At least one k-WTA unit is active on essentially every
+ingest, so boosting (`BOOST_STRENGTH` 1.0 x (target - dc), target ~0.0195) cannot suppress it, and one of the ~193 active
+slots per region is permanently taken. `kwta_duty_dev_mean` is stable at ~0.016-0.024 (target dc 0.0195), i.e. the average
+unit is as far from target as the target itself. This is independent of binding_replay and of the lag. Which region/unit,
+and whether it predates R1 (the seed-42 pilots lack the metric), is not yet known. Candidate causes to check: a grown
+unit seeded with a large-norm weight (`grow_region_seeded`), or dead-by-design k-WTA dynamics with a weak boost.
