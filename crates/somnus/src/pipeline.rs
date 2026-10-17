@@ -278,6 +278,7 @@ pub(crate) fn spawn_asr_thread(
         let asr_cnt = Arc::clone(asr_count);
         let asr_min_chars = args.asr_min_chars;
         let memory_dir = args.memory_dir.clone();
+        let models_dir = args.models_dir.clone();
         std::thread::spawn(move || {
             let mut dec = dec;
             // gaps.md §40: does one ORT panic leave the Session's ORT-internal state
@@ -325,6 +326,21 @@ pub(crate) fn spawn_asr_thread(
                         somnus_metrics::counted_core!(somnus_metrics::Metric::AsrPanic, 1);
                         panicked_this_session = true;
                         capture_asr_panic_input(&memory_dir, &hidden_for_capture);
+                        // The ORT Session's internal state after a panic is unknowable (gaps.md
+                        // §40 poisoning question); stop depending on it: continue on a fresh one.
+                        match WhisperDecoder::new(&models_dir) {
+                            Ok(fresh) => {
+                                dec = fresh;
+                                tracing::warn!("whisper decoder session rebuilt after panic");
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    ?e,
+                                    "whisper decoder rebuild failed; keeping old session"
+                                );
+                                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+                            }
+                        }
                     }
                 }
             }

@@ -333,4 +333,50 @@ mod tests {
             );
         }
     }
+
+    /// §40 concurrency hypothesis: two decoder sessions decoding on separate threads at once
+    /// (the live pipeline runs the ASR thread next to the audio/video encoders and the LM).
+    /// `cargo test -p somnus --release whisper_asr::tests::stress_concurrent -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stress_concurrent_decoders_for_ort_panic() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let dir = models_dir();
+        if !dir.join("whisper_tiny_decoder.onnx").exists() {
+            return;
+        }
+        let n = WHISPER_ENC_SEQ * WHISPER_ENC_DIM;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let handles: Vec<_> = (0..3u64)
+            .map(|t| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let mut dec = WhisperDecoder::new(&dir).unwrap();
+                    let mut x = 0x1234_5678_9ABC_DEF0u64 ^ (t << 32);
+                    let (mut ok, mut panics, mut errs) = (0u32, 0u32, 0u32);
+                    while std::time::Instant::now() < deadline {
+                        let hidden: Vec<f32> = (0..n)
+                            .map(|_| {
+                                x ^= x << 13;
+                                x ^= x >> 7;
+                                x ^= x << 17;
+                                ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+                            })
+                            .collect();
+                        match catch_unwind(AssertUnwindSafe(|| dec.decode_greedy(&hidden, 32))) {
+                            Ok(Ok(_)) => ok += 1,
+                            Ok(Err(_)) => errs += 1,
+                            Err(_) => panics += 1,
+                        }
+                    }
+                    (ok, errs, panics)
+                })
+            })
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            let (ok, errs, panics) = h.join().unwrap();
+            println!("STRESS_CONC thread {i}: ok={ok} err={errs} panic={panics}");
+            assert_eq!(panics, 0);
+        }
+    }
 }
