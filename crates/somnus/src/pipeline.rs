@@ -271,7 +271,7 @@ pub(crate) fn spawn_asr_thread(
     whisper_dec: Option<WhisperDecoder>,
     lang_tx: &mpsc::Sender<String>,
     asr_count: &Arc<AtomicUsize>,
-) -> Option<std::sync::mpsc::SyncSender<Vec<f32>>> {
+) -> Option<(std::sync::mpsc::SyncSender<Vec<f32>>, AsrShutdown)> {
     if let Some(dec) = whisper_dec {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
         let lang_tx_asr = lang_tx.clone();
@@ -279,6 +279,9 @@ pub(crate) fn spawn_asr_thread(
         let asr_min_chars = args.asr_min_chars;
         let memory_dir = args.memory_dir.clone();
         let models_dir = args.models_dir.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stop_t, done_t) = (Arc::clone(&stop), Arc::clone(&done));
         std::thread::spawn(move || {
             let mut dec = dec;
             // gaps.md §40: does one ORT panic leave the Session's ORT-internal state
@@ -286,7 +289,21 @@ pub(crate) fn spawn_asr_thread(
             // degraded, or does the thread fully recover? Tracked in-thread since this
             // is the only thread that ever touches `dec`/`Session`.
             let mut panicked_this_session = false;
-            while let Ok(hidden) = rx.recv() {
+            loop {
+                // Poll with a timeout so a shutdown request is honoured even while idle.
+                if stop_t.load(Ordering::Relaxed) {
+                    break;
+                }
+                let hidden = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(h) => h,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                // Do not start a decode once shutdown began: the ORT runtime is about to be
+                // torn down by process exit (gaps.md §40).
+                if stop_t.load(Ordering::Relaxed) {
+                    break;
+                }
                 // ORT's Whisper decoder occasionally panics instead of returning Err
                 // (e.g. "GetElementType is not implemented") — an intermittent, unfixed
                 // ORT-side issue (see ai-docs/a_b_qwen3_findings.md). catch_unwind stops
@@ -344,10 +361,36 @@ pub(crate) fn spawn_asr_thread(
                     }
                 }
             }
+            done_t.store(true, Ordering::Release);
         });
-        Some(tx)
+        Some((tx, AsrShutdown { stop, done }))
     } else {
         None
+    }
+}
+
+/// Handle to ask the ASR thread to finish its in-flight decode and stop (gaps.md §40).
+pub(crate) struct AsrShutdown {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsrShutdown {
+    /// Signal the thread and wait up to `timeout` for it to exit. The process exits right after
+    /// the main loop with `std::process::exit`, which runs the ORT library's static destructors
+    /// while a still-running `Session::run` on this thread would hit a half-destroyed runtime:
+    /// every logged `GetElementType is not implemented` failure happened within ~0.5 s after the
+    /// "exiting" log line, never mid-run. Returns whether the thread finished in time.
+    pub(crate) fn stop_and_wait(&self, timeout: std::time::Duration) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        while !self.done.load(Ordering::Acquire) {
+            if t0.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        true
     }
 }
 

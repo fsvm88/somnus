@@ -558,7 +558,11 @@ pub async fn run() -> Result<()> {
     // Decouples Whisper decoding from audio accumulation: the audio thread sends
     // encoder hidden states via a bounded channel and returns immediately; decoding
     // happens concurrently.  Channel capacity 2: one being decoded + one buffered.
-    let asr_hidden_tx = pipeline::spawn_asr_thread(&args, whisper_dec, &lang_tx, &asr_count);
+    let (asr_hidden_tx, asr_shutdown) =
+        match pipeline::spawn_asr_thread(&args, whisper_dec, &lang_tx, &asr_count) {
+            Some((tx, sd)) => (Some(tx), Some(sd)),
+            None => (None, None),
+        };
 
     // ── audio encoder task ────────────────────────────────────────────────────
     let mut audio_emb_rx =
@@ -854,6 +858,15 @@ pub async fn run() -> Result<()> {
                     somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
                 }
             }
+        }
+    }
+
+    // Let the ASR thread finish (not start) its decode before process exit tears the ORT runtime
+    // down under it (gaps.md §40: that race produced every `GetElementType is not implemented`).
+    if let Some(sd) = &asr_shutdown {
+        if !sd.stop_and_wait(std::time::Duration::from_secs(30)) {
+            tracing::warn!("ASR thread still decoding after 30 s; exiting anyway");
+            somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
         }
     }
 
