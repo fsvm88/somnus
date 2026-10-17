@@ -937,15 +937,16 @@ fn spill_hot_buffer(
     max_warm_records: usize,
     max_cold_records: usize,
 ) {
-    let mut spilled = 0usize;
-    for record in episodic.iter_records() {
-        if let Err(e) = recall.cold.append(record) {
-            tracing::warn!(?e, "cold archive append error");
-            somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
-            break;
-        }
+    let cold_before = recall.cold.len();
+    if let Err(e) = recall.cold.append_batch(episodic.iter_records()) {
+        tracing::warn!(?e, "cold archive append error");
+        somnus_metrics::counted_core!(somnus_metrics::Metric::ColdArchiveOpError, 1);
+    }
+    // Only records that landed in cold are consolidated into warm (same as the old per-record loop,
+    // which stopped at the first failed append).
+    let spilled = recall.cold.len() - cold_before;
+    for record in episodic.iter_records().take(spilled) {
         recall.warm.insert(record.clone());
-        spilled += 1;
     }
     somnus_metrics::counted_core!(
         somnus_metrics::Metric::ColdArchiveSpillBytesWritten,

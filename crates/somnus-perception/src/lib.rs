@@ -930,7 +930,10 @@ impl PerceptionProcessor {
         // Phase 2: backward + optimizer step.
         if let Some(loss) = total_loss {
             let loss_val: f32 = loss.clone().into_scalar::<f32>();
-            let model = self.model.take().unwrap();
+            let model = self
+                .model
+                .take()
+                .expect("model already taken (re-entrant optimizer step?)");
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
             let model = self.optimizer.step(self.current_lr, model, grads_p);
@@ -1025,7 +1028,10 @@ impl PerceptionProcessor {
 
         if let Some(loss) = total_loss {
             let loss_val: f32 = loss.clone().into_scalar::<f32>();
-            let model = self.model.take().unwrap();
+            let model = self
+                .model
+                .take()
+                .expect("model already taken (re-entrant optimizer step?)");
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
             let model = self.optimizer.step(self.current_lr, model, grads_p);
@@ -1287,7 +1293,10 @@ impl PerceptionProcessor {
             // "loss-scale" pilot was a no-op by construction, not a real dosage test. Scaling
             // the step size actually changes the update magnitude.
             let loss_val: f32 = loss.clone().into_scalar::<f32>();
-            let model = self.model.take().unwrap();
+            let model = self
+                .model
+                .take()
+                .expect("model already taken (re-entrant optimizer step?)");
             let grads = loss.backward();
             let mut grads_p = GradientsParams::from_grads(grads, &model);
             // freeze_heads (gaps.md §33 candidate (d), 2026-08-16): the five output heads are
@@ -1399,7 +1408,10 @@ impl PerceptionProcessor {
 
         if let Some(loss) = total_loss {
             let loss_val: f32 = loss.clone().into_scalar::<f32>();
-            let model = self.model.take().unwrap();
+            let model = self
+                .model
+                .take()
+                .expect("model already taken (re-entrant optimizer step?)");
             let grads = loss.backward();
             let grads_p = GradientsParams::from_grads(grads, &model);
             let model = self.optimizer.step(self.current_lr, model, grads_p);
@@ -1589,7 +1601,10 @@ impl PerceptionProcessor {
         };
         somnus_metrics::timed_core!(somnus_metrics::Metric::FusedReplayBackward, {
             if let Some(loss) = combined {
-                let model = self.model.take().unwrap();
+                let model = self
+                    .model
+                    .take()
+                    .expect("model already taken (re-entrant optimizer step?)");
                 let grads = loss.backward();
                 let grads_p = GradientsParams::from_grads(grads, &model);
                 let model = self.optimizer.step(self.current_lr, model, grads_p);
@@ -1644,7 +1659,10 @@ impl PerceptionProcessor {
 
             if let Some(loss) = total_loss {
                 let loss_val: f32 = loss.clone().into_scalar::<f32>();
-                let model = self.model.take().unwrap();
+                let model = self
+                    .model
+                    .take()
+                    .expect("model already taken (re-entrant optimizer step?)");
                 let grads = loss.backward();
                 let grads_p = GradientsParams::from_grads(grads, &model);
                 let model = self.optimizer.step(self.current_lr, model, grads_p);
@@ -2530,7 +2548,10 @@ impl PerceptionProcessor {
                     Param::from_mapped_value(ParamId::new(), fresh, mapper)
                 }
             }
-            let model = self.model.take().unwrap();
+            let model = self
+                .model
+                .take()
+                .expect("model already taken (re-entrant optimizer step?)");
             self.model = Some(model.map(&mut GraphDetacher));
             self.optimizer = AdamWConfig::new().init();
         });

@@ -81,34 +81,57 @@ impl ColdArchive {
 
     /// Quantise and append one episode record.
     pub fn append(&mut self, record: &EpisodeRecord) -> MemoryResult<()> {
-        if record.values.len() != COLD_DIM {
-            return Err(MemoryError::DimMismatch {
-                expected: COLD_DIM,
-                got: record.values.len(),
-            });
-        }
-        let max_abs = record.values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
-        let quantised: Vec<i8> = record
-            .values
-            .iter()
-            .map(|&v| (v / scale).round().clamp(-127.0, 127.0) as i8)
-            .collect();
+        self.append_batch(std::iter::once(record))
+    }
 
+    /// Quantise and append many records through one file handle and one buffered writer.
+    ///
+    /// Records are written in order; on the first error (dimension mismatch or I/O) the records
+    /// already written stay in the archive and `len()` reflects exactly those, so a caller can
+    /// compare `len()` before and after to see how many landed.
+    pub fn append_batch<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a EpisodeRecord>,
+    ) -> MemoryResult<()> {
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
         let mut w = BufWriter::new(&mut file);
-        w.write_all(&record.id.to_le_bytes())?;
-        w.write_all(&record.timestamp_secs.to_le_bytes())?;
-        w.write_all(&scale.to_le_bytes())?;
-        // Safety: i8 and u8 have same size/alignment; transmuting to &[u8] for writing is fine.
-        w.write_all(unsafe {
-            std::slice::from_raw_parts(quantised.as_ptr() as *const u8, COLD_DIM)
-        })?;
-        w.write_all(&[record.ingest_source as u8])?;
-        w.write_all(&record.salience.to_le_bytes())?;
-        w.flush()?;
-        self.len += 1;
-        Ok(())
+        let mut written = 0usize;
+        let result = (|| -> MemoryResult<()> {
+            for record in records {
+                if record.values.len() != COLD_DIM {
+                    return Err(MemoryError::DimMismatch {
+                        expected: COLD_DIM,
+                        got: record.values.len(),
+                    });
+                }
+                let max_abs = record.values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+                let quantised: Vec<i8> = record
+                    .values
+                    .iter()
+                    .map(|&v| (v / scale).round().clamp(-127.0, 127.0) as i8)
+                    .collect();
+                w.write_all(&record.id.to_le_bytes())?;
+                w.write_all(&record.timestamp_secs.to_le_bytes())?;
+                w.write_all(&scale.to_le_bytes())?;
+                // Safety: i8 and u8 have same size/alignment; transmuting to &[u8] for writing is fine.
+                w.write_all(unsafe {
+                    std::slice::from_raw_parts(quantised.as_ptr() as *const u8, COLD_DIM)
+                })?;
+                w.write_all(&[record.ingest_source as u8])?;
+                w.write_all(&record.salience.to_le_bytes())?;
+                written += 1;
+            }
+            Ok(())
+        })();
+        // Flush what was buffered even when a later record failed, so len() matches the file.
+        let flushed = w.flush();
+        match (&result, flushed) {
+            (_, Ok(())) => self.len += written,
+            (Ok(()), Err(e)) => return Err(e.into()),
+            (Err(_), Err(_)) => {} // file state unknown; len stays, original error returned
+        }
+        result
     }
 
     /// Iterate all records, dequantising each vector.
@@ -525,5 +548,41 @@ mod tests {
             .map(|r| r.unwrap().ingest_source)
             .collect();
         assert_eq!(back, sources);
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_append_and_reports_partial_progress() {
+        let a_dir = TempDir::new().unwrap();
+        let b_dir = TempDir::new().unwrap();
+        let mut seq = ColdArchive::open(a_dir.path()).unwrap();
+        let mut bat = ColdArchive::open(b_dir.path()).unwrap();
+        let recs: Vec<_> = (0..5)
+            .map(|i| make_record(i, 0.1 * (i as f32 + 1.0)))
+            .collect();
+        for r in &recs {
+            seq.append(r).unwrap();
+        }
+        bat.append_batch(&recs).unwrap();
+        assert_eq!(seq.len(), bat.len());
+        let a = std::fs::read(a_dir.path().join("episodes.cold")).unwrap();
+        let b = std::fs::read(b_dir.path().join("episodes.cold")).unwrap();
+        assert_eq!(
+            a, b,
+            "batched file must be byte-identical to sequential appends"
+        );
+
+        // A bad record mid-batch: earlier records land, len() says exactly how many.
+        let mut bad = make_record(99, 0.5);
+        bad.values.truncate(3);
+        let before = bat.len();
+        let batch = [
+            make_record(10, 0.2),
+            make_record(11, 0.3),
+            bad,
+            make_record(12, 0.4),
+        ];
+        assert!(bat.append_batch(&batch).is_err());
+        assert_eq!(bat.len(), before + 2);
+        assert_eq!(bat.iter().unwrap().count(), before + 2);
     }
 }

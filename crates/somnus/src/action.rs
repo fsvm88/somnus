@@ -804,7 +804,10 @@ impl ActionDecoder {
         let loss_val: f32 = loss.clone().into_scalar::<f32>();
 
         // Take/replace pattern for the optimizer step.
-        let model = self.model.take().unwrap();
+        let model = self
+            .model
+            .take()
+            .expect("model already taken (re-entrant optimizer step?)");
         let grads = loss.backward();
         let grads_p = GradientsParams::from_grads(grads, &model);
         let model = self.optimizer.step(PROJ_LR, model, grads_p);
@@ -938,7 +941,10 @@ impl ActionDecoder {
         let loss = (proj_unit - text_unit).powf_scalar(2.0).mean();
         let loss_val: f32 = loss.clone().into_scalar::<f32>();
 
-        let model = self.model.take().unwrap();
+        let model = self
+            .model
+            .take()
+            .expect("model already taken (re-entrant optimizer step?)");
         let grads = loss.backward();
         let grads_p = GradientsParams::from_grads(grads, &model);
         let model = self.optimizer.step(PROJ_LR, model, grads_p);
@@ -991,7 +997,10 @@ impl ActionDecoder {
         let loss = (proj_unit - target_t).powf_scalar(2.0).mean();
         let loss_val: f32 = loss.clone().into_scalar::<f32>();
 
-        let model = self.model.take().unwrap();
+        let model = self
+            .model
+            .take()
+            .expect("model already taken (re-entrant optimizer step?)");
         let grads = loss.backward();
         let grads_p = GradientsParams::from_grads(grads, &model);
         let model = self.optimizer.step(PROJ_LR, model, grads_p);
@@ -1147,7 +1156,10 @@ impl ActionDecoder {
         // ── Step 1: Prefill ──────────────────────────────────────────────────
         // prefill_sess is a local — outputs borrows it, not self, so we can write
         // to self.kv_cache.bufs while outputs is alive. No intermediate Vec needed.
-        let mut prefill_sess = self.prefill_kv_session.take().unwrap();
+        let mut prefill_sess = self
+            .prefill_kv_session
+            .take()
+            .expect("generate_kv requires the KV prefill session");
         let first_logits: Vec<f32> = {
             let arr = Array3::from_shape_vec((1, prefix_len, LM_HIDDEN), prefix_embeds)
                 .map_err(|e| anyhow::anyhow!("ndarray: {e}"))?;
@@ -1202,7 +1214,10 @@ impl ActionDecoder {
                 }
             }
 
-            let mut decode_sess = self.decode_kv_session.take().unwrap();
+            let mut decode_sess = self
+                .decode_kv_session
+                .take()
+                .expect("generate_kv requires the KV decode session");
             for _ in 1..max_tokens {
                 if next_id == EOS_TOKEN_ID || self.kv_cache.pos >= kv_size {
                     break;
