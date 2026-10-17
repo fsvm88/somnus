@@ -21,6 +21,7 @@
 >   growth events, gist rates, duty-cycle stats; record deviations); (b) keep it, document as intended in an ADR note.
 >   **R4** (batch the REM scoring matmul: ~11.6 s + ~12 s/cycle) is queued behind it.
 > - **gaps.md §50 (corrected after a per-region diagnostic): a few large-norm original units fire on every ingest (`kwta_duty_max`->1.0), grown units win most slots but stay at init norm 0.01 (near-zero filler, inferred).** Needs user direction (growth/boost design); `duty_cycle_report` log line added. Seed-43 wake-lag pilot DONE: lag30 collapses the settle gate at the cycle-30 promotion (see ADR 0048 'Second seed').
+> - **§40 SOLVED 2026-10-17 (ba1291b):** the Whisper "GetElementType" failure is a shutdown race (process::exit tears ORT down under the ASR thread's in-flight decode; 27/27 failures within 0.5 s after the exit log line, 0 mid-run). Fixed with `AsrShutdown::stop_and_wait`; verified on 2 runs (0 failures vs 14/14 logs before). Earlier "0 ASR errors" claims were wrong (failures happen after the last metrics write).
 > - **ADR 0048 4-arm pilot RUN 2026-10-17** (results in the ADR: lag fixes the settle-gate cascade, adopt criterion on mean_output_mse NOT met, single seed). Next: second seed / noise baseline, duty-cycle metric.
 > - **Still queued (user said keep):** R8 (k-WTA alloc/dedupe), R10 (cold append batch, not worthwhile today),
 >   moving the video encoder off MIGraphX (CPU EP measured 23 ms vs 54 ms isolated), other `ab_*` snapshot dirs still
