@@ -472,9 +472,11 @@ mod tests {
         }
         assert_eq!(capped.len(), 3, "inserts beyond the cap are skipped");
         // First-writer-wins: records 0-2 kept, later ones dropped.
-        // Order-insensitive: HNSW result order among near-equal candidates is not stable
-        // (this assertion failed ~1 in 3 full-suite runs with the order-sensitive form).
-        let mut ids: Vec<u64> = capped.query(&[0.0f32; 8], 3).iter().map(|r| r.id).collect();
+        // Read the stored records directly, not via the HNSW index: approximate search over
+        // near-identical vectors (and an all-zeros cue) is not deterministic, and this test
+        // is about which records were kept, not about search (it still flaked ~1 in 3 runs
+        // after the order-insensitive fix).
+        let mut ids: Vec<u64> = capped.records_since(0.0).iter().map(|r| r.id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![0, 1, 2]);
 
