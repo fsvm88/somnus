@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use somnus_sensory::Timestamp;
 use ndarray::{Array3, Array4};
 use ort::{session::Session, value::TensorRef};
+use somnus_sensory::Timestamp;
 
 #[cfg(not(feature = "mn10_env"))]
 use crate::preprocess::mel::ClapMel;

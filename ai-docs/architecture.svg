@@ -1,293 +1,245 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 980" font-family="monospace, 'Courier New'" font-size="12">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1120" font-family="monospace, 'Courier New', Courier, monospace" font-size="11">
   <defs>
     <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
       <polygon points="0 0, 8 3, 0 6" fill="#555"/>
     </marker>
     <marker id="arrow-blue" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-      <polygon points="0 0, 8 3, 0 6" fill="#4477cc"/>
+      <polygon points="0 0, 8 3, 0 6" fill="#4455aa"/>
     </marker>
     <marker id="arrow-orange" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
       <polygon points="0 0, 8 3, 0 6" fill="#cc7700"/>
     </marker>
     <marker id="arrow-green" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-      <polygon points="0 0, 8 3, 0 6" fill="#336633"/>
+      <polygon points="0 0, 8 3, 0 6" fill="#447744"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#775599"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#993333"/>
     </marker>
   </defs>
 
   <!-- Background -->
-  <rect width="1100" height="980" fill="#f8f8f8"/>
+  <rect width="1400" height="1120" fill="#f8f8f8"/>
 
-  <!-- ══════════════════════════════════════
-       TITLE
-  ══════════════════════════════════════ -->
-  <text x="550" y="28" text-anchor="middle" font-size="16" font-weight="bold" fill="#222">somnus — Architecture (as of 2026-08-16)</text>
+  <!-- Title -->
+  <text x="700" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#222">somnus — architecture (as of 2026-08-16)</text>
+  <text x="700" y="50" text-anchor="middle" font-size="11" fill="#555">Data flows top to bottom. Solid arrows: wake-time flow. Dashed arrows: optional, top-down, or recall paths.</text>
 
-  <!-- ══════════════════════════════════════
-       LAYER 0 — INPUT SOURCES  (y=50)
-  ══════════════════════════════════════ -->
-  <!-- Audio input -->
-  <rect x="60" y="50" width="140" height="44" rx="6" fill="#dce8f8" stroke="#4477cc" stroke-width="1.5"/>
-  <text x="130" y="70" text-anchor="middle" font-weight="bold" fill="#223355">audio input</text>
-  <text x="130" y="85" text-anchor="middle" font-size="10" fill="#445">mic / file (cpal)</text>
+  <!-- ═══ INPUTS ═══ -->
+  <rect x="40" y="62" width="400" height="58" rx="8" fill="none" stroke="#aabbdd" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="50" y="75" font-size="9" fill="#7788bb">somnus-sensory</text>
 
-  <!-- Video input -->
-  <rect x="230" y="50" width="140" height="44" rx="6" fill="#dce8f8" stroke="#4477cc" stroke-width="1.5"/>
-  <text x="300" y="70" text-anchor="middle" font-weight="bold" fill="#223355">video input</text>
-  <text x="300" y="85" text-anchor="middle" font-size="10" fill="#445">webcam / file (nokhwa)</text>
+  <rect x="60" y="78" width="170" height="36" rx="6" fill="#dce8f8" stroke="#4477cc" stroke-width="1.5"/>
+  <text x="145" y="93" text-anchor="middle" font-weight="bold" fill="#223355">audio input</text>
+  <text x="145" y="107" text-anchor="middle" font-size="10" fill="#445">mic / file (cpal)</text>
 
-  <!-- Text bypass -->
-  <rect x="400" y="50" width="140" height="44" rx="6" fill="#e8e0f8" stroke="#775599" stroke-width="1.5" stroke-dasharray="5,3"/>
-  <text x="470" y="70" text-anchor="middle" font-weight="bold" fill="#443366">text bypass</text>
-  <text x="470" y="85" text-anchor="middle" font-size="10" fill="#554">stdin (debug/research)</text>
+  <rect x="260" y="78" width="170" height="36" rx="6" fill="#dce8f8" stroke="#4477cc" stroke-width="1.5"/>
+  <text x="345" y="93" text-anchor="middle" font-weight="bold" fill="#223355">video input</text>
+  <text x="345" y="107" text-anchor="middle" font-size="10" fill="#445">webcam / file (nokhwa)</text>
 
-  <!-- Sensory crate label -->
-  <rect x="47" y="40" width="240" height="62" rx="8" fill="none" stroke="#aabbdd" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="55" y="52" font-size="9" fill="#aabbdd">somnus-sensory</text>
+  <rect x="520" y="78" width="170" height="36" rx="6" fill="#ece4f8" stroke="#775599" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="605" y="93" text-anchor="middle" font-weight="bold" fill="#443366">text bypass</text>
+  <text x="605" y="107" text-anchor="middle" font-size="10" fill="#554">stdin (debug / research)</text>
 
-  <!-- ══════════════════════════════════════
-       LAYER 1 — ENCODERS (y=145)
-  ══════════════════════════════════════ -->
-  <!-- Whisper-tiny -->
-  <rect x="30" y="145" width="128" height="48" rx="6" fill="#fff3d0" stroke="#aa8800" stroke-width="1.5"/>
-  <text x="94" y="163" text-anchor="middle" font-weight="bold" fill="#554400">Whisper-tiny</text>
-  <text x="94" y="178" text-anchor="middle" font-size="10" fill="#665">384-dim speech</text>
-  <text x="94" y="190" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX (frozen)</text>
+  <!-- Input → encoder arrows -->
+  <line x1="145" y1="114" x2="145" y2="172" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="175" y1="114" x2="335" y2="172" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="345" y1="114" x2="545" y2="172" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="605" y1="114" x2="745" y2="172" stroke="#775599" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-purple)"/>
 
-  <!-- CLAP-HTSAT -->
-  <rect x="172" y="145" width="128" height="48" rx="6" fill="#fff3d0" stroke="#aa8800" stroke-width="1.5"/>
-  <text x="236" y="163" text-anchor="middle" font-weight="bold" fill="#554400">CLAP-HTSAT</text>
-  <text x="236" y="178" text-anchor="middle" font-size="10" fill="#665">512-dim env</text>
-  <text x="236" y="190" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX (frozen)</text>
+  <!-- ═══ ENCODERS (frozen) ═══ -->
+  <rect x="40" y="150" width="810" height="78" rx="8" fill="none" stroke="#ccaa44" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="50" y="163" font-size="9" fill="#bb9922">somnus-encoding · frozen pretrained encoders</text>
 
-  <!-- DINOv3-ViT-S -->
-  <rect x="314" y="145" width="128" height="48" rx="6" fill="#fff3d0" stroke="#aa8800" stroke-width="1.5"/>
-  <text x="378" y="163" text-anchor="middle" font-weight="bold" fill="#554400">DINOv3-ViT-S</text>
-  <text x="378" y="178" text-anchor="middle" font-size="10" fill="#665">384-dim visual</text>
-  <text x="378" y="190" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX (frozen)</text>
+  <rect x="60" y="172" width="170" height="50" rx="6" fill="#fff3d0" stroke="#aa8800" stroke-width="1.5"/>
+  <text x="145" y="190" text-anchor="middle" font-weight="bold" fill="#554400">Whisper-tiny</text>
+  <text x="145" y="204" text-anchor="middle" font-size="10" fill="#665">384-dim speech (ASR text)</text>
+  <text x="145" y="216" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX</text>
 
-  <!-- Qwen3 embed -->
-  <rect x="456" y="145" width="128" height="48" rx="6" fill="#f0e8f8" stroke="#775599" stroke-width="1.5"/>
-  <text x="520" y="163" text-anchor="middle" font-weight="bold" fill="#442266">Qwen3 embed</text>
-  <text x="520" y="178" text-anchor="middle" font-size="10" fill="#554">1024-dim mean-pool</text>
-  <text x="520" y="190" text-anchor="middle" font-size="9" fill="#888">+ LM hidden state (--lang-use-lm)</text>
+  <rect x="260" y="172" width="170" height="50" rx="6" fill="#fff3d0" stroke="#aa8800" stroke-width="1.5"/>
+  <text x="345" y="190" text-anchor="middle" font-weight="bold" fill="#554400">CLAP-HTSAT</text>
+  <text x="345" y="204" text-anchor="middle" font-size="10" fill="#665">512-dim environmental sound</text>
+  <text x="345" y="216" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX</text>
 
-  <!-- Encoding crate label -->
-  <rect x="22" y="136" width="570" height="66" rx="8" fill="none" stroke="#ccaa44" stroke-width="1" stroke-dasharray="4,3"/>
-  <text x="30" y="148" font-size="9" fill="#ccaa44">somnus-encoding</text>
+  <rect x="460" y="172" width="170" height="50" rx="6" fill="#fff3d0" stroke="#aa8800" stroke-width="1.5"/>
+  <text x="545" y="190" text-anchor="middle" font-weight="bold" fill="#554400">DINOv3-ViT-S</text>
+  <text x="545" y="204" text-anchor="middle" font-size="10" fill="#665">384-dim visual</text>
+  <text x="545" y="216" text-anchor="middle" font-size="9" fill="#888">ORT/MIGraphX</text>
 
-  <!-- Arrows: input → encoders -->
-  <line x1="130" y1="94" x2="94" y2="145" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="130" y1="94" x2="236" y2="145" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="300" y1="94" x2="378" y2="145" stroke="#555" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="470" y1="94" x2="520" y2="145" stroke="#775599" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+  <rect x="660" y="172" width="170" height="50" rx="6" fill="#f0e8f8" stroke="#775599" stroke-width="1.5"/>
+  <text x="745" y="190" text-anchor="middle" font-weight="bold" fill="#442266">Qwen3 embed</text>
+  <text x="745" y="204" text-anchor="middle" font-size="10" fill="#554">1024-dim mean-pooled</text>
+  <text x="745" y="216" text-anchor="middle" font-size="9" fill="#888">+ LM hidden (--lang-use-lm)</text>
 
-  <!-- Whisper ASR → language region (note arc) -->
-  <text x="94" y="200" text-anchor="middle" font-size="9" fill="#aa8800">ASR → language region ↓</text>
+  <!-- Encoder → region arrows -->
+  <line x1="145" y1="222" x2="135" y2="296" stroke="#aa8800" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="345" y1="222" x2="300" y2="296" stroke="#aa8800" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="545" y1="222" x2="465" y2="296" stroke="#aa8800" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <line x1="745" y1="222" x2="795" y2="296" stroke="#775599" stroke-width="1.2" marker-end="url(#arrow-purple)"/>
 
-  <!-- ══════════════════════════════════════
-       LAYER 2 — REGIONAL CONCEPT AREAS (y=255)
-  ══════════════════════════════════════ -->
-  <rect x="22" y="242" width="784" height="76" rx="10" fill="#e8f4e8" stroke="#336633" stroke-width="2"/>
-  <text x="414" y="259" text-anchor="middle" font-weight="bold" font-size="13" fill="#224422">Regional concept areas — k-WTA (baseline n=1024, k=20, 2% sparsity) + SAE decoder</text>
-  <text x="414" y="272" text-anchor="middle" font-size="10" fill="#224422">per-region: encoder weights, SAE decoder, output head, duty-cycle boosting — trainable (burn/CPU during NREM)</text>
-  <text x="414" y="285" text-anchor="middle" font-size="10" fill="#224422">inference: GPU via ORT/MIGraphX (perception_encoder.onnx)  |  grown to n=9,821/region (2026-08-15)</text>
+  <!-- ═══ REGIONAL CONCEPT AREAS ═══ -->
+  <rect x="40" y="276" width="860" height="96" rx="10" fill="#e8f4e8" stroke="#336633" stroke-width="2"/>
+  <text x="890" y="292" text-anchor="end" font-size="9" fill="#336633">somnus-perception</text>
 
-  <!-- Region boxes -->
-  <rect x="34" y="293" width="110" height="18" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
-  <text x="89" y="306" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">audio-speech  [0]</text>
+  <rect x="60" y="296" width="150" height="26" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
+  <text x="135" y="313" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">audio-speech [0]</text>
 
-  <rect x="156" y="293" width="110" height="18" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
-  <text x="211" y="306" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">audio-env  [1]</text>
+  <rect x="225" y="296" width="150" height="26" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
+  <text x="300" y="313" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">audio-env [1]</text>
 
-  <rect x="278" y="293" width="110" height="18" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
-  <text x="333" y="306" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">visual  [2]</text>
+  <rect x="390" y="296" width="150" height="26" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
+  <text x="465" y="313" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">visual [2]</text>
 
-  <rect x="400" y="293" width="110" height="18" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
-  <text x="455" y="306" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">symbolic  [3]</text>
+  <rect x="555" y="296" width="150" height="26" rx="4" fill="#c8e6c8" stroke="#336633" stroke-width="1"/>
+  <text x="630" y="313" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a3a1a">symbolic [3]</text>
 
-  <rect x="522" y="293" width="110" height="18" rx="4" fill="#d0c8f0" stroke="#775599" stroke-width="1"/>
-  <text x="577" y="306" text-anchor="middle" font-size="10" font-weight="bold" fill="#221a44">language  [4]</text>
+  <rect x="720" y="296" width="150" height="26" rx="4" fill="#d0c8f0" stroke="#775599" stroke-width="1"/>
+  <text x="795" y="313" text-anchor="middle" font-size="10" font-weight="bold" fill="#221a44">language [4]</text>
 
-  <!-- Perception crate label -->
-  <text x="700" y="309" font-size="9" fill="#336633">somnus-perception</text>
+  <text x="450" y="345" text-anchor="middle" font-size="12" font-weight="bold" fill="#224422">Regional concept areas — k-WTA (baseline n=1024, k=20, 2% sparsity) + SAE decoder</text>
+  <text x="450" y="360" text-anchor="middle" font-size="10" fill="#224422">trainable (burn/CPU during NREM) · inference ORT/MIGraphX · grown to n=9,821 per region (2026-08-15)</text>
 
-  <!-- Arrows: encoders → regions -->
-  <line x1="94" y1="193" x2="89" y2="293" stroke="#aa8800" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="236" y1="193" x2="211" y2="293" stroke="#aa8800" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="378" y1="193" x2="333" y2="293" stroke="#aa8800" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="520" y1="193" x2="577" y2="293" stroke="#775599" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <!-- Whisper ASR text → language -->
-  <path d="M 94 207 Q 94 250 577 293" stroke="#aa8800" stroke-width="1" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+  <!-- Region → binding -->
+  <line x1="450" y1="372" x2="450" y2="438" stroke="#336633" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="460" y="424" font-size="10" fill="#336633">5 region tokens</text>
 
-  <!-- Top-down prior feedback (dashed, orange) -->
-  <path d="M 414 242 Q 414 220 414 194" stroke="#cc7700" stroke-width="1.2" fill="none" stroke-dasharray="5,3" marker-end="url(#arrow-orange)"/>
-  <text x="420" y="232" font-size="9" fill="#cc7700">top-down prior</text>
-  <text x="420" y="242" font-size="9" fill="#cc7700">(prior_beta ×β)</text>
+  <!-- Top-down prior (binding → regions) -->
+  <path d="M 200 438 V 374" stroke="#cc7700" stroke-width="1.2" fill="none" stroke-dasharray="5,3" marker-end="url(#arrow-orange)"/>
+  <text x="208" y="420" font-size="10" fill="#cc7700">top-down prior (β)</text>
 
-  <!-- ══════════════════════════════════════
-       LAYER 3 — BINDING AREA (y=375)
-  ══════════════════════════════════════ -->
-  <rect x="100" y="370" width="560" height="60" rx="8" fill="#f0f4ff" stroke="#4455aa" stroke-width="2"/>
-  <text x="380" y="390" text-anchor="middle" font-weight="bold" fill="#223388">Binding area (integrative / hippocampal analog)</text>
-  <text x="380" y="405" text-anchor="middle" font-size="10" fill="#223388">4-head cross-attention over 5 region tokens (D_PROJ=128) + GRU temporal context (hidden=256)</text>
-  <text x="380" y="418" text-anchor="middle" font-size="10" fill="#223388">→ 640-dim episode vector   |  working memory ring (WM=8, default)   |  GPU: perception_binding.onnx</text>
+  <!-- ═══ BINDING AREA ═══ -->
+  <rect x="40" y="440" width="860" height="60" rx="8" fill="#f0f4ff" stroke="#4455aa" stroke-width="2"/>
+  <text x="470" y="458" text-anchor="middle" font-size="12" font-weight="bold" fill="#223388">Binding area (integrative · hippocampal analogue)</text>
+  <text x="470" y="473" text-anchor="middle" font-size="10" fill="#223388">4-head cross-attention over 5 region tokens (D_PROJ=128) + GRU temporal context (hidden=256) → 640-dim episode</text>
+  <text x="470" y="487" text-anchor="middle" font-size="10" fill="#223388">working memory ring (WM=8) · GPU: perception_binding.onnx</text>
 
-  <!-- Cross-attention gain modulation note -->
-  <text x="670" y="397" font-size="9" fill="#aa5500">attn weights →</text>
-  <text x="670" y="408" font-size="9" fill="#aa5500">per-region gain</text>
+  <!-- Binding → episodic -->
+  <line x1="450" y1="500" x2="450" y2="540" stroke="#4455aa" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
 
-  <!-- Arrow regions → binding -->
-  <line x1="414" y1="311" x2="380" y2="370" stroke="#336633" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <!-- ═══ EPISODIC BUFFER (HOT) ═══ -->
+  <rect x="240" y="540" width="420" height="70" rx="8" fill="#ffe8e8" stroke="#993333" stroke-width="2"/>
+  <text x="450" y="558" text-anchor="middle" font-size="12" font-weight="bold" fill="#551111">Episodic buffer — HOT (VRAM)</text>
+  <text x="450" y="573" text-anchor="middle" font-size="10" fill="#551111">bounded ring (CAPACITY=4096) · one-shot write per episode</text>
+  <text x="450" y="588" text-anchor="middle" font-size="10" fill="#551111">sleep triggers: wakefulness pressure (S3) · high-water mark</text>
+  <text x="450" y="601" text-anchor="middle" font-size="10" fill="#551111">schedule fallback · wake-performance degradation</text>
 
-  <!-- ══════════════════════════════════════
-       LAYER 4 — EPISODIC BUFFER / HOT (y=480)
-  ══════════════════════════════════════ -->
-  <rect x="200" y="468" width="360" height="52" rx="8" fill="#ffe8e8" stroke="#993333" stroke-width="2"/>
-  <text x="380" y="488" text-anchor="middle" font-weight="bold" fill="#551111">Episodic buffer — HOT (VRAM)</text>
-  <text x="380" y="502" text-anchor="middle" font-size="10" fill="#551111">bounded ring (CAPACITY=4096)  |  one-shot write per episode</text>
-  <text x="380" y="515" text-anchor="middle" font-size="10" fill="#551111">sleep trigger: wakefulness pressure (S3) · high_water · schedule · perf_degradation</text>
+  <!-- Episodic → sleep -->
+  <line x1="450" y1="610" x2="450" y2="645" stroke="#993333" stroke-width="1.5" marker-end="url(#arrow-red)"/>
+  <text x="460" y="630" font-size="10" fill="#993333">replay</text>
 
-  <!-- Arrow binding → episodic -->
-  <line x1="380" y1="430" x2="380" y2="468" stroke="#4455aa" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <!-- ═══ SLEEP CYCLE ═══ -->
+  <rect x="40" y="645" width="860" height="140" rx="10" fill="#fff8e8" stroke="#886600" stroke-width="2"/>
+  <text x="470" y="664" text-anchor="middle" font-size="12" font-weight="bold" fill="#553300">Sleep cycle (wake/sleep controller)</text>
 
-  <!-- ══════════════════════════════════════
-       LAYER 5 — SLEEP CYCLE BLOCK (y=560)
-  ══════════════════════════════════════ -->
-  <rect x="22" y="558" width="784" height="100" rx="10" fill="#fff8e8" stroke="#886600" stroke-width="2"/>
-  <text x="414" y="577" text-anchor="middle" font-weight="bold" font-size="13" fill="#553300">Sleep cycle (wake/sleep controller)</text>
+  <rect x="60" y="674" width="400" height="98" rx="6" fill="#fff0cc" stroke="#aa8800" stroke-width="1.5"/>
+  <text x="260" y="692" text-anchor="middle" font-size="11" font-weight="bold" fill="#553300">NREM — consolidation</text>
+  <text x="260" y="710" text-anchor="middle" font-size="10" fill="#553300">replay → k-WTA + SAE (AdamW, cosine LR)</text>
+  <text x="260" y="724" text-anchor="middle" font-size="10" fill="#553300">homeostatic decay · hot→cold spill · warm dump</text>
+  <text x="260" y="738" text-anchor="middle" font-size="10" fill="#553300">projection training (640→5×1024, cosine loss, CPU/Qwen)</text>
 
-  <!-- NREM -->
-  <rect x="40" y="586" width="340" height="62" rx="6" fill="#fff0cc" stroke="#aa8800" stroke-width="1.5"/>
-  <text x="210" y="601" text-anchor="middle" font-weight="bold" fill="#553300">NREM (consolidation)</text>
-  <text x="210" y="615" text-anchor="middle" font-size="10" fill="#553300">replay → k-WTA + SAE (AdamW, cosine LR)</text>
-  <text x="210" y="628" text-anchor="middle" font-size="10" fill="#553300">homeostatic decay · hot→cold spill · warm dump</text>
-  <text x="210" y="641" text-anchor="middle" font-size="10" fill="#553300">projection training (640→5×1024, cosine loss, CPU/Qwen)</text>
+  <rect x="480" y="674" width="400" height="98" rx="6" fill="#f8f0ff" stroke="#775599" stroke-width="1.5"/>
+  <text x="680" y="692" text-anchor="middle" font-size="11" font-weight="bold" fill="#442266">REM — generative</text>
+  <text x="680" y="710" text-anchor="middle" font-size="10" fill="#442266">gist-level self-probe (k-means k=32, within-session)</text>
+  <text x="680" y="724" text-anchor="middle" font-size="10" fill="#442266">growth: cascade-correlation unit add when ws_gist &lt; 0.85</text>
+  <text x="680" y="738" text-anchor="middle" font-size="10" fill="#442266">creative recombination → synthetic → hot (next NREM)</text>
 
-  <!-- REM -->
-  <rect x="400" y="586" width="390" height="62" rx="6" fill="#f8f0ff" stroke="#775599" stroke-width="1.5"/>
-  <text x="595" y="601" text-anchor="middle" font-weight="bold" fill="#442266">REM (generative)</text>
-  <text x="595" y="615" text-anchor="middle" font-size="10" fill="#442266">gist-level self-probe (k-means k=32, within-session)</text>
-  <text x="595" y="628" text-anchor="middle" font-size="10" fill="#442266">growth: cascade-corr unit add when ws_gist &lt; 0.85</text>
-  <text x="595" y="641" text-anchor="middle" font-size="10" fill="#442266">creative recombination → synthetic → hot (next NREM)</text>
+  <!-- Sleep → warm -->
+  <line x1="260" y1="772" x2="260" y2="818" stroke="#aa8800" stroke-width="1.5" marker-end="url(#arrow)"/>
 
-  <!-- Arrow episodic → sleep -->
-  <line x1="380" y1="520" x2="380" y2="558" stroke="#993333" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="384" y="543" font-size="9" fill="#993333">replay</text>
+  <!-- ═══ MEMORY TIERS ═══ -->
+  <rect x="60" y="818" width="360" height="62" rx="8" fill="#e8f0ff" stroke="#335599" stroke-width="2"/>
+  <text x="240" y="838" text-anchor="middle" font-size="12" font-weight="bold" fill="#112255">Semantic store — WARM (RAM)</text>
+  <text x="240" y="853" text-anchor="middle" font-size="10" fill="#112255">hnsw_rs HNSW (L2) · max 35% free RAM / 2500B</text>
+  <text x="240" y="867" text-anchor="middle" font-size="10" fill="#112255">warm/records.bin · ef=16</text>
 
-  <!-- ══════════════════════════════════════
-       LAYER 6 — MEMORY TIERS (y=710)
-  ══════════════════════════════════════ -->
-  <!-- Warm / Semantic -->
-  <rect x="160" y="710" width="280" height="58" rx="8" fill="#e8f0ff" stroke="#335599" stroke-width="2"/>
-  <text x="300" y="730" text-anchor="middle" font-weight="bold" fill="#112255">Semantic store — WARM (system RAM)</text>
-  <text x="300" y="745" text-anchor="middle" font-size="10" fill="#112255">hnsw_rs HNSW (L2)  |  max: 35% free RAM / 2500B</text>
-  <text x="300" y="758" text-anchor="middle" font-size="10" fill="#112255">persisted: warm/records.bin  |  ef=16  |  somnus-memory</text>
+  <!-- Warm → cold -->
+  <line x1="240" y1="880" x2="240" y2="928" stroke="#335599" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+  <text x="248" y="910" font-size="10" fill="#335599">spill</text>
 
-  <!-- Cold / Archive -->
-  <rect x="160" y="790" width="280" height="58" rx="8" fill="#e8ffe8" stroke="#226622" stroke-width="2"/>
-  <text x="300" y="810" text-anchor="middle" font-weight="bold" fill="#113311">Cold archive — COLD (disk)</text>
-  <text x="300" y="825" text-anchor="middle" font-size="10" fill="#113311">INT8 append-only + PQ (27.5× compression)</text>
-  <text x="300" y="838" text-anchor="middle" font-size="10" fill="#113311">max: 20% free disk / 661B  |  somnus-memory</text>
+  <rect x="60" y="928" width="360" height="62" rx="8" fill="#e8ffe8" stroke="#226622" stroke-width="2"/>
+  <text x="240" y="948" text-anchor="middle" font-size="12" font-weight="bold" fill="#113311">Cold archive — COLD (disk)</text>
+  <text x="240" y="963" text-anchor="middle" font-size="10" fill="#113311">INT8 append-only · PQ codebook (27.5× compression)</text>
+  <text x="240" y="977" text-anchor="middle" font-size="10" fill="#113311">max 20% free disk · 665B/record</text>
 
   <!-- Recollection layer -->
-  <rect x="520" y="730" width="280" height="98" rx="8" fill="#f8ffe8" stroke="#447744" stroke-width="1.5"/>
-  <text x="660" y="750" text-anchor="middle" font-weight="bold" fill="#224422">Recollection layer</text>
-  <text x="660" y="765" text-anchor="middle" font-size="10" fill="#224422">cross-tier index (warm-first)</text>
-  <text x="660" y="779" text-anchor="middle" font-size="10" fill="#224422">warm == cold union (continuous sync)</text>
-  <text x="660" y="793" text-anchor="middle" font-size="10" fill="#224422">warm rebuilt from cold on snapshot restore</text>
-  <text x="660" y="807" text-anchor="middle" font-size="10" fill="#224422">(cold→warm promote() stub — not needed)</text>
-  <text x="660" y="821" text-anchor="middle" font-size="10" fill="#224422">ep_salience = warm L2 distance per episode</text>
+  <rect x="500" y="818" width="380" height="110" rx="8" fill="#f8ffe8" stroke="#447744" stroke-width="1.5"/>
+  <text x="690" y="838" text-anchor="middle" font-size="12" font-weight="bold" fill="#224422">Recollection layer</text>
+  <text x="690" y="853" text-anchor="middle" font-size="10" fill="#224422">cross-tier index, warm-first</text>
+  <text x="690" y="867" text-anchor="middle" font-size="10" fill="#224422">warm == cold union (continuous sync)</text>
+  <text x="690" y="881" text-anchor="middle" font-size="10" fill="#224422">warm rebuilt from cold on snapshot restore</text>
+  <text x="690" y="895" text-anchor="middle" font-size="10" fill="#224422">ep_salience = warm L2 distance per episode</text>
+  <text x="690" y="916" text-anchor="middle" font-size="10" fill="#666">cold→warm promote() is a stub (not needed yet)</text>
 
-  <!-- Arrows sleep → warm -->
-  <line x1="210" y1="658" x2="300" y2="710" stroke="#aa8800" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <!-- hot→cold spill -->
-  <line x1="300" y1="768" x2="300" y2="790" stroke="#335599" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="304" y="782" font-size="9" fill="#335599">spill</text>
+  <!-- Warm ↔ recollection -->
+  <line x1="420" y1="842" x2="498" y2="842" stroke="#447744" stroke-width="1.2" marker-end="url(#arrow-green)"/>
+  <line x1="498" y1="858" x2="422" y2="858" stroke="#447744" stroke-width="1.2" marker-end="url(#arrow-green)"/>
 
-  <!-- Recollection ↔ warm -->
-  <line x1="440" y1="750" x2="520" y2="762" stroke="#447744" stroke-width="1.2" marker-end="url(#arrow)"/>
-  <line x1="520" y1="775" x2="440" y2="755" stroke="#447744" stroke-width="1.2" marker-end="url(#arrow)"/>
+  <!-- Recall (wake): recollection → binding -->
+  <path d="M 880 872 H 912 V 452 H 902" stroke="#447744" stroke-width="1.2" fill="none" stroke-dasharray="5,3" marker-end="url(#arrow-green)"/>
 
-  <!-- Recollection → binding (recall during wake) -->
-  <path d="M 660 730 Q 800 600 660 430" stroke="#447744" stroke-width="1.2" fill="none" stroke-dasharray="5,3" marker-end="url(#arrow-green)"/>
-  <text x="780" y="590" font-size="9" fill="#447744">recall</text>
-  <text x="780" y="600" font-size="9" fill="#447744">(wake)</text>
+  <!-- Sleep → observability (dashed, runs between cold and recollection) -->
+  <line x1="435" y1="785" x2="435" y2="1028" stroke="#888" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
 
-  <!-- ══════════════════════════════════════
-       ACTION DECODER (right side, y=370)
-  ══════════════════════════════════════ -->
-  <rect x="820" y="370" width="250" height="130" rx="8" fill="#fff0f8" stroke="#993366" stroke-width="2"/>
-  <text x="945" y="390" text-anchor="middle" font-weight="bold" fill="#551133">ActionDecoder</text>
-  <text x="945" y="407" text-anchor="middle" font-size="10" fill="#551133">linear 640→5×1024 (projection)</text>
-  <text x="945" y="421" text-anchor="middle" font-size="10" fill="#551133">frozen Qwen3-0.6B (CPU only)</text>
-  <text x="945" y="435" text-anchor="middle" font-size="10" fill="#551133">attn weights → per-region gain</text>
-  <text x="945" y="449" text-anchor="middle" font-size="10" fill="#551133">autoregressive decode on stdin query</text>
-  <text x="945" y="463" text-anchor="middle" font-size="10" fill="#551133">→ stdout JSON</text>
-  <text x="945" y="478" text-anchor="middle" font-size="10" fill="#551133">NREM: projection trains on LM hidden states</text>
-  <text x="945" y="492" text-anchor="middle" font-size="10" fill="#551133">(cosine alignment loss, ADR 0015)</text>
+  <!-- ═══ SIDEBAR: ACTION DECODER ═══ -->
+  <rect x="940" y="440" width="420" height="130" rx="8" fill="#fff0f8" stroke="#993366" stroke-width="2"/>
+  <text x="1150" y="460" text-anchor="middle" font-size="12" font-weight="bold" fill="#551133">ActionDecoder</text>
+  <text x="1150" y="478" text-anchor="middle" font-size="10" fill="#551133">linear 640→5×1024 (projection) · frozen Qwen3-0.6B (CPU)</text>
+  <text x="1150" y="493" text-anchor="middle" font-size="10" fill="#551133">every episode: attn weights → per-region gain</text>
+  <text x="1150" y="508" text-anchor="middle" font-size="10" fill="#551133">on query (stdin): autoregressive text → stdout JSON</text>
+  <text x="1150" y="523" text-anchor="middle" font-size="10" fill="#551133">NREM: projection trained on LM hidden states (ADR 0015)</text>
 
-  <!-- Arrow episode → action decoder -->
-  <line x1="660" y1="398" x2="820" y2="415" stroke="#993366" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <!-- Binding → decoder -->
+  <line x1="900" y1="488" x2="940" y2="488" stroke="#993366" stroke-width="1.5" marker-end="url(#arrow-red)"/>
 
-  <!-- ══════════════════════════════════════
-       NEUROMODULATION SIDEBAR (right, y=560)
-  ══════════════════════════════════════ -->
-  <rect x="820" y="558" width="250" height="220" rx="8" fill="#fafaf0" stroke="#887700" stroke-width="1.5" stroke-dasharray="6,3"/>
-  <text x="945" y="577" text-anchor="middle" font-weight="bold" fill="#554400">Neuromodulation (ADR 0024)</text>
-  <text x="945" y="592" text-anchor="middle" font-size="10" fill="#554400">EWMA self-regulation controllers</text>
+  <!-- ═══ SIDEBAR: NEUROMODULATION ═══ -->
+  <rect x="940" y="592" width="420" height="292" rx="8" fill="#fafaf0" stroke="#887700" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="1150" y="612" text-anchor="middle" font-size="12" font-weight="bold" fill="#554400">Neuromodulation (ADR 0024)</text>
+  <text x="1150" y="628" text-anchor="middle" font-size="10" fill="#554400">EWMA self-regulation controllers</text>
 
-  <text x="830" y="610" font-size="9" fill="#554400">S1 — adaptive salience gate</text>
-  <text x="830" y="622" font-size="9" fill="#776600">   τ_s = μ_L2 + 0.5·σ_L2  (wake_reconstruct)</text>
-  <text x="830" y="636" font-size="9" fill="#554400">S2 — settle-rate modulation</text>
-  <text x="830" y="648" font-size="9" fill="#776600">   fire settle when cosine &lt; EWMA − 0.1</text>
-  <text x="830" y="662" font-size="9" fill="#554400">S3 — wakefulness pressure homeostat</text>
-  <text x="830" y="674" font-size="9" fill="#776600">   P += novelty/rate; sleep when P ≥ 1.0</text>
-  <text x="830" y="688" font-size="9" fill="#554400">S4 — prior-beta auto-scale</text>
-  <text x="830" y="700" font-size="9" fill="#776600">   β: 0.01→0.05 when 3-cycle cosine &gt; 0.65</text>
-  <text x="830" y="714" font-size="9" fill="#554400">S5 — startup-queryable priors</text>
-  <text x="830" y="726" font-size="9" fill="#776600">   max_warm = 35% RAM; max_cold = 20% disk</text>
-  <text x="830" y="740" font-size="9" fill="#554400">S6 — adaptive wake ceiling</text>
-  <text x="830" y="752" font-size="9" fill="#776600">   max_wake = max(600s, 3×wake_ewma)</text>
-  <text x="830" y="766" font-size="9" fill="#554400">S7 — wake-interval throttle</text>
-  <text x="830" y="778" text-anchor="start" font-size="9" fill="#776600">   decrement interval on MSE stagnation (3c)</text>
+  <text x="956" y="650" font-size="10" font-weight="bold" fill="#554400">S1 adaptive salience gate</text>
+  <text x="972" y="664" font-size="10" fill="#776600">τ_s = μ_L2 + 0.5·σ_L2 (wake_reconstruct)</text>
+  <text x="956" y="684" font-size="10" font-weight="bold" fill="#554400">S2 settle-rate modulation</text>
+  <text x="972" y="698" font-size="10" fill="#776600">fire settle when cosine &lt; EWMA − 0.1</text>
+  <text x="956" y="718" font-size="10" font-weight="bold" fill="#554400">S3 wakefulness pressure homeostat</text>
+  <text x="972" y="732" font-size="10" fill="#776600">P += novelty/rate; sleep when P ≥ 1.0</text>
+  <text x="956" y="752" font-size="10" font-weight="bold" fill="#554400">S4 prior-beta auto-scale</text>
+  <text x="972" y="766" font-size="10" fill="#776600">β: 0.01→0.05 when 3-cycle cosine &gt; 0.65</text>
+  <text x="956" y="786" font-size="10" font-weight="bold" fill="#554400">S5 startup-queryable priors</text>
+  <text x="972" y="800" font-size="10" fill="#776600">max_warm = 35% RAM · max_cold = 20% disk</text>
+  <text x="956" y="820" font-size="10" font-weight="bold" fill="#554400">S6 adaptive wake ceiling</text>
+  <text x="972" y="834" font-size="10" fill="#776600">max_wake = max(600s, 3×wake_ewma)</text>
+  <text x="956" y="846" font-size="10" font-weight="bold" fill="#554400">S7 wake-interval throttle</text>
+  <text x="972" y="860" font-size="10" fill="#776600">decrement interval on MSE stagnation (3 cycles)</text>
 
-  <!-- ══════════════════════════════════════
-       CAMPAIGN METRICS SIDEBAR (bottom right)
-  ══════════════════════════════════════ -->
-  <rect x="820" y="790" width="250" height="88" rx="8" fill="#f0f8f0" stroke="#336633" stroke-width="1.5"/>
-  <text x="945" y="808" text-anchor="middle" font-weight="bold" font-size="10" fill="#224422">10x campaign (82 sessions, done 2026-08-15)</text>
-  <text x="830" y="823" font-size="9" fill="#224422">[1024]×5 → [9821]×5 (101.7% of 9,660 target)</text>
-  <text x="830" y="836" font-size="9" fill="#224422">791 cycles · 188 growth events · 0 panics</text>
-  <text x="830" y="849" font-size="9" fill="#224422">output_mse 1st-vs-last-10: 0.0430→0.0112 (−74%)</text>
-  <text x="830" y="862" font-size="9" fill="#224422">gist_recall_rate 0.562 · warm_recall_l2 0.381</text>
-  <text x="830" y="875" font-size="9" fill="#224422">detail: engineering-log.md §34</text>
+  <!-- ═══ SIDEBAR: CAMPAIGN ═══ -->
+  <rect x="940" y="898" width="420" height="104" rx="8" fill="#f0f8f0" stroke="#336633" stroke-width="1.5"/>
+  <text x="1150" y="918" text-anchor="middle" font-size="11" font-weight="bold" fill="#224422">10x growth campaign (82 sessions, done 2026-08-15)</text>
+  <text x="956" y="936" font-size="10" fill="#224422">units per region: 1024 → 9821 (101.7% of 9,660 target)</text>
+  <text x="956" y="951" font-size="10" fill="#224422">791 cycles · 188 growth events · 0 panics</text>
+  <text x="956" y="966" font-size="10" fill="#224422">output MSE, first vs last 10: 0.0430 → 0.0112 (−74%)</text>
+  <text x="956" y="981" font-size="10" fill="#224422">gist_recall_rate 0.562 · warm_recall_l2 0.381</text>
+  <text x="956" y="996" font-size="10" fill="#224422">details: ai-docs/engineering-log.md §34</text>
 
-  <!-- ══════════════════════════════════════
-       OBSERVABILITY / TELEMETRY (bottom left)
-  ══════════════════════════════════════ -->
-  <rect x="22" y="900" width="784" height="54" rx="8" fill="#f4f4f4" stroke="#888" stroke-width="1.5"/>
-  <text x="414" y="918" text-anchor="middle" font-weight="bold" fill="#444">Observability</text>
-  <text x="414" y="933" text-anchor="middle" font-size="10" fill="#444">structured NDJSON per cycle (metrics_*.jsonl)  ·  eval_metrics.py → 4 PNGs (language trajectory, growth timeline, MSE, sleep triggers)</text>
-  <text x="414" y="947" text-anchor="middle" font-size="10" fill="#444">train_campaign.sh (multi-session outer loop)  ·  snapshot: weights + episodic + region_sizes + EWMA state + warm/records.bin + wake_ewma.bin + sal_ewma.bin</text>
+  <!-- ═══ OBSERVABILITY ═══ -->
+  <rect x="40" y="1028" width="1320" height="56" rx="8" fill="#f4f4f4" stroke="#888" stroke-width="1.5"/>
+  <text x="700" y="1046" text-anchor="middle" font-size="11" font-weight="bold" fill="#444">Observability and snapshots</text>
+  <text x="700" y="1062" text-anchor="middle" font-size="10" fill="#444">per-cycle NDJSON (metrics_*.jsonl) · eval_metrics.py → PNG plots · train_campaign.sh drives multi-session runs</text>
+  <text x="700" y="1076" text-anchor="middle" font-size="10" fill="#444">snapshot: weights + episodic + region sizes + EWMA state + warm/records.bin + wake/sal EWMA files</text>
 
-  <!-- Arrow sleep → observability -->
-  <line x1="414" y1="658" x2="414" y2="900" stroke="#888" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arrow)"/>
-
-  <!-- ══════════════════════════════════════
-       LEGEND
-  ══════════════════════════════════════ -->
-  <rect x="22" y="960" width="784" height="16" rx="4" fill="none"/>
-  <line x1="30" y1="970" x2="60" y2="970" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="65" y="973" font-size="9" fill="#444">data flow (wake)</text>
-  <line x1="160" y1="970" x2="190" y2="970" stroke="#cc7700" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-orange)"/>
-  <text x="195" y="973" font-size="9" fill="#cc7700">top-down prior</text>
-  <line x1="290" y1="970" x2="320" y2="970" stroke="#447744" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-green)"/>
-  <text x="325" y="973" font-size="9" fill="#447744">recall (wake)</text>
-  <line x1="410" y1="970" x2="440" y2="970" stroke="#775599" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
-  <text x="445" y="973" font-size="9" fill="#775599">text / language path</text>
-  <rect x="555" y="963" width="10" height="10" fill="#fff3d0" stroke="#aa8800" stroke-width="1"/>
-  <text x="570" y="973" font-size="9" fill="#444">frozen (ORT/MIGraphX)</text>
-  <rect x="670" y="963" width="10" height="10" fill="#e8f4e8" stroke="#336633" stroke-width="1"/>
-  <text x="685" y="973" font-size="9" fill="#444">trainable (burn/CPU)</text>
+  <!-- ═══ LEGEND ═══ -->
+  <line x1="40" y1="1104" x2="72" y2="1104" stroke="#555" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="78" y="1108" font-size="10" fill="#444">wake data flow</text>
+  <line x1="200" y1="1104" x2="232" y2="1104" stroke="#cc7700" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-orange)"/>
+  <text x="238" y="1108" font-size="10" fill="#cc7700">top-down prior</text>
+  <line x1="340" y1="1104" x2="372" y2="1104" stroke="#447744" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrow-green)"/>
+  <text x="378" y="1108" font-size="10" fill="#447744">recall (wake)</text>
+  <line x1="480" y1="1104" x2="512" y2="1104" stroke="#775599" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-purple)"/>
+  <text x="518" y="1108" font-size="10" fill="#775599">text / language path</text>
+  <rect x="660" y="1097" width="12" height="12" fill="#fff3d0" stroke="#aa8800" stroke-width="1"/>
+  <text x="678" y="1108" font-size="10" fill="#444">frozen (ORT/MIGraphX)</text>
+  <rect x="820" y="1097" width="12" height="12" fill="#e8f4e8" stroke="#336633" stroke-width="1"/>
+  <text x="838" y="1108" font-size="10" fill="#444">trainable (burn/CPU)</text>
 </svg>

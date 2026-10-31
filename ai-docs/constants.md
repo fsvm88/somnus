@@ -75,9 +75,9 @@ Verified against code 2026-08-16 (this file's creation pass). If a value here di
 | `HNSW_EF_C` (construction ef) | 100 | const | `somnus-memory/src/semantic.rs:22` | |
 | `--recall-ef` (search ef) | 16 | CLI | `somnus/src/lib.rs:202` | Overrides the struct's `SEARCH_EF=64` init constant (`semantic.rs:23`) at startup via `set_search_ef` — **16 is the effective production value**, not 64. Calibrated at scale per ADR 0024 S5. |
 | `--max-warm-records` | **200000** | CLI | `somnus/src/lib.rs:201-208`, formula at `somnus/src/lib.rs:1105-1114` | Hardened 2026-08-16 (ADR 0047) — every real campaign has hardcoded this since 2026-06-17, ending the completed 10x campaign at 151,725 warm records (comfortably under cap). `0` opts back into the ADR 0024 S5 auto-derive formula: `free_ram_bytes×0.35/2500`, clamped `[1_000, 1_000_000]`. |
-| `--max-cold-records` | 0 → auto: `free_disk_bytes×0.20/RECORD_BYTES` | CLI | `somnus/src/lib.rs:1117-1136` | `RECORD_BYTES=661` (`somnus-memory/src/cold.rs:34`). Falls back to unlimited (0) if the disk lookup fails (e.g. btrfs), per ADR 0024. |
+| `--max-cold-records` | 0 → auto: `free_disk_bytes×0.20/RECORD_BYTES` | CLI | `somnus/src/lib.rs:1117-1136` | `RECORD_BYTES=665` (`somnus-memory/src/cold.rs:34`). Falls back to unlimited (0) if the disk lookup fails (e.g. btrfs), per ADR 0024. |
 | `PQ_M` / `PQ_K` / `PQ_SUB_DIM` | 8 / 256 / 80 | const | `somnus-memory/src/pq.rs:26-28` | Product-quantization compression, 27.5× reduction (roadmap.md 11a). |
-| `RECORD_BYTES` (INT8 cold) | 661 | const | `somnus-memory/src/cold.rs:34` | 8(id)+8(ts)+4(salience)+640(vec)+1(source... )+... |
+| `RECORD_BYTES` (INT8 cold) | 665 | const | `somnus-memory/src/cold.rs:34` | 8(id)+8(ts)+4(scale)+640(vec)+1(src)+4(salience) = 665. Verified 2026-10-31 against a copy of the live `episodes.cold` (105,425,118 B = 8 + 158,534 × 665). |
 
 ## Neuromodulation (ADR 0024, S1-S7)
 

@@ -251,11 +251,14 @@ pub(crate) fn restore_memory(
                 // save_weights writes `<stem>.safetensors`; check that, not the stem path itself.
                 let w_path = weights_path(&args.memory_dir);
                 if w_path.with_extension("safetensors").exists() {
-                    let sizes =
-                        load_region_sizes(&args.memory_dir).unwrap_or([somnus_perception::N_UNITS; 5]);
+                    let sizes = load_region_sizes(&args.memory_dir)
+                        .unwrap_or([somnus_perception::N_UNITS; 5]);
                     if let Err(e) = perception.load_weights_with_sizes(&w_path, sizes) {
                         tracing::warn!(?e, "weight restore failed — starting with fresh weights");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
+                        somnus_metrics::counted_core!(
+                            somnus_metrics::Metric::StartupRestoreDegraded,
+                            1
+                        );
                     } else {
                         info!(sizes = ?sizes, "perception weights restored");
                         if args.persist_duty_cycles {
@@ -399,7 +402,10 @@ pub(crate) fn init_action_decoder(args: &Args, snapshot_found: bool) -> Option<A
                 if dec_w.with_extension("safetensors").exists() {
                     if let Err(e) = d.load_weights(&dec_w) {
                         tracing::warn!(?e, "decoder weight restore failed — starting fresh");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
+                        somnus_metrics::counted_core!(
+                            somnus_metrics::Metric::StartupRestoreDegraded,
+                            1
+                        );
                     } else {
                         info!("decoder projection weights restored");
                     }
@@ -408,7 +414,10 @@ pub(crate) fn init_action_decoder(args: &Args, snapshot_found: bool) -> Option<A
                         "snapshot found but no decoder_weights.safetensors — \
                          projection starts fresh; generation incoherent until trained"
                     );
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::StartupRestoreDegraded, 1);
+                    somnus_metrics::counted_core!(
+                        somnus_metrics::Metric::StartupRestoreDegraded,
+                        1
+                    );
                 }
                 info!("action decoder ready");
                 Some(d)

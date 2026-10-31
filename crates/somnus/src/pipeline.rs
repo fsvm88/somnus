@@ -14,7 +14,9 @@ use std::{
 use anyhow::Result;
 use crossbeam_channel::{bounded, TrySendError};
 use somnus_encoding::{AudioEmbedding, VideoEmbedding, VideoEncoder};
-use somnus_sensory::{AudioCapture, AudioFrame, MediaFile, SensorMetrics, VideoCapture, VideoFrame};
+use somnus_sensory::{
+    AudioCapture, AudioFrame, MediaFile, SensorMetrics, VideoCapture, VideoFrame,
+};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -111,7 +113,10 @@ pub(crate) fn start_media_sources(args: &Args) -> Result<MediaStreams> {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!(?e, file = ?path, "file loop: failed to open");
-                            somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::MediaSourceError,
+                                1
+                            );
                             break;
                         }
                     };
@@ -150,7 +155,10 @@ pub(crate) fn start_media_sources(args: &Args) -> Result<MediaStreams> {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!(?e, file = ?path, "file sequence: failed to open");
-                            somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::MediaSourceError,
+                                1
+                            );
                             return;
                         }
                     };
@@ -214,7 +222,10 @@ pub(crate) fn start_media_sources(args: &Args) -> Result<MediaStreams> {
                         },
                         Err(e) => {
                             tracing::error!(?e, "video capture error");
-                            somnus_metrics::counted_core!(somnus_metrics::Metric::MediaSourceError, 1);
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::MediaSourceError,
+                                1
+                            );
                             break;
                         }
                     }
@@ -316,9 +327,15 @@ pub(crate) fn spawn_asr_thread(
                 let failed = !matches!(result, Ok(Ok(_)));
                 if panicked_this_session {
                     if failed {
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::AsrPostPanicFailure, 1);
+                        somnus_metrics::counted_core!(
+                            somnus_metrics::Metric::AsrPostPanicFailure,
+                            1
+                        );
                     } else {
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::AsrPostPanicSuccess, 1);
+                        somnus_metrics::counted_core!(
+                            somnus_metrics::Metric::AsrPostPanicSuccess,
+                            1
+                        );
                     }
                 }
                 match result {
@@ -355,7 +372,10 @@ pub(crate) fn spawn_asr_thread(
                                     ?e,
                                     "whisper decoder rebuild failed; keeping old session"
                                 );
-                                somnus_metrics::counted_core!(somnus_metrics::Metric::MiscWarning, 1);
+                                somnus_metrics::counted_core!(
+                                    somnus_metrics::Metric::MiscWarning,
+                                    1
+                                );
                             }
                         }
                     }

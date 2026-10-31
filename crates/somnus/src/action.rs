@@ -15,13 +15,13 @@ use burn::{
     optim::{AdamWConfig, GradientsParams, ModuleOptimizer},
     tensor::{activation, Device, Tensor, TensorData},
 };
-use somnus_perception::TensorF32Ext;
 use ndarray::{Array2, Array3, ArrayView4};
 use ort::{
     session::Session,
     value::{DynValueTypeMarker, TensorRef, ValueRef},
 };
 use safetensors::SafeTensors;
+use somnus_perception::TensorF32Ext;
 use std::io::Write as _; // for stdout().flush() in streaming generation
 use tokenizers::Tokenizer;
 

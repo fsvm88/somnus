@@ -105,6 +105,7 @@ use action::ActionDecoder;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
+use safetensors::SafeTensors;
 use somnus_encoding::{
     preprocess::resample::SincResampler, AudioEmbedding, AudioEncoder, AudioEncoderSource,
     VideoEmbedding,
@@ -112,7 +113,6 @@ use somnus_encoding::{
 use somnus_memory::{EpisodicBuffer, IngestSource, RecollectionLayer};
 use somnus_perception::{PerceptionProcessor, WakeReconWorker};
 use somnus_sensory::{AudioFrame, Timestamp};
-use safetensors::SafeTensors;
 use std::{
     io::{BufWriter, Write},
     sync::{
@@ -228,19 +228,20 @@ impl AudioProcessor {
 
         self.src_buf.extend_from_slice(&mono);
 
-        let (resample_result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::AudioResample, {
-            (|| -> Result<()> {
-                while self.src_buf.len() >= AUDIO_CHUNK {
-                    let chunk = self.src_buf[..AUDIO_CHUNK].to_vec();
-                    self.src_buf.drain(..AUDIO_CHUNK);
-                    self.buf_16k
-                        .extend_from_slice(&self.r16k.as_mut().unwrap().process(&chunk)?);
-                    self.buf_env
-                        .extend_from_slice(&self.r_env.as_mut().unwrap().process(&chunk)?);
-                }
-                Ok(())
-            })()
-        });
+        let (resample_result, _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::AudioResample, {
+                (|| -> Result<()> {
+                    while self.src_buf.len() >= AUDIO_CHUNK {
+                        let chunk = self.src_buf[..AUDIO_CHUNK].to_vec();
+                        self.src_buf.drain(..AUDIO_CHUNK);
+                        self.buf_16k
+                            .extend_from_slice(&self.r16k.as_mut().unwrap().process(&chunk)?);
+                        self.buf_env
+                            .extend_from_slice(&self.r_env.as_mut().unwrap().process(&chunk)?);
+                    }
+                    Ok(())
+                })()
+            });
         resample_result?;
 
         let mut embs = Vec::new();
@@ -708,7 +709,7 @@ pub async fn run() -> Result<()> {
             maybe = audio_emb_rx.recv(), if !audio_emb_closed => {
                 match maybe {
                     Some(emb) => {
-                        let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
+                        let _ = pending_embs.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &audio_emb_json(&emb));
                         match emb.source {
                             AudioEncoderSource::Speech => st.speech_encode_total_ms += emb.encode_ms,
@@ -745,7 +746,7 @@ pub async fn run() -> Result<()> {
             maybe = video_emb_rx.recv(), if !video_emb_closed => {
                 match maybe {
                     Some(emb) => {
-                        let _ = pending_embs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
+                        let _ = pending_embs.try_update(Ordering::Relaxed, Ordering::Relaxed, |x| Some(x.saturating_sub(1)));
                         sink_write(&mut sink, &video_emb_json(&emb));
                         st.video_encode_total_ms += emb.encode_ms;
                         let (result, d_perc) = somnus_metrics::timed_core!(
@@ -1718,8 +1719,8 @@ mod ort_crossover_tests {
 mod main_helpers_tests {
     use super::*;
     use crossbeam_channel::bounded;
-    use somnus_memory::IngestSource;
     use proptest::prelude::*;
+    use somnus_memory::IngestSource;
 
     // ── thread_budgets ────────────────────────────────────────────────────────
 

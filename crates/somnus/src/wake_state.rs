@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use somnus_memory::{load_growth_cooldown_remaining, load_sal_ewma, load_settle_ewma, load_wake_ewma};
+use somnus_memory::{
+    load_growth_cooldown_remaining, load_sal_ewma, load_settle_ewma, load_wake_ewma,
+};
 
 use crate::cli::Args;
 

@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use somnus_sensory::{Timestamp, VideoFrame};
 use ndarray::Array4;
 use ort::{session::Session, value::TensorRef};
+use somnus_sensory::{Timestamp, VideoFrame};
 
 use crate::{
     audio::mean_pool_2d, preprocess::image::frame_to_tensor, session_cpu, session_with_migraphx,

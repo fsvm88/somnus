@@ -797,7 +797,10 @@ impl PerceptionProcessor {
                     self.latest_inputs[RegionId::Language.as_index()] = Some(emb);
                 }
             } else {
-                somnus_metrics::counted_core!(somnus_metrics::Metric::RefreshLanguageCacheSkipped, 1);
+                somnus_metrics::counted_core!(
+                    somnus_metrics::Metric::RefreshLanguageCacheSkipped,
+                    1
+                );
             }
         });
     }
@@ -1663,58 +1666,61 @@ impl PerceptionProcessor {
         episode: &[f32],
         regional: &[Vec<f32>; 5],
     ) -> PerceptionResult<f32> {
-        let (result, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::WakeReconstructStep, {
-            let device = self.device.clone();
-            let ep_t: Tensor<2> = Tensor::from_data(
-                TensorData::new(episode.to_vec(), [1, episode.len()]),
-                &device,
-            );
-            let mut total_loss: Option<Tensor<1>> = None;
-            let mut n = 0usize;
+        let (result, _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::WakeReconstructStep, {
+                let device = self.device.clone();
+                let ep_t: Tensor<2> = Tensor::from_data(
+                    TensorData::new(episode.to_vec(), [1, episode.len()]),
+                    &device,
+                );
+                let mut total_loss: Option<Tensor<1>> = None;
+                let mut n = 0usize;
 
-            for (head_idx, input) in regional.iter().enumerate() {
-                if input.is_empty() {
-                    continue;
-                }
-                let target: Tensor<2> =
-                    Tensor::from_data(TensorData::new(input.clone(), [1, input.len()]), &device);
-
-                let pred = {
-                    let model = self.model_ref();
-                    match head_idx {
-                        0 => model.speech_head.forward(ep_t.clone()),
-                        1 => model.env_head.forward(ep_t.clone()),
-                        2 => model.visual_head.forward(ep_t.clone()),
-                        3 => model.symbolic_head.forward(ep_t.clone()),
-                        4 => model.language_head.forward(ep_t.clone()),
-                        _ => unreachable!(),
+                for (head_idx, input) in regional.iter().enumerate() {
+                    if input.is_empty() {
+                        continue;
                     }
-                };
+                    let target: Tensor<2> = Tensor::from_data(
+                        TensorData::new(input.clone(), [1, input.len()]),
+                        &device,
+                    );
 
-                let loss: Tensor<1> = (pred - target).powi_scalar(2).mean();
-                total_loss = Some(match total_loss {
-                    None => loss,
-                    Some(acc) => acc + loss,
-                });
-                n += 1;
-            }
+                    let pred = {
+                        let model = self.model_ref();
+                        match head_idx {
+                            0 => model.speech_head.forward(ep_t.clone()),
+                            1 => model.env_head.forward(ep_t.clone()),
+                            2 => model.visual_head.forward(ep_t.clone()),
+                            3 => model.symbolic_head.forward(ep_t.clone()),
+                            4 => model.language_head.forward(ep_t.clone()),
+                            _ => unreachable!(),
+                        }
+                    };
 
-            if let Some(loss) = total_loss {
-                let loss_val: f32 = loss.clone().into_scalar::<f32>();
-                let model = self
-                    .model
-                    .take()
-                    .expect("model already taken (re-entrant optimizer step?)");
-                let grads = loss.backward();
-                let grads_p = GradientsParams::from_grads(grads, &model);
-                let model = self.optimizer.step(self.current_lr, model, grads_p);
-                self.ema_heads.update(&model);
-                self.model = Some(model);
-                Ok(loss_val / n.max(1) as f32)
-            } else {
-                Ok(0.0)
-            }
-        });
+                    let loss: Tensor<1> = (pred - target).powi_scalar(2).mean();
+                    total_loss = Some(match total_loss {
+                        None => loss,
+                        Some(acc) => acc + loss,
+                    });
+                    n += 1;
+                }
+
+                if let Some(loss) = total_loss {
+                    let loss_val: f32 = loss.clone().into_scalar::<f32>();
+                    let model = self
+                        .model
+                        .take()
+                        .expect("model already taken (re-entrant optimizer step?)");
+                    let grads = loss.backward();
+                    let grads_p = GradientsParams::from_grads(grads, &model);
+                    let model = self.optimizer.step(self.current_lr, model, grads_p);
+                    self.ema_heads.update(&model);
+                    self.model = Some(model);
+                    Ok(loss_val / n.max(1) as f32)
+                } else {
+                    Ok(0.0)
+                }
+            });
         result
     }
 
@@ -1965,32 +1971,33 @@ impl PerceptionProcessor {
     /// Returns [Vec<f32>; 5] with one prediction per region. Empty regions get empty vectors.
     /// Used to detect staleness: compare predicted vs stored outputs via cosine similarity.
     pub fn infer_episode_outputs(&self, episode: &[f32]) -> PerceptionResult<[Vec<f32>; 5]> {
-        let (outputs, _) = somnus_metrics::timed_core!(somnus_metrics::Metric::InferEpisodeOutputs, {
-            let device = self.device.clone();
-            let ep_t: Tensor<2> =
-                Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
-            let model = self.model_ref();
+        let (outputs, _) =
+            somnus_metrics::timed_core!(somnus_metrics::Metric::InferEpisodeOutputs, {
+                let device = self.device.clone();
+                let ep_t: Tensor<2> =
+                    Tensor::from_data(TensorData::new(episode.to_vec(), [1, EPISODE_DIM]), &device);
+                let model = self.model_ref();
 
-            let mut outputs: [Vec<f32>; 5] = Default::default();
-            let heads: [&Linear; 5] = [
-                &model.speech_head,
-                &model.env_head,
-                &model.visual_head,
-                &model.symbolic_head,
-                &model.language_head,
-            ];
+                let mut outputs: [Vec<f32>; 5] = Default::default();
+                let heads: [&Linear; 5] = [
+                    &model.speech_head,
+                    &model.env_head,
+                    &model.visual_head,
+                    &model.symbolic_head,
+                    &model.language_head,
+                ];
 
-            for (i, head) in heads.iter().enumerate() {
-                let pred: Tensor<2> = head.forward(ep_t.clone());
-                let pred_vec: Vec<f32> = pred
-                    .into_data()
-                    .convert::<f32>()
-                    .try_to_vec::<f32>()
-                    .map_err(|e| PerceptionError::Burn(format!("tensor extraction: {}", e)))?;
-                outputs[i] = pred_vec;
-            }
-            outputs
-        });
+                for (i, head) in heads.iter().enumerate() {
+                    let pred: Tensor<2> = head.forward(ep_t.clone());
+                    let pred_vec: Vec<f32> = pred
+                        .into_data()
+                        .convert::<f32>()
+                        .try_to_vec::<f32>()
+                        .map_err(|e| PerceptionError::Burn(format!("tensor extraction: {}", e)))?;
+                    outputs[i] = pred_vec;
+                }
+                outputs
+            });
         Ok(outputs)
     }
 
@@ -3232,7 +3239,10 @@ impl PerceptionProcessor {
                     }
                     Err(e) => {
                         tracing::warn!(?e, "ORT encoder in settle failed; aborting settle");
-                        somnus_metrics::counted_core!(somnus_metrics::Metric::OrtEncoderFallback, 1);
+                        somnus_metrics::counted_core!(
+                            somnus_metrics::Metric::OrtEncoderFallback,
+                            1
+                        );
                         break;
                     }
                 }
@@ -3293,7 +3303,10 @@ impl PerceptionProcessor {
                                 ?e,
                                 "ORT binding in settle failed; falling back to burn"
                             );
-                            somnus_metrics::counted_core!(somnus_metrics::Metric::OrtBindingFallback, 1);
+                            somnus_metrics::counted_core!(
+                                somnus_metrics::Metric::OrtBindingFallback,
+                                1
+                            );
                             if let Some(ref h) = saved_hidden {
                                 ort.gru_hidden = h.clone();
                             }

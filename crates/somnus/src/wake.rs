@@ -700,7 +700,10 @@ pub(crate) fn sleep_cycle(
             ];
             for r in perception.duty_cycle_report() {
                 let region_max = r.top5.first().map_or(0.0, |&(_, dc)| dc);
-                somnus_metrics::counted_core!(DUTY_MAX_METRICS[r.region], (region_max * 1e6) as u64);
+                somnus_metrics::counted_core!(
+                    DUTY_MAX_METRICS[r.region],
+                    (region_max * 1e6) as u64
+                );
                 info!(
                     region = r.region,
                     n_units = r.n_units,
@@ -722,7 +725,10 @@ pub(crate) fn sleep_cycle(
                 somnus_metrics::Metric::KwtaDutyDevMean,
                 (duty_dev * 1e6) as u64
             );
-            somnus_metrics::counted_core!(somnus_metrics::Metric::KwtaDutyMax, (duty_max * 1e6) as u64);
+            somnus_metrics::counted_core!(
+                somnus_metrics::Metric::KwtaDutyMax,
+                (duty_max * 1e6) as u64
+            );
             somnus_metrics::counted_core!(
                 somnus_metrics::Metric::MemoryDirDiskFreeBytes,
                 memory_dir_disk_free_bytes(&args.memory_dir)
@@ -875,7 +881,10 @@ pub(crate) fn sleep_cycle(
                         ?e,
                         "ORT session rebuild failed — continuing with existing session"
                     );
-                    somnus_metrics::counted_core!(somnus_metrics::Metric::OrtSessionRebuildFailed, 1);
+                    somnus_metrics::counted_core!(
+                        somnus_metrics::Metric::OrtSessionRebuildFailed,
+                        1
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(?e, "ORT session init failed — running with burn inference");

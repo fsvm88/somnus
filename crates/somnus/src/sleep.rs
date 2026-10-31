@@ -370,7 +370,10 @@ fn persist_snapshot(
     let warm_dir = memory_dir.join("warm");
     match recall.warm.dump(&warm_dir) {
         Ok(bytes_written) => {
-            somnus_metrics::counted_core!(somnus_metrics::Metric::SemanticStoreDumpBytes, bytes_written);
+            somnus_metrics::counted_core!(
+                somnus_metrics::Metric::SemanticStoreDumpBytes,
+                bytes_written
+            );
         }
         Err(e) => {
             tracing::warn!(?e, "warm HNSW dump failed — next restart will cold-rebuild");
@@ -709,7 +712,10 @@ fn grow_poor_regions(
                     seeds = cc_seeds[i].len(),
                     "growing region (cascade-correlation)"
                 );
-                somnus_metrics::counted_core!(somnus_metrics::Metric::GrowthBatchSize, batch as u64);
+                somnus_metrics::counted_core!(
+                    somnus_metrics::Metric::GrowthBatchSize,
+                    batch as u64
+                );
                 perception.grow_region_seeded(region, batch, &cc_seeds[i]);
                 regions_grown.push(region);
             }
@@ -1452,33 +1458,37 @@ fn run_nrem(
             }
 
             // ── Projection distillation: LM hidden-state targets (Gap 6) ────────────
-            let (_, d_proj) = somnus_metrics::timed_core!(somnus_metrics::Metric::SleepProjDistill, {
-                if let Some(ref mut dec) = decoder {
-                    let distill_pairs: Vec<(&[f32], &[f32])> = filtered_indices
-                        .iter()
-                        .filter_map(|&i| {
-                            let (ep, _, _, _, lm_h) = &batch[i];
-                            lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
-                        })
-                        .collect();
-                    if !distill_pairs.is_empty() {
-                        match dec.projection_step_batch_distill(&distill_pairs) {
-                            Ok(loss) => {
-                                let cnt = distill_pairs.len();
-                                total_proj_loss += loss * cnt as f32;
-                                proj_loss_n += cnt;
-                                if loss > proj_loss_max {
-                                    proj_loss_max = loss;
+            let (_, d_proj) =
+                somnus_metrics::timed_core!(somnus_metrics::Metric::SleepProjDistill, {
+                    if let Some(ref mut dec) = decoder {
+                        let distill_pairs: Vec<(&[f32], &[f32])> = filtered_indices
+                            .iter()
+                            .filter_map(|&i| {
+                                let (ep, _, _, _, lm_h) = &batch[i];
+                                lm_h.as_ref().map(|h| (ep.as_slice(), h.as_slice()))
+                            })
+                            .collect();
+                        if !distill_pairs.is_empty() {
+                            match dec.projection_step_batch_distill(&distill_pairs) {
+                                Ok(loss) => {
+                                    let cnt = distill_pairs.len();
+                                    total_proj_loss += loss * cnt as f32;
+                                    proj_loss_n += cnt;
+                                    if loss > proj_loss_max {
+                                        proj_loss_max = loss;
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(?e, "projection_step_batch_distill error");
-                                somnus_metrics::counted_core!(somnus_metrics::Metric::NremStepError, 1);
+                                Err(e) => {
+                                    tracing::warn!(?e, "projection_step_batch_distill error");
+                                    somnus_metrics::counted_core!(
+                                        somnus_metrics::Metric::NremStepError,
+                                        1
+                                    );
+                                }
                             }
                         }
                     }
-                }
-            });
+                });
             proj_us_total += d_proj.as_micros() as u64;
             n_batches += 1;
 

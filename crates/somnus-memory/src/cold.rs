@@ -28,7 +28,7 @@ const MAGIC: &[u8; 8] = b"SMNCOLD3";
 //   salience:      f32   4 B
 //   ──────────────────────
 //   total:               665 B
-/// On-disk bytes per record: id(8) + ts(8) + scale(4) + values(`COLD_DIM`×4) + src(1) +
+/// On-disk bytes per record: id(8) + ts(8) + scale(4) + values(`COLD_DIM`) + src(1) +
 /// salience(4). Exposed so callers (the spill loop) can derive bytes-written from a record
 /// count instead of duplicating this layout arithmetic.
 pub const RECORD_BYTES: usize = 8 + 8 + 4 + COLD_DIM + 1 + 4;
@@ -47,8 +47,10 @@ pub struct ColdArchive {
 impl ColdArchive {
     /// Open (or create) the archive file.
     pub fn open(dir: &Path) -> MemoryResult<Self> {
-        let (result, _) =
-            somnus_metrics::timed_core!(somnus_metrics::Metric::ColdArchiveOpen, Self::open_inner(dir));
+        let (result, _) = somnus_metrics::timed_core!(
+            somnus_metrics::Metric::ColdArchiveOpen,
+            Self::open_inner(dir)
+        );
         result
     }
 

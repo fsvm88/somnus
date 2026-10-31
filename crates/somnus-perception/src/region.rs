@@ -145,8 +145,10 @@ impl KWtaLayer {
     pub fn forward(&mut self, input: &[f32], device: &Device) -> SparseActivation {
         let data = TensorData::new(input.to_vec(), [1, input.len()]);
         let t = Tensor::<2>::from_data(data, device);
-        let z: Tensor<2> =
-            somnus_metrics::timed!(somnus_metrics::Metric::KwtaScoreMatmul, self.linear.forward(t));
+        let z: Tensor<2> = somnus_metrics::timed!(
+            somnus_metrics::Metric::KwtaScoreMatmul,
+            self.linear.forward(t)
+        );
         let z_vec: Vec<f32> = z.to_f32_vec();
         self.select_top_k(z_vec)
     }
@@ -172,8 +174,10 @@ impl KWtaLayer {
         let n_in = inputs[0].len();
         let flat: Vec<f32> = inputs.iter().flat_map(|v| v.iter().copied()).collect();
         let t = Tensor::<2>::from_data(TensorData::new(flat, [inputs.len(), n_in]), device);
-        let z: Tensor<2> =
-            somnus_metrics::timed!(somnus_metrics::Metric::KwtaScoreMatmul, self.linear.forward(t));
+        let z: Tensor<2> = somnus_metrics::timed!(
+            somnus_metrics::Metric::KwtaScoreMatmul,
+            self.linear.forward(t)
+        );
         let z_vec: Vec<f32> = z.to_f32_vec();
         z_vec
             .chunks_exact(self.n_units)
