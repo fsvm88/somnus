@@ -2481,104 +2481,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5614204febbc33cc07a2806aa6440b904ac012b68eecc37f4493ea4a76455a3d"
 
 [[package]]
-name = "somnus"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "burn",
- "burn-flex",
- "burn-store",
- "clap",
- "crossbeam-channel",
- "somnus-encoding",
- "somnus-memory",
- "somnus-metrics",
- "somnus-perception",
- "somnus-sensory",
- "ndarray 0.17.2",
- "ort",
- "proptest",
- "rayon",
- "safetensors 0.8.0",
- "serde_json",
- "sysinfo",
- "tempfile",
- "tokenizers",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "somnus-encoding"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "somnus-metrics",
- "somnus-sensory",
- "ndarray 0.17.2",
- "ort",
- "rubato",
- "rustfft",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "somnus-memory"
-version = "0.1.0"
-dependencies = [
- "bitcode",
- "somnus-metrics",
- "hnsw_rs",
- "log",
- "memmap2",
- "serde",
- "tempfile",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "somnus-metrics"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "serde_json",
-]
-
-[[package]]
-name = "somnus-perception"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "burn",
- "burn-flex",
- "burn-store",
- "somnus-memory",
- "somnus-metrics",
- "matrixmultiply",
- "ndarray 0.17.2",
- "ort",
- "proptest",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
-name = "somnus-sensory"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "crossbeam-channel",
- "somnus-metrics",
- "ffmpeg-next",
- "nokhwa",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6312,9 +6214,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -6661,6 +6563,104 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4fdfe13e1c42e45f497416afb8dc4e783bf0e25b7be9077c1c77c5fb14cb998"
 
 [[package]]
+name = "somnus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-flex",
+ "burn-store",
+ "clap",
+ "crossbeam-channel",
+ "ndarray 0.17.2",
+ "ort",
+ "proptest",
+ "rayon",
+ "safetensors 0.8.0",
+ "serde_json",
+ "somnus-encoding",
+ "somnus-memory",
+ "somnus-metrics",
+ "somnus-perception",
+ "somnus-sensory",
+ "sysinfo",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "somnus-encoding"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndarray 0.17.2",
+ "ort",
+ "rubato",
+ "rustfft",
+ "somnus-metrics",
+ "somnus-sensory",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "somnus-memory"
+version = "0.1.0"
+dependencies = [
+ "bitcode",
+ "hnsw_rs",
+ "log",
+ "memmap2",
+ "serde",
+ "somnus-metrics",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "somnus-metrics"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
+name = "somnus-perception"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-flex",
+ "burn-store",
+ "matrixmultiply",
+ "ndarray 0.17.2",
+ "ort",
+ "proptest",
+ "serde_json",
+ "somnus-memory",
+ "somnus-metrics",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "somnus-sensory"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "crossbeam-channel",
+ "ffmpeg-next",
+ "nokhwa",
+ "somnus-metrics",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6870,7 +6870,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
